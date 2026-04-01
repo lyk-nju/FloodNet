@@ -1,0 +1,9 @@
+dirs:
+    deps: deps
+    outputs: outputs
+    raw_data: raw_data
+
+wandb_info:
+    key: "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"  # Your WandB API key
+    project: "FloodNet"
+    entity: "laiyuankia-nanjing-university"

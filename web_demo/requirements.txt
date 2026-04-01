@@ -1,0 +1,10 @@
+#
+# Keep web_demo dependencies consistent with project root.
+# Installing from root requirements avoids missing runtime deps
+# (e.g. torch_ema, omegaconf, transformers, etc.).
+#
+-r ../requirements.txt
+
+# Extra (web server)
+flask-cors>=3.0.10
+

@@ -1,0 +1,10 @@
+traj_mask:
+  # During training, only keep ~20-30% of trajectory time steps.
+  enabled: true
+  keep_ratio_min: 0.20
+  keep_ratio_max: 0.30
+
+  # Keep the first and last time steps unmasked to preserve start/end constraints.
+  # If you want fully random masking without constraints, set to false.
+  keep_first_last: true
+

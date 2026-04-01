@@ -1,0 +1,34 @@
+**__pycache__**
+**.ipynb_checkpoints**
+**.DS_Store**
+**.vscode**
+*.pyc
+*.model
+*.pt
+*.pth
+logs*/
+*.log
+log_*
+slurm*
+*.bin
+
+# cache
+.ruff_cache/
+
+# logs
+lightning_logs/
+wandb/
+outputs/
+deps/
+raw_data/
+pretrained/
+tmp/
+
+# web
+server.pid
+
+# configs
+configs/paths.yaml
+
+# cuda
+cuda-ubuntu2004.pin
