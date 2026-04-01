@@ -327,44 +327,43 @@ class CustomLightningModule(BasicLightningModule):
                     decoded_single_generated.float().cpu().numpy(),
                 )
 
-                # Save condition trajectory XZ for visualization (red overlay).
+                # Save conditioning trajectory (T,2)=[x,z] for visualization (red overlay).
                 # Prefer frame-level traj_features (T,4)=[x,z,cos,sin]; else build from root traj xyz.
                 L_feat = int(decoded_single_generated.shape[0])
-                cond_xz = None
+                cond_traj = None
                 if "traj_features" in batch:
                     cond = batch["traj_features"][i]
                     if torch.is_tensor(cond):
                         cond = cond.detach().cpu().numpy()
                     cond = np.asarray(cond)
                     if cond.ndim == 2 and cond.shape[1] >= 2:
-                        cond_xz = cond[:L_feat, :2].astype(np.float32)
+                        cond_traj = cond[:L_feat, :2].astype(np.float32)
                     else:
                         rank_zero_info(
-                            f"Skip cond_traj_xz for {single_generated_id}: "
+                            f"Skip cond_traj for {single_generated_id}: "
                             f"traj_features bad shape {cond.shape}"
                         )
-                if cond_xz is None and "traj" in batch:
+                if cond_traj is None and "traj" in batch:
                     tr = batch["traj"][i]
                     if torch.is_tensor(tr):
                         tr = tr.detach().cpu().numpy()
                     tr = np.asarray(tr)[:L_feat]
                     if tr.ndim == 2 and tr.shape[1] >= 3:
-                        cond_xz = path_heading_features_from_root_xyz(tr)[:, :2].astype(
+                        cond_traj = path_heading_features_from_root_xyz(tr)[:, :2].astype(
                             np.float32
                         )
-                if cond_xz is not None:
+                if cond_traj is not None:
                     os.makedirs(
-                        f"{self.cfg.save_dir}/{single_dataset_id}/cond_traj_xz",
+                        f"{self.cfg.save_dir}/{single_dataset_id}/cond_traj",
                         exist_ok=True,
                     )
                     np.save(
-                        f"{self.cfg.save_dir}/{single_dataset_id}/cond_traj_xz/{single_generated_id}.npy",
-                        cond_xz,
+                        f"{self.cfg.save_dir}/{single_dataset_id}/cond_traj/{single_generated_id}.npy",
+                        cond_traj,
                     )
 
                 # Save traj_mask (if provided by dataset) so we can mask the root trajectory in visualization.
                 if "traj_mask" in batch:
-                    L_feat = int(decoded_single_generated.shape[0])
                     traj_mask_i = batch["traj_mask"][i]
                     if torch.is_tensor(traj_mask_i):
                         traj_mask_i = traj_mask_i.detach().cpu().numpy()
@@ -406,7 +405,7 @@ class CustomLightningModule(BasicLightningModule):
                     render_setting=self.cfg.test_setting,
                     frames_dir=f"{self.cfg.save_dir}/{dataset_id}/frames",
                     traj_mask_dir=f"{self.cfg.save_dir}/{dataset_id}/traj_mask",
-                    cond_traj_xz_dir=f"{self.cfg.save_dir}/{dataset_id}/cond_traj_xz",
+                    cond_traj_dir=f"{self.cfg.save_dir}/{dataset_id}/cond_traj",
                 )
 
                 # Create composite videos
