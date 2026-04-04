@@ -33,9 +33,10 @@ class LocalTrajEncoder(nn.Module):
 
 
 class TrajEncoder(nn.Module):
-    """
-    轻量轨迹编码器：将 token 对齐的平面+朝向特征映射到 traj_enc_dim，再经 WanModel 投到主干 dim。
-    默认 in_dim=4 对应 (x, z, cos ψ, sin ψ)；若仅有 (x,y,z) 可由调用方补全为 4D。
+    """Token-aligned trajectory encoder: maps (x, z, cos psi, sin psi) features to traj_enc_dim.
+
+    Input:  (B, T, in_dim)  — token-level 4D trajectory features
+    Output: (B, T, out_dim) — trajectory embeddings fed to WanModel / WanControlNet
     """
 
     def __init__(self, in_dim=4, hidden_dim=64, out_dim=64):
@@ -48,10 +49,4 @@ class TrajEncoder(nn.Module):
         self.out_dim = out_dim
 
     def forward(self, x):
-        """
-        Args:
-            x: (B, T, in_dim) 轨迹特征
-        Returns:
-            (B, T, out_dim)
-        """
         return self.mlp(x)

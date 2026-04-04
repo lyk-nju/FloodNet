@@ -1,59 +1,86 @@
-## FloodNet ControlNet 轨迹控制：设计规范与代码映射
+## FloodNet ControlNet Trajectory Control: Design Spec and Code Map
 
-本文档把“把 ControlNet 融合进 FloodDiffusion / Diffusion Forcing（Wan backbone）做轨迹控制”拆成可落地的模块任务，并给出**全局一致性约定**（任何一处改动都必须同步更新相关 Task 与实现）。
-
----
-
-## 与 Task 文档对应
-
-| 章节 | 文档 | 内容摘要 |
-|------|------|----------|
-| §1 | [`Task1-input.md`](Task1-input.md) | `traj_features`/mask/长度字段、token/帧对齐、stream buffer |
-| §2 | [`Task2-controlnet.md`](Task2-controlnet.md) | `WanControlNet` 结构、zero-init residual、初始化/冻结 |
-| §3 | [`Task3-backbone-inject.md`](Task3-backbone-inject.md) | `WanModel.forward` residual 注入接口与注入点 |
-| §4 | [`Task4-inference-stream.md`](Task4-inference-stream.md) | 推理与流式接口一致性、traj cache/CFG |
-| §5 | [`Task5-loss.md`](Task5-loss.md) | decode 后 motion space 的 `L_control_xz`，active window 对齐 |
-| §6 | [`Task6-config.md`](Task6-config.md) | config 键、冻结阶段、ckpt 兼容 |
+This document decomposes "adding a ControlNet branch to FloodDiffusion / Diffusion Forcing (Wan backbone) for trajectory control" into implementable module tasks, and defines **global consistency rules** that must be updated everywhere when any one rule changes.
 
 ---
 
-## 全局一致性约定（必须一致）
+## Implementation Status
 
-1. **ControlNet 的作用域**：ControlNet 输出的是 **对主干 hidden states 的残差**；只对 **latent tokens** 生效。标准 ControlNet 训练下，**主干不接收任何 traj tokens/特殊 mask/轨迹编码器输出**，以保持与原 FloodDiffusion 主干行为一致。
-2. **残差形状约定**：
-   - 推荐：每层 residual shape 为 **`(B, seq_len, dim)`**（只对应 latent 段）。
-   - 不推荐：`(B, 2*seq_len, dim)`（会导致 traj 段被改写，语义更复杂）。
-3. **zero-init 约定**：ControlNet 的 residual 输出头必须 **零初始化**，保证“刚加入 ControlNet 时模型行为≈原模型”，训练更稳定。
-4. **时间/窗口约定（FloodDiffusion）**：
-   - diffusion forcing 的 MSE 训练只在 **active window（最后 `chunk_size` positions）**上计算（当前已实现）。
-   - 轨迹控制损失 `L_control` 也必须与 active window **一致对齐**（同一 token 区间/同一帧区间）。
-5. **坐标与监督约定**：
-   - root trajectory `traj` 是 `(T,3)`，其中 **索引 0/2 是地面 \(x,z\)**，索引 1 是竖直 \(y\)。
-   - 第一版控制损失只监督 **\(x,z\)**（与常用轨迹条件不含 \(y\) 的设定一致）。
-6. **训练阶段约定**：
-   - Stage-1：冻结主干 `WanModel` + 文本编码器（以及 VAE），只训练 `WanControlNet + TrajEncoder (+ traj_in_proj/type_embed)`。
-   - Stage-2（可选）：小学习率解冻少量主干层做联合微调。
+| Task | File | Status | Summary |
+|------|------|--------|---------|
+| §1 | [`Task1-input.md`](Task1-input.md) | **Done** | `traj_features`/mask/length fields, token/frame alignment, stream buffer |
+| §2 | [`Task2-controlnet.md`](Task2-controlnet.md) | **Done** | `WanControlNet` structure, zero-init residuals, initialization/freezing |
+| §3 | [`Task3-backbone-inject.md`](Task3-backbone-inject.md) | **Done** | `WanModel.forward` residual injection interface |
+| §4 | [`Task4-inference-stream.md`](Task4-inference-stream.md) | **Partial** | ControlNet in all inference paths; CFG handling for ControlNet TBD |
+| §5 | [`Task5-loss.md`](Task5-loss.md) | **Done** | `L_control_xz` after VAE decode, active window alignment |
+| §6 | [`Task6-config.md`](Task6-config.md) | **Done** | Config keys, freeze strategy, checkpoint compatibility |
 
 ---
 
-## 最小训练开关（推荐）
+## Task Dependency Order
 
-- **仅需 2 个关键开关**：
-  - `use_controlnet_traj: true`
-  - `freeze_backbone_for_controlnet: true`
+```
+Task6 (config keys) ──► Task2 (WanControlNet init)
+                              │
+Task1 (input fields) ─────────┼──► Task4 (inference paths)
+                              │         │
+                        Task3 (inject)  │
+                              │         │
+                         Task5 (loss) ◄─┘
+```
 
-其余诸如 `use_traj_cond`（主干 FlexTraj）视为 legacy，不建议与 ControlNet 混用。
+- Task6 must be settled first (config keys flow into Task2 constructor and Task1 dataset fields).
+- Task1 and Task2 can proceed in parallel once Task6 is settled.
+- Task3 requires Task2 (needs `WanControlNet` to exist) and `WanModel` (already present).
+- Task4 requires Task1 (traj fields) + Task2 (controlnet instance) + Task3 (injection point).
+- Task5 requires Task4 (access to `control_aux["pred_x0_latent_list"]`).
 
 ---
 
-## 现有实现可复用点（无需重写）
+## Global Consistency Rules (must be kept in sync everywhere)
 
-- `FloodNet/models/diffusion_forcing_wan.py`
-  - triangular schedule `_get_noise_levels`
-  - active window MSE
-  - `control_aux["pred_x0_latent_list"]`：为 motion space 控制损失提供 decode 输入
-- `FloodNet/models/tools/wan_model.py`
-  - FlexTraj：`latent||traj` 拼接、共享 RoPE、cross-attn 只更新 latent、traj-only LoRA、`traj_in_proj` zero-init
-- `FloodNet/models/diffusion_forcing_wan.py::stream_generate_step`
-  - 已有 traj buffer + emb cache 机制（需让 ControlNet 与主干共享同一份 traj_emb）
+1. **ControlNet scope**: ControlNet outputs **per-layer residuals added to the backbone's hidden states**; applies only to **latent tokens**. Under standard ControlNet training, **the backbone receives no traj tokens / traj embeddings** — trajectory conditions enter only through the ControlNet branch, then propagate via residuals. This keeps backbone behavior identical to the original FloodDiffusion.
 
+2. **Residual tensor shape**: each residual is `(B, seq_len, dim)` — **only latent token positions**. Not `(B, 2*seq_len, dim)` (that would corrupt traj token positions when FlexTraj is also enabled).
+
+3. **Zero-init rule**: all ControlNet residual output heads (`zero_out[i]`) are initialized to exact zero weights and zero bias. This ensures the model with ControlNet added has identical behavior to the backbone alone at initialization, which stabilizes Stage-1 training.
+
+4. **Active window rule (FloodDiffusion)**:
+   - The diffusion forcing MSE is computed only on the **last `chunk_size` token positions** (the active window).
+   - `L_control_xz` must be aligned to the **same active window**: same token indices → same frame indices after VAE decode.
+
+5. **Coordinate convention**:
+   - Root trajectory `traj` has shape `(T, 3)`. **Index 0 = x (ground plane), index 1 = y (vertical height), index 2 = z (ground plane)**.
+   - Control loss supervises **only x and z** (indices `[0, 2]`). Height y is not supervised by the control loss (it is determined by pose and the main MSE loss).
+
+6. **Training stage convention**:
+   - **Stage-1**: Freeze backbone `WanModel` + text encoder + VAE. Train only `WanControlNet` + `TrajEncoder` (+ optionally `WanModel.traj_in_proj` / `traj_type_embed` if FlexTraj mode is also enabled on ControlNet).
+   - **Stage-2** (optional): Unfreeze a small number of backbone layers with a much lower learning rate.
+
+7. **CFG convention**: When CFG is active (`cfg_scale != 1.0`), both the conditional and null forward passes should go through the ControlNet branch using the **same traj_emb** (traj is not dropped in the null pass — only text is dropped). This is the correct behavior for text-CFG with traj ControlNet.
+
+---
+
+## Minimum config switches
+
+Two keys are sufficient to enable ControlNet mode:
+
+```yaml
+use_controlnet_traj: true          # enables WanControlNet branch
+freeze_backbone_for_controlnet: true  # Stage-1 freezing
+```
+
+`use_traj_cond` (the FlexTraj / backbone traj path) is **mutually exclusive** with `use_controlnet_traj` — do not enable both. The model constructor prints a warning and disables `use_traj_cond` if both are set.
+
+---
+
+## Reusable components (no rewrite needed)
+
+| Component | Location | Description |
+|-----------|----------|-------------|
+| Triangular noise schedule | `diffusion_forcing_wan.py::_get_noise_levels` | Already correct |
+| Active window MSE | `diffusion_forcing_wan.py::forward` | Already correct |
+| ControlNet auxiliary output | `control_aux["pred_x0_latent_list"]` | Already set in `forward()` |
+| Traj emb cache for streaming | `_traj_stream_version`, `_traj_emb_cache` in `diffusion_forcing_wan.py` | Shared by backbone and ControlNet |
+| `TrajEncoder` | `models/tools/traj_encoder.py` | MLP from 4D → `traj_out_dim` |
+| `build_traj_emb_from_batch` | `utils/traj_batch.py` | Constructs traj_emb from batch dict |

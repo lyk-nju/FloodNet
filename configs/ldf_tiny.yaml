@@ -116,14 +116,14 @@ model:
         chunk_size: 5
         use_text_cond: True
         text_len: 512
-        drop_out: 0.1
+        dropout: 0.1
         cfg_scale: 5.0
         prediction_type: "vel"
         causal: False
         use_traj_cond: false
         traj_encoder_in_dim: 4
         traj_out_dim: 64   # TrajEncoder 输出维 = WanModel.traj_enc_dim（经 traj_in_proj 进主干）
-        traj_drop_out: 0.1
+        traj_dropout: 0.1
         use_traj_emb_cache: true      # 推理流式 traj_emb 缓存（Task3）
         control_loss_weight: 0.2
         freeze_backbone_for_traj: true  # 只微调轨迹分支（文本 & 主干冻结）

@@ -1,7 +1,7 @@
 dirs:
-    deps: deps
+    deps: /home/yuankai/Text2Motion/FloodDiffusion/deps
     outputs: outputs
-    raw_data: raw_data
+    raw_data: /home/yuankai/Text2Motion/FloodDiffusion/raw_data
 
 wandb_info:
     key: "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"  # Your WandB API key

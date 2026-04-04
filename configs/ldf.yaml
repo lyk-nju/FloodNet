@@ -10,8 +10,8 @@ dirs:
     raw_data: /home/yuankai/Text2Motion/FloodDiffusion/raw_data
 
 save_dir: ./outputs
-resume_ckpt: "/home/yuankai/Text2Motion/Floodcontrol/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt"
-test_ckpt: "/home/yuankai/Text2Motion/Floodcontrol/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt"
+resume_ckpt: "${dirs.outputs}/20260401_192505_ldf/step_step=245000.ckpt"
+test_ckpt: "${dirs.outputs}/20260401_192505_ldf/step_step=245000.ckpt"
 test_vae_ckpt: "${dirs.outputs}/vae_1d_z4_step=300000.ckpt"
 test_vae:
     target: models.vae_wan_1d.VAEWanModel
@@ -39,7 +39,7 @@ logger:
 trainer: # lightning trainer
     max_steps: 300000
     accelerator: gpu
-    devices: [0,1]
+    devices: [0,1,2,3]
     log_every_n_steps: 100
     precision: bf16-mixed
 validation:
@@ -86,17 +86,17 @@ metrics:
 data:
     target: datasets.humanml3d.HumanML3DDataset
     collate_fn: datasets.humanml3d.collate_fn
-    train_bs: 16
+    train_bs: 8
     val_bs: 4
     test_bs: 1
-    num_workers: 2
+    num_workers: 8
     # mask_ratio: [0.2,0.3]       
     mask_ratio: 1.0
     train_meta_paths:
         - ${dirs.raw_data}/HumanML3D/train.txt
     val_meta_paths:
-        # - ${dirs.raw_data}/HumanML3D/val.txt
-        - ${dirs.raw_data}/HumanML3D/test_min.txt
+        - ${dirs.raw_data}/HumanML3D/val.txt
+        # - ${dirs.raw_data}/HumanML3D/test_min.txt
         # - ${dirs.raw_data}/HumanML3D/test.txt
     test_meta_paths:
         - ${dirs.raw_data}/HumanML3D/test_min.txt
@@ -126,22 +126,22 @@ model:
         # Trajectory condition encoder (used by ControlNet)
         traj_encoder_in_dim: 4
         traj_out_dim: 64
-        traj_drop_out: 0.1
+        traj_dropout: 0.1
         use_traj_emb_cache: true
 
         # Explicit motion-space control loss
-        control_loss_weight: 0.5
+        control_loss_weight: 1.0
 
 optimizer:
-  target: AdamW
-  params:
-    lr: 5e-4
-    betas: [0.9, 0.999]
-    weight_decay: 0.01
-    eps: 1e-8
+    target: AdamW
+    params:
+        lr: 1e-3
+        betas: [0.9, 0.999]
+        weight_decay: 0.01
+        eps: 1e-8
 
 lr_scheduler:
-  target: diffusers.optimization.get_cosine_schedule_with_warmup
-  params:
-    num_warmup_steps: 2000
-    num_training_steps: ${trainer.max_steps}
+    target: diffusers.optimization.get_cosine_schedule_with_warmup
+    params:
+        num_warmup_steps: 2000
+        num_training_steps: ${trainer.max_steps}

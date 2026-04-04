@@ -1,10 +1,8 @@
-import os
 import warnings
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from .tools.t5 import T5EncoderModel
 from utils.traj_batch import xyz_traj_to_features_4d
@@ -39,7 +37,7 @@ class DiffForcingWanModel(nn.Module):
         noise_steps=10,
         use_text_cond=True,
         text_len=512,
-        drop_out=0.1,
+        dropout=0.1,
         cfg_scale=5.0,
         prediction_type="vel",  # "vel", "x0", "noise"
         causal=False,
@@ -49,7 +47,7 @@ class DiffForcingWanModel(nn.Module):
         traj_out_dim=64,
         traj_in_dim=4,
         traj_encoder_in_dim=None,
-        traj_drop_out=0.1,
+        traj_dropout=0.1,
         use_traj_emb_cache=False,
         use_traj_kv_cache=None,
         control_loss_weight=1.0,  # used by train_ldf, not by model
@@ -82,14 +80,14 @@ class DiffForcingWanModel(nn.Module):
         self.chunk_size = chunk_size
         self.noise_steps = noise_steps
         self.use_text_cond = use_text_cond
-        self.drop_out = drop_out
+        self.dropout = dropout
         self.cfg_scale = cfg_scale
         self.prediction_type = prediction_type
         self.causal = causal
         self.use_traj_cond = use_traj_cond
         self.traj_out_dim = traj_out_dim
         self.traj_in_dim = traj_in_dim
-        self.traj_drop_out = traj_drop_out
+        self.traj_dropout = traj_dropout
         self.freeze_backbone_for_traj = freeze_backbone_for_traj
         self.use_controlnet_traj = bool(use_controlnet_traj)
         self.controlnet_init_from_backbone = bool(controlnet_init_from_backbone)
@@ -327,7 +325,7 @@ class DiffForcingWanModel(nn.Module):
         # using a local within-token encoder over 4 frames, then apply TrajEncoder.
         if (not (self.use_controlnet_traj or self.use_traj_cond)) or self.traj_encoder is None:
             return None
-        if training_dropout and np.random.rand() <= self.traj_drop_out:
+        if training_dropout and np.random.rand() <= self.traj_dropout:
             return None
 
         # Prefer frame-level traj_features if present; else derive from traj xyz.
@@ -440,40 +438,8 @@ class DiffForcingWanModel(nn.Module):
         time_steps = torch.tensor(time_steps, device=device)  # (B,)
         noise_level = self._get_noise_levels(device, seq_len, time_steps)  # (B, T)
 
-        # # Debug: Print noise levels
-        # print("Time steps and corresponding noise levels:")
-        # for i in range(batch_size):
-        #     t = time_steps[i].item()
-        #     # Get noise level at each position
-        #     start_idx = int(self.chunk_size * (t - 1))
-        #     end_idx = int(self.chunk_size * t) + 2
-        #     # Limit to valid range
-        #     start_idx = max(0, start_idx)
-        #     end_idx = min(seq_len, end_idx)
-        #     print(time_steps[i])
-        #     print(noise_level[i, start_idx:end_idx])
-
         # Add noise to entire sequence
         noisy_feature, noise = self.add_noise(feature, noise_level)  # (B, T, D)
-
-        # Debug: Print noise addition information
-        # print("Added noise levels at chunk positions:")
-        # for i in range(batch_size):
-        #     t = time_steps[i].item()
-        #     start_idx = int(self.chunk_size * (t - 1))
-        #     end_idx = int(self.chunk_size * t) + 2
-        #     # Limit to valid range
-        #     start_idx = max(0, start_idx)
-        #     end_idx = min(seq_len, end_idx)
-        #     test1 = (
-        #         feature[i, start_idx:end_idx, :] - noisy_feature[i, start_idx:end_idx, :]
-        #     )
-        #     test2 = (
-        #         noise[i, start_idx:end_idx, :] - noisy_feature[i, start_idx:end_idx, :]
-        #     )
-        #     # Compute length on last dimension
-        #     print(test1.norm(dim=-1))
-        #     print(test2.norm(dim=-1))
 
         feature = self.preprocess(feature)  # (B, C, T, 1, 1)
         noisy_feature = self.preprocess(noisy_feature)  # (B, C, T, 1, 1)
@@ -500,8 +466,8 @@ class DiffForcingWanModel(nn.Module):
                 for single_text_list, single_text_end_list in zip(
                     text_list, text_end_list
                 ):
-                    # Paper: classifier-free guidance — with prob drop_out replace text by "" at train time
-                    if np.random.rand() > self.drop_out:
+                    # Paper: classifier-free guidance — with prob dropout replace text by "" at train time
+                    if np.random.rand() > self.dropout:
                         single_text_end_list = [0] + [
                             min(t, seq_len) for t in single_text_end_list
                         ]
@@ -533,7 +499,7 @@ class DiffForcingWanModel(nn.Module):
                     )
             else:
                 all_text_context = [
-                    (u if np.random.rand() > self.drop_out else "") for u in text_list
+                    (u if np.random.rand() > self.dropout else "") for u in text_list
                 ]
                 all_text_context = self.encode_text_with_cache(all_text_context, device)
                 all_text_context = [u.to(self.param_dtype) for u in all_text_context]
@@ -635,15 +601,6 @@ class DiffForcingWanModel(nn.Module):
         batch_size = len(feature_length)
         seq_len = max(feature_length).item()
 
-        # # debug
-        # x["text"] = [["walk forward.", "sit down.", "stand up."] for _ in range(batch_size)]
-        # x["feature_text_end"] = [[1, 2, 3] for _ in range(batch_size)]
-        # text = x["text"]
-        # text_end = x["feature_text_end"]
-        # print(text)
-        # print(text_end)
-        # print(batch_size, seq_len, self.chunk_size)
-
         if num_denoise_steps is None:
             num_denoise_steps = self.noise_steps
         assert num_denoise_steps % self.chunk_size == 0
@@ -737,15 +694,9 @@ class DiffForcingWanModel(nn.Module):
                 x, gen_seq_len, device, training_dropout=False
             )
             traj_seq_lens = self._get_traj_seq_lens(x, gen_seq_len, device)
+        # ControlNet mode: backbone stays unconditional on traj; only ControlNet branch consumes it.
         traj_emb_backbone = traj_emb if (self.use_traj_cond and not self.use_controlnet_traj) else None
         traj_seq_lens_backbone = traj_seq_lens if (self.use_traj_cond and not self.use_controlnet_traj) else None
-        traj_emb_backbone = None
-        traj_seq_lens_backbone = None
-        if self.use_traj_cond and not (
-            self.use_controlnet_traj and self.controlnet_only_traj_cond
-        ):
-            traj_emb_backbone = traj_emb
-            traj_seq_lens_backbone = traj_seq_lens
 
         # Progressively advance from t=0 to t=max_t
         for step in range(total_steps):
@@ -865,15 +816,6 @@ class DiffForcingWanModel(nn.Module):
         feature_length = x["feature_length"]
         batch_size = len(feature_length)
         seq_len = max(feature_length).item()
-
-        # # debug
-        # x["text"] = [["walk forward.", "sit down.", "stand up."] for _ in range(batch_size)]
-        # x["feature_text_end"] = [[1, 2, 3] for _ in range(batch_size)]
-        # text = x["text"]
-        # text_end = x["feature_text_end"]
-        # print(text)
-        # print(text_end)
-        # print(batch_size, seq_len, self.chunk_size)
 
         if num_denoise_steps is None:
             num_denoise_steps = self.noise_steps
@@ -1323,24 +1265,9 @@ class DiffForcingWanModel(nn.Module):
                 if traj_emb is not None
                 else None
             )
-            traj_emb_backbone = None
-            traj_seq_lens_backbone = None
-            if self.use_traj_cond and not (
-                self.use_controlnet_traj and self.controlnet_only_traj_cond
-            ):
-                traj_emb_backbone = traj_emb
-                traj_seq_lens_backbone = traj_seq_lens
-
-            # print("////////////////////")
-            # print("current step: ", self.current_step)
-            # print("chunk size: ", self.chunk_size)
-            # print("start_index: ", start_index)
-            # print("end_index: ", end_index)
-            # print("noisy_input shape: ", noisy_input[0].shape)
-            # print("noise_level: ", noise_level[0, start_index:end_index])
-            # print("text_condition shape: ", len(text_condition))
-            # print("commit_index: ", self.commit_index)
-            # print("////////////////////")
+            # ControlNet mode: backbone stays unconditional on traj; only ControlNet branch consumes it.
+            traj_emb_backbone = traj_emb if (self.use_traj_cond and not self.use_controlnet_traj) else None
+            traj_seq_lens_backbone = traj_seq_lens if (self.use_traj_cond and not self.use_controlnet_traj) else None
 
             controlnet_residuals = self._maybe_controlnet_residuals(
                 noisy_input,

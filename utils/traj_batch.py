@@ -1,4 +1,4 @@
-"""轨迹 batch：路径朝向 [x,z,cos,sin] 与 DiffForcing → WanModel 的轨迹编码输入。"""
+"""Trajectory batch utilities: path-heading features [x, z, cos, sin] for DiffForcing/WanModel."""
 
 from __future__ import annotations
 
@@ -12,11 +12,10 @@ _PATH_HEADING_EPS = 1e-8
 def path_heading_features_from_root_xyz(
     traj_xyz: np.ndarray, eps: float = _PATH_HEADING_EPS
 ) -> np.ndarray:
-    """
-    根轨迹 (T,3) 的 x,y,z → (T,4)：[x, z, cos ψ, sin ψ]。
+    """Convert root trajectory (T, 3) xyz to (T, 4) path-heading features [x, z, cos(psi), sin(psi)].
 
-    ψ 为 **xz 路径朝向**（位移差分单位化），与 `xyz_traj_to_features_4d` 逻辑一致；
-    用于数据集 `traj_features`，与仅能提供路径的推理条件对齐。
+    psi is the xz path heading (normalised displacement), consistent with xyz_traj_to_features_4d.
+    Used for dataset traj_features and inference trajectory conditioning.
     """
     traj_xyz = np.asarray(traj_xyz, dtype=np.float64)
     t_len = traj_xyz.shape[0]
@@ -45,10 +44,9 @@ def path_heading_features_from_root_xyz(
 def xyz_traj_to_features_4d(
     traj_xyz: torch.Tensor, eps: float = _PATH_HEADING_EPS
 ) -> torch.Tensor:
-    """
-    (B,T,3) 列 x,y,z → (B,T,4)：[x, z, cos ψ, sin ψ]，ψ 为 **xz 路径朝向**（差分单位化）。
+    """Convert (B, T, 3) xyz trajectory to (B, T, 4) path-heading features [x, z, cos(psi), sin(psi)].
 
-    与 `path_heading_features_from_root_xyz` 及数据集 `traj_features` 语义一致。
+    Semantically identical to path_heading_features_from_root_xyz (numpy counterpart).
     """
     x_coord = traj_xyz[..., 0:1]
     z_coord = traj_xyz[..., 2:3]
@@ -82,10 +80,10 @@ def build_traj_emb_from_batch(
     traj_drop_out: float,
     training_dropout: bool,
 ) -> torch.Tensor | None:
-    """
-    返回 TrajEncoder 输出 (B,T,traj_enc_dim)，供 ``WanModel.forward(..., traj_emb=...)``。
-    参数名 ``traj_emb`` 为历史兼容，语义是 **encoder 输出、尚未** ``traj_in_proj``。
-    无轨迹或 dropout 时返回 None。优先 `traj_features`；否则由 `traj` xyz 经路径朝向补四维。
+    """Build trajectory embedding (B, T, traj_enc_dim) for WanModel.forward(traj_emb=...).
+
+    Returns None when trajectory is absent or dropped out.
+    Prefers traj_features (precomputed 4D); falls back to traj xyz converted on the fly.
     """
     if not use_traj_cond or traj_encoder is None:
         return None

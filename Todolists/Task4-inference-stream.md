@@ -1,55 +1,142 @@
-## Task4 — 推理与流式（generate / stream_generate / stream_generate_step）
+## Task4 — Inference and Streaming (generate / stream_generate / stream_generate_step)
 
-对应 [`target.md`](target.md) §4。
+Corresponds to [`target.md`](target.md) §4.
 
----
-
-## 目标
-
-让 ControlNet 在三种推理路径里都生效，并且三者对 traj 条件的使用**一致**：
-
-- `generate`
-- `stream_generate`
-- `stream_generate_step`（最关键，web_demo/在线生成会走这里）
+**Status: Partial.** ControlNet is wired into `generate()` and `stream_generate()`. The CFG path for ControlNet requires verification and may need explicit handling for the null pass.
 
 ---
 
-## 需要做的事情
+## Goal
 
-1. **推理路径统一调用顺序**
+ControlNet must be active in all three inference paths, and all three must handle the trajectory condition consistently:
 
-每次调用主干 `WanModel` 前：
-
-- 构造/更新 `traj_emb`（优先从 stream buffer 产出；非 stream 则从 batch 字段产出）
-- 调用 `WanControlNet(...)` 得到 `controlnet_residuals`
-- 调用 `WanModel(..., controlnet_residuals=controlnet_residuals, traj_emb=traj_emb, ...)`
-
-2. **CFG 与 ControlNet**
-
-当前 `generate/stream_generate` 有 CFG（`cfg_scale != 1.0` 会跑一次 null 文本）。
-
-约定：
-
-- ControlNet residual 应该随文本条件变化而变化（与主干一致），因此：
-  - 有 CFG 时，最好也算一份 `residuals_null`，并按同样方式合成（或至少保证 residual 在 null 文本时可用）。
-
-第一版可接受的简化：
-
-- 先让 residual 只依赖 traj（text 仅通过主干 cross-attn），CFG 只作用主干；但后续若出现“text 改变而控制分支不变”的割裂，需要补全 residual 的 CFG。
-
-3. **traj cache 一致性**
-
-`DiffForcingWanModel` 已有 `_traj_stream_version` 与 `_traj_emb_cache`。
-
-要求：
-
-- 控制分支与主干共享同一份 `traj_emb`（即同一个 cache key 产物）
-- 当新的 traj chunk 写入 buffer 时，必须 bump version，避免使用旧 `traj_emb`
+- `generate` — offline full-sequence generation
+- `stream_generate` — streaming wrapper (calls `stream_generate_step` in a loop)
+- `stream_generate_step` — the core step, used by web demo and online generation
 
 ---
 
-## 必须验证
+## Required Call Sequence (all three paths)
 
-- `stream_generate_step` 在 traj 改变时，`traj_emb` cache key 改变且输出跟随改变。
-- `generate` 与 `stream_generate` 在同一输入下（不考虑随机噪声）行为一致性合理（至少没有“只有其中一个路径生效 controlnet”）。
+Every call to the backbone `WanModel` must follow this order:
 
+```
+1. Compute / retrieve traj_emb:
+   - Non-stream: build_traj_emb_from_batch(x, seq_len, device, traj_encoder, ...)
+   - Stream:     _stream_compute_traj_emb(...)   [uses traj buffer + cache]
+
+2. Compute ControlNet residuals (if controlnet is enabled):
+   controlnet_residuals = _maybe_controlnet_residuals(
+       noisy_input, t, context, seq_len,
+       traj_emb=traj_emb,       # same traj_emb as above
+       traj_seq_lens=traj_seq_lens
+   )
+
+3. Call backbone with residuals:
+   pred = self.model(
+       x=noisy_input, t=t, context=context, seq_len=seq_len,
+       traj_emb=None,            # ControlNet mode: backbone gets no traj
+       traj_seq_lens=None,
+       controlnet_residuals=controlnet_residuals,
+   )
+```
+
+The ControlNet always receives `traj_emb`; the backbone always receives `None` for `traj_emb` in standard ControlNet mode.
+
+---
+
+## CFG (Classifier-Free Guidance) Handling
+
+When `cfg_scale != 1.0`, inference runs **two forward passes**: one conditional (with text) and one unconditional (null text). The final prediction is:
+
+```
+pred = cfg_scale * cond_pred - (cfg_scale - 1) * null_pred
+```
+
+**Current behavior**: ControlNet is called once per denoising step. The CFG loop calls the backbone twice (cond + null) but the ControlNet is not explicitly called with the null text context.
+
+**Correct behavior for text-CFG + traj-ControlNet**:
+- Traj conditioning comes from ControlNet, not from text. It is **not** dropped in the null pass.
+- Text is dropped in the null pass (via null/empty context).
+- Therefore: the ControlNet residuals should be computed with the **conditional text context** and reused in both passes. This is the most efficient and semantically correct approach since traj is not a text-conditional signal.
+
+**Implementation approach** (to verify or fix in `generate()` and `stream_generate_step()`):
+
+```python
+# Compute residuals once using conditional context
+controlnet_residuals = _maybe_controlnet_residuals(
+    noisy_input, t, context_cond, seq_len, traj_emb, traj_seq_lens
+)
+
+# Conditional pass
+pred_cond = self.model(
+    x=noisy_input, t=t, context=context_cond, seq_len=seq_len,
+    controlnet_residuals=controlnet_residuals
+)
+
+# Unconditional pass: reuse same residuals (traj not dropped)
+pred_null = self.model(
+    x=noisy_input, t=t, context=context_null, seq_len=seq_len,
+    controlnet_residuals=controlnet_residuals   # same residuals
+)
+
+pred = cfg_scale * pred_cond - (cfg_scale - 1) * pred_null
+```
+
+**Alternative (simpler, also acceptable)**: Call ControlNet once per step with `context_cond`, inject into both passes. This is what the current implementation appears to do — verify it is actually happening correctly.
+
+---
+
+## Traj Cache Consistency
+
+`DiffForcingWanModel` maintains a version-keyed cache to avoid recomputing `traj_emb` when the trajectory has not changed:
+
+```python
+self._traj_stream_version: int      # incremented when traj buffer changes
+self._traj_emb_cache: dict          # {version: traj_emb_tensor}
+```
+
+**Rules**:
+1. When a new trajectory chunk is written to `traj_buffer`, increment `_traj_stream_version`.
+2. `_stream_compute_traj_emb` checks the current version and recomputes only if version changed.
+3. ControlNet and backbone share the **same** cached `traj_emb` object — do not call `_stream_compute_traj_emb` twice.
+4. If no traj is provided for a step (user did not specify trajectory), `traj_emb = None` is passed to both ControlNet and backbone.
+
+---
+
+## Step-by-Step: Adding ControlNet to `stream_generate_step`
+
+If `stream_generate_step` does not yet call ControlNet, add the following (file: `diffusion_forcing_wan.py`):
+
+1. After computing `traj_emb` (via `_stream_compute_traj_emb`):
+   ```python
+   traj_seq_lens = self._get_traj_seq_lens(...)  # existing helper
+   controlnet_residuals = self._maybe_controlnet_residuals(
+       noisy_feature_input, t, context, seq_len, traj_emb, traj_seq_lens
+   )
+   ```
+
+2. Pass to backbone:
+   ```python
+   pred = self.model(
+       x=noisy_feature_input, t=t, context=context, seq_len=seq_len,
+       traj_emb=None,   # ControlNet mode
+       controlnet_residuals=controlnet_residuals,
+   )
+   ```
+
+3. Do **not** change `traj_emb` passed to backbone — it must remain `None` in ControlNet mode.
+
+---
+
+## Verification Checklist
+
+1. **ControlNet active in all three paths**: With `use_controlnet_traj=True`, set a breakpoint or add a log inside `_maybe_controlnet_residuals`. Verify it is called during `generate()`, `stream_generate()`, and `stream_generate_step()`.
+
+2. **Backbone receives no traj**: With `use_controlnet_traj=True`, verify `traj_emb_backbone is None` at the `self.model(...)` call site in all three paths.
+
+3. **Cache invalidation**: In streaming mode, feed two steps with different traj values. Verify `_traj_stream_version` increments between steps and `_traj_emb_cache` is refreshed.
+
+4. **CFG consistency**: With `cfg_scale=2.0`, verify the output changes meaningfully when text changes but traj is fixed (text CFG is working). Verify the output changes when traj changes but text is fixed (traj ControlNet is working).
+
+5. **`generate` and `stream_generate` agreement**: On the same input (fix random seed), `generate` and `stream_generate` should produce outputs with similar quality metrics (they won't be numerically identical due to different chunking, but both should show trajectory following).

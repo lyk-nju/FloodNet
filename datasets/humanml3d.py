@@ -68,9 +68,6 @@ class HumanML3DDataset(Dataset):
                             try:
                                 data["name"] = name
                                 data["dataset"] = dataset_name
-                                ##############################
-                                # feature
-                                ##############################
                                 if self.feature_path is not None:
                                     feature_path = os.path.join(
                                         data_path, self.feature_path, name + ".npy"
@@ -78,9 +75,6 @@ class HumanML3DDataset(Dataset):
                                     feature = self.load_feature(feature_path)
                                     data["feature"] = feature
                                     data["feature_length"] = feature.shape[0]
-                                ##############################
-                                # token
-                                ##############################
                                 if self.token_path is not None:
                                     token_path = os.path.join(
                                         data_path,
@@ -90,18 +84,12 @@ class HumanML3DDataset(Dataset):
                                     token = self.load_token(token_path)
                                     data["token"] = token
                                     data["token_length"] = token.shape[0]
-                                ##############################
-                                # text
-                                ##############################
                                 if self.text_path is not None:
                                     text_path = os.path.join(
                                         data_path, self.text_path, name + ".txt"
                                     )
                                     text_data = self.load_text(text_path)
                                     data["text_data"] = text_data
-                                ##############################
-                                # end
-                                ##############################
                                 dataset.append(data)
                             except LengthMismatchError:
                                 ignored_cnt += 1
@@ -171,24 +159,19 @@ class HumanML3DDataset(Dataset):
         output = {}
         output["dataset"] = data["dataset"]
         output["name"] = data["name"]
-        ##############################
-        # feature
-        ##############################
+        # --- feature ---
         crop_start = 0
         feature_length = None
         if "feature" in data:
             feature, feature_length, crop_start = self.process_feature(data["feature"])
             output["feature"] = feature
             output["feature_length"] = feature_length
-        ##############################
-        # traj
-        ##############################
+            # --- traj (derived from feature) ---
             traj = extract_root_trajectory_263(feature)
             output["traj"] = traj
             output["traj_length"] = len(traj)
-        ##############################
-        # token
-        ##############################
+
+        # --- token ---
         if "token" in data:
             token, token_length = self.process_token(
                 data["token"],
@@ -197,9 +180,7 @@ class HumanML3DDataset(Dataset):
             )
             output["token"] = token
             output["token_length"] = token_length
-        ##############################
-        # mask
-        ##############################
+            # --- mask (token-level sparsity, expanded to frame-level) ---
             token_mask = self.sample_token_mask(token_length)
             output["token_mask"] = token_mask
 
@@ -212,15 +193,13 @@ class HumanML3DDataset(Dataset):
                 else:
                     traj_mask = traj_mask[:traj_length]
                 output["traj_mask"] = traj_mask
-        ##############################
-        # traj_features：[x,z,cos ψ,sin ψ]，ψ 为 xz 路径朝向
-        ##############################
+
+        # --- traj_features: [x, z, cos(psi), sin(psi)], psi = xz path heading ---
         if "feature" in output and "token" in output:
             traj_features = path_heading_features_from_root_xyz(output["traj"])
             output["traj_features"] = traj_features
-        ##############################
-        # text
-        ##############################
+
+        # --- text ---
         if "text_data" in data:
             text_dict = random.choice(data["text_data"])
             text, text_tokens, f_tag, to_tag = self.process_text_dict(text_dict)

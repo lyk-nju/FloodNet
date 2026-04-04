@@ -1,12 +1,13 @@
-## Todolists — FloodNet ControlNet 轨迹控制改造
+## Todolists — FloodNet ControlNet Trajectory Control
 
-- **[`target.md`](target.md)**：总规范、全局一致性约定、与代码映射、Task 文档索引。
-- **[`Task1-input.md`](Task1-input.md)**：轨迹条件字段、token/帧对齐、mask 语义、stream buffer 字段。
-- **[`Task2-controlnet.md`](Task2-controlnet.md)**：ControlNet 分支结构、zero-init residual、与主干 `WanModel` 的接口约定。
-- **[`Task3-backbone-inject.md`](Task3-backbone-inject.md)**：在 `WanModel` blocks 循环中注入 residual 的最小改动与张量形状。
-- **[`Task4-inference-stream.md`](Task4-inference-stream.md)**：`generate/stream_generate/stream_generate_step` 接入 ControlNet、traj 缓存一致性。
-- **[`Task5-loss.md`](Task5-loss.md)**：motion space 显式轨迹损失（decode 后 root xz），active window 对齐。
-- **[`Task6-config.md`](Task6-config.md)**：YAML/参数入口、冻结策略、兼容旧 checkpoint 的加载约定。
+This folder contains the design specification and implementation guide for adding ControlNet-based trajectory control to FloodDiffusion.
 
-修改任一约定（如 residual 的注入点、loss 的时间范围、mask 语义）时，请同步更新 `target.md` 与对应 Task 文档，避免出现“训练/推理不一致”。
+- **[`target.md`](target.md)**: Overall spec, global consistency rules, cross-task dependency order, code map, implementation status table.
+- **[`Task1-input.md`](Task1-input.md)**: Trajectory condition fields, exact batch tensor shapes, token/frame alignment (VAE factor 4), mask semantics, stream buffer specification.
+- **[`Task2-controlnet.md`](Task2-controlnet.md)**: `WanControlNet` class — constructor signature, forward I/O shapes, zero-init residual heads, `init_from_backbone`, freeze strategy.
+- **[`Task3-backbone-inject.md`](Task3-backbone-inject.md)**: `WanModel.forward` residual injection — exact code, tensor shapes, compatibility with FlexTraj, verification steps.
+- **[`Task4-inference-stream.md`](Task4-inference-stream.md)**: `generate` / `stream_generate` / `stream_generate_step` — required call sequence, CFG handling for ControlNet, traj cache consistency.
+- **[`Task5-loss.md`](Task5-loss.md)**: Motion-space control loss — exact formula, VAE decode steps, active window alignment, axis convention `[x, z]` = indices `[0, 2]`.
+- **[`Task6-config.md`](Task6-config.md)**: Complete YAML key reference table, freeze strategy code, checkpoint compatibility, mutual exclusion rules.
 
+**When changing any design decision** (e.g., residual injection point, loss time range, mask semantics), update `target.md` global rules **and** the relevant Task document. Inconsistencies between training and inference are the most common source of subtle bugs.

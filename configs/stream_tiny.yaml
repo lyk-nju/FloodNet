@@ -25,10 +25,10 @@ model:
         chunk_size: 5
         use_text_cond: True
         text_len: 128
-        drop_out: 0.1
+        dropout: 0.1
         cfg_scale: 5.0
         prediction_type: "vel"
         causal: False
         use_traj_cond: True
         traj_out_dim: 2
-        traj_drop_out: 0.1
+        traj_dropout: 0.1

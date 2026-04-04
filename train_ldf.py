@@ -269,7 +269,7 @@ class CustomLightningModule(BasicLightningModule):
             self.log(f"metrics/t2m_metrics/{key}", value, sync_dist=True)
 
     def update_test(self, batch):
-        # 在每次 test 生成前固定随机种子，保证扩散噪声完全一致
+        # Fix seed before each test generation so diffusion noise is reproducible.
         seed_everything(self.cfg.seed)
         
         with self.ema.average_parameters(self.model.parameters()):
