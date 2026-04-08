@@ -1,10 +1,20 @@
-# FloodNet：`chunk` 训练下 `control_loss` 卡住的关键原因（坐标原点与对齐）
+# FloodNet：`control_loss` 低不下去的关键原因（坐标原点、对齐方式与权重尺度）
 
-### 背景与结论一句话
+### 背景与结论一句话（先纠正一个容易踩的前提）
 
-当前 FloodNet 的显式控制损失（`train_ldf.py::_compute_control_loss_xz`）在 `chunk` 模式下是 **“只解码最后窗口 → 还原 root 绝对 xz → 与 GT 窗口帧段的绝对 xz 做 MSE”**。  
-在这套 263 表示的还原函数 `recover_root_rot_pos()` 里，**每次从一段 motion 序列恢复 root 轨迹时，第一帧 \(x=z=0\) 是硬约定**。  
-因此当只解码窗口时，窗口的第 0 帧预测 root xz 会被固定成 (0,0)，但 GT 窗口起点 `traj[start_f]` 通常不为 (0,0)，会形成 **结构性的误差地板**，使 `control_loss` 很难降到极小（例如 0.01）。
+本项目里要分清楚两件事：
+
+- **LDF 扩散训练本身**：模型内部确实有 `chunk_size`（默认 5）用于 active window 的扩散 MSE，对齐论文做法。
+- **显式控制损失 `control_loss`**（`train_ldf.py::_compute_control_loss_xz`）：它是否按窗口（active window）计算，取决于训练脚本从 config 读到的 `chunk_size_tokens` 是否为 `None`。
+
+在当前的 `FloodNet/configs/ldf.yaml` 中，`model.params` **没有** `chunk_size` 这个 key，因此训练脚本里：
+
+- `chunk_size_tokens = self.cfg.model.params.get("chunk_size", None)` 会得到 **`None`**
+- `control_loss` 会走“**全序列**”分支：解码全序列 latent → 还原全程 root xz → 与 GT 全程 traj 对比（都从 (0,0) 开始）
+
+因此 **在当前默认配置下，不会出现“窗口起点原点不一致”的结构性地板**；`control_loss≈0.08` 更应理解为“真实的轨迹预测误差（在该 loss 定义下）”。
+
+> 下面第 3 节仍保留“窗口原点不一致”的分析，但它只在你显式让 `control_loss` 按窗口算时才会发生（例如在 `model.params` 里补上 `chunk_size`，或强制只解码窗口）。
 
 ---
 
@@ -50,7 +60,7 @@
 
 ### 3. `chunk` 控制损失的“最大问题点”（最值得注意）
 
-当前实现中（当 `chunk_size_tokens` 生效）：
+**仅当你让 `control_loss` 按窗口计算时**（即 `chunk_size_tokens` 生效，例如在 `model.params` 显式配置了 `chunk_size`）：
 
 - pred 侧：只解码窗口 token → 用 `recover_root_rot_pos` 恢复轨迹  
   ⇒ 预测窗口第 0 帧 root xz **必为 (0,0)**
@@ -67,6 +77,11 @@
 
 - `control_loss` 出现明显地板（plateau），很难压到 0.01
 - 学习率调度只能影响“接近地板的速度/抖动”，无法从根本上消掉该项
+
+**而在当前默认配置（`chunk_size_tokens=None`）下**：
+
+- `control_loss` 解码全序列并从 `traj[0]` 对齐开始比较
+- 不存在上述“窗口第 0 帧固定为 (0,0) 但 GT 窗口起点不为 (0,0)”的问题
 
 ---
 
@@ -100,7 +115,14 @@ MotionLCM 的实现（代码层面）主要是：
 
 ### 6. 如果目标是“`mask_ratio=1.0` 且 `control_loss≈0.01`”，应优先改什么（而不是先改 scheduler）
 
-学习率调度会影响收敛速度与稳定性，但对结构性地板无能为力。要实现极低控制误差，需要优先调整“监督量/对齐方式”之一：
+这里先分两种情形：
+
+- **情形 A（当前默认配置：`chunk_size_tokens=None`，控制损失按全序列算）**  
+  `control_loss≈0.08` 是“真实误差”，更需要优先关注 **梯度/权重尺度是否足够**（见下方补充）。
+- **情形 B（你显式让控制损失按窗口算）**  
+  此时可能出现第 3 节描述的“窗口原点不一致”问题，才需要优先调整“监督量/对齐方式”。
+
+对情形 B：要实现极低控制误差，需要优先调整“监督量/对齐方式”之一：
 
 - **相对量监督（更符合 chunk + self-forcing）**  
   用 \(\Delta x,\Delta z\) 或 root 速度（`[1:3]`）做监督，避免绝对起点问题。
@@ -108,6 +130,14 @@ MotionLCM 的实现（代码层面）主要是：
   让 pred/gt 在窗口起点对齐后再算绝对误差（例如平移对齐或在积分时注入 init xz）。
 - **监督对象改为 joints（对齐 MotionLCM/OmniControl “dense spatial control”语义）**  
   对 pelvis/feet 等 joints 的 xyz（或 xz）做 masked loss，配合稳定的 mask 归一化策略。
+
+补充（情形 A 最值得注意的“问题最大处”）：**控制信号权重可能过弱**
+
+在常见日志尺度下，扩散 MSE（latent space）可能在 ~7.x，而 `control_loss` 在 ~0.0x，直接相加时控制项对总梯度的影响可能很小。  
+这会导致“控制 loss 下降很慢/效果一般”，即便不存在窗口原点问题。此时优先排查/尝试：
+
+- 增大 `control_loss_weight`（例如 2、5、10 做短跑对照）
+- 或对两类 loss 做更合理的尺度归一化（例如按维度/有效帧数/窗口长度归一）
 
 ---
 

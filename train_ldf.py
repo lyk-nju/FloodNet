@@ -163,12 +163,21 @@ class CustomLightningModule(BasicLightningModule):
                 self.model.parameters(), decay=self.cfg.model.ema_decay
             )
             rank_zero_info("init ema from current model weights")
-        # When has_new_traj_params, optimizer/scheduler param groups mismatch -> skip restore
-        # Set to empty lists (don't pop) so Lightning passes "key exists" check but restores nothing
-        if has_new_cond_params:
+        # When has_new_cond_params, optimizer/scheduler param groups mismatch -> skip restore.
+        # When resume_reset_optimizer=True, skip restore so LR/schedule follow current yaml (not ckpt).
+        # Set to empty lists (don't pop) so Lightning passes "key exists" check but restores nothing.
+        reset_optim_on_resume = bool(self.cfg.get("resume_reset_optimizer", False))
+        if has_new_cond_params or reset_optim_on_resume:
             checkpoint["optimizer_states"] = []
             checkpoint["lr_schedulers"] = []
-            rank_zero_info("Skip restoring optimizer/scheduler (new cond params)")
+            if has_new_cond_params and reset_optim_on_resume:
+                rank_zero_info(
+                    "Skip restoring optimizer/scheduler (new cond params + resume_reset_optimizer)"
+                )
+            elif has_new_cond_params:
+                rank_zero_info("Skip restoring optimizer/scheduler (new cond params)")
+            else:
+                rank_zero_info("Skip restoring optimizer/scheduler (resume_reset_optimizer)")
         compare_statedict_and_parameters(
             state_dict=self.model.state_dict(),
             named_parameters=self.model.named_parameters(),
@@ -205,7 +214,7 @@ class CustomLightningModule(BasicLightningModule):
                 traj = batch["traj"]
                 traj_mask = batch["traj_mask"]
                 traj_length = batch["traj_length"]
-                chunk_size_tokens = self.cfg.model.params.get("chunk_size", None)
+                chunk_size_tokens = getattr(self.model, "chunk_size", None)
                 decode_mode = self.cfg.model.params.get("control_loss_decode_mode", "chunk")
                 align_start_xz = bool(
                     self.cfg.model.params.get("control_loss_align_start_xz", False)
