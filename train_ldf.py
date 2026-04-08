@@ -44,60 +44,59 @@ class CustomLightningModule(BasicLightningModule):
         device,
         chunk_size_tokens: int | None = None,
         token_to_frame: int = 4,
-        decode_mode: str = "chunk",
-        align_start_xz: bool = False,
     ):
         """
         Motion-space control loss on ground plane only.
 
-        - Decode each predicted x0 latent to 263D motion.
-        - Extract root trajectory and compare only xz components against GT `traj`.
-        - Normalize by valid masked frame count.
+        Always decodes the full predicted latent sequence so that recover_root_rot_pos()
+        integrates velocities from frame 0, giving correct absolute xz positions with no
+        floor bias.  When chunk_size_tokens is set, only the active window [start_f:end_f]
+        of the recovered trajectory is compared against GT – matching the diffusion-forcing
+        training objective while keeping the absolute coordinate reference intact.
         """
         loss_control = 0.0
         n_valid = 0.0
         for i in range(len(pred_list)):
             pred_latent_full = pred_list[i].to(device)  # (T_token, z_dim)
             t_tok = pred_latent_full.size(0)
+
+            # Determine active-window frame range in the full sequence.
             if chunk_size_tokens is not None and t_tok > chunk_size_tokens:
-                # Align with diffusion-forcing active window (last chunk_size tokens).
-                pred_latent = (
-                    pred_latent_full
-                    if str(decode_mode).lower() == "full"
-                    else pred_latent_full[-chunk_size_tokens:]
-                )
-                # Frame index range in GT corresponding to the same token window.
                 start_f = (t_tok - chunk_size_tokens) * token_to_frame
                 end_f = t_tok * token_to_frame
             else:
-                pred_latent = pred_latent_full
                 start_f = 0
-                end_f = None
+                end_f = None  # use full sequence
 
-            decoded = vae.decode(pred_latent.unsqueeze(0))[0].float()
+            # Always decode the full latent sequence so the trajectory is integrated
+            # from frame 0 – absolute positions are correct with no offset bias.
+            decoded = vae.decode(pred_latent_full.unsqueeze(0))[0].float()
             L_motion = decoded.size(0)
             L_gt_total = min(int(traj_length[i].item()), traj.shape[1])
+
             if end_f is None:
-                gt_slice = slice(0, L_gt_total)
+                pred_sl = slice(0, L_motion)
+                gt_sl = slice(0, L_gt_total)
             else:
-                gt_slice = slice(min(start_f, L_gt_total), min(end_f, L_gt_total))
-            L_gt = gt_slice.stop - gt_slice.start
-            L = min(L_motion, L_gt)
+                pred_sl = slice(min(start_f, L_motion), min(end_f, L_motion))
+                gt_sl = slice(min(start_f, L_gt_total), min(end_f, L_gt_total))
+
+            L = min(pred_sl.stop - pred_sl.start, gt_sl.stop - gt_sl.start)
             if L <= 0:
                 continue
-            pred_traj = extract_root_trajectory_263_torch(decoded[:L].unsqueeze(0))
-            gt_traj = traj[i, gt_slice, :][:L].unsqueeze(0).to(
+
+            # Extract trajectory from full decoded motion, then slice active window.
+            pred_traj_full = extract_root_trajectory_263_torch(decoded.unsqueeze(0))  # (1, L_motion, 3)
+            pred_traj = pred_traj_full[:, pred_sl, :][:, :L, :]
+            gt_traj = traj[i, gt_sl, :][:L].unsqueeze(0).to(
                 pred_traj.device, dtype=pred_traj.dtype
             )
-            mask = traj_mask[i, gt_slice][:L].unsqueeze(0).to(
+            mask = traj_mask[i, gt_sl][:L].unsqueeze(0).to(
                 pred_traj.device, dtype=pred_traj.dtype
             )
-            # Ground-plane only: align with xz trajectory conditioning (ignore root height y).
+
             pred_xz = pred_traj[..., [0, 2]]
             gt_xz = gt_traj[..., [0, 2]]
-            # Optional: align window start to remove arbitrary translation when decoding only a chunk.
-            if align_start_xz and pred_xz.size(1) > 0:
-                pred_xz = pred_xz - pred_xz[:, :1, :] + gt_xz[:, :1, :]
             sq_err = ((pred_xz - gt_xz) ** 2).sum(dim=-1)
             loss_control = loss_control + (mask * sq_err).sum()
             n_valid += mask.sum().item()
@@ -215,10 +214,6 @@ class CustomLightningModule(BasicLightningModule):
                 traj_mask = batch["traj_mask"]
                 traj_length = batch["traj_length"]
                 chunk_size_tokens = getattr(self.model, "chunk_size", None)
-                decode_mode = self.cfg.model.params.get("control_loss_decode_mode", "chunk")
-                align_start_xz = bool(
-                    self.cfg.model.params.get("control_loss_align_start_xz", False)
-                )
                 loss_control = self._compute_control_loss_xz(
                     pred_list,
                     traj,
@@ -227,8 +222,6 @@ class CustomLightningModule(BasicLightningModule):
                     self.vae,
                     self.device,
                     chunk_size_tokens=chunk_size_tokens,
-                    decode_mode=decode_mode,
-                    align_start_xz=align_start_xz,
                 )
                 if loss_control is not None:
                     out["total"] = out["total"] + control_weight * loss_control

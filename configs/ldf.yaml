@@ -131,7 +131,6 @@ model:
 
         # Explicit motion-space control loss
         control_loss_weight: 1.0
-        control_loss_align_start_xz: true
 
 optimizer:
     target: AdamW

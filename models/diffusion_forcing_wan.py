@@ -51,7 +51,6 @@ class DiffForcingWanModel(nn.Module):
         use_traj_emb_cache=False,
         use_traj_kv_cache=None,
         control_loss_weight=1.0,  # used by train_ldf, not by model
-        control_loss_align_start_xz=False,  # used by train_ldf, not by model
         freeze_backbone_for_traj=False,
         use_controlnet_traj=False,
         controlnet_init_from_backbone=True,
