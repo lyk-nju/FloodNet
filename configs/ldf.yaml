@@ -131,11 +131,12 @@ model:
 
         # Explicit motion-space control loss
         control_loss_weight: 1.0
+        control_loss_align_start_xz: true
 
 optimizer:
     target: AdamW
     params:
-        lr: 1e-3
+        lr: 1e-4
         betas: [0.9, 0.999]
         weight_decay: 0.01
         eps: 1e-8

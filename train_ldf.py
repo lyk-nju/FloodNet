@@ -44,6 +44,8 @@ class CustomLightningModule(BasicLightningModule):
         device,
         chunk_size_tokens: int | None = None,
         token_to_frame: int = 4,
+        decode_mode: str = "chunk",
+        align_start_xz: bool = False,
     ):
         """
         Motion-space control loss on ground plane only.
@@ -59,7 +61,11 @@ class CustomLightningModule(BasicLightningModule):
             t_tok = pred_latent_full.size(0)
             if chunk_size_tokens is not None and t_tok > chunk_size_tokens:
                 # Align with diffusion-forcing active window (last chunk_size tokens).
-                pred_latent = pred_latent_full[-chunk_size_tokens:]
+                pred_latent = (
+                    pred_latent_full
+                    if str(decode_mode).lower() == "full"
+                    else pred_latent_full[-chunk_size_tokens:]
+                )
                 # Frame index range in GT corresponding to the same token window.
                 start_f = (t_tok - chunk_size_tokens) * token_to_frame
                 end_f = t_tok * token_to_frame
@@ -87,7 +93,12 @@ class CustomLightningModule(BasicLightningModule):
                 pred_traj.device, dtype=pred_traj.dtype
             )
             # Ground-plane only: align with xz trajectory conditioning (ignore root height y).
-            sq_err = ((pred_traj[..., [0, 2]] - gt_traj[..., [0, 2]]) ** 2).sum(dim=-1)
+            pred_xz = pred_traj[..., [0, 2]]
+            gt_xz = gt_traj[..., [0, 2]]
+            # Optional: align window start to remove arbitrary translation when decoding only a chunk.
+            if align_start_xz and pred_xz.size(1) > 0:
+                pred_xz = pred_xz - pred_xz[:, :1, :] + gt_xz[:, :1, :]
+            sq_err = ((pred_xz - gt_xz) ** 2).sum(dim=-1)
             loss_control = loss_control + (mask * sq_err).sum()
             n_valid += mask.sum().item()
         if n_valid <= 0:
@@ -195,6 +206,10 @@ class CustomLightningModule(BasicLightningModule):
                 traj_mask = batch["traj_mask"]
                 traj_length = batch["traj_length"]
                 chunk_size_tokens = self.cfg.model.params.get("chunk_size", None)
+                decode_mode = self.cfg.model.params.get("control_loss_decode_mode", "chunk")
+                align_start_xz = bool(
+                    self.cfg.model.params.get("control_loss_align_start_xz", False)
+                )
                 loss_control = self._compute_control_loss_xz(
                     pred_list,
                     traj,
@@ -203,6 +218,8 @@ class CustomLightningModule(BasicLightningModule):
                     self.vae,
                     self.device,
                     chunk_size_tokens=chunk_size_tokens,
+                    decode_mode=decode_mode,
+                    align_start_xz=align_start_xz,
                 )
                 if loss_control is not None:
                     out["total"] = out["total"] + control_weight * loss_control
