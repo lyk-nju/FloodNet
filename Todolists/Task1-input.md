@@ -26,7 +26,7 @@ All fields below are produced by `HumanML3DDataset._process()` and padded by `co
 | `traj_length` | `(B,)` | int64 | Number of valid frames in `traj` for each sample. |
 | `traj_features` | `(B, T_frame, 4)` | float32 | Path-heading features `[x, z, cos(ψ), sin(ψ)]`. Same temporal length as `traj`. |
 | `traj_mask` | `(B, T_frame)` | float32 | Frame-level mask: 1 = trajectory known at this frame, 0 = unknown. Derived from `token_mask` by 4× repeat then truncated to `traj_length`. |
-| `token_mask` | `(B, T_token)` | float32 | Token-level mask: 1 = trajectory condition provided for this token. Sampled from `mask_ratio` (e.g., 1.0 = full trajectory, (0.2, 0.3) = random sparsity). |
+| `token_mask` | `(B, T_token)` | float32 | Token-level mask: 1 = trajectory condition provided for this token. **Train**: sampled from `data.mask_ratio`. **Val/test**: sampled from `data.val_mask_ratio` (default **1.0** in code if key omitted = full trajectory for metrics/video). |
 | `token` | `(B, T_token, 4)` | float32 | VAE latent tokens (the diffusion model's input). |
 | `token_length` | `(B,)` | int64 | Number of valid tokens for each sample. |
 | `feature` | `(B, T_frame, 263)` | float32 | Raw HumanML3D motion features. |

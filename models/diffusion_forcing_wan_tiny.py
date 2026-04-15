@@ -5,11 +5,21 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoConfig, AutoTokenizer, AutoModel
 
 from utils.traj_batch import build_traj_emb_from_batch, xyz_traj_to_features_4d
 from .tools.traj_encoder import TrajEncoder
 from .tools.wan_model import WanModel
+
+
+def _expand_precomputed_caption_keys(emb: dict) -> dict:
+    """Alias strip() keys so table matches HumanML3D captions after .strip()."""
+    out = dict(emb)
+    for k, v in emb.items():
+        s = k.strip()
+        if s not in out:
+            out[s] = v
+    return out
 
 
 class HFT5Encoder:
@@ -80,10 +90,19 @@ class DiffForcingWanModel(nn.Module):
         use_traj_kv_cache=None,
         control_loss_weight=1.0,  # used by train_ldf, not by model
         freeze_backbone_for_traj=False,
+        use_precomputed_text_emb=False,
+        precomputed_text_emb_path=None,
         **kwargs,
     ):
         kwargs.pop("traj_lora_rank", None)
         kwargs.pop("lora_rank_traj", None)
+        kwargs.pop("freeze_backbone_for_controlnet", None)
+        kwargs.pop("use_controlnet_traj", None)
+        kwargs.pop("controlnet_init_from_backbone", None)
+        if "dropout" in kwargs:
+            drop_out = kwargs.pop("dropout")
+        if "traj_dropout" in kwargs:
+            traj_drop_out = kwargs.pop("traj_dropout")
         if kwargs:
             raise TypeError(
                 "DiffForcingWanModel: unexpected keyword arguments "
@@ -123,21 +142,48 @@ class DiffForcingWanModel(nn.Module):
         self.prediction_type = prediction_type
         self.causal = causal
 
-        self.text_dim = 768  # umt5-base hidden size
         self.text_len = text_len
         self.model_name = model_name
-        
-        # Load model and tokenizer from HuggingFace
-        print(f"Loading {model_name} from HuggingFace...")
-        self.text_encoder = HFT5Encoder(
-            text_len=text_len,
-            dtype=torch.bfloat16,
-            device=torch.device("cpu"),
-            model_name=model_name,
-        )
-
-        # Text encoding cache
+        self.use_precomputed_text_emb = bool(use_precomputed_text_emb)
+        self._precomputed_text_emb = None
+        self.text_encoder = None
         self.text_cache = {}
+
+        if self.use_precomputed_text_emb:
+            if not precomputed_text_emb_path:
+                raise ValueError(
+                    "use_precomputed_text_emb=True requires precomputed_text_emb_path "
+                    "(run pretokenize_t5_text_tiny.py)."
+                )
+            blob = torch.load(
+                precomputed_text_emb_path, map_location="cpu", weights_only=False
+            )
+            self._precomputed_text_emb = _expand_precomputed_caption_keys(
+                blob["embeddings"]
+            )
+            if "" not in self._precomputed_text_emb:
+                raise KeyError(
+                    'precomputed embeddings must include empty string key "" for CFG / dropout.'
+                )
+            self.text_dim = int(blob.get("text_dim", 768))
+            print(
+                f"Loaded precomputed text embeddings from {precomputed_text_emb_path}: "
+                f"{len(self._precomputed_text_emb)} keys, text_dim={self.text_dim}"
+            )
+        else:
+            hf_cfg = AutoConfig.from_pretrained(model_name)
+            self.text_dim = int(
+                getattr(hf_cfg, "d_model", None)
+                or getattr(hf_cfg, "hidden_size", None)
+                or 768
+            )
+            print(f"Loading {model_name} from HuggingFace...")
+            self.text_encoder = HFT5Encoder(
+                text_len=text_len,
+                dtype=torch.bfloat16,
+                device=torch.device("cpu"),
+                model_name=model_name,
+            )
         traj_enc_dim = self.traj_out_dim if self.use_traj_cond else 0
         self.model = WanModel(
             model_type="t2v",
@@ -195,6 +241,26 @@ class DiffForcingWanModel(nn.Module):
         Returns:
             List[Tensor]: List of encoded text features
         """
+        if self._precomputed_text_emb is not None:
+            out = []
+            d = self._precomputed_text_emb
+            for text in text_list:
+                row = d.get(text)
+                if row is None:
+                    row = d.get(text.strip())
+                if row is None:
+                    preview = text.replace("\n", "\\n")
+                    if len(preview) > 160:
+                        preview = preview[:157] + "..."
+                    raise KeyError(
+                        "Caption not in precomputed T5 (tiny) table. "
+                        f"len={len(text)} preview={preview!r}. "
+                        "Re-run pretokenize_t5_text_tiny.py with the same config "
+                        "(include val/test meta paths), or set use_precomputed_text_emb=false."
+                    )
+                out.append(row.to(device))
+            return out
+
         text_features = []
         indices_to_encode = []
         texts_to_encode = []

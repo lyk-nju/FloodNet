@@ -39,6 +39,13 @@ All keys below live under `model.params` in `configs/ldf.yaml` (or `ldf_tiny.yam
 | `input_dim` | int | `4` | Input dimension of the noisy latent (VAE z-dim). |
 | `causal` | bool | `false` | Use causal (unidirectional) self-attention. False = bidirectional. |
 
+### `data.*` (HumanML3DDataset — trajectory mask)
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `mask_ratio` | float or `[lo, hi]` | `(0.2, 0.3)` | **Train** split only: token keep ratio / range for `token_mask` sampling. |
+| `val_mask_ratio` | float or `[lo, hi]` | **`1.0` if key omitted** | **Val / test** splits: same semantics as `mask_ratio`; default full trajectory for eval/video. Set explicitly to match train sparsity for ablations. |
+
 ---
 
 ## Example Config (ControlNet Stage-1)

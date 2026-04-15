@@ -253,6 +253,28 @@ class DiffForcingWanModel(nn.Module):
             traj_seq_lens=traj_seq_lens,
         )
 
+    def _try_cfg_double_batch_text_context(
+        self, text_context, text_null_per_sample, batch_size, model_seq_len
+    ):
+        """Build text context list for MotionLCM-style 2B CFG (cond || uncond).
+
+        WanModel/WanControlNet accept either one global caption per sample (len == B)
+        or frame-aligned captions (len == B * model_seq_len). Returns None if the
+        layout does not match either (caller falls back to two backbone forwards).
+        """
+        b = batch_size
+        n = len(text_context)
+        if n == b:
+            return list(text_context) + list(text_null_per_sample)
+        if n == b * model_seq_len:
+            null_flat = []
+            for i in range(b):
+                ni = text_null_per_sample[i]
+                for _ in range(model_seq_len):
+                    null_flat.append(ni)
+            return list(text_context) + null_flat
+        return None
+
     def encode_text_with_cache(self, text_list, device):
         """Encode text using cache
         Args:
@@ -716,49 +738,97 @@ class DiffForcingWanModel(nn.Module):
             for i in range(batch_size):
                 noisy_input.append(generated[i, :, :end_index, ...])
 
-            controlnet_residuals = self._maybe_controlnet_residuals(
-                noisy_input,
-                noise_level * self.time_embedding_scale,
-                all_text_context,
-                seq_len + self.chunk_size,
-                traj_emb,
-                traj_seq_lens,
+            gen_sl = seq_len + self.chunk_size
+            t_scaled = noise_level * self.time_embedding_scale
+            ctx_2b = (
+                self._try_cfg_double_batch_text_context(
+                    all_text_context, text_null_context, batch_size, gen_sl
+                )
+                if self.cfg_scale != 1.0
+                else None
             )
-            predicted_result = self.model(
-                noisy_input,
-                noise_level * self.time_embedding_scale,
-                all_text_context,
-                seq_len + self.chunk_size,
-                y=None,
-                traj_emb=traj_emb_backbone,
-                traj_seq_lens=traj_seq_lens_backbone,
-                controlnet_residuals=controlnet_residuals,
-            )  # (B, C, T, 1, 1)
-
-            # Adjust using CFG
-            if self.cfg_scale != 1.0:
-                controlnet_residuals_null = self._maybe_controlnet_residuals(
+            if ctx_2b is not None:
+                noisy_2b = list(noisy_input) + list(noisy_input)
+                t_2b = torch.cat([t_scaled, t_scaled], dim=0)
+                traj_cn_2b = (
+                    torch.cat([traj_emb, traj_emb], dim=0)
+                    if traj_emb is not None
+                    else None
+                )
+                traj_sl_2b = (
+                    torch.cat([traj_seq_lens, traj_seq_lens], dim=0)
+                    if traj_seq_lens is not None
+                    else None
+                )
+                traj_bb_2b = (
+                    torch.cat([traj_emb_backbone, traj_emb_backbone], dim=0)
+                    if traj_emb_backbone is not None
+                    else None
+                )
+                traj_bb_sl_2b = (
+                    torch.cat(
+                        [traj_seq_lens_backbone, traj_seq_lens_backbone], dim=0
+                    )
+                    if traj_seq_lens_backbone is not None
+                    else None
+                )
+                controlnet_residuals = self._maybe_controlnet_residuals(
+                    noisy_2b,
+                    t_2b,
+                    ctx_2b,
+                    gen_sl,
+                    traj_cn_2b,
+                    traj_sl_2b,
+                )
+                pred_2b = self.model(
+                    noisy_2b,
+                    t_2b,
+                    ctx_2b,
+                    gen_sl,
+                    y=None,
+                    traj_emb=traj_bb_2b,
+                    traj_seq_lens=traj_bb_sl_2b,
+                    controlnet_residuals=controlnet_residuals,
+                )
+                predicted_result = [
+                    self.cfg_scale * pred_2b[i]
+                    - (self.cfg_scale - 1) * pred_2b[i + batch_size]
+                    for i in range(batch_size)
+                ]
+            else:
+                controlnet_residuals = self._maybe_controlnet_residuals(
                     noisy_input,
-                    noise_level * self.time_embedding_scale,
-                    text_null_context,
-                    seq_len + self.chunk_size,
+                    t_scaled,
+                    all_text_context,
+                    gen_sl,
                     traj_emb,
                     traj_seq_lens,
                 )
-                predicted_result_null = self.model(
+                predicted_result = self.model(
                     noisy_input,
-                    noise_level * self.time_embedding_scale,
-                    text_null_context,
-                    seq_len + self.chunk_size,
+                    t_scaled,
+                    all_text_context,
+                    gen_sl,
                     y=None,
                     traj_emb=traj_emb_backbone,
                     traj_seq_lens=traj_seq_lens_backbone,
-                    controlnet_residuals=controlnet_residuals_null,
-                )  # (B, C, T, 1, 1)
-                predicted_result = [
-                    self.cfg_scale * pv - (self.cfg_scale - 1) * pvn
-                    for pv, pvn in zip(predicted_result, predicted_result_null)
-                ]
+                    controlnet_residuals=controlnet_residuals,
+                )
+                if self.cfg_scale != 1.0:
+                    predicted_result_null = self.model(
+                        noisy_input,
+                        t_scaled,
+                        text_null_context,
+                        gen_sl,
+                        y=None,
+                        traj_emb=traj_emb_backbone,
+                        traj_seq_lens=traj_seq_lens_backbone,
+                        controlnet_residuals=controlnet_residuals,
+                    )
+                    predicted_result = [
+                        self.cfg_scale * pv - (self.cfg_scale - 1) * pvn
+                        for pv, pvn in zip(predicted_result, predicted_result_null)
+                    ]
 
             for i in range(batch_size):
                 predicted_result_i = predicted_result[i]  # (C, input_length, 1, 1)
@@ -932,49 +1002,97 @@ class DiffForcingWanModel(nn.Module):
             for i in range(batch_size):
                 noisy_input.append(generated[i, :, :end_index, ...])
 
-            controlnet_residuals = self._maybe_controlnet_residuals(
-                noisy_input,
-                noise_level * self.time_embedding_scale,
-                all_text_context,
-                seq_len + self.chunk_size,
-                traj_emb,
-                traj_seq_lens,
+            gen_sl = seq_len + self.chunk_size
+            t_scaled = noise_level * self.time_embedding_scale
+            ctx_2b = (
+                self._try_cfg_double_batch_text_context(
+                    all_text_context, text_null_context, batch_size, gen_sl
+                )
+                if self.cfg_scale != 1.0
+                else None
             )
-            predicted_result = self.model(
-                noisy_input,
-                noise_level * self.time_embedding_scale,
-                all_text_context,
-                seq_len + self.chunk_size,
-                y=None,
-                traj_emb=traj_emb_backbone,
-                traj_seq_lens=traj_seq_lens_backbone,
-                controlnet_residuals=controlnet_residuals,
-            )  # (B, C, T, 1, 1)
-
-            # Adjust using CFG
-            if self.cfg_scale != 1.0:
-                controlnet_residuals_null = self._maybe_controlnet_residuals(
+            if ctx_2b is not None:
+                noisy_2b = list(noisy_input) + list(noisy_input)
+                t_2b = torch.cat([t_scaled, t_scaled], dim=0)
+                traj_cn_2b = (
+                    torch.cat([traj_emb, traj_emb], dim=0)
+                    if traj_emb is not None
+                    else None
+                )
+                traj_sl_2b = (
+                    torch.cat([traj_seq_lens, traj_seq_lens], dim=0)
+                    if traj_seq_lens is not None
+                    else None
+                )
+                traj_bb_2b = (
+                    torch.cat([traj_emb_backbone, traj_emb_backbone], dim=0)
+                    if traj_emb_backbone is not None
+                    else None
+                )
+                traj_bb_sl_2b = (
+                    torch.cat(
+                        [traj_seq_lens_backbone, traj_seq_lens_backbone], dim=0
+                    )
+                    if traj_seq_lens_backbone is not None
+                    else None
+                )
+                controlnet_residuals = self._maybe_controlnet_residuals(
+                    noisy_2b,
+                    t_2b,
+                    ctx_2b,
+                    gen_sl,
+                    traj_cn_2b,
+                    traj_sl_2b,
+                )
+                pred_2b = self.model(
+                    noisy_2b,
+                    t_2b,
+                    ctx_2b,
+                    gen_sl,
+                    y=None,
+                    traj_emb=traj_bb_2b,
+                    traj_seq_lens=traj_bb_sl_2b,
+                    controlnet_residuals=controlnet_residuals,
+                )
+                predicted_result = [
+                    self.cfg_scale * pred_2b[i]
+                    - (self.cfg_scale - 1) * pred_2b[i + batch_size]
+                    for i in range(batch_size)
+                ]
+            else:
+                controlnet_residuals = self._maybe_controlnet_residuals(
                     noisy_input,
-                    noise_level * self.time_embedding_scale,
-                    text_null_context,
-                    seq_len + self.chunk_size,
+                    t_scaled,
+                    all_text_context,
+                    gen_sl,
                     traj_emb,
                     traj_seq_lens,
                 )
-                predicted_result_null = self.model(
+                predicted_result = self.model(
                     noisy_input,
-                    noise_level * self.time_embedding_scale,
-                    text_null_context,
-                    seq_len + self.chunk_size,
+                    t_scaled,
+                    all_text_context,
+                    gen_sl,
                     y=None,
                     traj_emb=traj_emb_backbone,
                     traj_seq_lens=traj_seq_lens_backbone,
-                    controlnet_residuals=controlnet_residuals_null,
-                )  # (B, C, T, 1, 1)
-                predicted_result = [
-                    self.cfg_scale * pv - (self.cfg_scale - 1) * pvn
-                    for pv, pvn in zip(predicted_result, predicted_result_null)
-                ]
+                    controlnet_residuals=controlnet_residuals,
+                )
+                if self.cfg_scale != 1.0:
+                    predicted_result_null = self.model(
+                        noisy_input,
+                        t_scaled,
+                        text_null_context,
+                        gen_sl,
+                        y=None,
+                        traj_emb=traj_emb_backbone,
+                        traj_seq_lens=traj_seq_lens_backbone,
+                        controlnet_residuals=controlnet_residuals,
+                    )
+                    predicted_result = [
+                        self.cfg_scale * pv - (self.cfg_scale - 1) * pvn
+                        for pv, pvn in zip(predicted_result, predicted_result_null)
+                    ]
 
             for i in range(batch_size):
                 predicted_result_i = predicted_result[i]  # (C, input_length, 1, 1)
@@ -1269,49 +1387,97 @@ class DiffForcingWanModel(nn.Module):
             traj_emb_backbone = traj_emb if (self.use_traj_cond and not self.use_controlnet_traj) else None
             traj_seq_lens_backbone = traj_seq_lens if (self.use_traj_cond and not self.use_controlnet_traj) else None
 
-            controlnet_residuals = self._maybe_controlnet_residuals(
-                noisy_input,
-                noise_level * self.time_embedding_scale,
-                text_condition,
-                min(end_index, self.seq_len),
-                traj_emb,
-                traj_seq_lens,
+            model_sl = min(end_index, self.seq_len)
+            t_scaled = noise_level * self.time_embedding_scale
+            ctx_2b = (
+                self._try_cfg_double_batch_text_context(
+                    text_condition, text_null_context, self.batch_size, model_sl
+                )
+                if self.cfg_scale != 1.0
+                else None
             )
-            predicted_result = self.model(
-                noisy_input,
-                noise_level * self.time_embedding_scale,
-                text_condition,
-                min(end_index, self.seq_len),
-                y=None,
-                traj_emb=traj_emb_backbone,
-                traj_seq_lens=traj_seq_lens_backbone,
-                controlnet_residuals=controlnet_residuals,
-            )  # (B, C, T, 1, 1)
-
-            # Adjust using CFG
-            if self.cfg_scale != 1.0:
-                controlnet_residuals_null = self._maybe_controlnet_residuals(
+            if ctx_2b is not None:
+                noisy_2b = list(noisy_input) + list(noisy_input)
+                t_2b = torch.cat([t_scaled, t_scaled], dim=0)
+                traj_cn_2b = (
+                    torch.cat([traj_emb, traj_emb], dim=0)
+                    if traj_emb is not None
+                    else None
+                )
+                traj_sl_2b = (
+                    torch.cat([traj_seq_lens, traj_seq_lens], dim=0)
+                    if traj_seq_lens is not None
+                    else None
+                )
+                traj_bb_2b = (
+                    torch.cat([traj_emb_backbone, traj_emb_backbone], dim=0)
+                    if traj_emb_backbone is not None
+                    else None
+                )
+                traj_bb_sl_2b = (
+                    torch.cat(
+                        [traj_seq_lens_backbone, traj_seq_lens_backbone], dim=0
+                    )
+                    if traj_seq_lens_backbone is not None
+                    else None
+                )
+                controlnet_residuals = self._maybe_controlnet_residuals(
+                    noisy_2b,
+                    t_2b,
+                    ctx_2b,
+                    model_sl,
+                    traj_cn_2b,
+                    traj_sl_2b,
+                )
+                pred_2b = self.model(
+                    noisy_2b,
+                    t_2b,
+                    ctx_2b,
+                    model_sl,
+                    y=None,
+                    traj_emb=traj_bb_2b,
+                    traj_seq_lens=traj_bb_sl_2b,
+                    controlnet_residuals=controlnet_residuals,
+                )
+                predicted_result = [
+                    self.cfg_scale * pred_2b[i]
+                    - (self.cfg_scale - 1) * pred_2b[i + self.batch_size]
+                    for i in range(self.batch_size)
+                ]
+            else:
+                controlnet_residuals = self._maybe_controlnet_residuals(
                     noisy_input,
-                    noise_level * self.time_embedding_scale,
-                    text_null_context,
-                    min(end_index, self.seq_len),
+                    t_scaled,
+                    text_condition,
+                    model_sl,
                     traj_emb,
                     traj_seq_lens,
                 )
-                predicted_result_null = self.model(
+                predicted_result = self.model(
                     noisy_input,
-                    noise_level * self.time_embedding_scale,
-                    text_null_context,
-                    min(end_index, self.seq_len),
+                    t_scaled,
+                    text_condition,
+                    model_sl,
                     y=None,
                     traj_emb=traj_emb_backbone,
                     traj_seq_lens=traj_seq_lens_backbone,
-                    controlnet_residuals=controlnet_residuals_null,
-                )  # (B, C, T, 1, 1)
-                predicted_result = [
-                    self.cfg_scale * pv - (self.cfg_scale - 1) * pvn
-                    for pv, pvn in zip(predicted_result, predicted_result_null)
-                ]
+                    controlnet_residuals=controlnet_residuals,
+                )
+                if self.cfg_scale != 1.0:
+                    predicted_result_null = self.model(
+                        noisy_input,
+                        t_scaled,
+                        text_null_context,
+                        model_sl,
+                        y=None,
+                        traj_emb=traj_emb_backbone,
+                        traj_seq_lens=traj_seq_lens_backbone,
+                        controlnet_residuals=controlnet_residuals,
+                    )
+                    predicted_result = [
+                        self.cfg_scale * pv - (self.cfg_scale - 1) * pvn
+                        for pv, pvn in zip(predicted_result, predicted_result_null)
+                    ]
 
             for i in range(self.batch_size):
                 predicted_result_i = predicted_result[i]  # (C, input_length, 1, 1)

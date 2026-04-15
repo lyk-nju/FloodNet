@@ -1,3 +1,5 @@
+> **Note**：本文件为早期方案草案。**规格与实现以 [`target.md`](target.md) 与 [`Task5-loss.md`](Task5-loss.md) 为准。** 控制损失：**对整条预测 latent 做 VAE decode**，再在 **active window 对应帧段** 上算 `L_control_xz`（与扩散 MSE 的 last-`chunk_size` tokens 对齐），而不是「只对尾窗 token decode」。
+
 ## 目标
 
 以 **FloodDiffusion / Diffusion Forcing（triangular schedule + active window）** 为基础，在 **Wan latent backbone** 中融合 **ControlNet 风格的零初始化残差分支**，实现稳定的 **轨迹控制**（优先 root trajectory：\(x,z, \cos\psi,\sin\psi\)），并配套 **motion space 显式监督**（decode 后计算控制损失）。
@@ -39,7 +41,7 @@
 - 仅在 latent/velocity 回归上“希望模型自己学会遵循轨迹”往往不稳。
 - 训练时必须 decode 到 motion space，提取 root/joint 的 **global** 轨迹再监督。
 
-在工程上：复用现有 `control_aux["pred_x0_latent_list"]`，在 `train_ldf.py` 中 decode 并计算 `L_control_xz`（只监督 active window 或 last-frame mask 对齐）。
+在工程上：复用现有 `control_aux["pred_x0_latent_list"]`，在 `train_ldf.py` 中 **对完整 latent 序列 `vae.decode`**，再 **仅在 active window 帧段**（及 `traj_mask`）上计算 `L_control_xz`（与 `target.md` 规则 4 一致）。
 
 ## 需要实现的内容（按文件拆分）
 
@@ -108,13 +110,10 @@
 4. 修改 `FloodNet/train_ldf.py`
 
 - 在训练 step 中，若 `loss_dict` 含 `control_aux.pred_x0_latent_list`：
-  - 调用 VAE decode（冻结 VAE）得到 motion feature
-  - 提取 root xz（或 joint global xyz）
-  - 使用 `traj_mask`（注意 last-frame 语义）计算 `L_control_xz`
-  - `total = mse + λ_control * L_control_xz`
-- **active window 对齐**：
-  - 当前 diffusion forcing 的 MSE 只算最后 `chunk_size` positions。
-  - control loss 也应默认只监督对应的帧区间（至少先做一致：最后 `chunk_size` * 4 帧 or last-frame indices）。
+  - **Full-sequence** VAE decode（冻结 VAE）→ motion feature → root xz
+  - 将 pred/GT/`traj_mask` **切片到 active window 帧区间**（由 `getattr(model, "chunk_size")` 与 `T_token` 决定，见 `Task5-loss.md`）
+  - 在切片上计算 `L_control_xz`；`total = mse + λ_control * L_control_xz`
+- **active window 对齐**：扩散 MSE 与 `L_control_xz` 均针对 **最后 `chunk_size` 个 token** 所对应的 **帧范围**（实现上通过全 decode 后切片，避免尾窗-only decode 的原点错位）。
 
 ### E. 数据/对齐与 mask 语义（不改或最小改）
 

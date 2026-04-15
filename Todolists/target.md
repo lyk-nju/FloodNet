@@ -11,7 +11,7 @@ This document decomposes "adding a ControlNet branch to FloodDiffusion / Diffusi
 | §1 | [`Task1-input.md`](Task1-input.md) | **Done** | `traj_features`/mask/length fields, token/frame alignment, stream buffer |
 | §2 | [`Task2-controlnet.md`](Task2-controlnet.md) | **Done** | `WanControlNet` structure, zero-init residuals, initialization/freezing |
 | §3 | [`Task3-backbone-inject.md`](Task3-backbone-inject.md) | **Done** | `WanModel.forward` residual injection interface |
-| §4 | [`Task4-inference-stream.md`](Task4-inference-stream.md) | **Partial** | ControlNet in all inference paths; CFG handling for ControlNet TBD |
+| §4 | [`Task4-inference-stream.md`](Task4-inference-stream.md) | **Done** | ControlNet in all inference paths; CFG reuses cond residuals for null |
 | §5 | [`Task5-loss.md`](Task5-loss.md) | **Done** | `L_control_xz` after VAE decode, active window alignment |
 | §6 | [`Task6-config.md`](Task6-config.md) | **Done** | Config keys, freeze strategy, checkpoint compatibility |
 
@@ -48,6 +48,7 @@ Task1 (input fields) ─────────┼──► Task4 (inference pa
 4. **Active window rule (FloodDiffusion)**:
    - The diffusion forcing MSE is computed only on the **last `chunk_size` token positions** (the active window).
    - `L_control_xz` must be aligned to the **same active window**: same token indices → same frame indices after VAE decode.
+   - **Implementation detail** (`train_ldf.py::_compute_control_loss_xz`): VAE **decodes the full predicted latent sequence** (so `recover_root_rot_pos` integrates from the real clip start), then root-xz supervision uses only the **frame slice** corresponding to the active window (`chunk_size` tokens × temporal factor 4). This avoids the “window-only decode ⇒ first frame forced to (0,0)” mismatch; see [`Task5-loss.md`](Task5-loss.md).
 
 5. **Coordinate convention**:
    - Root trajectory `traj` has shape `(T, 3)`. **Index 0 = x (ground plane), index 1 = y (vertical height), index 2 = z (ground plane)**.
@@ -57,7 +58,7 @@ Task1 (input fields) ─────────┼──► Task4 (inference pa
    - **Stage-1**: Freeze backbone `WanModel` + text encoder + VAE. Train only `WanControlNet` + `TrajEncoder` (+ optionally `WanModel.traj_in_proj` / `traj_type_embed` if FlexTraj mode is also enabled on ControlNet).
    - **Stage-2** (optional): Unfreeze a small number of backbone layers with a much lower learning rate.
 
-7. **CFG convention**: When CFG is active (`cfg_scale != 1.0`), both the conditional and null forward passes should go through the ControlNet branch using the **same traj_emb** (traj is not dropped in the null pass — only text is dropped). This is the correct behavior for text-CFG with traj ControlNet.
+7. **CFG convention**: When CFG is active (`cfg_scale != 1.0`), the ControlNet branch uses the **same traj_emb** and the **same conditional `controlnet_residuals`** for both passes; only the backbone **text context** differs (cond vs null). Traj is not dropped in the null pass.
 
 ---
 

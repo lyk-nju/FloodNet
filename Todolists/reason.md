@@ -1,3 +1,5 @@
+> **补充（与实现对齐）**：当前 `train_ldf.py::_compute_control_loss_xz` 对 **整条 latent** 做 `vae.decode`，再在 **active window 帧段** 上与 GT 比较，因此下文讨论的「只对尾窗 decode 导致窗口首帧 xz 必为 (0,0)」**不适用于当前默认实现**；该段保留为对 **尾窗-only decode** 反模式的说明。详见 [`Task5-loss.md`](Task5-loss.md)。
+
 你指出：在 HumanML3D/263 这套表示下，recover_root_rot_pos() 的定义就是让序列第一帧 
 x
 0

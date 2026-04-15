@@ -1,20 +1,19 @@
 # FloodNet：`control_loss` 低不下去的关键原因（坐标原点、对齐方式与权重尺度）
 
-### 背景与结论一句话（先纠正一个容易踩的前提）
+### 背景与结论一句话（与实现对齐）
 
 本项目里要分清楚两件事：
 
-- **LDF 扩散训练本身**：模型内部确实有 `chunk_size`（默认 5）用于 active window 的扩散 MSE，对齐论文做法。
-- **显式控制损失 `control_loss`**（`train_ldf.py::_compute_control_loss_xz`）：它是否按窗口（active window）计算，取决于训练脚本从 config 读到的 `chunk_size_tokens` 是否为 `None`。
+- **LDF 扩散训练本身**：`DiffForcingWanModel` 使用 `chunk_size`（默认 **5**）定义 active window；扩散 MSE 只算最后 `chunk_size` 个 token 位置。
+- **显式控制损失 `control_loss`**（`train_ldf.py::_compute_control_loss_xz`）：
+  - **`chunk_size_tokens`** 来自 **`getattr(self.model, "chunk_size", None)`**（即模型实例上的 `chunk_size`，与 `diffusion_forcing_wan.py` 构造函数默认一致），**不是** `self.cfg.model.params.get("chunk_size", ...)`。
+  - **默认行为**：对每个样本 **先 VAE 解码整条预测 latent**，用完整序列做 `recover_root_rot_pos` 积分；再在 **帧维** 上取与 active window 对应的切片  
+    `[start_f, end_f)`，其中 `start_f = (T_token - chunk_size_tokens) * 4`、`end_f = T_token * 4`（当 `chunk_size_tokens` 非空且 `T_token > chunk_size_tokens` 时）。**只在切片内**用 `traj_mask` 做 masked MSE，与 [`target.md`](target.md) 规则 4、[`Task5-loss.md`](Task5-loss.md) 一致。
+  - 若 `chunk_size_tokens` 为 `None` 或 `T_token ≤ chunk_size_tokens`，则退化为「有效重叠长度内」的全程监督（无尾窗限制）。
 
-在当前的 `FloodNet/configs/ldf.yaml` 中，`model.params` **没有** `chunk_size` 这个 key，因此训练脚本里：
+因此：**当前实现是「全序列 decode + 仅 active window 内监督」**，不是「只 decode 尾窗 latent」。在这种做法下，**不会出现**「只对尾窗 decode 导致窗口内第一帧 xz 被 recover 钉在 (0,0)、与 `traj[start_f]` 不一致」那一类结构性地板。
 
-- `chunk_size_tokens = self.cfg.model.params.get("chunk_size", None)` 会得到 **`None`**
-- `control_loss` 会走“**全序列**”分支：解码全序列 latent → 还原全程 root xz → 与 GT 全程 traj 对比（都从 (0,0) 开始）
-
-因此 **在当前默认配置下，不会出现“窗口起点原点不一致”的结构性地板**；`control_loss≈0.08` 更应理解为“真实的轨迹预测误差（在该 loss 定义下）”。
-
-> 下面第 3 节仍保留“窗口原点不一致”的分析，但它只在你显式让 `control_loss` 按窗口算时才会发生（例如在 `model.params` 里补上 `chunk_size`，或强制只解码窗口）。
+> 下面第 3 节保留为 **反模式说明**：仅当有人改成「只对尾窗 latent 做 decode」且仍用绝对 xz 监督时，才会出现该问题。
 
 ---
 
@@ -58,30 +57,18 @@
 
 ---
 
-### 3. `chunk` 控制损失的“最大问题点”（最值得注意）
+### 3. 反模式：「只对尾窗 latent decode」时的结构性地板（当前仓库未采用）
 
-**仅当你让 `control_loss` 按窗口计算时**（即 `chunk_size_tokens` 生效，例如在 `model.params` 显式配置了 `chunk_size`）：
+若实现改成下面这种 **错误/高风险** 组合（与当前 `train_ldf.py` **不同**）：
 
-- pred 侧：只解码窗口 token → 用 `recover_root_rot_pos` 恢复轨迹  
-  ⇒ 预测窗口第 0 帧 root xz **必为 (0,0)**
-- gt 侧：切片得到 `traj[start_f:end_f]`  
-  ⇒ GT 窗口第 0 帧为 `traj[start_f]`，一般 **不为 (0,0)**
+- pred 侧：**只**对最后 `chunk_size` 个 token 的 latent 做 `vae.decode`，再 `recover_root_rot_pos`  
+  ⇒ 在该 **decode 片段内部**，恢复出的第 0 帧 root xz **又被约定为 (0,0)**
+- gt 侧：仍用绝对坐标切片 `traj[start_f:end_f]`  
+  ⇒ 切片内第 0 帧对应 `traj[start_f]`，一般 **≠ (0,0)**
 
-当 `mask_ratio=1.0` 时，窗口起点帧必被监督（mask=1），会产生一个不可消除项：
+则在 `mask_ratio=1.0` 且窗口起点被 mask 监督时，会出现不可消除项 \((0-x_{start})^2+(0-z_{start})^2\)，`control_loss` 易出现 **plateau**。
 
-\[
-(\,0-x_{start}\,)^2 + (\,0-z_{start}\,)^2
-\]
-
-这会造成：
-
-- `control_loss` 出现明显地板（plateau），很难压到 0.01
-- 学习率调度只能影响“接近地板的速度/抖动”，无法从根本上消掉该项
-
-**而在当前默认配置（`chunk_size_tokens=None`）下**：
-
-- `control_loss` 解码全序列并从 `traj[0]` 对齐开始比较
-- 不存在上述“窗口第 0 帧固定为 (0,0) 但 GT 窗口起点不为 (0,0)”的问题
+**当前实现避免该问题的方式**：**全序列 decode** 得到全局一致的 root 轨迹，再只在 `[start_f:end_f)` 上与 GT 比较（见 `train_ldf.py::_compute_control_loss_xz` 注释）。
 
 ---
 
@@ -98,18 +85,13 @@ MotionLCM 的实现（代码层面）主要是：
 - `VAE decode → feats2joints → joints/hint 的 masked loss`
 - 其生成/训练不是 FloodDiffusion/LDF 的 streaming `chunk` 机制（不是“只解码窗口再监督绝对 root xz”）
 
-因此 MotionLCM 能在它的 `cond_loss` 指标上压很低，并不等价于 FloodNet 当前的 `root xz absolute`、`chunk-only decode` 控制损失也能压到 0.01。
+因此 MotionLCM 能在它的 `cond_loss` 指标上压很低，并不等价于 FloodNet 当前的 `root xz`、**全序列 decode + active window 切片** 控制损失也能压到同一数值。
 
 ---
 
-### 5. 文档/实现不一致的地方（需要特别注意）
+### 5. 文档与代码
 
-`FloodNet/Todolists/Task5-loss.md` 中曾描述 control loss “不限制 active window”，但当前 `train_ldf.py::_compute_control_loss_xz` 的实现会在 `chunk_size_tokens` 存在时：
-
-- 只解码最后 `chunk_size` 个 token
-- 并将 GT 对齐到 `[start_f:end_f]` 的窗口
-
-如果后续要做实验对照，建议以代码为准，并更新/补充对应设计文档，避免团队内理解偏差。
+`Task5-loss.md` 已与 `train_ldf.py::_compute_control_loss_xz` 对齐：**全序列 VAE decode，监督仅在 active window 帧段（及 `traj_mask`）**。若再改 loss 行为，请同时更新 `Task5-loss.md` 与 [`target.md`](target.md) 规则 4。
 
 ---
 
@@ -117,12 +99,12 @@ MotionLCM 的实现（代码层面）主要是：
 
 这里先分两种情形：
 
-- **情形 A（当前默认配置：`chunk_size_tokens=None`，控制损失按全序列算）**  
-  `control_loss≈0.08` 是“真实误差”，更需要优先关注 **梯度/权重尺度是否足够**（见下方补充）。
-- **情形 B（你显式让控制损失按窗口算）**  
-  此时可能出现第 3 节描述的“窗口原点不一致”问题，才需要优先调整“监督量/对齐方式”。
+- **情形 A（当前默认：`chunk_size_tokens` 来自 `self.model.chunk_size`，通常为 5；全序列 decode + 尾窗帧监督）**  
+  不存在第 3 节「尾窗-only decode」的结构性地板；`control_loss` 量级主要反映 **尾窗内 xz 误差** 与 **mask 稀疏度**。若长期偏高，优先看 **`control_loss_weight`、与 latent MSE 的尺度平衡**、以及轨迹分支容量（见下方补充）。
+- **情形 B（若自行改成尾窗-only decode 或其它不对齐实现）**  
+  才可能触发第 3 节的地板，需要改监督量/对齐方式。
 
-对情形 B：要实现极低控制误差，需要优先调整“监督量/对齐方式”之一：
+对情形 B / 一般加强控制：可优先尝试：
 
 - **相对量监督（更符合 chunk + self-forcing）**  
   用 \(\Delta x,\Delta z\) 或 root 速度（`[1:3]`）做监督，避免绝对起点问题。

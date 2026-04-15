@@ -22,10 +22,15 @@ class HumanML3DDataset(Dataset):
         self.cfg = cfg
         self.split = split
         self.stream_mode = cfg.data.get("stream_mode", False)
-        # Trajectory observation sparsity on token timeline.
+        # Trajectory observation sparsity on token timeline (train uses mask_ratio).
         # - float in (0,1]: keep exactly ratio of tokens
         # - (min,max): keep a random ratio uniformly in [min,max] per sample (backwards compatible)
-        self.mask_ratio = cfg.data.get("mask_ratio", (0.2, 0.3))
+        # val/test default to full trajectory (1.0) for metrics/video alignment with deployment;
+        # set data.val_mask_ratio to override (e.g. match train sparsity for ablations).
+        if self.split in ("val", "test"):
+            self.mask_ratio = cfg.data.get("val_mask_ratio", 1.0)
+        else:
+            self.mask_ratio = cfg.data.get("mask_ratio", (0.2, 0.3))
         if self.split == "train":
             self.file_list = cfg.data.train_meta_paths
             self.min_length = cfg.data.min_length

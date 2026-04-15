@@ -53,6 +53,7 @@ class CustomLightningModule(BasicLightningModule):
         floor bias.  When chunk_size_tokens is set, only the active window [start_f:end_f]
         of the recovered trajectory is compared against GT – matching the diffusion-forcing
         training objective while keeping the absolute coordinate reference intact.
+
         """
         loss_control = 0.0
         n_valid = 0.0
@@ -304,6 +305,7 @@ class CustomLightningModule(BasicLightningModule):
         # Save motion
         generated_id = batch["name"]  # [batch_size]
         dataset_id = batch["dataset"]  # [batch_size]
+        step_tag = f"step_{int(self.global_step):06d}"
 
         # Decode motion to latent space
         # NOTE: inside the to() function, if will check current_tensor.device == target_device, then run this in each loop is fine.
@@ -312,6 +314,12 @@ class CustomLightningModule(BasicLightningModule):
             single_generated_id = generated_id[i]
             single_dataset_id = dataset_id[i]
             single_text = text[i]
+            text_dir = f"{self.cfg.save_dir}/{single_dataset_id}/text/{step_tag}"
+            token_dir = f"{self.cfg.save_dir}/{single_dataset_id}/token/{step_tag}"
+            feature_dir = f"{self.cfg.save_dir}/{single_dataset_id}/feature/{step_tag}"
+            cond_traj_dir = f"{self.cfg.save_dir}/{single_dataset_id}/cond_traj/{step_tag}"
+            traj_mask_dir = f"{self.cfg.save_dir}/{single_dataset_id}/traj_mask/{step_tag}"
+            frames_dir = f"{self.cfg.save_dir}/{single_dataset_id}/frames/{step_tag}"
             if "feature_text_end" in batch:
                 single_feature_text_end = batch["feature_text_end"][i]
                 frames = np.array(single_feature_text_end)
@@ -321,28 +329,20 @@ class CustomLightningModule(BasicLightningModule):
                 decoded_single_generated = self.vae.decode(
                     single_generated[None, :].to(self.device)
                 )[0]
-                os.makedirs(
-                    f"{self.cfg.save_dir}/{single_dataset_id}/text", exist_ok=True
-                )
+                os.makedirs(text_dir, exist_ok=True)
                 with open(
-                    f"{self.cfg.save_dir}/{single_dataset_id}/text/{single_generated_id}.txt",
+                    f"{text_dir}/{single_generated_id}.txt",
                     "w",
                 ) as f:
                     f.write(single_text)
-                os.makedirs(
-                    f"{self.cfg.save_dir}/{single_dataset_id}/token",
-                    exist_ok=True,
-                )
+                os.makedirs(token_dir, exist_ok=True)
                 np.save(
-                    f"{self.cfg.save_dir}/{single_dataset_id}/token/{single_generated_id}.npy",
+                    f"{token_dir}/{single_generated_id}.npy",
                     single_generated.float().cpu().numpy(),
                 )
-                os.makedirs(
-                    f"{self.cfg.save_dir}/{single_dataset_id}/feature",
-                    exist_ok=True,
-                )
+                os.makedirs(feature_dir, exist_ok=True)
                 np.save(
-                    f"{self.cfg.save_dir}/{single_dataset_id}/feature/{single_generated_id}.npy",
+                    f"{feature_dir}/{single_generated_id}.npy",
                     decoded_single_generated.float().cpu().numpy(),
                 )
 
@@ -372,12 +372,9 @@ class CustomLightningModule(BasicLightningModule):
                             np.float32
                         )
                 if cond_traj is not None:
-                    os.makedirs(
-                        f"{self.cfg.save_dir}/{single_dataset_id}/cond_traj",
-                        exist_ok=True,
-                    )
+                    os.makedirs(cond_traj_dir, exist_ok=True)
                     np.save(
-                        f"{self.cfg.save_dir}/{single_dataset_id}/cond_traj/{single_generated_id}.npy",
+                        f"{cond_traj_dir}/{single_generated_id}.npy",
                         cond_traj,
                     )
 
@@ -387,21 +384,16 @@ class CustomLightningModule(BasicLightningModule):
                     if torch.is_tensor(traj_mask_i):
                         traj_mask_i = traj_mask_i.detach().cpu().numpy()
                     traj_mask_i = np.asarray(traj_mask_i).reshape(-1)[:L_feat]
-                    os.makedirs(
-                        f"{self.cfg.save_dir}/{single_dataset_id}/traj_mask",
-                        exist_ok=True,
-                    )
+                    os.makedirs(traj_mask_dir, exist_ok=True)
                     np.save(
-                        f"{self.cfg.save_dir}/{single_dataset_id}/traj_mask/{single_generated_id}.npy",
+                        f"{traj_mask_dir}/{single_generated_id}.npy",
                         traj_mask_i,
                     )
                 # Save text_end if available
                 if frames is not None:
-                    os.makedirs(
-                        f"{self.cfg.save_dir}/{single_dataset_id}/frames", exist_ok=True
-                    )
+                    os.makedirs(frames_dir, exist_ok=True)
                     np.save(
-                        f"{self.cfg.save_dir}/{single_dataset_id}/frames/{single_generated_id}.npy",
+                        f"{frames_dir}/{single_generated_id}.npy",
                         frames,
                     )
             except Exception as e:
@@ -413,31 +405,43 @@ class CustomLightningModule(BasicLightningModule):
 
     def process_test_results(self):
         for dataset_id in os.listdir(self.cfg.save_dir):
-            feature_dir = f"{self.cfg.save_dir}/{dataset_id}/feature"
+            feature_root = f"{self.cfg.save_dir}/{dataset_id}/feature"
+            if not os.path.exists(feature_root):
+                continue
+            step_tag = f"step_{int(self.global_step):06d}"
+            feature_dir = f"{feature_root}/{step_tag}"
             if not os.path.exists(feature_dir):
                 continue
+            video_step_dir = f"{self.cfg.save_dir}/{dataset_id}/video/{step_tag}"
+            composite_step_dir = (
+                f"{self.cfg.save_dir}/{dataset_id}/composite/{step_tag}"
+            )
+            frames_dir = f"{self.cfg.save_dir}/{dataset_id}/frames/{step_tag}"
+            traj_mask_dir = f"{self.cfg.save_dir}/{dataset_id}/traj_mask/{step_tag}"
+            cond_traj_dir = f"{self.cfg.save_dir}/{dataset_id}/cond_traj/{step_tag}"
+            text_dir = f"{self.cfg.save_dir}/{dataset_id}/text/{step_tag}"
             # render video and save
             if self.cfg.test_setting.render:
                 render_video(
                     motion_dir=feature_dir,
-                    save_dir=f"{self.cfg.save_dir}/{dataset_id}/video",
+                    save_dir=video_step_dir,
                     render_setting=self.cfg.test_setting,
-                    frames_dir=f"{self.cfg.save_dir}/{dataset_id}/frames",
-                    traj_mask_dir=f"{self.cfg.save_dir}/{dataset_id}/traj_mask",
-                    cond_traj_dir=f"{self.cfg.save_dir}/{dataset_id}/cond_traj",
+                    frames_dir=frames_dir,
+                    traj_mask_dir=traj_mask_dir,
+                    cond_traj_dir=cond_traj_dir,
                 )
 
                 # Create composite videos
                 make_composite_compare_videos(
-                    result_folder=f"{self.cfg.save_dir}/{dataset_id}/video",
+                    result_folder=video_step_dir,
                     compare_folders=self.cfg.test_setting.get(dataset_id, {}).get(
                         "compare_folders", None
                     ),
                     compare_names=self.cfg.test_setting.get(dataset_id, {}).get(
                         "compare_names", None
                     ),
-                    text_folder=f"{self.cfg.save_dir}/{dataset_id}/text",
-                    save_dir=f"{self.cfg.save_dir}/{dataset_id}/composite",
+                    text_folder=text_dir,
+                    save_dir=composite_step_dir,
                 )
 
                 # wandb log video
@@ -447,12 +451,10 @@ class CustomLightningModule(BasicLightningModule):
                     and isinstance(self.logger, WandbLogger)
                 ):
                     video_to_log = []
-                    for video_path in sorted(
-                        os.listdir(f"{self.cfg.save_dir}/{dataset_id}/composite")
-                    ):
+                    for video_path in sorted(os.listdir(composite_step_dir)):
                         video_to_log.append(
                             wandb.Video(
-                                f"{self.cfg.save_dir}/{dataset_id}/composite/{video_path}",
+                                f"{composite_step_dir}/{video_path}",
                                 format="gif",
                             )
                         )
@@ -586,13 +588,6 @@ def main():
     )
 
     if cfg.train:
-        if not cfg.debug:
-            trainer.validate(
-                model,
-                dataloaders=[val_dataloader, test_dataloader],
-                ckpt_path=cfg.resume_ckpt,
-                weights_only=False,
-            )
         trainer.fit(
             model,
             train_dataloader,

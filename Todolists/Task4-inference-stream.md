@@ -2,7 +2,7 @@
 
 Corresponds to [`target.md`](target.md) §4.
 
-**Status: Partial.** ControlNet is wired into `generate()` and `stream_generate()`. The CFG path for ControlNet requires verification and may need explicit handling for the null pass.
+**Status: Done (CFG).** ControlNet is wired into `generate()`, `stream_generate()`, and `stream_generate_step()`. CFG reuses conditional `controlnet_residuals` for the null backbone pass (text-only CFG); see [`target.md`](target.md) rule 7.
 
 ---
 
@@ -53,37 +53,16 @@ When `cfg_scale != 1.0`, inference runs **two forward passes**: one conditional 
 pred = cfg_scale * cond_pred - (cfg_scale - 1) * null_pred
 ```
 
-**Current behavior**: ControlNet is called once per denoising step. The CFG loop calls the backbone twice (cond + null) but the ControlNet is not explicitly called with the null text context.
-
-**Correct behavior for text-CFG + traj-ControlNet**:
-- Traj conditioning comes from ControlNet, not from text. It is **not** dropped in the null pass.
-- Text is dropped in the null pass (via null/empty context).
-- Therefore: the ControlNet residuals should be computed with the **conditional text context** and reused in both passes. This is the most efficient and semantically correct approach since traj is not a text-conditional signal.
-
-**Implementation approach** (to verify or fix in `generate()` and `stream_generate_step()`):
+**Implemented behavior** (`diffusion_forcing_wan.py`): ControlNet is called **once** per denoising step with the **conditional** text context. The CFG null pass calls the backbone with **null text** and the **same** `controlnet_residuals` tensor (traj injection unchanged). See [`target.md`](target.md) rule 7.
 
 ```python
-# Compute residuals once using conditional context
 controlnet_residuals = _maybe_controlnet_residuals(
     noisy_input, t, context_cond, seq_len, traj_emb, traj_seq_lens
 )
-
-# Conditional pass
-pred_cond = self.model(
-    x=noisy_input, t=t, context=context_cond, seq_len=seq_len,
-    controlnet_residuals=controlnet_residuals
-)
-
-# Unconditional pass: reuse same residuals (traj not dropped)
-pred_null = self.model(
-    x=noisy_input, t=t, context=context_null, seq_len=seq_len,
-    controlnet_residuals=controlnet_residuals   # same residuals
-)
-
+pred_cond = self.model(..., context=context_cond, controlnet_residuals=controlnet_residuals)
+pred_null = self.model(..., context=context_null, controlnet_residuals=controlnet_residuals)
 pred = cfg_scale * pred_cond - (cfg_scale - 1) * pred_null
 ```
-
-**Alternative (simpler, also acceptable)**: Call ControlNet once per step with `context_cond`, inject into both passes. This is what the current implementation appears to do — verify it is actually happening correctly.
 
 ---
 
@@ -137,6 +116,6 @@ If `stream_generate_step` does not yet call ControlNet, add the following (file:
 
 3. **Cache invalidation**: In streaming mode, feed two steps with different traj values. Verify `_traj_stream_version` increments between steps and `_traj_emb_cache` is refreshed.
 
-4. **CFG consistency**: With `cfg_scale=2.0`, verify the output changes meaningfully when text changes but traj is fixed (text CFG is working). Verify the output changes when traj changes but text is fixed (traj ControlNet is working).
+4. **CFG consistency**: With `cfg_scale=2.0`, null pass must use the **same** `controlnet_residuals` as cond. Verify output changes when text changes but traj is fixed; verify output changes when traj changes but text is fixed.
 
 5. **`generate` and `stream_generate` agreement**: On the same input (fix random seed), `generate` and `stream_generate` should produce outputs with similar quality metrics (they won't be numerically identical due to different chunking, but both should show trajectory following).

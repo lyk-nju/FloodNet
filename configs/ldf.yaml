@@ -3,16 +3,20 @@ seed: 1234 # Seed value
 debug: false
 train: true
 
-# Override configs/paths_default.yaml: use FloodDiffusion deps + raw_data for training
 dirs:
-    deps: /home/yuankai/Text2Motion/FloodDiffusion/deps
+    deps: /data1/yuankai/text2motion/FloodDiffusion/deps
     outputs: ./outputs
-    raw_data: /home/yuankai/Text2Motion/FloodDiffusion/raw_data
+    raw_data: /data1/yuankai/text2motion/FloodDiffusion/raw_data
 
 save_dir: ./outputs
-resume_ckpt: "${dirs.outputs}/20260401_192505_ldf/step_step=240000.ckpt"
-test_ckpt: "${dirs.outputs}/20260401_192505_ldf/step_step=240000.ckpt"
-test_vae_ckpt: "${dirs.outputs}/vae_1d_z4_step=300000.ckpt"
+resume_ckpt: "/home/yuankai/text2motion/FloodDiffusion/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt"
+test_ckpt: "/home/yuankai/text2motion/FloodDiffusion/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt"
+# resume_ckpt: "/home/yuankai/text2motion/FloodNet/outputs/20260402_114343_ldf/step_step=300000.ckpt"
+# test_ckpt: "/home/yuankai/text2motion/FloodNet/outputs/20260402_114343_ldf/step_step=300000.ckpt"
+# resume_ckpt: "/home/yuankai/text2motion/FloodNet/outputs/20260409_005945_ldf/step_step=245000.ckpt"
+# test_ckpt: "/home/yuankai/text2motion/FloodNet/outputs/20260409_005945_ldf/step_step=245000.ckpt"
+
+test_vae_ckpt: "/home/yuankai/text2motion/FloodDiffusion/outputs/vae_1d_z4_step=300000.ckpt"
 test_vae:
     target: models.vae_wan_1d.VAEWanModel
     ema_decay: 0.99
@@ -37,9 +41,9 @@ logger:
         entity: "${wandb_info.entity}"
 
 trainer: # lightning trainer
-    max_steps: 300000
+    max_steps: 360000
     accelerator: gpu
-    devices: [0,1,2,3]
+    devices: [0,2,3]
     log_every_n_steps: 100
     precision: bf16-mixed
 validation:
@@ -86,12 +90,15 @@ metrics:
 data:
     target: datasets.humanml3d.HumanML3DDataset
     collate_fn: datasets.humanml3d.collate_fn
-    train_bs: 8
-    val_bs: 4
+    train_bs: 16
+    val_bs: 8
     test_bs: 1
-    num_workers: 8
+    num_workers: 4
     # mask_ratio: [0.2,0.3]       
     mask_ratio: 1.0
+    # val/test default to full traj mask in HumanML3DDataset (val_mask_ratio defaults to 1.0 if omitted).
+    # val_mask_ratio: 1.0
+
     train_meta_paths:
         - ${dirs.raw_data}/HumanML3D/train.txt
     val_meta_paths:
@@ -105,7 +112,7 @@ data:
     text_path: "texts"
     random_length: 0
     min_length: 40
-    max_length: 200
+    max_length: 190
 
 model:
     target: models.diffusion_forcing_wan.DiffForcingWanModel
@@ -130,8 +137,9 @@ model:
         use_traj_emb_cache: true
 
         # Explicit motion-space control loss
-        control_loss_weight: 1.0
+        control_loss_weight: 5.0
 
+resume_reset_optimizer: true
 optimizer:
     target: AdamW
     params:
@@ -140,7 +148,7 @@ optimizer:
         weight_decay: 0.01
         eps: 1e-8
 
-resume_reset_optimizer: true
+
 lr_scheduler:
     target: diffusers.optimization.get_cosine_schedule_with_warmup
     params:
