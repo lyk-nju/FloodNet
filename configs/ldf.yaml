@@ -10,7 +10,7 @@ dirs:
 
 save_dir: ./outputs
 resume_ckpt: "/home/yuankai/text2motion/FloodDiffusion/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt"
-test_ckpt: "/home/yuankai/text2motion/FloodDiffusion/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt"
+test_ckpt: /home/yuankai/text2motion/FloodNet/outputs/20260409_145822_ldf/step_step=245000.ckpt
 # resume_ckpt: "/home/yuankai/text2motion/FloodNet/outputs/20260402_114343_ldf/step_step=300000.ckpt"
 # test_ckpt: "/home/yuankai/text2motion/FloodNet/outputs/20260402_114343_ldf/step_step=300000.ckpt"
 # resume_ckpt: "/home/yuankai/text2motion/FloodNet/outputs/20260409_005945_ldf/step_step=245000.ckpt"
@@ -43,7 +43,7 @@ logger:
 trainer: # lightning trainer
     max_steps: 360000
     accelerator: gpu
-    devices: [0,2,3]
+    devices: [0,1,2,3]
     log_every_n_steps: 100
     precision: bf16-mixed
 validation:
@@ -137,7 +137,7 @@ model:
         use_traj_emb_cache: true
 
         # Explicit motion-space control loss
-        control_loss_weight: 5.0
+        control_loss_weight: 1.0
 
 resume_reset_optimizer: true
 optimizer:
