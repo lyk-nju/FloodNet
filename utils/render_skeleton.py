@@ -435,7 +435,7 @@ def render_simple_skeleton_video(
     frames: np.ndarray = None,
     traj_mask: np.ndarray = None,
     traj_mask_point_radius: int = 4,
-    cond_traj: np.ndarray = None,
+    traj_xz: np.ndarray = None,
     cond_traj_mask: np.ndarray = None,
     cond_traj_point_radius: int = 5,
 ):
@@ -620,18 +620,18 @@ def render_simple_skeleton_video(
         # treat NaN as 0
         traj_mask = np.nan_to_num(traj_mask, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Normalize/validate cond_traj (T,2)=[x,z] and cond_traj_mask.
-    if cond_traj is not None:
-        cond_traj = np.asarray(cond_traj).astype(np.float32)
-        if cond_traj.ndim != 2 or cond_traj.shape[1] != 2:
+    # Normalize/validate traj_xz (T,2)=[x,z] and cond_traj_mask.
+    if traj_xz is not None:
+        traj_xz = np.asarray(traj_xz).astype(np.float32)
+        if traj_xz.ndim != 2 or traj_xz.shape[1] != 2:
             raise ValueError(
-                f"cond_traj must be (T,2) [x,z], got shape={cond_traj.shape}"
+                f"traj_xz must be (T,2) [x,z], got shape={traj_xz.shape}"
             )
-        if cond_traj.shape[0] < len(traj):
-            pad = np.zeros((len(traj) - cond_traj.shape[0], 2), dtype=np.float32)
-            cond_traj = np.concatenate([cond_traj, pad], axis=0)
-        elif cond_traj.shape[0] > len(traj):
-            cond_traj = cond_traj[: len(traj)]
+        if traj_xz.shape[0] < len(traj):
+            pad = np.zeros((len(traj) - traj_xz.shape[0], 2), dtype=np.float32)
+            traj_xz = np.concatenate([traj_xz, pad], axis=0)
+        elif traj_xz.shape[0] > len(traj):
+            traj_xz = traj_xz[: len(traj)]
 
         if cond_traj_mask is None:
             cond_traj_mask = traj_mask
@@ -666,10 +666,10 @@ def render_simple_skeleton_video(
                 )
 
         # Conditioning trajectory on ground plane (red).
-        if cond_traj is not None and cond_traj_mask is not None:
+        if traj_xz is not None and cond_traj_mask is not None:
             visible_idx = np.where(cond_traj_mask[: frame + 1] > 0.0)[0]
             for j in visible_idx:
-                xz = cond_traj[j]
+                xz = traj_xz[j]
                 center = world_to_screen([float(xz[0]), 0.0, float(xz[1])])
                 draw_circle_vectorized(
                     img,

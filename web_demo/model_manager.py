@@ -17,7 +17,7 @@ import numpy as np
 from torch_ema import ExponentialMovingAverage
 from utils.initialize import instantiate, load_config, compare_statedict_and_parameters
 from utils.motion_process import StreamJointRecovery263
-from utils.traj_batch import path_heading_features_from_root_xyz
+from utils.traj_batch import root_to_traj_feats
 
 
 class FrameBuffer:
@@ -308,7 +308,7 @@ class ModelManager:
         self.current_token_mask = interp_mask.astype(np.float32)
 
         # Build token-step [x,z,cos,sin] features (same semantics as dataset traj_features).
-        self.current_traj_features = path_heading_features_from_root_xyz(self.current_traj_array)  # (N,4)
+        self.current_traj_features = root_to_traj_feats(self.current_traj_array)  # (N,4)
         self.current_traj_features = self.current_traj_features * self.current_token_mask[:, None]
 
         self.current_traj_waypoints = waypoints

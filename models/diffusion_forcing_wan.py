@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 from .tools.t5 import T5EncoderModel
-from utils.traj_batch import xyz_traj_to_features_4d
+from utils.traj_batch import root_to_traj_feats
 from .tools.traj_encoder import LocalTrajEncoder, TrajEncoder
 from .tools.wan_model import WanModel
 from .tools.wan_controlnet import WanControlNet
@@ -38,7 +38,8 @@ class DiffForcingWanModel(nn.Module):
         use_text_cond=True,
         text_len=512,
         dropout=0.1,
-        cfg_scale=5.0,
+        cfg_scale_text=5.0,
+        cfg_scale_traj=0.0,
         prediction_type="vel",  # "vel", "x0", "noise"
         causal=False,
         # Deprecated for ControlNet training: backbone stays unconditional on traj.
@@ -57,10 +58,15 @@ class DiffForcingWanModel(nn.Module):
         freeze_backbone_for_controlnet=False,
         use_precomputed_text_emb=False,
         precomputed_text_emb_path=None,
+        scheduled_sampling_prob=0.0,
         **kwargs,
     ):
         kwargs.pop("traj_lora_rank", None)
         kwargs.pop("lora_rank_traj", None)
+        # Backward compat: old checkpoints stored the param as cfg_scale.
+        _legacy_cfg_scale = kwargs.pop("cfg_scale", None)
+        if _legacy_cfg_scale is not None:
+            cfg_scale_text = _legacy_cfg_scale
         if kwargs:
             raise TypeError(
                 "DiffForcingWanModel: unexpected keyword arguments "
@@ -81,7 +87,8 @@ class DiffForcingWanModel(nn.Module):
         self.noise_steps = noise_steps
         self.use_text_cond = use_text_cond
         self.dropout = dropout
-        self.cfg_scale = cfg_scale
+        self.cfg_scale_text = cfg_scale_text
+        self.cfg_scale_traj = float(cfg_scale_traj)
         self.prediction_type = prediction_type
         self.causal = causal
         self.use_traj_cond = use_traj_cond
@@ -111,6 +118,7 @@ class DiffForcingWanModel(nn.Module):
             )
             use_traj_emb_cache = bool(use_traj_kv_cache)
         self.use_traj_emb_cache = use_traj_emb_cache
+        self.scheduled_sampling_prob = float(scheduled_sampling_prob)
 
         self.text_dim = 4096
         self.text_len = text_len
@@ -232,7 +240,7 @@ class DiffForcingWanModel(nn.Module):
                 for p in self.traj_encoder.parameters():
                     p.requires_grad = True
 
-    def _maybe_controlnet_residuals(
+    def _controlnet_forward(
         self,
         noisy_input,
         t_scaled,
@@ -253,7 +261,7 @@ class DiffForcingWanModel(nn.Module):
             traj_seq_lens=traj_seq_lens,
         )
 
-    def _try_cfg_double_batch_text_context(
+    def _build_cfg_2b_text(
         self, text_context, text_null_per_sample, batch_size, model_seq_len
     ):
         """Build text context list for MotionLCM-style 2B CFG (cond || uncond).
@@ -274,6 +282,26 @@ class DiffForcingWanModel(nn.Module):
                     null_flat.append(ni)
             return list(text_context) + null_flat
         return None
+
+    def _uncond_backbone_forward(
+        self, noisy_input, t_scaled, text_null_context, seq_len,
+        traj_emb_backbone, traj_seq_lens_backbone,
+    ):
+        """Single backbone forward with null text and no ControlNet residuals.
+
+        Used by separated CFG to obtain the fully unconditional prediction
+        (text OFF, traj OFF).  Returns a list of per-sample tensors.
+        """
+        return self.model(
+            noisy_input,
+            t_scaled,
+            text_null_context,
+            seq_len,
+            y=None,
+            traj_emb=traj_emb_backbone,
+            traj_seq_lens=traj_seq_lens_backbone,
+            controlnet_residuals=None,
+        )
 
     def encode_text_with_cache(self, text_list, device):
         """Encode text using cache
@@ -354,7 +382,7 @@ class DiffForcingWanModel(nn.Module):
         if "traj_features" in x and x["traj_features"] is not None:
             feats_frame = x["traj_features"].to(device)  # (B, T_frame, 4)
         elif "traj" in x and x["traj"] is not None:
-            feats_frame = xyz_traj_to_features_4d(x["traj"].to(device))
+            feats_frame = root_to_traj_feats(x["traj"].to(device))
         else:
             return None
 
@@ -363,9 +391,18 @@ class DiffForcingWanModel(nn.Module):
         if "traj_mask" in x and x["traj_mask"] is not None:
             mask_frame = x["traj_mask"].to(device=device, dtype=torch.float32)
         elif "token_mask" in x and x["token_mask"] is not None:
-            # Build frame mask by repeat-4.
+            # Build frame mask with causal VAE convention:
+            #   token 0 → frame 0; token k (k≥1) → frames [4k-3, 4k]
             tm = x["token_mask"].to(device=device, dtype=torch.float32)
-            mask_frame = tm.repeat_interleave(4, dim=1)
+            B_tm, N_tm = tm.shape
+            tf = feats_frame.shape[1]
+            mask_frame = tm.new_zeros(B_tm, tf)
+            mask_frame[:, 0] = tm[:, 0]
+            for k in range(1, N_tm):
+                sf = 4 * k - 3
+                ef = min(4 * k + 1, tf)
+                if sf < tf:
+                    mask_frame[:, sf:ef] = tm[:, k : k + 1].expand(-1, ef - sf)
         if mask_frame is not None:
             tf = feats_frame.shape[1]
             if mask_frame.shape[1] < tf:
@@ -379,15 +416,27 @@ class DiffForcingWanModel(nn.Module):
         if feats_frame.shape[1] == seq_len:
             feats_tok = feats_frame
         else:
-            need = seq_len * 4
+            # Causal VAE convention: N tokens → 4*(N-1)+1 frames
+            #   token 0 → frame 0 only
+            #   token k (k≥1) → frames [4k-3, 4k]
+            total_causal = 4 * (seq_len - 1) + 1 if seq_len > 1 else 1
             tf = feats_frame.shape[1]
-            if tf < need:
+            if tf < total_causal:
                 pad = feats_frame.new_zeros(
-                    feats_frame.shape[0], need - tf, feats_frame.shape[2]
+                    feats_frame.shape[0], total_causal - tf, feats_frame.shape[2]
                 )
                 feats_frame = torch.cat([feats_frame, pad], dim=1)
-            feats_frame = feats_frame[:, :need, :]
-            feats_4 = feats_frame.reshape(feats_frame.shape[0], seq_len, 4, 4)
+            feats_frame = feats_frame[:, :total_causal, :]
+            # Token 0: repeat frame 0 four times (causal seed frame)
+            tok0 = feats_frame[:, 0:1, :].unsqueeze(2).expand(-1, -1, 4, -1)  # (B,1,4,C)
+            if seq_len > 1:
+                # Tokens 1..seq_len-1: frames [1, 4*(seq_len-1)] in consecutive groups of 4
+                rest = feats_frame[:, 1:, :].reshape(
+                    feats_frame.shape[0], seq_len - 1, 4, feats_frame.shape[2]
+                )  # (B, seq_len-1, 4, C)
+                feats_4 = torch.cat([tok0, rest], dim=1)  # (B, seq_len, 4, C)
+            else:
+                feats_4 = tok0  # (B, 1, 4, C)
             if self.local_traj_encoder is None:
                 return None
             feats_tok = self.local_traj_encoder(feats_4)  # (B, seq_len, 4)
@@ -411,10 +460,9 @@ class DiffForcingWanModel(nn.Module):
                 .clamp(min=0, max=seq_len)
             )
         if "traj_length" in x and x["traj_length"] is not None:
-            return (
-                (x["traj_length"].to(device=device, dtype=torch.long) // 4)
-                .clamp(min=0, max=seq_len)
-            )
+            # Causal: N tokens → 4*(N-1)+1 frames, so frames→tokens = (T-1)//4 + 1
+            tl = x["traj_length"].to(device=device, dtype=torch.long)
+            return ((tl - 1) // 4 + 1).clamp(min=0, max=seq_len)
         return None
 
     def _get_noise_levels(self, device, seq_len, time_steps):
@@ -547,8 +595,51 @@ class DiffForcingWanModel(nn.Module):
         traj_emb_backbone = traj_emb if (self.use_traj_cond and not self.use_controlnet_traj) else None
         traj_seq_lens_backbone = traj_seq_lens if (self.use_traj_cond and not self.use_controlnet_traj) else None
 
+        # ── Scheduled Sampling ──────────────────────────────────────────────
+        # With probability ss_prob, replace context tokens (active-window prefix,
+        # noise_level ≈ 0) with the model's own x0 prediction (no_grad pass).
+        # This exposes the model to its own prediction errors during training,
+        # closing the teacher-forcing → generate exposure-bias gap.
+        if self.scheduled_sampling_prob > 0.0 and np.random.rand() < self.scheduled_sampling_prob:
+            with torch.no_grad():
+                cn_res_ss = self._controlnet_forward(
+                    noisy_feature_input,
+                    noise_level * self.time_embedding_scale,
+                    all_text_context,
+                    seq_len,
+                    traj_emb,
+                    traj_seq_lens,
+                )
+                pred_ss = self.model(
+                    noisy_feature_input,
+                    noise_level * self.time_embedding_scale,
+                    all_text_context,
+                    seq_len,
+                    y=None,
+                    traj_emb=traj_emb_backbone,
+                    traj_seq_lens=traj_seq_lens_backbone,
+                    controlnet_residuals=cn_res_ss,
+                )
+            # Replace context tokens (prefix before active window) with x0_hat.
+            for b in range(batch_size):
+                t_len = noisy_feature_input[b].shape[1]  # end_index for this sample
+                ctx_len = t_len - self.chunk_size        # tokens before active window
+                if ctx_len <= 0:
+                    continue
+                if self.prediction_type == "vel":
+                    # vel = x0 - noise  →  x0_hat = pred_vel + noise
+                    x0_hat = (pred_ss[b] + noise_ref[b]).detach()
+                elif self.prediction_type == "x0":
+                    x0_hat = pred_ss[b].detach()
+                else:
+                    continue  # "noise" type: skip SS for this sample
+                noisy_feature_input[b] = torch.cat(
+                    [x0_hat[:, :ctx_len], noisy_feature_input[b][:, ctx_len:]], dim=1
+                )
+        # ────────────────────────────────────────────────────────────────────
+
         # Through WanModel
-        controlnet_residuals = self._maybe_controlnet_residuals(
+        controlnet_residuals = self._controlnet_forward(
             noisy_feature_input,
             noise_level * self.time_embedding_scale,
             all_text_context,
@@ -741,10 +832,10 @@ class DiffForcingWanModel(nn.Module):
             gen_sl = seq_len + self.chunk_size
             t_scaled = noise_level * self.time_embedding_scale
             ctx_2b = (
-                self._try_cfg_double_batch_text_context(
+                self._build_cfg_2b_text(
                     all_text_context, text_null_context, batch_size, gen_sl
                 )
-                if self.cfg_scale != 1.0
+                if self.cfg_scale_text != 1.0
                 else None
             )
             if ctx_2b is not None:
@@ -772,7 +863,7 @@ class DiffForcingWanModel(nn.Module):
                     if traj_seq_lens_backbone is not None
                     else None
                 )
-                controlnet_residuals = self._maybe_controlnet_residuals(
+                controlnet_residuals = self._controlnet_forward(
                     noisy_2b,
                     t_2b,
                     ctx_2b,
@@ -790,13 +881,31 @@ class DiffForcingWanModel(nn.Module):
                     traj_seq_lens=traj_bb_sl_2b,
                     controlnet_residuals=controlnet_residuals,
                 )
-                predicted_result = [
-                    self.cfg_scale * pred_2b[i]
-                    - (self.cfg_scale - 1) * pred_2b[i + batch_size]
-                    for i in range(batch_size)
-                ]
+                if self.cfg_scale_traj > 0.0:
+                    # Separated CFG: reuse 2-batch (out_full, out_null_text);
+                    # one extra backbone forward for out_uncond (text OFF, traj OFF).
+                    # Formula:
+                    #   out = out_uncond
+                    #       + w_text * (out_full - out_null_text)
+                    #       + w_traj * (out_null_text - out_uncond)
+                    pred_uncond = self._uncond_backbone_forward(
+                        noisy_input, t_scaled, text_null_context, gen_sl,
+                        traj_emb_backbone, traj_seq_lens_backbone,
+                    )
+                    predicted_result = [
+                        pred_uncond[i]
+                        + self.cfg_scale_text * (pred_2b[i] - pred_2b[i + batch_size])
+                        + self.cfg_scale_traj * (pred_2b[i + batch_size] - pred_uncond[i])
+                        for i in range(batch_size)
+                    ]
+                else:
+                    predicted_result = [
+                        self.cfg_scale_text * pred_2b[i]
+                        - (self.cfg_scale_text - 1) * pred_2b[i + batch_size]
+                        for i in range(batch_size)
+                    ]
             else:
-                controlnet_residuals = self._maybe_controlnet_residuals(
+                controlnet_residuals = self._controlnet_forward(
                     noisy_input,
                     t_scaled,
                     all_text_context,
@@ -814,7 +923,18 @@ class DiffForcingWanModel(nn.Module):
                     traj_seq_lens=traj_seq_lens_backbone,
                     controlnet_residuals=controlnet_residuals,
                 )
-                if self.cfg_scale != 1.0:
+                if self.cfg_scale_text != 1.0:
+                    # Re-compute ControlNet residuals with null text so the uncond
+                    # branch is truly unconditioned on text (Bug fix: previously
+                    # reused cond residuals, making CFG uncond branch not truly null).
+                    controlnet_residuals_null = self._controlnet_forward(
+                        noisy_input,
+                        t_scaled,
+                        text_null_context,
+                        gen_sl,
+                        traj_emb,
+                        traj_seq_lens,
+                    )
                     predicted_result_null = self.model(
                         noisy_input,
                         t_scaled,
@@ -823,10 +943,10 @@ class DiffForcingWanModel(nn.Module):
                         y=None,
                         traj_emb=traj_emb_backbone,
                         traj_seq_lens=traj_seq_lens_backbone,
-                        controlnet_residuals=controlnet_residuals,
+                        controlnet_residuals=controlnet_residuals_null,
                     )
                     predicted_result = [
-                        self.cfg_scale * pv - (self.cfg_scale - 1) * pvn
+                        self.cfg_scale_text * pv - (self.cfg_scale_text - 1) * pvn
                         for pv, pvn in zip(predicted_result, predicted_result_null)
                     ]
 
@@ -1005,10 +1125,10 @@ class DiffForcingWanModel(nn.Module):
             gen_sl = seq_len + self.chunk_size
             t_scaled = noise_level * self.time_embedding_scale
             ctx_2b = (
-                self._try_cfg_double_batch_text_context(
+                self._build_cfg_2b_text(
                     all_text_context, text_null_context, batch_size, gen_sl
                 )
-                if self.cfg_scale != 1.0
+                if self.cfg_scale_text != 1.0
                 else None
             )
             if ctx_2b is not None:
@@ -1036,7 +1156,7 @@ class DiffForcingWanModel(nn.Module):
                     if traj_seq_lens_backbone is not None
                     else None
                 )
-                controlnet_residuals = self._maybe_controlnet_residuals(
+                controlnet_residuals = self._controlnet_forward(
                     noisy_2b,
                     t_2b,
                     ctx_2b,
@@ -1054,13 +1174,31 @@ class DiffForcingWanModel(nn.Module):
                     traj_seq_lens=traj_bb_sl_2b,
                     controlnet_residuals=controlnet_residuals,
                 )
-                predicted_result = [
-                    self.cfg_scale * pred_2b[i]
-                    - (self.cfg_scale - 1) * pred_2b[i + batch_size]
-                    for i in range(batch_size)
-                ]
+                if self.cfg_scale_traj > 0.0:
+                    # Separated CFG: reuse 2-batch (out_full, out_null_text);
+                    # one extra backbone forward for out_uncond (text OFF, traj OFF).
+                    # Formula:
+                    #   out = out_uncond
+                    #       + w_text * (out_full - out_null_text)
+                    #       + w_traj * (out_null_text - out_uncond)
+                    pred_uncond = self._uncond_backbone_forward(
+                        noisy_input, t_scaled, text_null_context, gen_sl,
+                        traj_emb_backbone, traj_seq_lens_backbone,
+                    )
+                    predicted_result = [
+                        pred_uncond[i]
+                        + self.cfg_scale_text * (pred_2b[i] - pred_2b[i + batch_size])
+                        + self.cfg_scale_traj * (pred_2b[i + batch_size] - pred_uncond[i])
+                        for i in range(batch_size)
+                    ]
+                else:
+                    predicted_result = [
+                        self.cfg_scale_text * pred_2b[i]
+                        - (self.cfg_scale_text - 1) * pred_2b[i + batch_size]
+                        for i in range(batch_size)
+                    ]
             else:
-                controlnet_residuals = self._maybe_controlnet_residuals(
+                controlnet_residuals = self._controlnet_forward(
                     noisy_input,
                     t_scaled,
                     all_text_context,
@@ -1078,7 +1216,18 @@ class DiffForcingWanModel(nn.Module):
                     traj_seq_lens=traj_seq_lens_backbone,
                     controlnet_residuals=controlnet_residuals,
                 )
-                if self.cfg_scale != 1.0:
+                if self.cfg_scale_text != 1.0:
+                    # Re-compute ControlNet residuals with null text so the uncond
+                    # branch is truly unconditioned on text (Bug fix: previously
+                    # reused cond residuals, making CFG uncond branch not truly null).
+                    controlnet_residuals_null = self._controlnet_forward(
+                        noisy_input,
+                        t_scaled,
+                        text_null_context,
+                        gen_sl,
+                        traj_emb,
+                        traj_seq_lens,
+                    )
                     predicted_result_null = self.model(
                         noisy_input,
                         t_scaled,
@@ -1087,10 +1236,10 @@ class DiffForcingWanModel(nn.Module):
                         y=None,
                         traj_emb=traj_emb_backbone,
                         traj_seq_lens=traj_seq_lens_backbone,
-                        controlnet_residuals=controlnet_residuals,
+                        controlnet_residuals=controlnet_residuals_null,
                     )
                     predicted_result = [
-                        self.cfg_scale * pv - (self.cfg_scale - 1) * pvn
+                        self.cfg_scale_text * pv - (self.cfg_scale_text - 1) * pvn
                         for pv, pvn in zip(predicted_result, predicted_result_null)
                     ]
 
@@ -1297,7 +1446,25 @@ class DiffForcingWanModel(nn.Module):
                     ],
                     dim=1,
                 )
-            emb = self.traj_encoder(xyz_traj_to_features_4d(traj_slice))
+            feats_frame = root_to_traj_feats(traj_slice)  # (B, T_frames, 4)
+            # Apply the same LocalTrajEncoder grouping as the training path (_build_traj_emb).
+            # Causal VAE: N tokens → 4*(N-1)+1 frames; group frames into (B, ctx_len, 4, 4).
+            total_causal = 4 * (ctx_len - 1) + 1 if ctx_len > 1 else 1
+            tf = feats_frame.shape[1]
+            if tf < total_causal:
+                pad = feats_frame.new_zeros(feats_frame.shape[0], total_causal - tf, feats_frame.shape[2])
+                feats_frame = torch.cat([feats_frame, pad], dim=1)
+            feats_frame = feats_frame[:, :total_causal, :]
+            tok0 = feats_frame[:, 0:1, :].unsqueeze(2).expand(-1, -1, 4, -1)  # (B,1,4,4)
+            if ctx_len > 1:
+                rest = feats_frame[:, 1:, :].reshape(feats_frame.shape[0], ctx_len - 1, 4, feats_frame.shape[2])
+                feats_4 = torch.cat([tok0, rest], dim=1)  # (B, ctx_len, 4, 4)
+            else:
+                feats_4 = tok0
+            if self.local_traj_encoder is None:
+                return None
+            feats_tok = self.local_traj_encoder(feats_4)  # (B, ctx_len, 4)
+            emb = self.traj_encoder(feats_tok)
             if self.use_traj_emb_cache:
                 self._traj_emb_cache[key] = emb
             return emb
@@ -1390,10 +1557,10 @@ class DiffForcingWanModel(nn.Module):
             model_sl = min(end_index, self.seq_len)
             t_scaled = noise_level * self.time_embedding_scale
             ctx_2b = (
-                self._try_cfg_double_batch_text_context(
+                self._build_cfg_2b_text(
                     text_condition, text_null_context, self.batch_size, model_sl
                 )
-                if self.cfg_scale != 1.0
+                if self.cfg_scale_text != 1.0
                 else None
             )
             if ctx_2b is not None:
@@ -1421,7 +1588,7 @@ class DiffForcingWanModel(nn.Module):
                     if traj_seq_lens_backbone is not None
                     else None
                 )
-                controlnet_residuals = self._maybe_controlnet_residuals(
+                controlnet_residuals = self._controlnet_forward(
                     noisy_2b,
                     t_2b,
                     ctx_2b,
@@ -1439,13 +1606,31 @@ class DiffForcingWanModel(nn.Module):
                     traj_seq_lens=traj_bb_sl_2b,
                     controlnet_residuals=controlnet_residuals,
                 )
-                predicted_result = [
-                    self.cfg_scale * pred_2b[i]
-                    - (self.cfg_scale - 1) * pred_2b[i + self.batch_size]
-                    for i in range(self.batch_size)
-                ]
+                if self.cfg_scale_traj > 0.0:
+                    # Separated CFG: reuse 2-batch (out_full, out_null_text);
+                    # one extra backbone forward for out_uncond (text OFF, traj OFF).
+                    # Formula:
+                    #   out = out_uncond
+                    #       + w_text * (out_full - out_null_text)
+                    #       + w_traj * (out_null_text - out_uncond)
+                    pred_uncond = self._uncond_backbone_forward(
+                        noisy_input, t_scaled, text_null_context, model_sl,
+                        traj_emb_backbone, traj_seq_lens_backbone,
+                    )
+                    predicted_result = [
+                        pred_uncond[i]
+                        + self.cfg_scale_text * (pred_2b[i] - pred_2b[i + self.batch_size])
+                        + self.cfg_scale_traj * (pred_2b[i + self.batch_size] - pred_uncond[i])
+                        for i in range(self.batch_size)
+                    ]
+                else:
+                    predicted_result = [
+                        self.cfg_scale_text * pred_2b[i]
+                        - (self.cfg_scale_text - 1) * pred_2b[i + self.batch_size]
+                        for i in range(self.batch_size)
+                    ]
             else:
-                controlnet_residuals = self._maybe_controlnet_residuals(
+                controlnet_residuals = self._controlnet_forward(
                     noisy_input,
                     t_scaled,
                     text_condition,
@@ -1463,7 +1648,15 @@ class DiffForcingWanModel(nn.Module):
                     traj_seq_lens=traj_seq_lens_backbone,
                     controlnet_residuals=controlnet_residuals,
                 )
-                if self.cfg_scale != 1.0:
+                if self.cfg_scale_text != 1.0:
+                    controlnet_residuals_null = self._controlnet_forward(
+                        noisy_input,
+                        t_scaled,
+                        text_null_context,
+                        model_sl,
+                        traj_emb,
+                        traj_seq_lens,
+                    )
                     predicted_result_null = self.model(
                         noisy_input,
                         t_scaled,
@@ -1472,10 +1665,10 @@ class DiffForcingWanModel(nn.Module):
                         y=None,
                         traj_emb=traj_emb_backbone,
                         traj_seq_lens=traj_seq_lens_backbone,
-                        controlnet_residuals=controlnet_residuals,
+                        controlnet_residuals=controlnet_residuals_null,
                     )
                     predicted_result = [
-                        self.cfg_scale * pv - (self.cfg_scale - 1) * pvn
+                        self.cfg_scale_text * pv - (self.cfg_scale_text - 1) * pvn
                         for pv, pvn in zip(predicted_result, predicted_result_null)
                     ]
 

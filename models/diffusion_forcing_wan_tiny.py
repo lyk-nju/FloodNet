@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoConfig, AutoTokenizer, AutoModel
 
-from utils.traj_batch import build_traj_emb_from_batch, xyz_traj_to_features_4d
+from utils.traj_batch import build_traj_emb, root_to_traj_feats
 from .tools.traj_encoder import TrajEncoder
 from .tools.wan_model import WanModel
 
@@ -78,7 +78,7 @@ class DiffForcingWanModel(nn.Module):
         use_text_cond=True,
         text_len=512,
         drop_out=0.1,
-        cfg_scale=5.0,
+        cfg_scale_text=5.0,
         prediction_type="vel",  # "vel", "x0", "noise"
         causal=False,
         use_traj_cond=False,
@@ -96,6 +96,10 @@ class DiffForcingWanModel(nn.Module):
     ):
         kwargs.pop("traj_lora_rank", None)
         kwargs.pop("lora_rank_traj", None)
+        # Backward compat: old checkpoints stored the param as cfg_scale.
+        _legacy_cfg_scale = kwargs.pop("cfg_scale", None)
+        if _legacy_cfg_scale is not None:
+            cfg_scale_text = _legacy_cfg_scale
         kwargs.pop("freeze_backbone_for_controlnet", None)
         kwargs.pop("use_controlnet_traj", None)
         kwargs.pop("controlnet_init_from_backbone", None)
@@ -138,7 +142,7 @@ class DiffForcingWanModel(nn.Module):
         self.noise_steps = noise_steps
         self.use_text_cond = use_text_cond
         self.drop_out = drop_out
-        self.cfg_scale = cfg_scale
+        self.cfg_scale_text = cfg_scale_text
         self.prediction_type = prediction_type
         self.causal = causal
 
@@ -301,7 +305,7 @@ class DiffForcingWanModel(nn.Module):
         return x
 
     def _build_traj_emb(self, x, seq_len, device, training_dropout=False):
-        return build_traj_emb_from_batch(
+        return build_traj_emb(
             x,
             seq_len,
             device,
@@ -663,7 +667,7 @@ class DiffForcingWanModel(nn.Module):
             )  # (B, C, T, 1, 1)
 
             # Adjust using CFG
-            if self.cfg_scale != 1.0:
+            if self.cfg_scale_text != 1.0:
                 predicted_result_null = self.model(
                     noisy_input,
                     noise_level * self.time_embedding_scale,
@@ -674,7 +678,7 @@ class DiffForcingWanModel(nn.Module):
                     traj_seq_lens=traj_seq_lens,
                 )  # (B, C, T, 1, 1)
                 predicted_result = [
-                    self.cfg_scale * pv - (self.cfg_scale - 1) * pvn
+                    self.cfg_scale_text * pv - (self.cfg_scale_text - 1) * pvn
                     for pv, pvn in zip(predicted_result, predicted_result_null)
                 ]
 
@@ -863,7 +867,7 @@ class DiffForcingWanModel(nn.Module):
             )  # (B, C, T, 1, 1)
 
             # Adjust using CFG
-            if self.cfg_scale != 1.0:
+            if self.cfg_scale_text != 1.0:
                 predicted_result_null = self.model(
                     noisy_input,
                     noise_level * self.time_embedding_scale,
@@ -874,7 +878,7 @@ class DiffForcingWanModel(nn.Module):
                     traj_seq_lens=traj_seq_lens,
                 )  # (B, C, T, 1, 1)
                 predicted_result = [
-                    self.cfg_scale * pv - (self.cfg_scale - 1) * pvn
+                    self.cfg_scale_text * pv - (self.cfg_scale_text - 1) * pvn
                     for pv, pvn in zip(predicted_result, predicted_result_null)
                 ]
 
@@ -1080,7 +1084,7 @@ class DiffForcingWanModel(nn.Module):
                     ],
                     dim=1,
                 )
-            emb = self.traj_encoder(xyz_traj_to_features_4d(traj_slice))
+            emb = self.traj_encoder(root_to_traj_feats(traj_slice))
             if self.use_traj_emb_cache:
                 self._traj_emb_cache[key] = emb
             return emb
@@ -1190,7 +1194,7 @@ class DiffForcingWanModel(nn.Module):
             )  # (B, C, T, 1, 1)
 
             # Adjust using CFG
-            if self.cfg_scale != 1.0:
+            if self.cfg_scale_text != 1.0:
                 predicted_result_null = self.model(
                     noisy_input,
                     noise_level * self.time_embedding_scale,
@@ -1201,7 +1205,7 @@ class DiffForcingWanModel(nn.Module):
                     traj_seq_lens=traj_seq_lens,
                 )  # (B, C, T, 1, 1)
                 predicted_result = [
-                    self.cfg_scale * pv - (self.cfg_scale - 1) * pvn
+                    self.cfg_scale_text * pv - (self.cfg_scale_text - 1) * pvn
                     for pv, pvn in zip(predicted_result, predicted_result_null)
                 ]
 

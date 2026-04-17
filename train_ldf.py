@@ -23,7 +23,7 @@ from utils.initialize import (
     save_config_and_codes,
 )
 from utils.lightning_module import BasicLightningModule
-from utils.traj_batch import path_heading_features_from_root_xyz
+from utils.traj_batch import root_to_traj_feats
 from utils.visualize import (  # evaluate_video
     make_composite_compare_videos,
     render_video,
@@ -62,16 +62,28 @@ class CustomLightningModule(BasicLightningModule):
             t_tok = pred_latent_full.size(0)
 
             # Determine active-window frame range in the full sequence.
+            # Causal: token k → last frame 4k; token k (k≥1) → first frame 4k-3
             if chunk_size_tokens is not None and t_tok > chunk_size_tokens:
-                start_f = (t_tok - chunk_size_tokens) * token_to_frame
-                end_f = t_tok * token_to_frame
+                start_tok = t_tok - chunk_size_tokens
+                start_f = 0 if start_tok == 0 else 4 * start_tok - 3
+                end_f = t_tok * token_to_frame  # clamped to L_motion = 4*(t_tok-1)+1
             else:
+                start_tok = 0
                 start_f = 0
                 end_f = None  # use full sequence
 
-            # Always decode the full latent sequence so the trajectory is integrated
-            # from frame 0 – absolute positions are correct with no offset bias.
-            decoded = vae.decode(pred_latent_full.unsqueeze(0))[0].float()
+            # Decode full latent for correct absolute-position integration, but detach
+            # the past (non-active) tokens so gradients only flow through the active
+            # window.  Without detach, the velocity-integration chain amplifies the
+            # gradient for early tokens by O(T/chunk) – enough to flip direction on
+            # long sequences (e.g. 000021 with 179 frames / 45 tokens).
+            if start_tok > 0:
+                latent_past = pred_latent_full[:start_tok].detach()
+                latent_active = pred_latent_full[start_tok:]
+                latent_for_decode = torch.cat([latent_past, latent_active], dim=0)
+            else:
+                latent_for_decode = pred_latent_full
+            decoded = vae.decode(latent_for_decode.unsqueeze(0))[0].float()
             L_motion = decoded.size(0)
             L_gt_total = min(int(traj_length[i].item()), traj.shape[1])
 
@@ -317,7 +329,7 @@ class CustomLightningModule(BasicLightningModule):
             text_dir = f"{self.cfg.save_dir}/{single_dataset_id}/text/{step_tag}"
             token_dir = f"{self.cfg.save_dir}/{single_dataset_id}/token/{step_tag}"
             feature_dir = f"{self.cfg.save_dir}/{single_dataset_id}/feature/{step_tag}"
-            cond_traj_dir = f"{self.cfg.save_dir}/{single_dataset_id}/cond_traj/{step_tag}"
+            cond_traj_dir = f"{self.cfg.save_dir}/{single_dataset_id}/traj_xz/{step_tag}"
             traj_mask_dir = f"{self.cfg.save_dir}/{single_dataset_id}/traj_mask/{step_tag}"
             frames_dir = f"{self.cfg.save_dir}/{single_dataset_id}/frames/{step_tag}"
             if "feature_text_end" in batch:
@@ -349,33 +361,33 @@ class CustomLightningModule(BasicLightningModule):
                 # Save conditioning trajectory (T,2)=[x,z] for visualization (red overlay).
                 # Prefer frame-level traj_features (T,4)=[x,z,cos,sin]; else build from root traj xyz.
                 L_feat = int(decoded_single_generated.shape[0])
-                cond_traj = None
+                traj_xz = None
                 if "traj_features" in batch:
                     cond = batch["traj_features"][i]
                     if torch.is_tensor(cond):
                         cond = cond.detach().cpu().numpy()
                     cond = np.asarray(cond)
                     if cond.ndim == 2 and cond.shape[1] >= 2:
-                        cond_traj = cond[:L_feat, :2].astype(np.float32)
+                        traj_xz = cond[:L_feat, :2].astype(np.float32)
                     else:
                         rank_zero_info(
-                            f"Skip cond_traj for {single_generated_id}: "
+                            f"Skip traj_xz for {single_generated_id}: "
                             f"traj_features bad shape {cond.shape}"
                         )
-                if cond_traj is None and "traj" in batch:
+                if traj_xz is None and "traj" in batch:
                     tr = batch["traj"][i]
                     if torch.is_tensor(tr):
                         tr = tr.detach().cpu().numpy()
                     tr = np.asarray(tr)[:L_feat]
                     if tr.ndim == 2 and tr.shape[1] >= 3:
-                        cond_traj = path_heading_features_from_root_xyz(tr)[:, :2].astype(
+                        traj_xz = root_to_traj_feats(tr)[:, :2].astype(
                             np.float32
                         )
-                if cond_traj is not None:
+                if traj_xz is not None:
                     os.makedirs(cond_traj_dir, exist_ok=True)
                     np.save(
                         f"{cond_traj_dir}/{single_generated_id}.npy",
-                        cond_traj,
+                        traj_xz,
                     )
 
                 # Save traj_mask (if provided by dataset) so we can mask the root trajectory in visualization.
@@ -418,7 +430,7 @@ class CustomLightningModule(BasicLightningModule):
             )
             frames_dir = f"{self.cfg.save_dir}/{dataset_id}/frames/{step_tag}"
             traj_mask_dir = f"{self.cfg.save_dir}/{dataset_id}/traj_mask/{step_tag}"
-            cond_traj_dir = f"{self.cfg.save_dir}/{dataset_id}/cond_traj/{step_tag}"
+            cond_traj_dir = f"{self.cfg.save_dir}/{dataset_id}/traj_xz/{step_tag}"
             text_dir = f"{self.cfg.save_dir}/{dataset_id}/text/{step_tag}"
             # render video and save
             if self.cfg.test_setting.render:

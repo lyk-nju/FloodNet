@@ -76,6 +76,16 @@ def parse_args():
             "'forward' uses training forward/control_aux active-window loss."
         ),
     )
+    parser.add_argument(
+        "--set",
+        nargs="*",
+        metavar="KEY=VALUE",
+        default=[],
+        help=(
+            "OmegaConf dot-path overrides, e.g. "
+            "--set model.params.cfg_scale_text=3.0 model.params.cfg_scale_traj=5.0"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -120,8 +130,9 @@ def _compute_control_loss_xz_stats(
         t_tok = pred_latent_full.size(0)
 
         if chunk_size_tokens is not None and t_tok > chunk_size_tokens:
-            start_f = (t_tok - chunk_size_tokens) * token_to_frame
-            end_f = t_tok * token_to_frame
+            start_tok = t_tok - chunk_size_tokens
+            start_f = 0 if start_tok == 0 else 4 * start_tok - 3
+            end_f = t_tok * token_to_frame  # clamped to L_motion = 4*(t_tok-1)+1
         else:
             start_f = 0
             end_f = None
@@ -246,8 +257,9 @@ def _compute_control_loss_xz_per_sample(
         pred_latent_full = pred_list[i].to(device)
         t_tok = pred_latent_full.size(0)
         if chunk_size_tokens is not None and t_tok > chunk_size_tokens:
-            start_f = (t_tok - chunk_size_tokens) * token_to_frame
-            end_f = t_tok * token_to_frame
+            start_tok = t_tok - chunk_size_tokens
+            start_f = 0 if start_tok == 0 else 4 * start_tok - 3
+            end_f = t_tok * token_to_frame  # clamped to L_motion = 4*(t_tok-1)+1
         else:
             start_f = 0
             end_f = None
@@ -360,6 +372,21 @@ def main():
     args = parse_args()
     _set_seed(args.seed)
     cfg = Config(args.config).config
+
+    # Apply --set overrides (dot-path KEY=VALUE pairs)
+    for kv in (args.set or []):
+        if "=" not in kv:
+            raise ValueError(f"--set expects KEY=VALUE, got: {kv!r}")
+        key, val = kv.split("=", 1)
+        # Try to cast to int/float/bool; fall back to string
+        for cast in (int, float, lambda x: {"true": True, "false": False}[x.lower()]):
+            try:
+                val = cast(val)
+                break
+            except (ValueError, KeyError):
+                pass
+        OmegaConf.update(cfg, key, val, merge=True)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     ckpt_path = args.ckpt or OmegaConf.select(cfg, "test_ckpt") or OmegaConf.select(cfg, "resume_ckpt")

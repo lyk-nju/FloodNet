@@ -17,4 +17,4 @@ model:
         tokenizer_path: "${dirs.deps}/t5_umt5-xxl-enc-bf16/google/umt5-xxl"
         input_dim: 4
         noise_steps: 10
-        cfg_scale: 6.0
+        cfg_scale_text: 6.0

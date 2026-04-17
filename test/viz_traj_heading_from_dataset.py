@@ -1,8 +1,8 @@
 """
-从 HumanML3D 数据集读取根轨迹 traj，可视化并用数值检查 path_heading_features_from_root_xyz。
+从 HumanML3D 数据集读取根轨迹 traj，可视化并用数值检查 root_to_traj_feats。
 
 检查内容：
-1) 对 traj 直接调用 path_heading_features_from_root_xyz 与数据集中 traj_features（若存在）是否一致。
+1) 对 traj 直接调用 root_to_traj_feats 与数据集中 traj_features（若存在）是否一致。
 2) 用与实现一致的差分规则独立复算 cos/sin，与函数输出的第 2、3 列最大误差（应接近 0）。
 
 运行（在 FloodNet 目录下，且已激活含 numpy/matplotlib 的环境）：
@@ -36,13 +36,13 @@ from datasets.humanml3d import HumanML3DDataset  # noqa: E402
 from utils.initialize import load_config  # noqa: E402
 from utils.traj_batch import (  # noqa: E402
     _PATH_HEADING_EPS,
-    path_heading_features_from_root_xyz,
+    root_to_traj_feats,
 )
 
 
 def _heading_reconstructed_max_err(traj_xyz: np.ndarray, feats: np.ndarray) -> float:
     """
-    按 path_heading_features_from_root_xyz 的差分定义复算每帧 (cos,sin)，与 feats[:,2:4] 比最大绝对误差。
+    按 root_to_traj_feats 的差分定义复算每帧 (cos,sin)，与 feats[:,2:4] 比最大绝对误差。
     """
     traj_xyz = np.asarray(traj_xyz, dtype=np.float64)
     t_len = traj_xyz.shape[0]
@@ -184,7 +184,7 @@ def main() -> int:
         sample = ds[idx]
         name = f"{sample.get('dataset', '?')}_{sample.get('name', idx)}"
         traj = np.asarray(sample["traj"], dtype=np.float32)
-        feats_fn = path_heading_features_from_root_xyz(traj)
+        feats_fn = root_to_traj_feats(traj)
 
         err_recon = _heading_reconstructed_max_err(traj, feats_fn)
         max_err_recon = max(max_err_recon, err_recon)

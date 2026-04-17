@@ -4,19 +4,19 @@ debug: false
 train: true
 
 dirs:
-    deps: /data1/yuankai/text2motion/FloodDiffusion/deps
+    deps: /data1/yuankai/text2Motion/FloodDiffusion/deps
     outputs: ./outputs
-    raw_data: /data1/yuankai/text2motion/FloodDiffusion/raw_data
+    raw_data: /data1/yuankai/text2Motion/FloodDiffusion/raw_data
 
 save_dir: ./outputs
-resume_ckpt: "/home/yuankai/text2motion/FloodDiffusion/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt"
-test_ckpt: /home/yuankai/text2motion/FloodNet/outputs/20260409_145822_ldf/step_step=245000.ckpt
-# resume_ckpt: "/home/yuankai/text2motion/FloodNet/outputs/20260402_114343_ldf/step_step=300000.ckpt"
-# test_ckpt: "/home/yuankai/text2motion/FloodNet/outputs/20260402_114343_ldf/step_step=300000.ckpt"
-# resume_ckpt: "/home/yuankai/text2motion/FloodNet/outputs/20260409_005945_ldf/step_step=245000.ckpt"
-# test_ckpt: "/home/yuankai/text2motion/FloodNet/outputs/20260409_005945_ldf/step_step=245000.ckpt"
+resume_ckpt: "/home/yuankai/Text2Motion/FloodDiffusion/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt"
+test_ckpt: /home/yuankai/Text2Motion/FloodDiffusion/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt
+# resume_ckpt: "/home/yuankai/Text2Motion/FloodNet/outputs/20260402_114343_ldf/step_step=300000.ckpt"
+# test_ckpt: "/home/yuankai/Text2Motion/FloodNet/outputs/20260402_114343_ldf/step_step=300000.ckpt"
+# resume_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20260415_114956_ldf/step_step=245000.ckpt
+# test_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20260415_114956_ldf/step_step=245000.ckpt
 
-test_vae_ckpt: "/home/yuankai/text2motion/FloodDiffusion/outputs/vae_1d_z4_step=300000.ckpt"
+test_vae_ckpt: "/home/yuankai/Text2Motion/FloodDiffusion/outputs/vae_1d_z4_step=300000.ckpt"
 test_vae:
     target: models.vae_wan_1d.VAEWanModel
     ema_decay: 0.99
@@ -43,7 +43,7 @@ logger:
 trainer: # lightning trainer
     max_steps: 360000
     accelerator: gpu
-    devices: [0,1,2,3]
+    devices: [0,1,2,3,4]
     log_every_n_steps: 100
     precision: bf16-mixed
 validation:
@@ -96,7 +96,6 @@ data:
     num_workers: 4
     # mask_ratio: [0.2,0.3]       
     mask_ratio: 1.0
-    # val/test default to full traj mask in HumanML3DDataset (val_mask_ratio defaults to 1.0 if omitted).
     # val_mask_ratio: 1.0
 
     train_meta_paths:
@@ -113,6 +112,11 @@ data:
     random_length: 0
     min_length: 40
     max_length: 190
+    # Smooth Root trajectory conditioning (Task8).
+    # Gaussian-smooths the xz components of traj_features fed to ControlNet.
+    # output["traj"] (GT for L_control_xz) is NOT affected.
+    # 0.0 = disabled (raw trajectory); 2.0 = ~6 cm effective smoothing (Kimodo equivalent).
+    smooth_traj_sigma: 0.0
 
 model:
     target: models.diffusion_forcing_wan.DiffForcingWanModel
@@ -139,11 +143,24 @@ model:
         # Explicit motion-space control loss
         control_loss_weight: 1.0
 
+        # Scheduled Sampling: probability of replacing context tokens (prefix before
+        # active window) with the model's own x0 prediction during each training step.
+        # 0.0 = pure teacher forcing (default); 0.5 = half steps use self-prediction.
+        # Recommended curriculum: start at 0.0, increase to 0.3~0.5 after 50k steps.
+        scheduled_sampling_prob: 0.0
+        # Separated CFG: independent guidance scales for text and trajectory.
+        # 0.0 = disabled (regular CFG, backward compatible).
+        # When > 0: out = out_uncond + cfg_scale_text*(out_full - out_null_text)
+        #                            + cfg_scale_traj*(out_null_text - out_uncond)
+        # Adds one extra backbone forward per denoising step (no extra ControlNet call).
+        # Recommended starting point: cfg_scale_text=3.0, cfg_scale_traj=5.0
+        cfg_scale_traj: 0.0
+
 resume_reset_optimizer: true
 optimizer:
     target: AdamW
     params:
-        lr: 1e-4
+        lr: 1e-3
         betas: [0.9, 0.999]
         weight_decay: 0.01
         eps: 1e-8

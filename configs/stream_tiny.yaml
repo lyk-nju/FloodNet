@@ -26,7 +26,7 @@ model:
         use_text_cond: True
         text_len: 128
         dropout: 0.1
-        cfg_scale: 5.0
+        cfg_scale_text: 5.0
         prediction_type: "vel"
         causal: False
         use_traj_cond: True

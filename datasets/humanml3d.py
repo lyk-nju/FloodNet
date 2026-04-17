@@ -10,7 +10,7 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from utils.motion_process import extract_root_trajectory_263
-from utils.traj_batch import path_heading_features_from_root_xyz
+from utils.traj_batch import root_to_traj_feats, smooth_root_xz
 
 
 class LengthMismatchError(Exception):
@@ -52,6 +52,7 @@ class HumanML3DDataset(Dataset):
         self.feature_path = cfg.data.get("feature_path", None)
         self.token_path = cfg.data.get("token_path", None)
         self.text_path = cfg.data.get("text_path", None)
+        self.smooth_traj_sigma = float(cfg.data.get("smooth_traj_sigma", 0.0))
         self.dataset = self._load_file_list()
 
         rank_zero_info(f"Loaded {len(self.dataset)} samples from {split} dataset.")
@@ -190,18 +191,31 @@ class HumanML3DDataset(Dataset):
             output["token_mask"] = token_mask
 
             if "traj" in output:
-                traj_mask = np.repeat(token_mask, 4).astype(np.float32)
+                # Causal VAE convention: token 0 → frame 0; token k (k≥1) → frames [4k-3, 4k]
                 traj_length = output["traj_length"]
-                if traj_mask.shape[0] < traj_length:
-                    pad = np.zeros((traj_length - traj_mask.shape[0],), dtype=np.float32)
-                    traj_mask = np.concatenate([traj_mask, pad], axis=0)
-                else:
-                    traj_mask = traj_mask[:traj_length]
+                traj_mask = np.zeros(traj_length, dtype=np.float32)
+                if len(token_mask) > 0:
+                    traj_mask[0] = token_mask[0]
+                for k in range(1, len(token_mask)):
+                    sf = 4 * k - 3
+                    ef = min(4 * k + 1, traj_length)
+                    if sf < traj_length:
+                        traj_mask[sf:ef] = token_mask[k]
                 output["traj_mask"] = traj_mask
 
         # --- traj_features: [x, z, cos(psi), sin(psi)], psi = xz path heading ---
+        # output["traj"] (raw) is kept unchanged for L_control_xz GT supervision.
+        # traj_features feeds the ControlNet conditioning signal only.
         if "feature" in output and "token" in output:
-            traj_features = path_heading_features_from_root_xyz(output["traj"])
+            traj_xyz = output["traj"]  # (T, 3), numpy
+            if self.smooth_traj_sigma > 0.0:
+                traj_xz_smooth = smooth_root_xz(traj_xyz[:, [0, 2]], sigma=self.smooth_traj_sigma)
+                traj_xyz_for_cond = traj_xyz.copy()
+                traj_xyz_for_cond[:, 0] = traj_xz_smooth[:, 0]
+                traj_xyz_for_cond[:, 2] = traj_xz_smooth[:, 1]
+            else:
+                traj_xyz_for_cond = traj_xyz
+            traj_features = root_to_traj_feats(traj_xyz_for_cond)
             output["traj_features"] = traj_features
 
         # --- text ---
@@ -233,9 +247,12 @@ class HumanML3DDataset(Dataset):
         crop token to align with feature (VAE temporal factor 4). Otherwise use original random crop."""
         token_length = len(token)
         if crop_start is not None and feature_length is not None:
-            # Align token with feature: token_start = crop_start//4, token_len = feature_length//4
-            token_start = crop_start // 4
-            token_len = feature_length // 4
+            # Causal VAE convention: frame f → token (f+3)//4
+            #   token 0 covers frame 0; token k (k≥1) covers frames [4k-3, 4k]
+            token_start = (crop_start + 3) // 4
+            last_frame = crop_start + feature_length - 1
+            token_end = (last_frame + 3) // 4  # inclusive
+            token_len = token_end - token_start + 1
             end = min(token_start + token_len, token_length)
             if token_start >= token_length or token_len <= 0:
                 token = token[:1]  # fallback: at least 1 token
