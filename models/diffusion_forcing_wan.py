@@ -677,7 +677,7 @@ class DiffForcingWanModel(nn.Module):
                     predicted_result[b][:, -self.chunk_size :, ...]
                     - noise_ref[b][:, -self.chunk_size :, ...]
                 ) ** 2
-            sample_loss = squared_error.sum().mean()
+            sample_loss = squared_error.mean()
             loss += sample_loss
         loss = loss / batch_size
 
@@ -890,7 +890,7 @@ class DiffForcingWanModel(nn.Module):
                     #       + w_traj * (out_null_text - out_uncond)
                     pred_uncond = self._uncond_backbone_forward(
                         noisy_input, t_scaled, text_null_context, gen_sl,
-                        traj_emb_backbone, traj_seq_lens_backbone,
+                        None, None,  # truly unconditional: text OFF, traj OFF
                     )
                     predicted_result = [
                         pred_uncond[i]
@@ -1183,7 +1183,7 @@ class DiffForcingWanModel(nn.Module):
                     #       + w_traj * (out_null_text - out_uncond)
                     pred_uncond = self._uncond_backbone_forward(
                         noisy_input, t_scaled, text_null_context, gen_sl,
-                        traj_emb_backbone, traj_seq_lens_backbone,
+                        None, None,  # truly unconditional: text OFF, traj OFF
                     )
                     predicted_result = [
                         pred_uncond[i]
@@ -1615,7 +1615,7 @@ class DiffForcingWanModel(nn.Module):
                     #       + w_traj * (out_null_text - out_uncond)
                     pred_uncond = self._uncond_backbone_forward(
                         noisy_input, t_scaled, text_null_context, model_sl,
-                        traj_emb_backbone, traj_seq_lens_backbone,
+                        None, None,  # truly unconditional: text OFF, traj OFF
                     )
                     predicted_result = [
                         pred_uncond[i]

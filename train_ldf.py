@@ -145,6 +145,9 @@ class CustomLightningModule(BasicLightningModule):
             named_parameters=self.vae.named_parameters(),
             named_buffers=self.vae.named_buffers(),
         )
+        self.vae.eval()
+        for p in self.vae.parameters():
+            p.requires_grad_(False)
 
         # metric models
         self.recover_dim = self.cfg.metrics.dim
@@ -162,6 +165,15 @@ class CustomLightningModule(BasicLightningModule):
                     "Loaded pretrained LDF with strict=False. "
                     f"Missing keys (new cond modules init from scratch): {result.missing_keys}"
                 )
+        # Re-init ControlNet from the *loaded* backbone when starting from a base ckpt.
+        # init_from_backbone in __init__ runs before weights are loaded, so it copies random
+        # weights — moving the call here ensures it copies the actual pretrained backbone.
+        if (use_controlnet_traj
+                and self.cfg.model.params.get("controlnet_init_from_backbone", True)
+                and result.missing_keys
+                and any("controlnet." in k for k in result.missing_keys)):
+            self.model.controlnet.init_from_backbone(self.model.model)
+            rank_zero_info("Re-initialized ControlNet from loaded pretrained backbone weights")
             if result.unexpected_keys:
                 rank_zero_info(
                     f"Unexpected keys in checkpoint (ignored): {result.unexpected_keys}"
@@ -195,6 +207,14 @@ class CustomLightningModule(BasicLightningModule):
             named_parameters=self.model.named_parameters(),
             named_buffers=self.model.named_buffers(),
         )
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # VAE is a frozen decoder used only for L_control; keep it in eval mode regardless
+        # of Lightning's train/eval switches so its parameters never enter train behaviour.
+        if hasattr(self, "vae"):
+            self.vae.eval()
+        return self
 
     @staticmethod
     def _copy_traj_fields_to_model_batch(batch, model_batch):
