@@ -245,24 +245,50 @@ class WanCrossAttention(WanSelfAttention):
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
-        Args stream mode:
+        Args stream mode (frame-aligned, plain):
             x(Tensor): Shape [B, L1, C]
+            context(Tensor): Shape [BxL1, L2, C]
+            context_lens(Tensor): Shape [BxL1]
+        Args stream mode (frame-aligned, FlexTraj):
+            x(Tensor): Shape [B, 2*L1, C]  — [latent || traj]
             context(Tensor): Shape [BxL1, L2, C]
             context_lens(Tensor): Shape [BxL1]
         """
         out_sizes = x.size()
-        b, n, d = context.size(0), self.num_heads, self.head_dim
+        bq = x.size(0)
+        b_ctx = context.size(0)
+        n, d = self.num_heads, self.head_dim
 
-        # compute query, key, value
-        q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        k = self.norm_k(self.k(context)).view(b, -1, n, d)
-        v = self.v(context).view(b, -1, n, d)
+        k = self.norm_k(self.k(context)).view(b_ctx, -1, n, d)
+        v = self.v(context).view(b_ctx, -1, n, d)
 
-        # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        if b_ctx == bq:
+            # Standard: one context per sample (no frame-alignment)
+            q = self.norm_q(self.q(x)).view(bq, -1, n, d)
+            x = flash_attention(q, k, v, k_lens=context_lens)
+            x = x.flatten(2).view(*out_sizes)
+        else:
+            # Frame-aligned: b_ctx = bq * L_lat
+            Lq = x.size(1)
+            L_lat = b_ctx // bq
+            q_all = self.norm_q(self.q(x)).view(bq, Lq, n, d)  # (bq, Lq, n, d)
 
-        # output
-        x = x.flatten(2).view(*out_sizes)
+            if Lq == L_lat:
+                # Plain frame-aligned: each token has its own context
+                q = q_all.reshape(b_ctx, 1, n, d)
+                x = flash_attention(q, k, v, k_lens=context_lens)
+                x = x.flatten(2).view(*out_sizes)
+            else:
+                # FlexTraj: x = [lat_0..L_lat ‖ traj_0..L_lat], Lq = 2*L_lat
+                # Each latent token k and its paired traj token k attend to context[b*L_lat+k]
+                q_lat = q_all[:, :L_lat].reshape(b_ctx, 1, n, d)
+                q_traj = q_all[:, L_lat:].reshape(b_ctx, 1, n, d)
+                out_lat = flash_attention(q_lat, k, v, k_lens=context_lens)
+                out_traj = flash_attention(q_traj, k, v, k_lens=context_lens)
+                out_lat = out_lat.flatten(2).view(bq, L_lat, -1)
+                out_traj = out_traj.flatten(2).view(bq, L_lat, -1)
+                x = torch.cat([out_lat, out_traj], dim=1)  # (bq, 2*L_lat, C)
+
         x = self.o(x)
         return x
 

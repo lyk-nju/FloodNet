@@ -130,11 +130,12 @@ class CustomLightningModule(BasicLightningModule):
         )
         if "ema_state" in vae_ckpt:
             self.vae.load_state_dict(vae_ckpt["state_dict"], strict=True)
-            self.vae_ema = ExponentialMovingAverage(
+            vae_ema = ExponentialMovingAverage(
                 self.vae.parameters(), decay=self.cfg.test_vae.ema_decay
             )
-            self.vae_ema.load_state_dict(vae_ckpt["ema_state"])
-            self.vae_ema.copy_to(self.vae.parameters())
+            vae_ema.load_state_dict(vae_ckpt["ema_state"])
+            vae_ema.copy_to(self.vae.parameters())
+            del vae_ema  # EMA weights now in self.vae; no need to keep shadow copy
             rank_zero_info(f"Loaded VAE model from {self.cfg.test_vae_ckpt} with EMA")
         else:
             self.vae.load_state_dict(vae_ckpt["state_dict"], strict=True)
@@ -184,7 +185,8 @@ class CustomLightningModule(BasicLightningModule):
             rank_zero_info("init ema from ckpt")
         else:
             self.ema = ExponentialMovingAverage(
-                self.model.parameters(), decay=self.cfg.model.ema_decay
+                [p for p in self.model.parameters() if p.requires_grad],
+                decay=self.cfg.model.ema_decay,
             )
             rank_zero_info("init ema from current model weights")
         # When has_new_cond_params, optimizer/scheduler param groups mismatch -> skip restore.
@@ -265,7 +267,7 @@ class CustomLightningModule(BasicLightningModule):
         return out
 
     def update_metrics(self, batch):
-        with self.ema.average_parameters(self.model.parameters()):
+        with self.ema.average_parameters([p for p in self.model.parameters() if p.requires_grad]):
             model_batch = batch.copy()
             model_batch["feature"] = batch["token"]
             model_batch["feature_length"] = batch["token_length"]
@@ -321,119 +323,132 @@ class CustomLightningModule(BasicLightningModule):
             self.log(f"metrics/t2m_metrics/{key}", value, sync_dist=True)
 
     def update_test(self, batch):
-        # Fix seed before each test generation so diffusion noise is reproducible.
+        # Fix seed for reproducible test generation, but save/restore the training RNG so
+        # that training noise stays i.i.d. when the training loop resumes after validation.
+        import random
+        _py   = random.getstate()
+        _np   = np.random.get_state()
+        _cpu  = torch.random.get_rng_state()
+        _cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         seed_everything(self.cfg.seed)
-        
-        with self.ema.average_parameters(self.model.parameters()):
-            model_batch = batch.copy()
-            model_batch["feature"] = batch["token"]
-            model_batch["feature_length"] = batch["token_length"]
-            if "token_text_end" in batch:
-                model_batch["feature_text_end"] = batch["token_text_end"]
-            self._copy_traj_fields_to_model_batch(batch, model_batch)
-            output = self.model.generate(model_batch)
-        generated = output["generated"]
-        text = output["text"]
-        # Save motion
-        generated_id = batch["name"]  # [batch_size]
-        dataset_id = batch["dataset"]  # [batch_size]
-        step_tag = f"step_{int(self.global_step):06d}"
-
-        # Decode motion to latent space
-        # NOTE: inside the to() function, if will check current_tensor.device == target_device, then run this in each loop is fine.
-        for i in range(len(generated)):
-            single_generated = generated[i]
-            single_generated_id = generated_id[i]
-            single_dataset_id = dataset_id[i]
-            single_text = text[i]
-            text_dir = f"{self.cfg.save_dir}/{single_dataset_id}/text/{step_tag}"
-            token_dir = f"{self.cfg.save_dir}/{single_dataset_id}/token/{step_tag}"
-            feature_dir = f"{self.cfg.save_dir}/{single_dataset_id}/feature/{step_tag}"
-            cond_traj_dir = f"{self.cfg.save_dir}/{single_dataset_id}/traj_xz/{step_tag}"
-            traj_mask_dir = f"{self.cfg.save_dir}/{single_dataset_id}/traj_mask/{step_tag}"
-            frames_dir = f"{self.cfg.save_dir}/{single_dataset_id}/frames/{step_tag}"
-            if "feature_text_end" in batch:
-                single_feature_text_end = batch["feature_text_end"][i]
-                frames = np.array(single_feature_text_end)
-            else:
-                frames = None
-            try:
-                decoded_single_generated = self.vae.decode(
-                    single_generated[None, :].to(self.device)
-                )[0]
-                os.makedirs(text_dir, exist_ok=True)
-                with open(
-                    f"{text_dir}/{single_generated_id}.txt",
-                    "w",
-                ) as f:
-                    f.write(single_text)
-                os.makedirs(token_dir, exist_ok=True)
-                np.save(
-                    f"{token_dir}/{single_generated_id}.npy",
-                    single_generated.float().cpu().numpy(),
-                )
-                os.makedirs(feature_dir, exist_ok=True)
-                np.save(
-                    f"{feature_dir}/{single_generated_id}.npy",
-                    decoded_single_generated.float().cpu().numpy(),
-                )
-
-                # Save conditioning trajectory (T,2)=[x,z] for visualization (red overlay).
-                # Prefer frame-level traj_features (T,4)=[x,z,cos,sin]; else build from root traj xyz.
-                L_feat = int(decoded_single_generated.shape[0])
-                traj_xz = None
-                if "traj_features" in batch:
-                    cond = batch["traj_features"][i]
-                    if torch.is_tensor(cond):
-                        cond = cond.detach().cpu().numpy()
-                    cond = np.asarray(cond)
-                    if cond.ndim == 2 and cond.shape[1] >= 2:
-                        traj_xz = cond[:L_feat, :2].astype(np.float32)
-                    else:
-                        rank_zero_info(
-                            f"Skip traj_xz for {single_generated_id}: "
-                            f"traj_features bad shape {cond.shape}"
+        try:
+            with self.ema.average_parameters([p for p in self.model.parameters() if p.requires_grad]):
+                model_batch = batch.copy()
+                model_batch["feature"] = batch["token"]
+                model_batch["feature_length"] = batch["token_length"]
+                if "token_text_end" in batch:
+                    model_batch["feature_text_end"] = batch["token_text_end"]
+                self._copy_traj_fields_to_model_batch(batch, model_batch)
+                output = self.model.generate(model_batch)
+            generated = output["generated"]
+            text = output["text"]
+            # Save motion
+            generated_id = batch["name"]  # [batch_size]
+            dataset_id = batch["dataset"]  # [batch_size]
+            step_tag = f"step_{int(self.global_step):06d}"
+    
+            # Decode motion to latent space
+            # NOTE: inside the to() function, if will check current_tensor.device == target_device, then run this in each loop is fine.
+            for i in range(len(generated)):
+                single_generated = generated[i]
+                single_generated_id = generated_id[i]
+                single_dataset_id = dataset_id[i]
+                single_text = text[i]
+                text_dir = f"{self.cfg.save_dir}/{single_dataset_id}/text/{step_tag}"
+                token_dir = f"{self.cfg.save_dir}/{single_dataset_id}/token/{step_tag}"
+                feature_dir = f"{self.cfg.save_dir}/{single_dataset_id}/feature/{step_tag}"
+                cond_traj_dir = f"{self.cfg.save_dir}/{single_dataset_id}/traj_xz/{step_tag}"
+                traj_mask_dir = f"{self.cfg.save_dir}/{single_dataset_id}/traj_mask/{step_tag}"
+                frames_dir = f"{self.cfg.save_dir}/{single_dataset_id}/frames/{step_tag}"
+                if "feature_text_end" in batch:
+                    single_feature_text_end = batch["feature_text_end"][i]
+                    frames = np.array(single_feature_text_end)
+                else:
+                    frames = None
+                try:
+                    decoded_single_generated = self.vae.decode(
+                        single_generated[None, :].to(self.device)
+                    )[0]
+                    os.makedirs(text_dir, exist_ok=True)
+                    with open(
+                        f"{text_dir}/{single_generated_id}.txt",
+                        "w",
+                    ) as f:
+                        f.write(single_text)
+                    os.makedirs(token_dir, exist_ok=True)
+                    np.save(
+                        f"{token_dir}/{single_generated_id}.npy",
+                        single_generated.float().cpu().numpy(),
+                    )
+                    os.makedirs(feature_dir, exist_ok=True)
+                    np.save(
+                        f"{feature_dir}/{single_generated_id}.npy",
+                        decoded_single_generated.float().cpu().numpy(),
+                    )
+    
+                    # Save conditioning trajectory (T,2)=[x,z] for visualization (red overlay).
+                    # Prefer frame-level traj_features (T,4)=[x,z,cos,sin]; else build from root traj xyz.
+                    L_feat = int(decoded_single_generated.shape[0])
+                    traj_xz = None
+                    if "traj_features" in batch:
+                        cond = batch["traj_features"][i]
+                        if torch.is_tensor(cond):
+                            cond = cond.detach().cpu().numpy()
+                        cond = np.asarray(cond)
+                        if cond.ndim == 2 and cond.shape[1] >= 2:
+                            traj_xz = cond[:L_feat, :2].astype(np.float32)
+                        else:
+                            rank_zero_info(
+                                f"Skip traj_xz for {single_generated_id}: "
+                                f"traj_features bad shape {cond.shape}"
+                            )
+                    if traj_xz is None and "traj" in batch:
+                        tr = batch["traj"][i]
+                        if torch.is_tensor(tr):
+                            tr = tr.detach().cpu().numpy()
+                        tr = np.asarray(tr)[:L_feat]
+                        if tr.ndim == 2 and tr.shape[1] >= 3:
+                            traj_xz = root_to_traj_feats(tr)[:, :2].astype(
+                                np.float32
+                            )
+                    if traj_xz is not None:
+                        os.makedirs(cond_traj_dir, exist_ok=True)
+                        np.save(
+                            f"{cond_traj_dir}/{single_generated_id}.npy",
+                            traj_xz,
                         )
-                if traj_xz is None and "traj" in batch:
-                    tr = batch["traj"][i]
-                    if torch.is_tensor(tr):
-                        tr = tr.detach().cpu().numpy()
-                    tr = np.asarray(tr)[:L_feat]
-                    if tr.ndim == 2 and tr.shape[1] >= 3:
-                        traj_xz = root_to_traj_feats(tr)[:, :2].astype(
-                            np.float32
+    
+                    # Save traj_mask (if provided by dataset) so we can mask the root trajectory in visualization.
+                    if "traj_mask" in batch:
+                        traj_mask_i = batch["traj_mask"][i]
+                        if torch.is_tensor(traj_mask_i):
+                            traj_mask_i = traj_mask_i.detach().cpu().numpy()
+                        traj_mask_i = np.asarray(traj_mask_i).reshape(-1)[:L_feat]
+                        os.makedirs(traj_mask_dir, exist_ok=True)
+                        np.save(
+                            f"{traj_mask_dir}/{single_generated_id}.npy",
+                            traj_mask_i,
                         )
-                if traj_xz is not None:
-                    os.makedirs(cond_traj_dir, exist_ok=True)
-                    np.save(
-                        f"{cond_traj_dir}/{single_generated_id}.npy",
-                        traj_xz,
+                    # Save text_end if available
+                    if frames is not None:
+                        os.makedirs(frames_dir, exist_ok=True)
+                        np.save(
+                            f"{frames_dir}/{single_generated_id}.npy",
+                            frames,
+                        )
+                except Exception as e:
+                    rank_zero_info(
+                        f"Error in saving motion {single_generated_id} of dataset {single_dataset_id}: {e}"
                     )
-
-                # Save traj_mask (if provided by dataset) so we can mask the root trajectory in visualization.
-                if "traj_mask" in batch:
-                    traj_mask_i = batch["traj_mask"][i]
-                    if torch.is_tensor(traj_mask_i):
-                        traj_mask_i = traj_mask_i.detach().cpu().numpy()
-                    traj_mask_i = np.asarray(traj_mask_i).reshape(-1)[:L_feat]
-                    os.makedirs(traj_mask_dir, exist_ok=True)
-                    np.save(
-                        f"{traj_mask_dir}/{single_generated_id}.npy",
-                        traj_mask_i,
-                    )
-                # Save text_end if available
-                if frames is not None:
-                    os.makedirs(frames_dir, exist_ok=True)
-                    np.save(
-                        f"{frames_dir}/{single_generated_id}.npy",
-                        frames,
-                    )
-            except Exception as e:
-                rank_zero_info(
-                    f"Error in saving motion {single_generated_id} of dataset {single_dataset_id}: {e}"
-                )
-
-        return {"output": output}
+    
+            return {"output": output}
+        finally:
+            # Restore training RNG state unconditionally (even if generate() raises).
+            random.setstate(_py)
+            np.random.set_state(_np)
+            torch.random.set_rng_state(_cpu)
+            if _cuda is not None:
+                torch.cuda.set_rng_state_all(_cuda)
 
     def process_test_results(self):
         for dataset_id in os.listdir(self.cfg.save_dir):

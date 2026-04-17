@@ -25,8 +25,10 @@ class BasicLightningModule(LightningModule):
         )
 
         # NOTE: ligntning init stage the device is cpu, so no need to move to device
+        # EMA only tracks trainable params — frozen backbone (~123M) needs no shadow copy.
         self.ema = ExponentialMovingAverage(
-            self.model.parameters(), decay=cfg.model.ema_decay
+            [p for p in self.model.parameters() if p.requires_grad],
+            decay=cfg.model.ema_decay,
         )
         print_model_size(self.model)
 
@@ -81,7 +83,8 @@ class BasicLightningModule(LightningModule):
             rank_zero_info("init ema from ckpt")
         else:
             self.ema = ExponentialMovingAverage(
-                self.model.parameters(), decay=self.cfg.model.ema_decay
+                [p for p in self.model.parameters() if p.requires_grad],
+                decay=self.cfg.model.ema_decay,
             )
             rank_zero_info("init ema from current model weights")
 
@@ -149,17 +152,15 @@ class BasicLightningModule(LightningModule):
         if self.global_step % 100 == 0:
             self.log("ema_decay", self.ema.decay, sync_dist=False)
             with torch.no_grad():
-                model_params = torch.cat(
-                    [p.flatten() for p in self.model.parameters() if p.requires_grad]
-                )
-                ema_params = torch.cat(
-                    [
-                        self.ema.shadow_params[i].flatten()
-                        for i, (name, p) in enumerate(self.model.named_parameters())
-                        if p.requires_grad
-                    ]
-                )
-                avg_diff = torch.abs(model_params - ema_params).mean()
+                # Streaming mean to avoid allocating a ~500 MB concat tensor every 100 steps.
+                total_abs, total_n = torch.zeros((), device=self.device), 0
+                for p, sp in zip(
+                    (p for p in self.model.parameters() if p.requires_grad),
+                    self.ema.shadow_params,
+                ):
+                    total_abs += (p.detach() - sp.to(p.device)).abs().sum()
+                    total_n += p.numel()
+                avg_diff = total_abs / max(total_n, 1)
                 self.log("ema_diff/avg", avg_diff, sync_dist=True)
 
     # NOTE: lightning handles with torch.no_grad() and model.eval() automatically
@@ -168,7 +169,8 @@ class BasicLightningModule(LightningModule):
             if self.global_step % self.cfg.validation.test_steps == 0:
                 self.test_step(batch, batch_idx)
         else:
-            with self.ema.average_parameters(self.model.parameters()):
+            trainable = [p for p in self.model.parameters() if p.requires_grad]
+            with self.ema.average_parameters(trainable):
                 loss_dict = self._step(batch, is_training=False)
             # logging
             batch_size = self.cfg.data.val_bs

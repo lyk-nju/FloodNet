@@ -453,6 +453,13 @@ class DiffForcingWanModel(nn.Module):
         return self.traj_encoder(feats_tok)
 
     def _get_traj_seq_lens(self, x, seq_len, device):
+        # Prefer feature_length (= token_length) — exact, no rounding error.
+        if "feature_length" in x and x["feature_length"] is not None:
+            return (
+                x["feature_length"]
+                .to(device=device, dtype=torch.long)
+                .clamp(min=0, max=seq_len)
+            )
         if "traj_features_length" in x and x["traj_features_length"] is not None:
             return (
                 x["traj_features_length"]
@@ -460,9 +467,9 @@ class DiffForcingWanModel(nn.Module):
                 .clamp(min=0, max=seq_len)
             )
         if "traj_length" in x and x["traj_length"] is not None:
-            # Causal: N tokens → 4*(N-1)+1 frames, so frames→tokens = (T-1)//4 + 1
+            # Fallback: match dataset formula token_end = (feature_length + 2) // 4
             tl = x["traj_length"].to(device=device, dtype=torch.long)
-            return ((tl - 1) // 4 + 1).clamp(min=0, max=seq_len)
+            return ((tl + 2) // 4 + 1).clamp(min=0, max=seq_len)
         return None
 
     def _get_noise_levels(self, device, seq_len, time_steps):

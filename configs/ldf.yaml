@@ -111,7 +111,7 @@ data:
     text_path: "texts"
     random_length: 0
     min_length: 40
-    max_length: 190
+    max_length: 200
     # Smooth Root trajectory conditioning (Task8).
     # Gaussian-smooths the xz components of traj_features fed to ControlNet.
     # output["traj"] (GT for L_control_xz) is NOT affected.
