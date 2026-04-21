@@ -9,8 +9,8 @@ dirs:
     raw_data: /data1/yuankai/text2Motion/FloodDiffusion/raw_data
 
 save_dir: ./outputs
-resume_ckpt: "/home/yuankai/Text2Motion/FloodDiffusion/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt"
-test_ckpt: /home/yuankai/Text2Motion/FloodDiffusion/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt
+resume_ckpt: "/home/yuankai/Text2Motion/FloodNet/outputs/20260421_174420_ldf/step_step=246000.ckpt"
+test_ckpt: "/home/yuankai/Text2Motion/FloodNet/outputs/20260421_174420_ldf/step_step=246000.ckpt"
 
 test_vae_ckpt: "/home/yuankai/Text2Motion/FloodDiffusion/outputs/vae_1d_z4_step=300000.ckpt"
 test_vae:
@@ -131,7 +131,7 @@ model:
 
         # Explicit motion-space control loss
         control_loss_weight: 1.0
-        scheduled_sampling_prob: 0.0
+        scheduled_sampling_prob: 0.3
         cfg_scale_traj: 3.0
         cfg_scale_text: 5.0
 

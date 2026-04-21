@@ -83,6 +83,9 @@ def parse_args():
     # Top-k hardest samples
     parser.add_argument("--topk", type=int, default=0,
                         help="If >0, print the N hardest samples by ADE at the end.")
+    # Multiple generation runs for stable metrics
+    parser.add_argument("--num_runs", type=int, default=1,
+                        help="Number of generation runs per sample; metrics are averaged across runs.")
     return parser.parse_args()
 
 
@@ -234,6 +237,14 @@ def _compute_traj_metrics(
             seg_mse.append(None)
     result["seg_mse"] = seg_mse
 
+    # ── Trajectory smoothness: mean squared acceleration (jitter) ─────────────
+    # accel[t] = xz[t+1] - 2*xz[t] + xz[t-1]; lower = smoother
+    if pred_xz.shape[0] >= 3:
+        accel = pred_xz[2:] - 2 * pred_xz[1:-1] + pred_xz[:-2]  # (T-2, 2)
+        result["traj_jitter"] = float(accel.pow(2).sum(dim=-1).mean().item())
+    else:
+        result["traj_jitter"] = float("nan")
+
     # ── Prefix MSE: cumulative [0:ef] at ef = seg_size, 2*seg_size, ... ──────
     prefix_mse: List[Optional[float]] = []
     for ef in range(seg_size, T + 1, seg_size):
@@ -246,6 +257,33 @@ def _compute_traj_metrics(
             prefix_mse.append(None)
     result["prefix_mse"] = prefix_mse
 
+    return result
+
+
+def _average_traj_metrics(run_metrics: List[Dict]) -> Dict:
+    """Average _compute_traj_metrics dicts across multiple runs."""
+    if len(run_metrics) == 1:
+        return run_metrics[0].copy()
+    result: Dict = {}
+    if "T" in run_metrics[0]:
+        result["T"] = run_metrics[0]["T"]
+    if "masked_ratio" in run_metrics[0]:
+        result["masked_ratio"] = run_metrics[0]["masked_ratio"]
+    for key in ("ade", "fde", "mse", "traj_jitter"):
+        vals = [r[key] for r in run_metrics if key in r and r[key] == r[key]]
+        if vals:
+            result[key]             = float(np.mean(vals))
+            result[f"{key}_std"]    = float(np.std(vals))
+    for list_key in ("seg_mse", "prefix_mse"):
+        if list_key not in run_metrics[0]:
+            continue
+        n = max(len(r.get(list_key, [])) for r in run_metrics)
+        avg = []
+        for s in range(n):
+            vals = [r[list_key][s] for r in run_metrics
+                    if s < len(r.get(list_key, [])) and r[list_key][s] is not None]
+            avg.append(float(np.mean(vals)) if vals else None)
+        result[list_key] = avg
     return result
 
 
@@ -454,6 +492,7 @@ def main():
         print(f"[eval] val samples (for T2M FID): {len(val_dataset)}")
 
     print(f"[eval] test samples (video + traj): {len(test_dataset)}")
+    print(f"[eval] num_runs   : {args.num_runs}")
     if args.forward_control_loss:
         print(f"[eval] forward_control_loss: ON  (chunk_size={chunk_size_tokens})")
     if args.traj_ablation:
@@ -470,119 +509,154 @@ def main():
         if args.max_batches > 0 and bidx >= args.max_batches:
             break
 
-        # Per-batch seed: ensures same output for identical seed + data order
-        _set_seed(args.seed + bidx)
         batch = _to_device(batch, device)
+        batch_size_actual = len(batch["name"])
 
-        with torch.no_grad():
-            model_batch = _build_model_batch(batch, device)
-            output = model.generate(model_batch)
-
-        generated = output["generated"]
-        text       = output.get("text", [""] * len(generated))
-
-        # ── Forward control loss (batch-level, one model() call) ──────────────
+        # Accumulate per-sample metrics across runs
+        sample_run_metrics: List[List[Dict]] = [[] for _ in range(batch_size_actual)]
+        text_cache: Optional[List[str]] = None
+        # Saved on run 0 for files/rendering/viz
+        decoded_run0:  List[Optional[torch.Tensor]]  = [None] * batch_size_actual
+        pred_xz_run0:  List[Optional[np.ndarray]]    = [None] * batch_size_actual
+        abl_xz_run0:   List[Optional[np.ndarray]]    = [None] * batch_size_actual
         fwd_stats_batch: Optional[List[Dict]] = None
-        if args.forward_control_loss and "traj" in batch:
-            try:
+        ablation_generated_run0: Optional[List] = None
+
+        # Resolve directories once (outside run loop)
+        sample_root_cache: Dict[int, Any] = {}
+        for i in range(batch_size_actual):
+            dataset_id = batch["dataset"][i]
+            sample_root = out_root / dataset_id
+            dirs = {
+                "text":         sample_root / "text",
+                "token":        sample_root / "token",
+                "feature":      sample_root / "feature",
+                "cond_traj":    sample_root / "traj_xz",
+                "pred_traj":    sample_root / "pred_traj_xz",
+                "traj_mask":    sample_root / "traj_mask",
+                "frames":       sample_root / "frames",
+                "video":        sample_root / "video",
+                "composite":    sample_root / "composite",
+                "viz":          sample_root / "traj_viz",
+            }
+            for k, d in dirs.items():
+                if k != "viz":
+                    d.mkdir(parents=True, exist_ok=True)
+            sample_root_cache[i] = dirs
+
+        for run_idx in range(args.num_runs):
+            _set_seed(args.seed + run_idx * 100000 + bidx)
+
+            with torch.no_grad():
+                model_batch = _build_model_batch(batch, device)
+                output = model.generate(model_batch)
+
+            generated = output["generated"]
+            if text_cache is None:
+                text_cache = output.get("text", [""] * len(generated))
+
+            # fwd_ctrl_loss and ablation: run once on run 0
+            if run_idx == 0:
+                if args.forward_control_loss and "traj" in batch:
+                    try:
+                        with torch.no_grad():
+                            fwd_out = model(model_batch)
+                        if "control_aux" in fwd_out:
+                            pred_list = fwd_out["control_aux"]["pred_x0_latent_list"]
+                            fwd_stats_batch = _compute_fwd_ctrl_loss_per_sample(
+                                pred_list=pred_list,
+                                traj=model_batch["traj"],
+                                traj_mask=model_batch["traj_mask"],
+                                traj_length=model_batch["traj_length"],
+                                vae=vae,
+                                device=device,
+                                chunk_size_tokens=chunk_size_tokens,
+                            )
+                    except Exception as e:
+                        print(f"[fwd_ctrl_loss] bidx={bidx:05d} failed: {e}")
+
+                if args.traj_ablation:
+                    try:
+                        with torch.no_grad():
+                            mb_no_traj = _build_model_batch(_remove_traj_fields(batch), device)
+                            out_no = model.generate(mb_no_traj)
+                        ablation_generated_run0 = out_no["generated"]
+                    except Exception as e:
+                        print(f"[traj_ablation] bidx={bidx:05d} failed: {e}")
+
+            for i in range(len(generated)):
+                sample_name = batch["name"][i]
+                dirs = sample_root_cache[i]
+
+                single_generated  = generated[i].detach()
+                decoded_generated = vae.decode(single_generated[None, :].to(device))[0].float().detach().to(device)
+
+                # Files: save only on run 0
+                if run_idx == 0:
+                    decoded_run0[i] = decoded_generated
+                    sample_text = text_cache[i] if text_cache and i < len(text_cache) else ""
+                    (dirs["text"] / f"{sample_name}.txt").write_text(sample_text)
+                    np.save(dirs["token"]   / f"{sample_name}.npy", single_generated.float().cpu().numpy())
+                    np.save(dirs["feature"] / f"{sample_name}.npy", decoded_generated.float().cpu().numpy())
+
+                    if "traj_features" in batch:
+                        cond = batch["traj_features"][i]
+                        if torch.is_tensor(cond): cond = cond.detach().cpu().numpy()
+                        cond = np.asarray(cond)
+                        if cond.ndim == 2 and cond.shape[1] >= 2:
+                            np.save(dirs["cond_traj"] / f"{sample_name}.npy", cond[:, :2].astype(np.float32))
+                    elif "traj" in batch:
+                        tr = batch["traj"][i]
+                        if torch.is_tensor(tr): tr = tr.detach().cpu().numpy()
+                        tr = np.asarray(tr)
+                        if tr.ndim == 2 and tr.shape[1] >= 3:
+                            np.save(dirs["cond_traj"] / f"{sample_name}.npy",
+                                    root_to_traj_feats(tr)[:, :2].astype(np.float32))
+                    if "traj_mask" in batch:
+                        m = batch["traj_mask"][i]
+                        if torch.is_tensor(m): m = m.detach().cpu().numpy()
+                        np.save(dirs["traj_mask"] / f"{sample_name}.npy", np.asarray(m).reshape(-1))
+                    if "feature_text_end" in batch:
+                        frames = batch["feature_text_end"][i]
+                        if torch.is_tensor(frames): frames = frames.detach().cpu().numpy()
+                        np.save(dirs["frames"] / f"{sample_name}.npy", np.asarray(frames))
+
+                    with torch.no_grad():
+                        pred_xz_np = extract_root_trajectory_263_torch(
+                            decoded_generated[None, :]
+                        )[0, :, [0, 2]].cpu().numpy().astype(np.float32)
+                    pred_xz_run0[i] = pred_xz_np
+                    np.save(dirs["pred_traj"] / f"{sample_name}.npy", pred_xz_np)
+
+                # Traj metrics: every run
+                if "traj" in batch and "traj_mask" in batch:
+                    rec = _compute_traj_metrics(decoded_generated, batch, i, seg_size=args.seg_size)
+                    sample_run_metrics[i].append(rec)
+
+        # ── Ablation XZ (run 0) ───────────────────────────────────────────────
+        if ablation_generated_run0 is not None:
+            for i in range(len(ablation_generated_run0)):
+                abl_single  = ablation_generated_run0[i].detach()
+                abl_decoded = vae.decode(abl_single[None, :].to(device))[0].float().detach().to(device)
                 with torch.no_grad():
-                    fwd_out = model(model_batch)
-                if "control_aux" in fwd_out:
-                    pred_list = fwd_out["control_aux"]["pred_x0_latent_list"]
-                    fwd_stats_batch = _compute_fwd_ctrl_loss_per_sample(
-                        pred_list=pred_list,
-                        traj=model_batch["traj"],
-                        traj_mask=model_batch["traj_mask"],
-                        traj_length=model_batch["traj_length"],
-                        vae=vae,
-                        device=device,
-                        chunk_size_tokens=chunk_size_tokens,
-                    )
-            except Exception as e:
-                print(f"[fwd_ctrl_loss] batch_{bidx:05d} failed: {e}")
-
-        # ── Ablation: generate WITHOUT traj conditioning ──────────────────────
-        ablation_generated: Optional[List] = None
-        if args.traj_ablation:
-            try:
-                with torch.no_grad():
-                    mb_no_traj = _build_model_batch(_remove_traj_fields(batch), device)
-                    out_no = model.generate(mb_no_traj)
-                ablation_generated = out_no["generated"]
-            except Exception as e:
-                print(f"[traj_ablation] batch_{bidx:05d} failed: {e}")
-
-        for i in range(len(generated)):
-            sample_name = batch["name"][i]
-            dataset_id  = batch["dataset"][i]
-            sample_text = text[i] if i < len(text) else ""
-
-            sample_root   = out_root / dataset_id
-            text_dir      = sample_root / "text"
-            token_dir     = sample_root / "token"
-            feature_dir   = sample_root / "feature"
-            cond_traj_dir = sample_root / "traj_xz"
-            pred_traj_dir = sample_root / "pred_traj_xz"
-            traj_mask_dir = sample_root / "traj_mask"
-            frames_dir    = sample_root / "frames"
-            video_dir     = sample_root / "video"
-            composite_dir = sample_root / "composite"
-            viz_dir       = sample_root / "traj_viz"
-            for d in [text_dir, token_dir, feature_dir, cond_traj_dir, pred_traj_dir,
-                      traj_mask_dir, frames_dir, video_dir, composite_dir]:
-                d.mkdir(parents=True, exist_ok=True)
-
-            single_generated  = generated[i].detach()
-            decoded_generated = vae.decode(single_generated[None, :].to(device))[0].float().detach().to(device)
-
-            # Save text / token / feature
-            (text_dir / f"{sample_name}.txt").write_text(sample_text)
-            np.save(token_dir   / f"{sample_name}.npy", single_generated.float().cpu().numpy())
-            np.save(feature_dir / f"{sample_name}.npy", decoded_generated.float().cpu().numpy())
-
-            # Save conditioning trajectory
-            if "traj_features" in batch:
-                cond = batch["traj_features"][i]
-                if torch.is_tensor(cond):
-                    cond = cond.detach().cpu().numpy()
-                cond = np.asarray(cond)
-                if cond.ndim == 2 and cond.shape[1] >= 2:
-                    np.save(cond_traj_dir / f"{sample_name}.npy", cond[:, :2].astype(np.float32))
-            elif "traj" in batch:
-                tr = batch["traj"][i]
-                if torch.is_tensor(tr):
-                    tr = tr.detach().cpu().numpy()
-                tr = np.asarray(tr)
-                if tr.ndim == 2 and tr.shape[1] >= 3:
-                    np.save(cond_traj_dir / f"{sample_name}.npy",
-                            root_to_traj_feats(tr)[:, :2].astype(np.float32))
-
-            if "traj_mask" in batch:
-                m = batch["traj_mask"][i]
-                if torch.is_tensor(m):
-                    m = m.detach().cpu().numpy()
-                np.save(traj_mask_dir / f"{sample_name}.npy", np.asarray(m).reshape(-1))
-
-            if "feature_text_end" in batch:
-                frames = batch["feature_text_end"][i]
-                if torch.is_tensor(frames):
-                    frames = frames.detach().cpu().numpy()
-                np.save(frames_dir / f"{sample_name}.npy", np.asarray(frames))
-
-            # ── Trajectory control metrics ────────────────────────────────────
-            rec: Dict = {"name": sample_name}
-            if "traj" in batch and "traj_mask" in batch:
-                traj_rec = _compute_traj_metrics(
-                    decoded_generated, batch, i, seg_size=args.seg_size
-                )
-                rec.update(traj_rec)
-
-                # Save predicted trajectory XZ
-                with torch.no_grad():
-                    pred_xz_np = extract_root_trajectory_263_torch(
-                        decoded_generated[None, :]
+                    abl_xz_run0[i] = extract_root_trajectory_263_torch(
+                        abl_decoded[None, :]
                     )[0, :, [0, 2]].cpu().numpy().astype(np.float32)
-                np.save(pred_traj_dir / f"{sample_name}.npy", pred_xz_np)
+
+        # ── Build final per-sample record (averaged across runs) ──────────────
+        feature_dir = sample_root_cache[0]["feature"] if batch_size_actual > 0 else None
+        video_dir   = sample_root_cache[0]["video"]   if batch_size_actual > 0 else None
+
+        for i in range(batch_size_actual):
+            sample_name = batch["name"][i]
+            dirs = sample_root_cache[i]
+            feature_dir = dirs["feature"]
+            video_dir   = dirs["video"]
+            composite_dir = dirs["composite"]
+
+            rec: Dict = {"name": sample_name, "num_runs": args.num_runs}
+            if sample_run_metrics[i]:
+                rec.update(_average_traj_metrics(sample_run_metrics[i]))
 
                 # Console: per-sample summary
                 seg_str = "  ".join(
@@ -590,9 +664,11 @@ def main():
                     if v is not None else f"[{s*args.seg_size}:-]=nan"
                     for s, v in enumerate(rec.get("seg_mse", []))
                 )
-                print(f"  {sample_name}  ADE={rec.get('ade', float('nan')):.4f}"
+                ade_std_str = (f"±{rec['ade_std']:.4f}" if "ade_std" in rec else "")
+                print(f"  {sample_name}  ADE={rec.get('ade', float('nan')):.4f}{ade_std_str}"
                       f"  FDE={rec.get('fde', float('nan')):.4f}"
-                      f"  MSE={rec.get('mse', float('nan')):.4f}  T={rec.get('T', 0)}")
+                      f"  MSE={rec.get('mse', float('nan')):.4f}  T={rec.get('T', 0)}"
+                      f"  (runs={args.num_runs})")
                 if seg_str:
                     print(f"    seg_mse : {seg_str}")
                 pfx = [f"{(s+1)*args.seg_size}f={v:.4f}" if v is not None else f"{(s+1)*args.seg_size}f=nan"
@@ -600,7 +676,7 @@ def main():
                 if pfx:
                     print(f"    pfx_mse : {'  '.join(pfx)}")
 
-            # ── Attach forward control loss ───────────────────────────────────
+            # fwd_ctrl_loss (run 0)
             if fwd_stats_batch is not None and i < len(fwd_stats_batch):
                 fwd = fwd_stats_batch[i]
                 rec["fwd_ctrl_loss"] = fwd["loss"]
@@ -609,10 +685,9 @@ def main():
                 print(f"    fwd_ctrl_loss={fwd['loss']:.6f}  n_valid={fwd['n_valid']:.0f}"
                       f"  win={fwd['window_len']}")
 
-            # ── Ablation metrics (no-traj generation) ─────────────────────────
-            abl_xz_np: Optional[np.ndarray] = None
-            if ablation_generated is not None and i < len(ablation_generated):
-                abl_single  = ablation_generated[i].detach()
+            # ablation (run 0)
+            if ablation_generated_run0 is not None and i < len(ablation_generated_run0):
+                abl_single  = ablation_generated_run0[i].detach()
                 abl_decoded = vae.decode(abl_single[None, :].to(device))[0].float().detach().to(device)
                 if "traj" in batch and "traj_mask" in batch:
                     abl_rec = _compute_traj_metrics(abl_decoded, batch, i, seg_size=args.seg_size)
@@ -621,45 +696,42 @@ def main():
                     rec["ablation_mse"] = abl_rec.get("mse", float("nan"))
                     print(f"    ablation: ADE={rec['ablation_ade']:.4f}"
                           f"  FDE={rec['ablation_fde']:.4f}"
-                          f"  MSE={rec['ablation_mse']:.4f}"
                           f"  [ControlNet Δ ADE={rec.get('ade', float('nan')) - rec['ablation_ade']:+.4f}]")
-                with torch.no_grad():
-                    abl_xz_np = extract_root_trajectory_263_torch(
-                        abl_decoded[None, :]
-                    )[0, :, [0, 2]].cpu().numpy().astype(np.float32)
 
-            # ── XZ trajectory plot ────────────────────────────────────────────
-            if args.viz_traj and "traj" in batch:
-                viz_dir.mkdir(parents=True, exist_ok=True)
+            # viz_traj (uses run 0 decoded)
+            if args.viz_traj and "traj" in batch and pred_xz_run0[i] is not None:
+                dirs["viz"].mkdir(parents=True, exist_ok=True)
                 traj_len_v = (int(batch["traj_length"][i].item())
                               if "traj_length" in batch else batch["traj"][i].shape[0])
                 gt_xz_plot = batch["traj"][i][:traj_len_v, [0, 2]].float().cpu().numpy()
                 msk_plot   = batch["traj_mask"][i].cpu().numpy() if "traj_mask" in batch else None
                 title_extra = f"  ADE={rec.get('ade', float('nan')):.4f}"
+                if "ade_std" in rec:
+                    title_extra += f"±{rec['ade_std']:.4f}"
                 if "ablation_ade" in rec:
                     title_extra += f"  abl_ADE={rec['ablation_ade']:.4f}"
                 _plot_traj_xz(
                     name=sample_name,
                     gt_xz=gt_xz_plot,
-                    pred_xz=pred_xz_np,
-                    pred_no_traj_xz=abl_xz_np,
+                    pred_xz=pred_xz_run0[i],
+                    pred_no_traj_xz=abl_xz_run0[i],
                     traj_mask=msk_plot,
-                    output_path=str(viz_dir / f"{sample_name}.png"),
+                    output_path=str(dirs["viz"] / f"{sample_name}.png"),
                     title_extra=title_extra,
                 )
 
             traj_records.append(rec)
 
-        # Render videos for this batch
+        # Render videos for this batch (uses files from run 0)
         if cfg.test_setting.render:
             try:
                 render_video(
                     motion_dir=str(feature_dir),
                     save_dir=str(video_dir),
                     render_setting=cfg.test_setting,
-                    frames_dir=str(frames_dir),
-                    traj_mask_dir=str(traj_mask_dir),
-                    cond_traj_dir=str(cond_traj_dir),
+                    frames_dir=str(dirs["frames"]),
+                    traj_mask_dir=str(dirs["traj_mask"]),
+                    cond_traj_dir=str(dirs["cond_traj"]),
                 )
                 make_composite_compare_videos(
                     result_folder=str(video_dir),
@@ -763,6 +835,13 @@ def main():
             pfx_means.append(float(np.mean(vals)) if vals else None)
         final_metrics["traj/prefix_mse_per_slot"] = pfx_means
 
+        # Trajectory smoothness aggregation
+        jitter_vals = [r["traj_jitter"] for r in valid_traj
+                       if "traj_jitter" in r and r["traj_jitter"] == r["traj_jitter"]]
+        if jitter_vals:
+            final_metrics["traj/jitter_mean"] = float(np.mean(jitter_vals))
+            final_metrics["traj/jitter_std"]  = float(np.std(jitter_vals))
+
         # Forward control loss aggregation
         fwd_vals = [r["fwd_ctrl_loss"] for r in valid_traj
                     if "fwd_ctrl_loss" in r and r["fwd_ctrl_loss"] == r["fwd_ctrl_loss"]]
@@ -784,13 +863,38 @@ def main():
                           if "ablation_ade" in r and r["ade"] == r["ade"]]
             final_metrics["traj/ctrl_delta_ADE_mean"] = float(np.mean(delta_ades))
 
-    # Per-sample breakdown
-    per_sample_path = out_root / "traj_per_sample.json"
-    per_sample_path.write_text(json.dumps(traj_records, indent=2))
-    print(f"\n[eval] Traj per-sample saved to: {per_sample_path}")
+    # Build output: per-sample entries first, then aggregate summary
+    output_dict: Dict = {}
+
+    # Per-sample section
+    for r in traj_records:
+        name = r["name"]
+        entry: Dict = {"T": r.get("T", 0)}
+        for k in ("ade", "fde", "mse", "traj_jitter",
+                  "fwd_ctrl_loss", "ablation_ade", "ablation_fde", "ablation_mse"):
+            if k in r:
+                entry[k] = r[k]
+        if "seg_mse" in r:
+            entry["seg_mse"] = {
+                f"[{s*args.seg_size}:{(s+1)*args.seg_size}]": v
+                for s, v in enumerate(r["seg_mse"])
+            }
+        if "prefix_mse" in r:
+            entry["prefix_mse"] = {
+                f"[0:{(s+1)*args.seg_size}]": v
+                for s, v in enumerate(r["prefix_mse"])
+            }
+        output_dict[name] = entry
+
+    # Aggregate summary at the end
+    output_dict["summary"] = final_metrics
 
     metrics_path = out_root / "metrics.json"
-    metrics_path.write_text(json.dumps(final_metrics, indent=2))
+    metrics_path.write_text(json.dumps(output_dict, indent=2))
+
+    # Keep traj_per_sample.json for backward compatibility (full raw records)
+    per_sample_path = out_root / "traj_per_sample.json"
+    per_sample_path.write_text(json.dumps(traj_records, indent=2))
 
     print("\n" + "=" * 60)
     print("Evaluation Summary")
