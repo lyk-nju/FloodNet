@@ -6,6 +6,7 @@
 # - Zero-initialized residual heads so initial behavior matches the backbone.
 
 import math
+import warnings
 from typing import List, Optional
 
 import torch
@@ -145,7 +146,21 @@ class WanControlNet(nn.Module):
     @torch.no_grad()
     def init_from_backbone(self, backbone) -> None:
         """Copy matching weights from a WanModel instance."""
-        self.load_state_dict(backbone.state_dict(), strict=False)
+        result = self.load_state_dict(backbone.state_dict(), strict=False)
+        if result.missing_keys:
+            # Expected: ControlNet-only layers (zero_out heads, traj_in_proj) have no backbone counterpart.
+            warnings.warn(
+                f"init_from_backbone: {len(result.missing_keys)} ControlNet-only keys "
+                f"not copied from backbone (will keep current init): {result.missing_keys}",
+                stacklevel=2,
+            )
+        if result.unexpected_keys:
+            # Keys present in backbone but absent from ControlNet — silently ignored by strict=False.
+            warnings.warn(
+                f"init_from_backbone: {len(result.unexpected_keys)} backbone keys have no "
+                f"ControlNet counterpart (ignored): {result.unexpected_keys}",
+                stacklevel=2,
+            )
         # Ensure zero heads remain exactly zero.
         for m in self.zero_out:
             nn.init.zeros_(m.weight)

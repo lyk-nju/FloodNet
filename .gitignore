@@ -24,6 +24,12 @@ raw_data/
 pretrained/
 tmp/
 
+# debug
+ref/
+test/
+exp_result/
+image/
+
 # web
 server.pid
 

@@ -5,7 +5,6 @@ Manages model loading, frame buffering, and streaming generation
 import sys
 import os
 import threading
-import queue
 import time
 from collections import deque
 
@@ -60,7 +59,7 @@ class ModelManager:
     """
     Manages model loading and real-time frame generation.
     Trajectory control is active when the user provides waypoints and the model config enables
-    trajectory conditioning (legacy `use_traj_cond` or ControlNet `use_controlnet_traj`).
+    trajectory conditioning via ControlNet branch (enabled when model.freeze_backbone=True).
     """
     def __init__(self, config_path=None, traj_mask_cfg=None):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -90,12 +89,16 @@ class ModelManager:
         self.is_generating = False
         self.generation_thread = None
         self.should_stop = False
+        self.reset_pending = False  # True while waiting for thread to stop before reset
         
-        # Trajectory control: waypoints → interpolated path (one point per token step)
+        # Trajectory control: waypoints → interpolated path
+        # current_traj_features_frame: (N*4, 4) float32 — frame-level [x,z,cos,sin].
+        # Each token step consumes 4 consecutive frames, passed through LocalTrajEncoder
+        # to match the training distribution exactly.
         self.current_traj_waypoints = None
-        self.current_traj_array = None  # (N, 3) float32, N = TRAJ_INTERP_LENGTH
-        self.current_traj_features = None  # (N, 4) float32, [x,z,cos,sin] per token step
-        self.current_token_mask = None  # (N,) float32, 1=keep, 0=drop per token step
+        self.current_traj_array = None         # (N, 3) float32, N = TRAJ_INTERP_LENGTH (token-level)
+        self.current_traj_features_frame = None  # (N*4, 4) float32, frame-level features
+        self.current_token_mask = None         # (N,) float32, 1=keep, 0=drop per token step
         self.traj_token_index = 0
         self.TRAJ_INTERP_LENGTH = 2000
         
@@ -209,27 +212,38 @@ class ModelManager:
                 target=cfg.model.target, cfg=None, hfstyle=False, **cfg.model.params
             )
             checkpoint = torch.load(cfg.test_ckpt, map_location="cpu", weights_only=False)
-            use_traj_cond = cfg.model.params.get("use_traj_cond", False)
-            use_controlnet_traj = cfg.model.params.get("use_controlnet_traj", False)
-            strict_load = not (use_traj_cond or use_controlnet_traj)  # allow missing new cond params
-            load_result = model.load_state_dict(
-                checkpoint["state_dict"], strict=strict_load
-            )
-            if (use_traj_cond or use_controlnet_traj) and not strict_load:
+            try:
+                model.load_state_dict(checkpoint["state_dict"], strict=True)
+            except RuntimeError as exc:
+                print(
+                    "Strict checkpoint load failed; falling back to strict=False for backward compatibility."
+                )
+                print(f"Reason: {exc}")
+                load_result = model.load_state_dict(checkpoint["state_dict"], strict=False)
                 if load_result.missing_keys:
-                    print(
-                        f"Loaded with strict=False (traj). Missing keys (init from scratch): {load_result.missing_keys}"
-                    )
+                    print(f"Missing keys (initialized from current model): {load_result.missing_keys}")
                 if load_result.unexpected_keys:
                     print(f"Unexpected keys (ignored): {load_result.unexpected_keys}")
 
             if "ema_state" in checkpoint:
-                ema = ExponentialMovingAverage(
-                    model.parameters(), decay=cfg.model.ema_decay
+                n_shadow = len(checkpoint["ema_state"]["shadow_params"])
+                all_params = list(model.parameters())
+                if n_shadow == len(all_params):
+                    ema_params = all_params
+                elif getattr(model, "freeze_backbone", False) and model.controlnet is not None:
+                    ema_params = list(model.controlnet.parameters()) + (
+                        list(model.traj_encoder.parameters()) if model.traj_encoder is not None else []
+                    )
+                else:
+                    ema_params = all_params
+                assert len(ema_params) == n_shadow, (
+                    f"EMA shadow_params count ({n_shadow}) does not match "
+                    f"selected param group ({len(ema_params)})."
                 )
+                ema = ExponentialMovingAverage(ema_params, decay=cfg.model.ema_decay)
                 ema.load_state_dict(checkpoint["ema_state"])
-                ema.copy_to(model.parameters())
-                print("Loaded model with EMA")
+                ema.copy_to(ema_params)
+                print(f"Loaded model with EMA ({n_shadow} params)")
             else:
                 print("Loaded model without EMA")
             
@@ -283,7 +297,7 @@ class ModelManager:
         if waypoints is None or len(waypoints) == 0:
             self.current_traj_waypoints = None
             self.current_traj_array = None
-            self.current_traj_features = None
+            self.current_traj_features_frame = None
             self.current_token_mask = None
             print("Trajectory control cleared")
             return
@@ -293,23 +307,31 @@ class ModelManager:
         if waypoints.shape[1] == 2:
             waypoints = np.c_[waypoints[:, 0], np.zeros(len(waypoints)), waypoints[:, 1]]
         n = len(waypoints)
-        indices = np.linspace(0, n - 1, self.TRAJ_INTERP_LENGTH, dtype=np.float64)
+
+        # Token-level interpolation (for mask and reference).
+        indices_tok = np.linspace(0, n - 1, self.TRAJ_INTERP_LENGTH, dtype=np.float64)
         self.current_traj_array = np.stack([
-            np.interp(indices, np.arange(n), waypoints[:, 0]),
-            np.interp(indices, np.arange(n), waypoints[:, 1]),
-            np.interp(indices, np.arange(n), waypoints[:, 2]),
-        ], axis=1).astype(np.float32)
+            np.interp(indices_tok, np.arange(n), waypoints[:, 0]),
+            np.interp(indices_tok, np.arange(n), waypoints[:, 1]),
+            np.interp(indices_tok, np.arange(n), waypoints[:, 2]),
+        ], axis=1).astype(np.float32)  # (N_tok, 3)
+
+        # Frame-level interpolation at 4× resolution — one xyz per motion frame so that
+        # each token step gets 4 consecutive frames for LocalTrajEncoder, matching training.
+        n_frames = self.TRAJ_INTERP_LENGTH * 4
+        indices_frm = np.linspace(0, n - 1, n_frames, dtype=np.float64)
+        traj_frame = np.stack([
+            np.interp(indices_frm, np.arange(n), waypoints[:, 0]),
+            np.interp(indices_frm, np.arange(n), waypoints[:, 1]),
+            np.interp(indices_frm, np.arange(n), waypoints[:, 2]),
+        ], axis=1).astype(np.float32)  # (N_tok*4, 3)
+        self.current_traj_features_frame = root_to_traj_feats(traj_frame)  # (N_tok*4, 4)
 
         # Randomly mask user waypoints (sparse trajectory hints, aligned with training).
-        # Then map waypoint-level mask onto interpolated time steps via nearest neighbor.
         waypoint_mask = self._sample_waypoint_mask(n)  # (n,)
-        interp_mask_idx = np.clip(np.round(indices).astype(np.int64), 0, n - 1)  # (TRAJ_INTERP_LENGTH,)
-        interp_mask = waypoint_mask[interp_mask_idx].astype(np.float32)  # (TRAJ_INTERP_LENGTH,)
-        self.current_token_mask = interp_mask.astype(np.float32)
-
-        # Build token-step [x,z,cos,sin] features (same semantics as dataset traj_features).
-        self.current_traj_features = root_to_traj_feats(self.current_traj_array)  # (N,4)
-        self.current_traj_features = self.current_traj_features * self.current_token_mask[:, None]
+        interp_mask_idx = np.clip(np.round(indices_tok).astype(np.int64), 0, n - 1)
+        interp_mask = waypoint_mask[interp_mask_idx].astype(np.float32)  # (N_tok,)
+        self.current_token_mask = interp_mask
 
         self.current_traj_waypoints = waypoints
         if self._last_traj_mask_keep is not None and self._last_traj_mask_total is not None:
@@ -327,7 +349,9 @@ class ModelManager:
         """Pause generation (keeps all state)"""
         self.should_stop = True
         if self.generation_thread:
-            self.generation_thread.join(timeout=2.0)
+            self.generation_thread.join(timeout=5.0)
+            if self.generation_thread.is_alive():
+                print("Warning: generation thread did not stop within timeout; model state may be unsafe")
         self.is_generating = False
         print("Generation paused (state preserved)")
     
@@ -356,10 +380,22 @@ class ModelManager:
                 - Recommended: 0.3-0.7 for visible smoothing
             denoise_steps: Number of denoising steps (1-50, default 10)
         """
-        # Stop if running
+        # Stop if running, then poll until thread truly exits (max 10s total)
         if self.is_generating:
             self.pause_generation()
-        
+        if self.generation_thread is not None and self.generation_thread.is_alive():
+            self.reset_pending = True
+            print("Reset pending — waiting for generation thread to finish...")
+            for _ in range(20):  # up to 10s more (20 × 0.5s)
+                self.generation_thread.join(timeout=0.5)
+                if not self.generation_thread.is_alive():
+                    break
+            if self.generation_thread.is_alive():
+                print("Reset failed: generation thread still running after 15s timeout")
+                self.reset_pending = False
+                return
+        self.reset_pending = False
+
         # Clear everything
         self.frame_buffer.clear()
         self.vae.clear_cache()
@@ -411,18 +447,31 @@ class ModelManager:
                         
                         # Generate one token (produces 4 frames from VAE)
                         x = {"text": [self.current_text]}
-                        if self.current_traj_features is not None:
-                            idx = min(self.traj_token_index, self.current_traj_features.shape[0] - 1)
-                            x["traj_features"] = self.current_traj_features[idx : idx + 1]  # (1,4)
+                        if self.current_traj_features_frame is not None:
+                            tok_idx = min(self.traj_token_index, self.TRAJ_INTERP_LENGTH - 1)
+                            frm_start = tok_idx * 4
+                            frm_end = min(frm_start + 4, self.current_traj_features_frame.shape[0])
+                            frames = self.current_traj_features_frame[frm_start:frm_end]  # (≤4, 4)
+                            # Pad to exactly 4 frames if near trajectory end
+                            if frames.shape[0] < 4:
+                                pad = np.zeros((4 - frames.shape[0], 4), dtype=np.float32)
+                                frames = np.concatenate([frames, pad], axis=0)
+                            # Apply LocalTrajEncoder to match training path exactly:
+                            #   training: frame-level (B,T,4,4) → LocalTrajEncoder → (B,T,4) → TrajEncoder
+                            #   here:     (1,1,4,4)              → LocalTrajEncoder → (1,1,4) → TrajEncoder
+                            frames_t = torch.from_numpy(frames).float().to(device)  # (4, 4)
+                            frames_t = frames_t.unsqueeze(0).unsqueeze(0)           # (1, 1, 4, 4)
+                            tok_feat = self.model.local_traj_encoder(frames_t)      # (1, 1, 4)
+                            x["traj_features"] = tok_feat  # (1, 1, 4) tensor, matches buffer shape
                             if self.current_token_mask is not None:
-                                x["token_mask"] = self.current_token_mask[idx : idx + 1]  # (1,)
+                                x["token_mask"] = self.current_token_mask[tok_idx : tok_idx + 1][None, :]  # (1,1)
                         
                         # Generate from model (1 token)
                         # Note: denoise_steps is set in init_generated, not here
                         output = self.model.stream_generate_step(
                             x, first_chunk=self.first_chunk
                         )
-                        if self.current_traj_features is not None:
+                        if self.current_traj_features_frame is not None:
                             self.traj_token_index += 1
                         generated = output["generated"]
                         

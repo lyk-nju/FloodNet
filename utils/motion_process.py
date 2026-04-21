@@ -89,6 +89,52 @@ def extract_root_trajectory_263_torch(feature_263: torch.Tensor) -> torch.Tensor
     return r_pos
 
 
+def extract_root_trajectory_length(feature_263: np.ndarray, xy_only: bool = True) -> float:
+    """Compute the geometric path length of the recovered root trajectory.
+
+    Args:
+        feature_263: (T, 263) motion feature array.
+        xy_only: If True, measure on the ground plane (x, z). If False, use full 3D.
+
+    Returns:
+        Total path length along the trajectory polyline.
+    """
+    traj = extract_root_trajectory_263(feature_263)
+    if traj.shape[0] < 2:
+        return 0.0
+    if xy_only:
+        pts = traj[:, [0, 2]]
+    else:
+        pts = traj
+    diffs = np.diff(pts, axis=0)
+    return float(np.linalg.norm(diffs, axis=1).sum())
+
+
+def extract_root_trajectory_length(feature_263: np.ndarray | torch.Tensor, xy_only: bool = True) -> float:
+    """Compute the path length of the recovered root trajectory.
+
+    Args:
+        feature_263: (T, 263) numpy array or (B, T, 263) / (T, 263) tensor.
+        xy_only: If True, measure length on the ground plane xz only.
+
+    Returns:
+        Total path length along the trajectory.
+    """
+    if isinstance(feature_263, np.ndarray):
+        feat = torch.from_numpy(feature_263).float()
+    else:
+        feat = feature_263.float()
+    if feat.dim() == 2:
+        feat = feat.unsqueeze(0)
+    _, r_pos = recover_root_rot_pos(feat)
+    traj = r_pos[0]
+    coords = traj[:, [0, 2]] if xy_only else traj
+    if coords.size(0) < 2:
+        return 0.0
+    diffs = coords[1:] - coords[:-1]
+    return float(torch.norm(diffs, dim=-1).sum().item())
+
+
 def recover_joint_positions_263(data: np.ndarray, joints_num) -> np.ndarray:
     """
     Recovers 3D joint positions from the rotation-invariant local positions (ric_data).

@@ -42,77 +42,97 @@ class CustomLightningModule(BasicLightningModule):
         traj_length,
         vae,
         device,
+        train_mode: int = 3,
         chunk_size_tokens: int | None = None,
         token_to_frame: int = 4,
     ):
         """
-        Motion-space control loss on ground plane only.
+        XZ-plane trajectory control loss.  Behaviour is selected by train_mode:
 
-        Always decodes the full predicted latent sequence so that recover_root_rot_pos()
-        integrates velocities from frame 0, giving correct absolute xz positions with no
-        floor bias.  When chunk_size_tokens is set, only the active window [start_f:end_f]
-        of the recovered trajectory is compared against GT – matching the diffusion-forcing
-        training objective while keeping the absolute coordinate reference intact.
-
+          Mode 1 — active window, absolute coords, NO detach
+                   Loss only on active window frames; gradient flows to ALL tokens
+                   via cumsum (position[t] = Σvel[0..t]).
+          Mode 2 — active window, absolute coords, detach past tokens
+                   Past latents are detached before VAE decode; gradient is
+                   confined to active window tokens, but absolute position has
+                   a fixed offset from the detached past (old '20260419' style).
+          Mode 3 — full sequence, absolute coords, NO detach  [DEFAULT]
+                   Every frame compared; each token gets balanced gradient from
+                   all future positions it affects.  Proven to converge (20260402).
+          Mode 4 — full sequence, absolute coords, detach past tokens
+                   Full comparison coverage but gradient only flows through the
+                   active window tokens (past frames contribute to loss value,
+                   not to gradient).
+          Mode 5 — active window, relative displacement, detach anchor
+                   pred_xz and gt_xz are both shifted to be relative to the
+                   first frame of the active window; gradient cancels for all
+                   past tokens and flows only through the active window.
         """
+        # Derive booleans from mode for readability
+        use_active_window = train_mode in (1, 2, 5)   # slice to active window for comparison
+        detach_past       = train_mode in (2, 4)       # detach past latents before decode
+        relative_disp     = train_mode == 5            # subtract anchor frame
+
         loss_control = 0.0
         n_valid = 0.0
         for i in range(len(pred_list)):
             pred_latent_full = pred_list[i].to(device)  # (T_token, z_dim)
             t_tok = pred_latent_full.size(0)
 
-            # Determine active-window frame range in the full sequence.
-            # Causal: token k → last frame 4k; token k (k≥1) → first frame 4k-3
+            # Active-window token/frame bounds (always computed; used conditionally)
             if chunk_size_tokens is not None and t_tok > chunk_size_tokens:
                 start_tok = t_tok - chunk_size_tokens
-                start_f = 0 if start_tok == 0 else 4 * start_tok - 3
-                end_f = t_tok * token_to_frame  # clamped to L_motion = 4*(t_tok-1)+1
+                start_f   = 0 if start_tok == 0 else 4 * start_tok - 3
+                end_f     = t_tok * token_to_frame
             else:
                 start_tok = 0
-                start_f = 0
-                end_f = None  # use full sequence
+                start_f   = 0
+                end_f     = None
 
-            # Decode full latent for correct absolute-position integration, but detach
-            # the past (non-active) tokens so gradients only flow through the active
-            # window.  Without detach, the velocity-integration chain amplifies the
-            # gradient for early tokens by O(T/chunk) – enough to flip direction on
-            # long sequences (e.g. 000021 with 179 frames / 45 tokens).
-            if start_tok > 0:
-                latent_past = pred_latent_full[:start_tok].detach()
-                latent_active = pred_latent_full[start_tok:]
-                latent_for_decode = torch.cat([latent_past, latent_active], dim=0)
+            # Optionally detach past latents so gradient stays in active window
+            if detach_past and start_tok > 0:
+                latent_for_decode = torch.cat(
+                    [pred_latent_full[:start_tok].detach(), pred_latent_full[start_tok:]], dim=0
+                )
             else:
                 latent_for_decode = pred_latent_full
-            decoded = vae.decode(latent_for_decode.unsqueeze(0))[0].float()
-            L_motion = decoded.size(0)
+
+            decoded   = vae.decode(latent_for_decode.unsqueeze(0))[0].float()
+            L_motion  = decoded.size(0)
             L_gt_total = min(int(traj_length[i].item()), traj.shape[1])
 
-            if end_f is None:
-                pred_sl = slice(0, L_motion)
-                gt_sl = slice(0, L_gt_total)
+            # Frame slice to compare
+            if use_active_window and end_f is not None:
+                pred_sl = slice(min(start_f, L_motion),   min(end_f, L_motion))
+                gt_sl   = slice(min(start_f, L_gt_total), min(end_f, L_gt_total))
             else:
-                pred_sl = slice(min(start_f, L_motion), min(end_f, L_motion))
-                gt_sl = slice(min(start_f, L_gt_total), min(end_f, L_gt_total))
+                pred_sl = slice(0, L_motion)
+                gt_sl   = slice(0, L_gt_total)
 
             L = min(pred_sl.stop - pred_sl.start, gt_sl.stop - gt_sl.start)
             if L <= 0:
                 continue
 
-            # Extract trajectory from full decoded motion, then slice active window.
-            pred_traj_full = extract_root_trajectory_263_torch(decoded.unsqueeze(0))  # (1, L_motion, 3)
+            pred_traj_full = extract_root_trajectory_263_torch(decoded.unsqueeze(0))
             pred_traj = pred_traj_full[:, pred_sl, :][:, :L, :]
-            gt_traj = traj[i, gt_sl, :][:L].unsqueeze(0).to(
-                pred_traj.device, dtype=pred_traj.dtype
-            )
-            mask = traj_mask[i, gt_sl][:L].unsqueeze(0).to(
-                pred_traj.device, dtype=pred_traj.dtype
-            )
+            gt_traj   = traj[i, gt_sl, :][:L].unsqueeze(0).to(pred_traj.device, dtype=pred_traj.dtype)
+            mask      = traj_mask[i, gt_sl][:L].unsqueeze(0).to(pred_traj.device, dtype=pred_traj.dtype)
 
             pred_xz = pred_traj[..., [0, 2]]
-            gt_xz = gt_traj[..., [0, 2]]
+            gt_xz   = gt_traj[...,  [0, 2]]
+
+            if relative_disp:
+                # Subtract the first frame of the window as a fixed anchor.
+                # Past-token gradients cancel algebraically (Σvel[0..t] − Σvel[0..start_f]),
+                # so detach() is purely a compute optimisation.
+                anchor  = pred_xz[:, 0:1, :].detach()
+                pred_xz = pred_xz - anchor
+                gt_xz   = gt_xz   - gt_xz[:, 0:1, :]
+
             sq_err = ((pred_xz - gt_xz) ** 2).sum(dim=-1)
             loss_control = loss_control + (mask * sq_err).sum()
             n_valid += mask.sum().item()
+
         if n_valid <= 0:
             return None
         return loss_control / n_valid
@@ -155,23 +175,20 @@ class CustomLightningModule(BasicLightningModule):
         self.t2m_metrics = T2MMetrics(self.cfg.metrics.t2m)
 
     def on_load_checkpoint(self, checkpoint):
-        use_traj_cond = self.cfg.model.params.get("use_traj_cond", False)
-        use_controlnet_traj = self.cfg.model.params.get("use_controlnet_traj", False)
-        strict = not (use_traj_cond or use_controlnet_traj)
+        ckpt_keys = set(checkpoint["state_dict"].keys())
+        controlnet_missing = not any(k.startswith("controlnet.") for k in ckpt_keys)
+        strict = not controlnet_missing
         result = self.model.load_state_dict(checkpoint["state_dict"], strict=strict)
-        has_new_cond_params = (use_traj_cond or use_controlnet_traj) and result.missing_keys
-        if (use_traj_cond or use_controlnet_traj) and not strict:
-            if result.missing_keys:
-                rank_zero_info(
-                    "Loaded pretrained LDF with strict=False. "
-                    f"Missing keys (new cond modules init from scratch): {result.missing_keys}"
-                )
+        has_new_cond_params = controlnet_missing and bool(result.missing_keys)
+        if not strict and result.missing_keys:
+            rank_zero_info(
+                "Loaded pretrained LDF with strict=False (base checkpoint without ControlNet). "
+                f"Missing keys (new modules init from scratch): {result.missing_keys}"
+            )
         # Re-init ControlNet from the *loaded* backbone when starting from a base ckpt.
         # init_from_backbone in __init__ runs before weights are loaded, so it copies random
         # weights — moving the call here ensures it copies the actual pretrained backbone.
-        if (use_controlnet_traj
-                and self.cfg.model.params.get("controlnet_init_from_backbone", True)
-                and result.missing_keys
+        if (controlnet_missing
                 and any("controlnet." in k for k in result.missing_keys)):
             self.model.controlnet.init_from_backbone(self.model.model)
             rank_zero_info("Re-initialized ControlNet from loaded pretrained backbone weights")
@@ -248,6 +265,7 @@ class CustomLightningModule(BasicLightningModule):
                 traj = batch["traj"]
                 traj_mask = batch["traj_mask"]
                 traj_length = batch["traj_length"]
+                train_mode = self.cfg.get("control_loss_train_mode", 3)
                 chunk_size_tokens = getattr(self.model, "chunk_size", None)
                 loss_control = self._compute_control_loss_xz(
                     pred_list,
@@ -256,6 +274,7 @@ class CustomLightningModule(BasicLightningModule):
                     traj_length,
                     self.vae,
                     self.device,
+                    train_mode=train_mode,
                     chunk_size_tokens=chunk_size_tokens,
                 )
                 if loss_control is not None:

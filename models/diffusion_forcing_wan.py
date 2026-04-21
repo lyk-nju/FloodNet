@@ -42,36 +42,18 @@ class DiffForcingWanModel(nn.Module):
         cfg_scale_traj=0.0,
         prediction_type="vel",  # "vel", "x0", "noise"
         causal=False,
-        # Deprecated for ControlNet training: backbone stays unconditional on traj.
-        # Keep for backwards-compat only (FlexTraj mode when controlnet disabled).
-        use_traj_cond=False,
         traj_out_dim=64,
         traj_in_dim=4,
         traj_encoder_in_dim=None,
         traj_dropout=0.1,
         use_traj_emb_cache=False,
         use_traj_kv_cache=None,
-        control_loss_weight=1.0,  # used by train_ldf, not by model
-        freeze_backbone_for_traj=False,
-        use_controlnet_traj=False,
-        controlnet_init_from_backbone=True,
-        freeze_backbone_for_controlnet=False,
+        control_loss_weight=1.0,
+        freeze_backbone=True,
         use_precomputed_text_emb=False,
         precomputed_text_emb_path=None,
         scheduled_sampling_prob=0.0,
-        **kwargs,
     ):
-        kwargs.pop("traj_lora_rank", None)
-        kwargs.pop("lora_rank_traj", None)
-        # Backward compat: old checkpoints stored the param as cfg_scale.
-        _legacy_cfg_scale = kwargs.pop("cfg_scale", None)
-        if _legacy_cfg_scale is not None:
-            cfg_scale_text = _legacy_cfg_scale
-        if kwargs:
-            raise TypeError(
-                "DiffForcingWanModel: unexpected keyword arguments "
-                f"{sorted(kwargs.keys())}"
-            )
         super().__init__()
         if traj_encoder_in_dim is not None:
             traj_in_dim = traj_encoder_in_dim
@@ -91,26 +73,10 @@ class DiffForcingWanModel(nn.Module):
         self.cfg_scale_traj = float(cfg_scale_traj)
         self.prediction_type = prediction_type
         self.causal = causal
-        self.use_traj_cond = use_traj_cond
         self.traj_out_dim = traj_out_dim
         self.traj_in_dim = traj_in_dim
         self.traj_dropout = traj_dropout
-        self.freeze_backbone_for_traj = freeze_backbone_for_traj
-        self.use_controlnet_traj = bool(use_controlnet_traj)
-        self.controlnet_init_from_backbone = bool(controlnet_init_from_backbone)
-        self.freeze_backbone_for_controlnet = bool(freeze_backbone_for_controlnet)
-        if self.use_controlnet_traj and use_traj_cond:
-            warnings.warn(
-                "use_traj_cond=True is ignored when use_controlnet_traj=True. "
-                "Backbone stays unconditional; traj is consumed by ControlNet only.",
-                stacklevel=2,
-            )
-        if self.use_controlnet_traj and freeze_backbone_for_traj:
-            warnings.warn(
-                "freeze_backbone_for_traj=True is a legacy FlexTraj setting and is ignored "
-                "when use_controlnet_traj=True. Use freeze_backbone_for_controlnet instead.",
-                stacklevel=2,
-            )
+        self.freeze_backbone = bool(freeze_backbone)
         if use_traj_kv_cache is not None:
             warnings.warn(
                 "`use_traj_kv_cache` is deprecated; use `use_traj_emb_cache`.",
@@ -153,10 +119,9 @@ class DiffForcingWanModel(nn.Module):
 
         # Text encoding cache (only used when running live T5)
         self.text_cache = {}
-        # Default (recommended) behavior: backbone matches original FloodDiffusion (no traj tokens),
-        # ControlNet is the ONLY consumer of trajectory condition and injects residuals into backbone.
+        # Backbone is unconditional on traj; ControlNet is the sole trajectory consumer.
         traj_enc_dim_backbone = 0
-        traj_enc_dim_controlnet = self.traj_out_dim if self.use_controlnet_traj else 0
+        traj_enc_dim_controlnet = self.traj_out_dim
         self.model = WanModel(
             model_type="t2v",
             patch_size=(1, 1, 1),
@@ -177,68 +142,43 @@ class DiffForcingWanModel(nn.Module):
             traj_enc_dim=traj_enc_dim_backbone,
         )
 
-        self.controlnet = None
-        if self.use_controlnet_traj:
-            self.controlnet = WanControlNet(
-                model_type="t2v",
-                patch_size=(1, 1, 1),
-                text_len=self.text_len,
-                in_dim=self.input_dim,
-                dim=self.hidden_dim,
-                ffn_dim=self.ffn_dim,
-                freq_dim=self.freq_dim,
-                text_dim=self.text_dim,
-                out_dim=self.input_dim,
-                num_heads=self.num_heads,
-                num_layers=self.num_layers,
-                window_size=(-1, -1),
-                qk_norm=True,
-                cross_attn_norm=True,
-                eps=1e-6,
-                causal=self.causal,
-                traj_enc_dim=traj_enc_dim_controlnet,
-            )
-            if self.controlnet_init_from_backbone:
-                self.controlnet.init_from_backbone(self.model)
+        self.controlnet = WanControlNet(
+            model_type="t2v",
+            patch_size=(1, 1, 1),
+            text_len=self.text_len,
+            in_dim=self.input_dim,
+            dim=self.hidden_dim,
+            ffn_dim=self.ffn_dim,
+            freq_dim=self.freq_dim,
+            text_dim=self.text_dim,
+            out_dim=self.input_dim,
+            num_heads=self.num_heads,
+            num_layers=self.num_layers,
+            window_size=(-1, -1),
+            qk_norm=True,
+            cross_attn_norm=True,
+            eps=1e-6,
+            causal=self.causal,
+            traj_enc_dim=traj_enc_dim_controlnet,
+        )
+        self.controlnet.init_from_backbone(self.model)
 
-        # Trajectory encoder is only needed for ControlNet conditioning (recommended path).
-        # FlexTraj mode (backbone_use_traj) is kept as legacy and should not be mixed with ControlNet.
-        if self.use_controlnet_traj or (self.use_traj_cond and not self.use_controlnet_traj):
-            # Local within-token encoder: compress masked 4-frame traj feats -> token-level 4D.
-            self.local_traj_encoder = LocalTrajEncoder(hidden_dim=32)
-            self.traj_encoder = TrajEncoder(
-                in_dim=self.traj_in_dim, hidden_dim=64, out_dim=self.traj_out_dim
-            )
-        else:
-            self.local_traj_encoder = None
-            self.traj_encoder = None
+        # Local within-token encoder: compress masked 4-frame traj feats -> token-level 4D.
+        self.local_traj_encoder = LocalTrajEncoder(hidden_dim=32)
+        self.traj_encoder = TrajEncoder(
+            in_dim=self.traj_in_dim, hidden_dim=64, out_dim=self.traj_out_dim
+        )
         self.param_dtype = torch.float32
         self._traj_stream_version = 0
         self._traj_emb_cache = {}
 
-        if freeze_backbone_for_traj:
-            trainable_substrings = (
-                "traj_in_proj",
-                "traj_type_embed",
-            )
-            for name, p in self.model.named_parameters():
-                if any(s in name for s in trainable_substrings):
-                    continue
-                p.requires_grad = False
-
-            if self.traj_encoder is not None:
-                for p in self.traj_encoder.parameters():
-                    p.requires_grad = True
-
-        if self.freeze_backbone_for_controlnet:
+        if self.freeze_backbone:
             for p in self.model.parameters():
                 p.requires_grad = False
-            if self.controlnet is not None:
-                for p in self.controlnet.parameters():
-                    p.requires_grad = True
-            if self.traj_encoder is not None:
-                for p in self.traj_encoder.parameters():
-                    p.requires_grad = True
+            for p in self.controlnet.parameters():
+                p.requires_grad = True
+            for p in self.traj_encoder.parameters():
+                p.requires_grad = True
 
     def _controlnet_forward(
         self,
@@ -249,8 +189,6 @@ class DiffForcingWanModel(nn.Module):
         traj_emb,
         traj_seq_lens,
     ):
-        if self.controlnet is None:
-            return None
         return self.controlnet(
             noisy_input,
             t_scaled,
@@ -285,7 +223,6 @@ class DiffForcingWanModel(nn.Module):
 
     def _uncond_backbone_forward(
         self, noisy_input, t_scaled, text_null_context, seq_len,
-        traj_emb_backbone, traj_seq_lens_backbone,
     ):
         """Single backbone forward with null text and no ControlNet residuals.
 
@@ -298,8 +235,8 @@ class DiffForcingWanModel(nn.Module):
             text_null_context,
             seq_len,
             y=None,
-            traj_emb=traj_emb_backbone,
-            traj_seq_lens=traj_seq_lens_backbone,
+            traj_emb=None,
+            traj_seq_lens=None,
             controlnet_residuals=None,
         )
 
@@ -371,11 +308,7 @@ class DiffForcingWanModel(nn.Module):
         return x
 
     def _build_traj_emb(self, x, seq_len, device, training_dropout=False):
-        # Standard ControlNet conditioning: build token-level traj features from frame-level traj_features
-        # using a local within-token encoder over 4 frames, then apply TrajEncoder.
-        if (not (self.use_controlnet_traj or self.use_traj_cond)) or self.traj_encoder is None:
-            return None
-        if training_dropout and np.random.rand() <= self.traj_dropout:
+        if self.traj_encoder is None:
             return None
 
         # Prefer frame-level traj_features if present; else derive from traj xyz.
@@ -587,20 +520,20 @@ class DiffForcingWanModel(nn.Module):
 
         traj_emb = None
         traj_seq_lens = None
-        if self.use_controlnet_traj or self.use_traj_cond:
-            # If only traj/control branch is trainable, dropping traj condition can make loss
-            # independent of all trainable params and break backward.
-            traj_training_dropout = not (
-                self.freeze_backbone_for_traj or self.freeze_backbone_for_controlnet
-            )
-            traj_emb = self._build_traj_emb(
-                x, seq_len, device, training_dropout=traj_training_dropout
-            )
-            traj_seq_lens = self._get_traj_seq_lens(x, seq_len, device)
+        traj_dropped = False  # True when dropout zeroed out traj condition this step
+        if self.training:
+            # DDP: all ranks must make the SAME dropout decision each step.
+            # Sample on rank 0, broadcast to all other ranks; independent per-rank
+            # sampling causes ranks to disagree on which params are used → DDP
+            # all-reduce deadlock → "Resource temporarily unavailable".
+            drop = torch.empty(1, device=device).uniform_()
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.broadcast(drop, src=0)
+            traj_dropped = drop.item() < self.traj_dropout
 
-        # Backbone stays unconditional on traj in standard ControlNet mode.
-        traj_emb_backbone = traj_emb if (self.use_traj_cond and not self.use_controlnet_traj) else None
-        traj_seq_lens_backbone = traj_seq_lens if (self.use_traj_cond and not self.use_controlnet_traj) else None
+        if not traj_dropped:
+            traj_emb = self._build_traj_emb(x, seq_len, device, training_dropout=False)
+            traj_seq_lens = self._get_traj_seq_lens(x, seq_len, device)
 
         # ── Scheduled Sampling ──────────────────────────────────────────────
         # With probability ss_prob, replace context tokens (active-window prefix,
@@ -623,8 +556,8 @@ class DiffForcingWanModel(nn.Module):
                     all_text_context,
                     seq_len,
                     y=None,
-                    traj_emb=traj_emb_backbone,
-                    traj_seq_lens=traj_seq_lens_backbone,
+                    traj_emb=None,
+                    traj_seq_lens=None,
                     controlnet_residuals=cn_res_ss,
                 )
             # Replace context tokens (prefix before active window) with x0_hat.
@@ -660,8 +593,8 @@ class DiffForcingWanModel(nn.Module):
             all_text_context,
             seq_len,
             y=None,
-            traj_emb=traj_emb_backbone,
-            traj_seq_lens=traj_seq_lens_backbone,
+            traj_emb=None,
+            traj_seq_lens=None,
             controlnet_residuals=controlnet_residuals,
         )  # (B, C, T, 1, 1)
 
@@ -690,10 +623,9 @@ class DiffForcingWanModel(nn.Module):
 
         loss_dict = {"total": loss, "mse": loss}
 
-        # MotionLCM-style control loss: prepare pred_x0_latent for decoding (train_ldf will add L_control)
-        if ("traj" in x) and (self.prediction_type in ("vel", "x0")) and (
-            self.use_traj_cond or self.use_controlnet_traj
-        ):
+        # MotionLCM-style control loss: prepare pred_x0_latent for decoding (train_ldf will add L_control).
+        # Skip when traj was dropped this step — L_control without traj conditioning is meaningless.
+        if ("traj" in x) and (self.prediction_type in ("vel", "x0")) and not traj_dropped:
             pred_x0_latent_list = []
             for b in range(batch_size):
                 if self.prediction_type == "vel":
@@ -807,16 +739,8 @@ class DiffForcingWanModel(nn.Module):
         text_null_context = [u.to(self.param_dtype) for u in text_null_context]
 
         gen_seq_len = seq_len + self.chunk_size
-        traj_emb = None
-        traj_seq_lens = None
-        if self.use_controlnet_traj or self.use_traj_cond:
-            traj_emb = self._build_traj_emb(
-                x, gen_seq_len, device, training_dropout=False
-            )
-            traj_seq_lens = self._get_traj_seq_lens(x, gen_seq_len, device)
-        # ControlNet mode: backbone stays unconditional on traj; only ControlNet branch consumes it.
-        traj_emb_backbone = traj_emb if (self.use_traj_cond and not self.use_controlnet_traj) else None
-        traj_seq_lens_backbone = traj_seq_lens if (self.use_traj_cond and not self.use_controlnet_traj) else None
+        traj_emb = self._build_traj_emb(x, gen_seq_len, device, training_dropout=False)
+        traj_seq_lens = self._get_traj_seq_lens(x, gen_seq_len, device)
 
         # Progressively advance from t=0 to t=max_t
         for step in range(total_steps):
@@ -858,18 +782,6 @@ class DiffForcingWanModel(nn.Module):
                     if traj_seq_lens is not None
                     else None
                 )
-                traj_bb_2b = (
-                    torch.cat([traj_emb_backbone, traj_emb_backbone], dim=0)
-                    if traj_emb_backbone is not None
-                    else None
-                )
-                traj_bb_sl_2b = (
-                    torch.cat(
-                        [traj_seq_lens_backbone, traj_seq_lens_backbone], dim=0
-                    )
-                    if traj_seq_lens_backbone is not None
-                    else None
-                )
                 controlnet_residuals = self._controlnet_forward(
                     noisy_2b,
                     t_2b,
@@ -884,8 +796,8 @@ class DiffForcingWanModel(nn.Module):
                     ctx_2b,
                     gen_sl,
                     y=None,
-                    traj_emb=traj_bb_2b,
-                    traj_seq_lens=traj_bb_sl_2b,
+                    traj_emb=None,
+                    traj_seq_lens=None,
                     controlnet_residuals=controlnet_residuals,
                 )
                 if self.cfg_scale_traj > 0.0:
@@ -897,7 +809,6 @@ class DiffForcingWanModel(nn.Module):
                     #       + w_traj * (out_null_text - out_uncond)
                     pred_uncond = self._uncond_backbone_forward(
                         noisy_input, t_scaled, text_null_context, gen_sl,
-                        None, None,  # truly unconditional: text OFF, traj OFF
                     )
                     predicted_result = [
                         pred_uncond[i]
@@ -926,8 +837,8 @@ class DiffForcingWanModel(nn.Module):
                     all_text_context,
                     gen_sl,
                     y=None,
-                    traj_emb=traj_emb_backbone,
-                    traj_seq_lens=traj_seq_lens_backbone,
+                    traj_emb=None,
+                    traj_seq_lens=None,
                     controlnet_residuals=controlnet_residuals,
                 )
                 if self.cfg_scale_text != 1.0:
@@ -948,8 +859,8 @@ class DiffForcingWanModel(nn.Module):
                         text_null_context,
                         gen_sl,
                         y=None,
-                        traj_emb=traj_emb_backbone,
-                        traj_seq_lens=traj_seq_lens_backbone,
+                        traj_emb=None,
+                        traj_seq_lens=None,
                         controlnet_residuals=controlnet_residuals_null,
                     )
                     predicted_result = [
@@ -1102,13 +1013,8 @@ class DiffForcingWanModel(nn.Module):
         gen_seq_len = seq_len + self.chunk_size
         traj_emb = None
         traj_seq_lens = None
-        if self.use_controlnet_traj or self.use_traj_cond:
-            traj_emb = self._build_traj_emb(
-                x, gen_seq_len, device, training_dropout=False
-            )
-            traj_seq_lens = self._get_traj_seq_lens(x, gen_seq_len, device)
-        traj_emb_backbone = traj_emb if (self.use_traj_cond and not self.use_controlnet_traj) else None
-        traj_seq_lens_backbone = traj_seq_lens if (self.use_traj_cond and not self.use_controlnet_traj) else None
+        traj_emb = self._build_traj_emb(x, gen_seq_len, device, training_dropout=False)
+        traj_seq_lens = self._get_traj_seq_lens(x, gen_seq_len, device)
 
         commit_index = 0
         # Progressively advance from t=0 to t=max_t
@@ -1151,18 +1057,6 @@ class DiffForcingWanModel(nn.Module):
                     if traj_seq_lens is not None
                     else None
                 )
-                traj_bb_2b = (
-                    torch.cat([traj_emb_backbone, traj_emb_backbone], dim=0)
-                    if traj_emb_backbone is not None
-                    else None
-                )
-                traj_bb_sl_2b = (
-                    torch.cat(
-                        [traj_seq_lens_backbone, traj_seq_lens_backbone], dim=0
-                    )
-                    if traj_seq_lens_backbone is not None
-                    else None
-                )
                 controlnet_residuals = self._controlnet_forward(
                     noisy_2b,
                     t_2b,
@@ -1177,8 +1071,8 @@ class DiffForcingWanModel(nn.Module):
                     ctx_2b,
                     gen_sl,
                     y=None,
-                    traj_emb=traj_bb_2b,
-                    traj_seq_lens=traj_bb_sl_2b,
+                    traj_emb=None,
+                    traj_seq_lens=None,
                     controlnet_residuals=controlnet_residuals,
                 )
                 if self.cfg_scale_traj > 0.0:
@@ -1190,7 +1084,6 @@ class DiffForcingWanModel(nn.Module):
                     #       + w_traj * (out_null_text - out_uncond)
                     pred_uncond = self._uncond_backbone_forward(
                         noisy_input, t_scaled, text_null_context, gen_sl,
-                        None, None,  # truly unconditional: text OFF, traj OFF
                     )
                     predicted_result = [
                         pred_uncond[i]
@@ -1219,8 +1112,8 @@ class DiffForcingWanModel(nn.Module):
                     all_text_context,
                     gen_sl,
                     y=None,
-                    traj_emb=traj_emb_backbone,
-                    traj_seq_lens=traj_seq_lens_backbone,
+                    traj_emb=None,
+                    traj_seq_lens=None,
                     controlnet_residuals=controlnet_residuals,
                 )
                 if self.cfg_scale_text != 1.0:
@@ -1241,8 +1134,8 @@ class DiffForcingWanModel(nn.Module):
                         text_null_context,
                         gen_sl,
                         y=None,
-                        traj_emb=traj_emb_backbone,
-                        traj_seq_lens=traj_seq_lens_backbone,
+                        traj_emb=None,
+                        traj_seq_lens=None,
                         controlnet_residuals=controlnet_residuals_null,
                     )
                     predicted_result = [
@@ -1333,7 +1226,7 @@ class DiffForcingWanModel(nn.Module):
         self._traj_emb_cache = {}
 
     def _stream_update_traj_buffers(self, x, device):
-        if not (self.use_controlnet_traj or self.use_traj_cond) or self.traj_encoder is None:
+        if self.traj_encoder is None:
             return
         buf_len = self.seq_len * 2 + self.chunk_size
         if self.commit_index >= buf_len:
@@ -1414,7 +1307,7 @@ class DiffForcingWanModel(nn.Module):
             self._traj_emb_cache = {}
 
     def _stream_build_traj_emb(self, x, end_index, device):
-        if not (self.use_controlnet_traj or self.use_traj_cond) or self.traj_encoder is None:
+        if self.traj_encoder is None:
             return None
         ctx_len = min(end_index, self.seq_len)
         start_t = max(0, end_index - self.seq_len)
@@ -1557,10 +1450,6 @@ class DiffForcingWanModel(nn.Module):
                 if traj_emb is not None
                 else None
             )
-            # ControlNet mode: backbone stays unconditional on traj; only ControlNet branch consumes it.
-            traj_emb_backbone = traj_emb if (self.use_traj_cond and not self.use_controlnet_traj) else None
-            traj_seq_lens_backbone = traj_seq_lens if (self.use_traj_cond and not self.use_controlnet_traj) else None
-
             model_sl = min(end_index, self.seq_len)
             t_scaled = noise_level * self.time_embedding_scale
             ctx_2b = (
@@ -1583,18 +1472,6 @@ class DiffForcingWanModel(nn.Module):
                     if traj_seq_lens is not None
                     else None
                 )
-                traj_bb_2b = (
-                    torch.cat([traj_emb_backbone, traj_emb_backbone], dim=0)
-                    if traj_emb_backbone is not None
-                    else None
-                )
-                traj_bb_sl_2b = (
-                    torch.cat(
-                        [traj_seq_lens_backbone, traj_seq_lens_backbone], dim=0
-                    )
-                    if traj_seq_lens_backbone is not None
-                    else None
-                )
                 controlnet_residuals = self._controlnet_forward(
                     noisy_2b,
                     t_2b,
@@ -1609,8 +1486,8 @@ class DiffForcingWanModel(nn.Module):
                     ctx_2b,
                     model_sl,
                     y=None,
-                    traj_emb=traj_bb_2b,
-                    traj_seq_lens=traj_bb_sl_2b,
+                    traj_emb=None,
+                    traj_seq_lens=None,
                     controlnet_residuals=controlnet_residuals,
                 )
                 if self.cfg_scale_traj > 0.0:
@@ -1651,8 +1528,8 @@ class DiffForcingWanModel(nn.Module):
                     text_condition,
                     model_sl,
                     y=None,
-                    traj_emb=traj_emb_backbone,
-                    traj_seq_lens=traj_seq_lens_backbone,
+                    traj_emb=None,
+                    traj_seq_lens=None,
                     controlnet_residuals=controlnet_residuals,
                 )
                 if self.cfg_scale_text != 1.0:
@@ -1670,8 +1547,8 @@ class DiffForcingWanModel(nn.Module):
                         text_null_context,
                         model_sl,
                         y=None,
-                        traj_emb=traj_emb_backbone,
-                        traj_seq_lens=traj_seq_lens_backbone,
+                        traj_emb=None,
+                        traj_seq_lens=None,
                         controlnet_residuals=controlnet_residuals_null,
                     )
                     predicted_result = [

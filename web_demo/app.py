@@ -184,7 +184,11 @@ def start_generation():
         if need_force_takeover:
             with consumption_monitor_lock:
                 last_frame_consumed_time = None
-        
+
+        # Ensure the previous generation thread is stopped before reinitializing.
+        if mm.is_generating:
+            mm.pause_generation()
+
         # Reset and start generation with history length, smoothing, and denoise steps
         mm.reset(history_length=history_length, smoothing_alpha=smoothing_alpha, denoise_steps=denoise_steps)
         mm.start_generation(text, history_length=history_length)
@@ -273,13 +277,12 @@ def update_trajectory():
                 'message': 'Model not initialized (start generation first)'
             }), 400
         
-        if waypoints is not None and len(waypoints) > 0:
-            with session_lock:
-                if active_session_id != session_id:
-                    return jsonify({
-                        'status': 'error',
-                        'message': 'Not the active session'
-                    }), 403
+        with session_lock:
+            if active_session_id != session_id:
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Not the active session'
+                }), 403
         
         model_manager.update_trajectory(waypoints)
         
@@ -407,6 +410,10 @@ def reset():
         # Clear consumption tracking
         with consumption_monitor_lock:
             last_frame_consumed_time = None
+
+        # If a generation thread is still around, stop it cleanly.
+        if model_manager and model_manager.is_generating:
+            model_manager.pause_generation()
         
         params_msg = f", smoothing: {smoothing_alpha}" if smoothing_alpha is not None else ""
         params_msg += f", steps: {denoise_steps}" if denoise_steps is not None else ""

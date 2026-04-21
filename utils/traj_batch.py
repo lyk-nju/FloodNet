@@ -122,8 +122,10 @@ def build_traj_emb(
     elif "traj" in x:
         traj = x["traj"].to(device)
         mask = x.get("traj_mask")
-        traj = align_temporal(traj, mask)
-        feats = root_to_traj_feats(traj)
+        # Compute heading from original xyz FIRST, then interpolate the 4D features.
+        # Interpolating xyz before heading distorts displacement direction and turn angles.
+        feats = root_to_traj_feats(traj)       # (B, T_orig, 4)
+        feats = align_temporal(feats, mask)    # → (B, seq_len, 4)
     else:
         return None
 

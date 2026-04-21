@@ -93,11 +93,11 @@ def render_video(
             if os.path.exists(cond_path):
                 traj_xz = np.load(cond_path)
 
+        frames = None
         if frames_dir is not None and os.path.exists(frames_dir):
             frames_path = os.path.join(frames_dir, npy_file.name)
-            frames = np.load(frames_path)
-        else:
-            frames = None
+            if os.path.exists(frames_path):
+                frames = np.load(frames_path)
 
         try:
             render_single_video(

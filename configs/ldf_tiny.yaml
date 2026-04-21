@@ -131,18 +131,11 @@ model:
         # use_precomputed_text_emb: true
         # precomputed_text_emb_path: "${dirs.raw_data}/HumanML3D/umt5_tiny_text_embeddings.pt"
 
-        use_traj_cond: false
-        use_controlnet_traj: true
-        freeze_backbone_for_controlnet: true
-        controlnet_init_from_backbone: true
-
-        # Trajectory condition encoder (used by ControlNet)
+        freeze_backbone: true
         traj_encoder_in_dim: 4
         traj_out_dim: 64
         traj_dropout: 0.1
         use_traj_emb_cache: true
-
-        # Explicit motion-space control loss
         control_loss_weight: 1.0
 
 
