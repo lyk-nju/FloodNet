@@ -16,7 +16,7 @@ test_ckpt: /home/yuankai/Text2Motion/FloodDiffusion/outputs/20251107_021814_ldf_
 # resume_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20260415_114956_ldf/step_step=245000.ckpt
 # test_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20260415_114956_ldf/step_step=245000.ckpt
 
-test_vae_ckpt: "/home/yuankai/Text2Motion/FloodDiffusion/outputs/vae_1d_z4_step=300000.ckpt"
+test_vae_ckpt: "/home/yuankai/Text2Motion/FloodNet/outputs/vae_1d_z4_step=300000.ckpt"
 test_vae:
     target: models.vae_wan_1d.VAEWanModel
     ema_decay: 0.99
@@ -148,7 +148,8 @@ model:
 #   2 — active window, absolute coords, detach past (gradient → active window only, wrong abs offset)
 #   3 — full sequence, absolute coords, no detach   (balanced gradient, proven in 20260402) [DEFAULT]
 #   4 — full sequence, absolute coords, detach past (full coverage loss, gradient → active window only)
-#   5 — active window, relative displacement        (direction-only, gradient → active window only)
+#   5 — active window, relative displacement, pred anchor  (loss = |e[t]-e[0]|², fixed offset → zero loss)
+#   6 — active window, relative displacement, GT anchor    (loss = |pred_rel[t]-gt_rel[t]|², true disp error)
 control_loss_train_mode: 2
 
 resume_reset_optimizer: true

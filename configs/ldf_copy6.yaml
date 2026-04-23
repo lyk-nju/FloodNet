@@ -9,10 +9,10 @@ dirs:
     raw_data: /data1/yuankai/text2Motion/FloodDiffusion/raw_data
 
 save_dir: ./outputs
-resume_ckpt: "/home/yuankai/Text2Motion/FloodDiffusion/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt"
-test_ckpt: /home/yuankai/Text2Motion/FloodDiffusion/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt
+resume_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt
+test_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt
 
-test_vae_ckpt: "/home/yuankai/Text2Motion/FloodDiffusion/outputs/vae_1d_z4_step=300000.ckpt"
+test_vae_ckpt: "/home/yuankai/Text2Motion/FloodNet/outputs/vae_1d_z4_step=300000.ckpt"
 test_vae:
     target: models.vae_wan_1d.VAEWanModel
     ema_decay: 0.99
@@ -39,13 +39,13 @@ logger:
 trainer: # lightning trainer
     max_steps: 250001
     accelerator: gpu
-    devices: [4]
+    devices: [0]
     log_every_n_steps: 100
     precision: bf16-mixed
 validation:
     validation_steps: 2000
     test_steps: 2000
-    save_every_n_steps: 2000
+    save_every_n_steps: 1000
     save_top_k: 100
 metrics:
     dim: 263
@@ -94,9 +94,10 @@ data:
     mask_ratio: 1.0
 
     train_meta_paths:
-        # - ${dirs.raw_data}/HumanML3D/train.txt
-        - ${dirs.raw_data}/HumanML3D/test_min.txt
+        - ${dirs.raw_data}/HumanML3D/train_stratified_300.txt
+        # - ${dirs.raw_data}/HumanML3D/test_min.txt
         # - ${dirs.raw_data}/HumanML3D/val.txt
+        # - ${dirs.raw_data}/HumanML3D/test.txt
     val_meta_paths:
         - ${dirs.raw_data}/HumanML3D/val.txt
         # - ${dirs.raw_data}/HumanML3D/test_min.txt
@@ -140,8 +141,8 @@ model:
 #   2 — active window, absolute coords, detach past (gradient → active window only, wrong abs offset)
 #   3 — full sequence, absolute coords, no detach   (balanced gradient, proven in 20260402) [DEFAULT]
 #   4 — full sequence, absolute coords, detach past (full coverage loss, gradient → active window only)
-#   5 — active window, relative displacement        (direction-only, gradient → active window only)
-control_loss_train_mode: 5
+#   5 — active window, relative displacement, pred anchor  (loss = |e[t]-e[0]|², fixed offset → zero loss)\n#   6 — active window, relative displacement, GT anchor    (loss = |pred_rel[t]-gt_rel[t]|², true disp error)
+control_loss_train_mode: 6
 
 resume_reset_optimizer: true
 optimizer:

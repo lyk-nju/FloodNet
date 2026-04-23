@@ -63,15 +63,19 @@ class CustomLightningModule(BasicLightningModule):
                    Full comparison coverage but gradient only flows through the
                    active window tokens (past frames contribute to loss value,
                    not to gradient).
-          Mode 5 — active window, relative displacement, detach anchor
-                   pred_xz and gt_xz are both shifted to be relative to the
-                   first frame of the active window; gradient cancels for all
-                   past tokens and flows only through the active window.
+          Mode 5 — active window, relative displacement, pred anchor
+                   Both shifted by pred's first frame; loss = |e[t]-e[0]|².
+                   A fixed absolute offset gives zero loss (known limitation).
+          Mode 6 — active window, relative displacement, GT anchor
+                   pred shifted by pred's first frame, gt shifted by gt's first
+                   frame; loss = |pred_rel[t]-gt_rel[t]|² — true displacement
+                   error, decoupled from absolute position.
         """
         # Derive booleans from mode for readability
-        use_active_window = train_mode in (1, 2, 5)   # slice to active window for comparison
-        detach_past       = train_mode in (2, 4)       # detach past latents before decode
-        relative_disp     = train_mode == 5            # subtract anchor frame
+        use_active_window = train_mode in (1, 2, 5, 6) # slice to active window for comparison
+        detach_past       = train_mode in (2, 4)        # detach past latents before decode
+        relative_disp     = train_mode in (5, 6)        # subtract anchor frame
+        relative_disp_gt_anchor = train_mode == 6       # use GT anchor (fixes Mode 5 bug)
 
         loss_control = 0.0
         n_valid = 0.0
@@ -122,12 +126,21 @@ class CustomLightningModule(BasicLightningModule):
             gt_xz   = gt_traj[...,  [0, 2]]
 
             if relative_disp:
-                # Subtract the first frame of the window as a fixed anchor.
-                # Past-token gradients cancel algebraically (Σvel[0..t] − Σvel[0..start_f]),
-                # so detach() is purely a compute optimisation.
-                anchor  = pred_xz[:, 0:1, :].detach()
-                pred_xz = pred_xz - anchor
-                gt_xz   = gt_xz   - gt_xz[:, 0:1, :]
+                if relative_disp_gt_anchor:
+                    # Mode 6: both pred and gt anchored to GT first frame.
+                    # loss = ||(pred[t]-pred[0]) - (gt[t]-gt[0])||^2
+                    # which equals ||pred_rel[t] - gt_rel[t]||^2 — true relative
+                    # displacement error, decoupled from absolute position.
+                    gt_anchor = gt_xz[:, 0:1, :].detach()
+                    pred_xz   = pred_xz - pred_xz[:, 0:1, :].detach()
+                    gt_xz     = gt_xz   - gt_anchor
+                else:
+                    # Mode 5: pred anchored to its own first frame (pred anchor).
+                    # loss = ||(e[t] - e[0])||^2 — measures error change, not error
+                    # itself; a fixed offset has zero loss (known design limitation).
+                    anchor  = pred_xz[:, 0:1, :].detach()
+                    pred_xz = pred_xz - anchor
+                    gt_xz   = gt_xz   - gt_xz[:, 0:1, :]
 
             sq_err = ((pred_xz - gt_xz) ** 2).sum(dim=-1)
             loss_control = loss_control + (mask * sq_err).sum()
