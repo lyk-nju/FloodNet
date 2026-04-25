@@ -16,7 +16,6 @@ import numpy as np
 from torch_ema import ExponentialMovingAverage
 from utils.initialize import instantiate, load_config, compare_statedict_and_parameters
 from utils.motion_process import StreamJointRecovery263
-from utils.traj_batch import root_to_traj_feats
 
 
 class FrameBuffer:
@@ -66,7 +65,7 @@ class ModelManager:
         print(f"Using device: {self.device}")
 
         traj_mask_cfg = traj_mask_cfg or {}
-        self.traj_mask_enabled = bool(traj_mask_cfg.get("enabled", True))
+        self.traj_mask_enabled = bool(traj_mask_cfg.get("enabled", False))
         self.traj_mask_keep_ratio_min = float(traj_mask_cfg.get("keep_ratio_min", 0.2))
         self.traj_mask_keep_ratio_max = float(traj_mask_cfg.get("keep_ratio_max", 0.3))
         self.traj_mask_keep_first_last = bool(traj_mask_cfg.get("keep_first_last", True))
@@ -91,16 +90,21 @@ class ModelManager:
         self.should_stop = False
         self.reset_pending = False  # True while waiting for thread to stop before reset
         
-        # Trajectory control: waypoints → interpolated path
-        # current_traj_features_frame: (N*4, 4) float32 — frame-level [x,z,cos,sin].
-        # Each token step consumes 4 consecutive frames, passed through LocalTrajEncoder
-        # to match the training distribution exactly.
+        # Trajectory control.
+        # Public/demo semantics stay in world-space xz coordinates. For streaming inference,
+        # we resample a future token-horizon from the character's current root position and
+        # let the model-side streaming path normalize the full visible window back to a
+        # clip-local origin before encoding.
+        self.traj_state_lock = threading.Lock()
         self.current_traj_waypoints = None
-        self.current_traj_array = None         # (N, 3) float32, N = TRAJ_INTERP_LENGTH (token-level)
-        self.current_traj_features_frame = None  # (N*4, 4) float32, frame-level features
-        self.current_token_mask = None         # (N,) float32, 1=keep, 0=drop per token step
-        self.traj_token_index = 0
-        self.TRAJ_INTERP_LENGTH = 2000
+        self.current_traj_array = None         # Latest world-space waypoint polyline, shape (N, 3)
+        self.current_traj_mode = "replace_future"
+        self.traj_plan_version = 0
+        self.traj_horizon_tokens = int(traj_mask_cfg.get("horizon_tokens", 20))
+        self.default_token_step = float(traj_mask_cfg.get("default_token_step", 0.25))
+        self.min_token_step = float(traj_mask_cfg.get("min_token_step", 0.05))
+        self.max_token_step = float(traj_mask_cfg.get("max_token_step", 1.50))
+        self.root_xz_history = deque(maxlen=120)
         
         # Model generation state
         self.first_chunk = True
@@ -269,7 +273,7 @@ class ModelManager:
             self.stream_recovery.reset()
             self.vae.clear_cache()
             self.first_chunk = True
-            self.traj_token_index = 0
+            self.root_xz_history.clear()
             self.model.init_generated(self.history_length, batch_size=1, num_denoise_steps=self.denoise_steps)
             print(f"Model initialized with history length: {self.history_length}, denoise steps: {self.denoise_steps}")
             
@@ -289,61 +293,163 @@ class ModelManager:
             # This allows continuous generation with text changes
             print(f"Text updated: '{old_text}' -> '{text}' (continuous generation)")
 
-    def update_trajectory(self, waypoints):
-        """Update trajectory control from waypoints (list of [x,z] or [x,y,z]).
-        Waypoints are interpolated to a fixed-length path for streaming.
-        Pass None to clear trajectory control.
+    def update_trajectory(self, waypoints, mode="replace_future"):
+        """Update trajectory control from world-space waypoints.
+
+        V1 semantics:
+        - `mode=replace_future`: replace only the future plan used by streaming inference.
+        - The latent state is preserved; only future trajectory conditioning is updated.
         """
-        if waypoints is None or len(waypoints) == 0:
-            self.current_traj_waypoints = None
-            self.current_traj_array = None
-            self.current_traj_features_frame = None
-            self.current_token_mask = None
-            print("Trajectory control cleared")
-            return
-        waypoints = np.array(waypoints, dtype=np.float64)
-        if waypoints.ndim == 1:
-            waypoints = waypoints.reshape(1, -1)
-        if waypoints.shape[1] == 2:
-            waypoints = np.c_[waypoints[:, 0], np.zeros(len(waypoints)), waypoints[:, 1]]
-        n = len(waypoints)
+        mode = mode or "replace_future"
+        if mode != "replace_future":
+            raise ValueError(f"Unsupported trajectory mode: {mode}")
 
-        # Token-level interpolation (for mask and reference).
-        indices_tok = np.linspace(0, n - 1, self.TRAJ_INTERP_LENGTH, dtype=np.float64)
-        self.current_traj_array = np.stack([
-            np.interp(indices_tok, np.arange(n), waypoints[:, 0]),
-            np.interp(indices_tok, np.arange(n), waypoints[:, 1]),
-            np.interp(indices_tok, np.arange(n), waypoints[:, 2]),
-        ], axis=1).astype(np.float32)  # (N_tok, 3)
+        with self.traj_state_lock:
+            self.current_traj_mode = mode
+            self.traj_plan_version += 1
 
-        # Frame-level interpolation at 4× resolution — one xyz per motion frame so that
-        # each token step gets 4 consecutive frames for LocalTrajEncoder, matching training.
-        n_frames = self.TRAJ_INTERP_LENGTH * 4
-        indices_frm = np.linspace(0, n - 1, n_frames, dtype=np.float64)
-        traj_frame = np.stack([
-            np.interp(indices_frm, np.arange(n), waypoints[:, 0]),
-            np.interp(indices_frm, np.arange(n), waypoints[:, 1]),
-            np.interp(indices_frm, np.arange(n), waypoints[:, 2]),
-        ], axis=1).astype(np.float32)  # (N_tok*4, 3)
-        self.current_traj_features_frame = root_to_traj_feats(traj_frame)  # (N_tok*4, 4)
+            if waypoints is None or len(waypoints) == 0:
+                self.current_traj_waypoints = None
+                self.current_traj_array = None
+                print("Trajectory control cleared")
+                return
 
-        # Randomly mask user waypoints (sparse trajectory hints, aligned with training).
-        waypoint_mask = self._sample_waypoint_mask(n)  # (n,)
-        interp_mask_idx = np.clip(np.round(indices_tok).astype(np.int64), 0, n - 1)
-        interp_mask = waypoint_mask[interp_mask_idx].astype(np.float32)  # (N_tok,)
-        self.current_token_mask = interp_mask
+            waypoints = np.asarray(waypoints, dtype=np.float32)
+            if waypoints.ndim == 1:
+                waypoints = waypoints.reshape(1, -1)
+            if waypoints.shape[1] == 2:
+                waypoints = np.c_[
+                    waypoints[:, 0],
+                    np.zeros(len(waypoints), dtype=np.float32),
+                    waypoints[:, 1],
+                ]
+            if waypoints.shape[1] != 3:
+                raise ValueError(
+                    f"Trajectory waypoints must have shape (N,2) or (N,3); got {waypoints.shape}"
+                )
 
-        self.current_traj_waypoints = waypoints
-        if self._last_traj_mask_keep is not None and self._last_traj_mask_total is not None:
-            masked_keep_steps = int(interp_mask.sum().item())
-            masked_total_steps = int(interp_mask.shape[0])
-            print(
-                f"Trajectory updated: {n} waypoints -> {len(self.current_traj_array)} time steps; "
-                f"keep (waypoints): {self._last_traj_mask_keep}/{self._last_traj_mask_total}, "
-                f"keep (time steps): {masked_keep_steps}/{masked_total_steps}"
-            )
-        else:
-            print(f"Trajectory updated: {n} waypoints -> {len(self.current_traj_array)} points")
+            self.current_traj_waypoints = waypoints.copy()
+            self.current_traj_array = waypoints.copy()
+
+        print(
+            f"Trajectory updated: {len(waypoints)} waypoints, "
+            f"mode={mode}, horizon={self.traj_horizon_tokens} tokens"
+        )
+
+    def _get_current_root_xyz(self) -> np.ndarray:
+        root_xyz = np.zeros(3, dtype=np.float32)
+        root_xyz[[0, 2]] = self.stream_recovery.r_pos_accum[[0, 2]].astype(np.float32)
+        return root_xyz
+
+    def _estimate_token_step_distance(self) -> float:
+        if len(self.root_xz_history) >= 5:
+            history = np.asarray(self.root_xz_history, dtype=np.float32)
+            frame_steps = np.linalg.norm(np.diff(history, axis=0), axis=1)
+            frame_steps = frame_steps[np.isfinite(frame_steps)]
+            if frame_steps.size > 0:
+                recent = frame_steps[-min(12, frame_steps.size) :]
+                token_step = float(np.median(recent) * 4.0)
+                return float(np.clip(token_step, self.min_token_step, self.max_token_step))
+        return self.default_token_step
+
+    @staticmethod
+    def _project_point_to_polyline(point_xyz: np.ndarray, waypoints_xyz: np.ndarray):
+        point_xz = point_xyz[[0, 2]]
+        if len(waypoints_xyz) == 1:
+            return waypoints_xyz[0].copy(), 0, 1.0
+
+        best_dist = None
+        best_proj = None
+        best_seg = 0
+        best_t = 0.0
+        for seg_idx in range(len(waypoints_xyz) - 1):
+            a = waypoints_xyz[seg_idx]
+            b = waypoints_xyz[seg_idx + 1]
+            a_xz = a[[0, 2]]
+            b_xz = b[[0, 2]]
+            ab = b_xz - a_xz
+            ab_len_sq = float(np.dot(ab, ab))
+            if ab_len_sq <= 1e-8:
+                t = 0.0
+                proj = a.copy()
+            else:
+                t = float(np.clip(np.dot(point_xz - a_xz, ab) / ab_len_sq, 0.0, 1.0))
+                proj = a + (b - a) * t
+            dist = float(np.linalg.norm(point_xz - proj[[0, 2]]))
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_proj = proj
+                best_seg = seg_idx
+                best_t = t
+        return best_proj, best_seg, best_t
+
+    @staticmethod
+    def _dedupe_polyline(points: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+        if len(points) <= 1:
+            return points
+        keep = [0]
+        for idx in range(1, len(points)):
+            if np.linalg.norm(points[idx, [0, 2]] - points[keep[-1], [0, 2]]) > eps:
+                keep.append(idx)
+        return points[keep]
+
+    def _build_remaining_polyline(self, root_xyz: np.ndarray, waypoints_xyz: np.ndarray) -> np.ndarray:
+        projected, seg_idx, seg_t = self._project_point_to_polyline(root_xyz, waypoints_xyz)
+        suffix = [projected.astype(np.float32)]
+        if len(waypoints_xyz) > 1:
+            if seg_t < 1.0 - 1e-6:
+                suffix.append(waypoints_xyz[seg_idx + 1].astype(np.float32))
+                suffix.extend(waypoints_xyz[seg_idx + 2 :].astype(np.float32))
+            else:
+                suffix.extend(waypoints_xyz[seg_idx + 1 :].astype(np.float32))
+        path = np.vstack([root_xyz.astype(np.float32), np.asarray(suffix, dtype=np.float32)])
+        return self._dedupe_polyline(path)
+
+    @staticmethod
+    def _resample_polyline(points_xyz: np.ndarray, num_tokens: int, token_step: float) -> np.ndarray:
+        if num_tokens <= 0:
+            return np.zeros((0, 3), dtype=np.float32)
+        if len(points_xyz) == 0:
+            return np.zeros((num_tokens, 3), dtype=np.float32)
+        if len(points_xyz) == 1:
+            return np.repeat(points_xyz.astype(np.float32), num_tokens, axis=0)
+
+        seg_lens = np.linalg.norm(np.diff(points_xyz[:, [0, 2]], axis=0), axis=1)
+        cum = np.concatenate([np.zeros(1, dtype=np.float32), np.cumsum(seg_lens).astype(np.float32)])
+        total_len = float(cum[-1])
+        if total_len <= 1e-6:
+            return np.repeat(points_xyz[:1].astype(np.float32), num_tokens, axis=0)
+
+        sample_d = np.arange(num_tokens, dtype=np.float32) * float(token_step)
+        sample_d = np.clip(sample_d, 0.0, total_len)
+        out = np.empty((num_tokens, 3), dtype=np.float32)
+        for dim in range(3):
+            out[:, dim] = np.interp(sample_d, cum, points_xyz[:, dim]).astype(np.float32)
+        return out
+
+    def _build_stream_traj_input(self):
+        with self.traj_state_lock:
+            if self.current_traj_waypoints is None:
+                return None
+            waypoints = self.current_traj_waypoints.copy()
+            plan_version = self.traj_plan_version
+            traj_mode = self.current_traj_mode
+
+        current_root = self._get_current_root_xyz()
+        token_step = self._estimate_token_step_distance()
+        polyline = self._build_remaining_polyline(current_root, waypoints)
+        future_traj = self._resample_polyline(
+            polyline,
+            num_tokens=self.traj_horizon_tokens,
+            token_step=token_step,
+        )
+        token_mask = np.ones((1, future_traj.shape[0]), dtype=np.float32)
+        return {
+            "traj": future_traj[None, :, :],
+            "token_mask": token_mask,
+            "traj_mode": traj_mode,
+            "traj_plan_version": plan_version,
+        }
     
     def pause_generation(self):
         """Pause generation (keeps all state)"""
@@ -400,7 +506,7 @@ class ModelManager:
         self.frame_buffer.clear()
         self.vae.clear_cache()
         self.first_chunk = True
-        self.traj_token_index = 0
+        self.root_xz_history.clear()
         
         if history_length is not None:
             self.history_length = history_length
@@ -430,7 +536,11 @@ class ModelManager:
     
     def _generation_loop(self):
         """Background loop: each iteration produces one latent token (→ 4 motion frames).
-        When trajectory is set, passes one traj point per step into the model's stream buffer.
+
+        When trajectory control is active, each step passes a future token-horizon in
+        world coordinates. The model-side streaming path then rewrites only the future
+        conditioning slots and normalizes the full visible context window back to a
+        clip-local origin before trajectory encoding.
         """
         print("Generation loop started")
         
@@ -447,32 +557,15 @@ class ModelManager:
                         
                         # Generate one token (produces 4 frames from VAE)
                         x = {"text": [self.current_text]}
-                        if self.current_traj_features_frame is not None:
-                            tok_idx = min(self.traj_token_index, self.TRAJ_INTERP_LENGTH - 1)
-                            frm_start = tok_idx * 4
-                            frm_end = min(frm_start + 4, self.current_traj_features_frame.shape[0])
-                            frames = self.current_traj_features_frame[frm_start:frm_end]  # (≤4, 4)
-                            # Pad to exactly 4 frames if near trajectory end
-                            if frames.shape[0] < 4:
-                                pad = np.zeros((4 - frames.shape[0], 4), dtype=np.float32)
-                                frames = np.concatenate([frames, pad], axis=0)
-                            # Apply LocalTrajEncoder to match training path exactly:
-                            #   training: frame-level (B,T,4,4) → LocalTrajEncoder → (B,T,4) → TrajEncoder
-                            #   here:     (1,1,4,4)              → LocalTrajEncoder → (1,1,4) → TrajEncoder
-                            frames_t = torch.from_numpy(frames).float().to(device)  # (4, 4)
-                            frames_t = frames_t.unsqueeze(0).unsqueeze(0)           # (1, 1, 4, 4)
-                            tok_feat = self.model.local_traj_encoder(frames_t)      # (1, 1, 4)
-                            x["traj_features"] = tok_feat  # (1, 1, 4) tensor, matches buffer shape
-                            if self.current_token_mask is not None:
-                                x["token_mask"] = self.current_token_mask[tok_idx : tok_idx + 1][None, :]  # (1,1)
+                        traj_input = self._build_stream_traj_input()
+                        if traj_input is not None:
+                            x.update(traj_input)
                         
                         # Generate from model (1 token)
                         # Note: denoise_steps is set in init_generated, not here
                         output = self.model.stream_generate_step(
                             x, first_chunk=self.first_chunk
                         )
-                        if self.current_traj_features_frame is not None:
-                            self.traj_token_index += 1
                         generated = output["generated"]
                         
                         # Decode with VAE (1 token -> 4 frames)
@@ -486,6 +579,9 @@ class ModelManager:
                         for i in range(decoded.shape[0]):
                             frame_data = decoded[i].cpu().numpy()
                             joints = self.stream_recovery.process_frame(frame_data)
+                            self.root_xz_history.append(
+                                self.stream_recovery.r_pos_accum[[0, 2]].astype(np.float32).copy()
+                            )
                             self.frame_buffer.add_frame(joints)
                         
                         step_time = time.time() - step_start
@@ -523,7 +619,7 @@ class ModelManager:
             "target_size": self.frame_buffer.target_size,
             "is_generating": self.is_generating,
             "current_text": self.current_text,
-            "trajectory_active": self.current_traj_array is not None,
+            "trajectory_active": self.current_traj_waypoints is not None,
             "smoothing_alpha": self.smoothing_alpha,
             "denoise_steps": self.denoise_steps,
         }
@@ -541,4 +637,3 @@ def get_model_manager(config_path=None, traj_mask_cfg=None):
         _traj_mask_cfg = traj_mask_cfg or {}
         _model_manager = ModelManager(config_path, traj_mask_cfg=_traj_mask_cfg)
     return _model_manager
-

@@ -1255,6 +1255,7 @@ class DiffForcingWanModel(nn.Module):
             if tf.dim() == 2:
                 tf = tf.unsqueeze(0)
             if tf.dim() == 3 and tf.size(0) == self.batch_size:
+                self.traj_buffer = None
                 if self.traj_features_buffer is None:
                     self.traj_features_buffer = torch.zeros(
                         self.batch_size, buf_len, tf.size(-1), device=device, dtype=tf.dtype
@@ -1262,12 +1263,14 @@ class DiffForcingWanModel(nn.Module):
                 else:
                     self.traj_features_buffer = self.traj_features_buffer.to(device)
                 k = max(0, min(tf.size(1), buf_len - self.commit_index))
+                self.traj_features_buffer[:, self.commit_index :, :] = 0
                 if k > 0:
                     self.traj_features_buffer[:, self.commit_index : self.commit_index + k, :] = tf[:, :k, :]
                     wrote = True
 
-                if "token_mask" in x and x["token_mask"] is not None:
-                    tm = x["token_mask"]
+                token_mask = x.get("token_mask")
+                if token_mask is not None:
+                    tm = token_mask
                     if isinstance(tm, np.ndarray):
                         tm = torch.from_numpy(tm).float().to(device)
                     if tm.dim() == 1:
@@ -1279,8 +1282,18 @@ class DiffForcingWanModel(nn.Module):
                             )
                         else:
                             self.token_mask_buffer = self.token_mask_buffer.to(device)
+                        self.token_mask_buffer[:, self.commit_index :] = 0
                         if k > 0:
                             self.token_mask_buffer[:, self.commit_index : self.commit_index + k] = tm[:, :k]
+                elif k > 0:
+                    if self.token_mask_buffer is None:
+                        self.token_mask_buffer = torch.zeros(
+                            self.batch_size, buf_len, device=device, dtype=tf.dtype
+                        )
+                    else:
+                        self.token_mask_buffer = self.token_mask_buffer.to(device)
+                    self.token_mask_buffer[:, self.commit_index :] = 0
+                    self.token_mask_buffer[:, self.commit_index : self.commit_index + k] = 1
 
         if "traj" in x and x["traj"] is not None:
             traj_in = x["traj"]
@@ -1291,6 +1304,7 @@ class DiffForcingWanModel(nn.Module):
             if traj_in.dim() == 1:
                 traj_in = traj_in.unsqueeze(0).unsqueeze(0)
             if traj_in.dim() == 3 and traj_in.size(0) == self.batch_size:
+                self.traj_features_buffer = None
                 if self.traj_buffer is None:
                     self.traj_buffer = torch.zeros(
                         self.batch_size, buf_len, 3, device=device, dtype=torch.float32
@@ -1298,13 +1312,41 @@ class DiffForcingWanModel(nn.Module):
                 else:
                     self.traj_buffer = self.traj_buffer.to(device)
                 k = max(0, min(traj_in.size(1), buf_len - self.commit_index))
+                self.traj_buffer[:, self.commit_index :, :] = 0
                 if k > 0:
                     self.traj_buffer[:, self.commit_index : self.commit_index + k, :] = traj_in[:, :k, :].to(device)
                     wrote = True
+                if self.token_mask_buffer is None:
+                    self.token_mask_buffer = torch.zeros(
+                        self.batch_size, buf_len, device=device, dtype=torch.float32
+                    )
+                else:
+                    self.token_mask_buffer = self.token_mask_buffer.to(device)
+                self.token_mask_buffer[:, self.commit_index :] = 0
+                tm = x.get("token_mask")
+                if tm is not None:
+                    if isinstance(tm, np.ndarray):
+                        tm = torch.from_numpy(tm).float().to(device)
+                    if tm.dim() == 1:
+                        tm = tm.unsqueeze(0)
+                    if tm.dim() == 2 and tm.size(0) == self.batch_size and k > 0:
+                        self.token_mask_buffer[:, self.commit_index : self.commit_index + k] = tm[:, :k]
+                elif k > 0:
+                    self.token_mask_buffer[:, self.commit_index : self.commit_index + k] = 1
 
         if wrote:
             self._traj_stream_version += 1
             self._traj_emb_cache = {}
+
+    def _expand_traj_tokens_to_causal_frames(self, traj_tokens):
+        if traj_tokens.size(1) <= 1:
+            return traj_tokens[:, :1, :]
+        alpha = traj_tokens.new_tensor([0.25, 0.5, 0.75, 1.0]).view(1, 1, 4, 1)
+        prev_tok = traj_tokens[:, :-1, :]
+        next_tok = traj_tokens[:, 1:, :]
+        interp = prev_tok.unsqueeze(2) + (next_tok - prev_tok).unsqueeze(2) * alpha
+        interp = interp.reshape(traj_tokens.shape[0], -1, traj_tokens.shape[-1])
+        return torch.cat([traj_tokens[:, :1, :], interp], dim=1)
 
     def _stream_build_traj_emb(self, x, end_index, device):
         if self.traj_encoder is None:
@@ -1337,6 +1379,9 @@ class DiffForcingWanModel(nn.Module):
             if self.use_traj_emb_cache and key in self._traj_emb_cache:
                 return self._traj_emb_cache[key]
             traj_slice = self.traj_buffer[:, start_t:end_index, :]
+            mask = None
+            if self.token_mask_buffer is not None:
+                mask = self.token_mask_buffer[:, start_t:end_index]
             if traj_slice.size(1) < ctx_len:
                 pad_len = ctx_len - traj_slice.size(1)
                 traj_slice = torch.cat(
@@ -1346,7 +1391,31 @@ class DiffForcingWanModel(nn.Module):
                     ],
                     dim=1,
                 )
-            feats_frame = root_to_traj_feats(traj_slice)  # (B, T_frames, 4)
+                if mask is not None:
+                    mask = torch.cat(
+                        [
+                            torch.zeros(self.batch_size, pad_len, device=device, dtype=mask.dtype),
+                            mask,
+                        ],
+                        dim=1,
+                    )
+
+            traj_slice = traj_slice.clone()
+            if mask is not None:
+                valid = mask > 0
+                first_valid = valid.to(dtype=torch.long).argmax(dim=1)
+                anchor = traj_slice[
+                    torch.arange(self.batch_size, device=device),
+                    first_valid,
+                ]
+            else:
+                anchor = traj_slice[:, 0, :]
+            traj_slice = traj_slice - anchor.unsqueeze(1)
+            if mask is not None:
+                traj_slice = traj_slice * mask.unsqueeze(-1).to(dtype=traj_slice.dtype)
+
+            traj_frames = self._expand_traj_tokens_to_causal_frames(traj_slice)
+            feats_frame = root_to_traj_feats(traj_frames)  # (B, T_frames, 4)
             # Apply the same LocalTrajEncoder grouping as the training path (_build_traj_emb).
             # Causal VAE: N tokens → 4*(N-1)+1 frames; group frames into (B, ctx_len, 4, 4).
             total_causal = 4 * (ctx_len - 1) + 1 if ctx_len > 1 else 1
@@ -1364,6 +1433,8 @@ class DiffForcingWanModel(nn.Module):
             if self.local_traj_encoder is None:
                 return None
             feats_tok = self.local_traj_encoder(feats_4)  # (B, ctx_len, 4)
+            if mask is not None:
+                feats_tok = feats_tok * mask.unsqueeze(-1).to(dtype=feats_tok.dtype)
             emb = self.traj_encoder(feats_tok)
             if self.use_traj_emb_cache:
                 self._traj_emb_cache[key] = emb

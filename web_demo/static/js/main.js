@@ -804,7 +804,8 @@ class MotionApp {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     session_id: this.sessionId,
-                    waypoints: waypoints && waypoints.length > 0 ? waypoints : null
+                    waypoints: waypoints && waypoints.length > 0 ? waypoints : null,
+                    mode: 'replace_future'
                 })
             });
         } catch (err) {
@@ -942,4 +943,3 @@ class MotionApp {
 window.addEventListener('DOMContentLoaded', () => {
     window.app = new MotionApp();
 });
-

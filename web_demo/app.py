@@ -259,11 +259,18 @@ def update_text():
 
 @app.route('/api/update_trajectory', methods=['POST'])
 def update_trajectory():
-    """Update trajectory control (waypoints). Pass waypoints as list of [x,z] or [x,y,z]. Pass null/empty to clear."""
+    """Update trajectory control (waypoints).
+
+    V1 semantics:
+    - `mode=replace_future` replaces only the future trajectory plan used by streaming.
+    - `waypoints` stay in world-space coordinates (`[x, z]` or `[x, y, z]`).
+    - `null` / empty clears trajectory control.
+    """
     try:
         data = request.json or {}
         session_id = data.get('session_id')
         waypoints = data.get('waypoints')
+        mode = data.get('mode', 'replace_future')
         
         if not session_id:
             return jsonify({
@@ -284,11 +291,12 @@ def update_trajectory():
                     'message': 'Not the active session'
                 }), 403
         
-        model_manager.update_trajectory(waypoints)
+        model_manager.update_trajectory(waypoints, mode=mode)
         
         return jsonify({
             'status': 'success',
-            'message': 'Trajectory updated' if waypoints else 'Trajectory cleared'
+            'message': 'Trajectory updated' if waypoints else 'Trajectory cleared',
+            'mode': mode,
         })
     except Exception as e:
         return jsonify({
@@ -542,4 +550,3 @@ if __name__ == '__main__':
     print(f"Demo config file: {demo_config_path}")
     print("Note: Model will be loaded on first generation request")
     app.run(host='0.0.0.0', port=args.port, debug=False, threaded=True)
-
