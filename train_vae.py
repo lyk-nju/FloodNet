@@ -1,4 +1,5 @@
 import os
+import random
 
 import numpy as np
 import torch
@@ -84,7 +85,7 @@ class CustomLightningModule(BasicLightningModule):
         for key, value in t2m_output.items():
             self.log(f"metrics/t2m_metrics/{key}", value, sync_dist=True)
 
-    def update_test(self, batch):
+    def update_test(self, batch, batch_idx=None, test_loader_idx=0):
         with self.ema.average_parameters(self.model.parameters()):
             output = self.model.generate(batch)
         motion = output["generated"]

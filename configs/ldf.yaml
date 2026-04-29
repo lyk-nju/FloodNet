@@ -9,8 +9,8 @@ dirs:
     raw_data: /data1/yuankai/text2Motion/FloodDiffusion/raw_data
 
 save_dir: ./outputs
-resume_ckpt: "/home/yuankai/Text2Motion/FloodDiffusion/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt"
-test_ckpt: /home/yuankai/Text2Motion/FloodDiffusion/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt
+resume_ckpt: "/home/yuankai/Text2Motion/FloodNet/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt"
+test_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt
 # resume_ckpt: "/home/yuankai/Text2Motion/FloodNet/outputs/20260421_105641_ldf/step_step=244000.ckpt"
 # test_ckpt: "/home/yuankai/Text2Motion/FloodNet/outputs/20260421_105641_ldf/step_step=244000.ckpt"
 # resume_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20260415_114956_ldf/step_step=245000.ckpt
@@ -43,7 +43,7 @@ logger:
 trainer: # lightning trainer
     max_steps: 360000
     accelerator: gpu
-    devices: [0,1,2,3,4]
+    devices: [4]
     log_every_n_steps: 100
     precision: bf16-mixed
 # Set to true to run T2M FID/R-Precision on val_meta_paths during eval.
@@ -51,10 +51,15 @@ trainer: # lightning trainer
 t2m_metric: false
 
 validation:
-    validation_steps: 2000
+    validation_steps: 2
     test_steps: 2000
     save_every_n_steps: 2000
     save_top_k: 100
+    eval_generation_metrics: true
+    eval_num_runs: 10
+    eval_seg_size: 20
+    eval_forward_control_loss: true
+    eval_forward_control_loss_window_mode: mean_chunk_windows
 metrics:
     dim: 263
     t2m:
@@ -95,15 +100,15 @@ data:
     target: datasets.humanml3d.HumanML3DDataset
     collate_fn: datasets.humanml3d.collate_fn
     train_bs: 8
-    val_bs: 16
+    val_bs: 64
     test_bs: 1
     num_workers: 4
     # mask_ratio: [0.2,0.3]       
     mask_ratio: 1.0
 
     train_meta_paths:
-        # - ${dirs.raw_data}/HumanML3D/train.txt
-        - ${dirs.raw_data}/HumanML3D/test_min.txt
+        - ${dirs.raw_data}/HumanML3D/train.txt
+        # - ${dirs.raw_data}/HumanML3D/test_min.txt
         # - ${dirs.raw_data}/HumanML3D/val.txt
     val_meta_paths:
         - ${dirs.raw_data}/HumanML3D/val.txt
@@ -111,6 +116,14 @@ data:
         # - ${dirs.raw_data}/HumanML3D/test.txt
     test_meta_paths:
         - ${dirs.raw_data}/HumanML3D/test_min.txt
+    # Optional separate inline probe sets.
+    # When set, these override the single test_meta_paths loader and produce
+    # separate metric prefixes such as eval/test/... and eval/train/...
+    # test_probe_meta_paths:
+    #     test:
+    #         - ${dirs.raw_data}/HumanML3D/test_probe.txt
+    #     train:
+    #         - ${dirs.raw_data}/HumanML3D/train_probe.txt
     feature_path: "new_joint_vecs"
     token_path: "TOKENS_20251030_085836_vae_wan_z4"
     text_path: "texts"

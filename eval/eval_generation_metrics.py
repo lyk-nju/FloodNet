@@ -6,6 +6,8 @@ Two-pass evaluation:
   Pass 1 — test_meta_paths (small set, e.g. test_min.txt)
     • Autoregressive generation + video rendering
     • Trajectory control metrics: ADE, FDE, MSE (masked XZ)
+    • OmniControl / MotionLCM-compatible control metrics:
+      Control L2 dist, Skating Ratio, traj_fail/kps_fail
     • Segment MSE & prefix MSE (error accumulation over time)
     • [--forward_control_loss]  training-equivalent active-window XZ loss
     • [--traj_ablation]         generate WITHOUT traj conditioning → ablation ADE/FDE/MSE
@@ -23,6 +25,7 @@ Usage:
         --forward_control_loss --traj_ablation --viz_traj --topk 3
 """
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -41,7 +44,7 @@ if PROJECT_ROOT not in sys.path:
 
 from metrics.t2m import T2MMetrics
 from utils.initialize import Config, get_function, instantiate, load_config, compare_statedict_and_parameters
-from utils.motion_process import extract_root_trajectory_263_torch
+from utils.motion_process import extract_root_trajectory_263_torch, recover_joint_positions_263
 from utils.traj_batch import root_to_traj_feats
 from utils.visualize import make_composite_compare_videos, render_video
 
@@ -88,6 +91,10 @@ def parse_args():
                         help="Number of generation runs per sample; metrics are averaged across runs.")
     parser.add_argument("--out_dir", type=str, default=None,
                         help="Root directory for eval outputs (default: eval/ next to this script).")
+    parser.add_argument("--probe_tag", type=str, default=None,
+                        help="Optional probe label used in output path / summaries, e.g. train or test.")
+    parser.add_argument("--meta_paths", nargs="+", default=None,
+                        help="Override cfg.data.test_meta_paths for this evaluation run.")
     return parser.parse_args()
 
 
@@ -97,12 +104,37 @@ def parse_args():
 
 def _set_seed(seed: int):
     random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    np.random.seed(seed % (2**32))
+    gen = torch.Generator()
+    gen.manual_seed(int(seed))
+    torch.random.set_rng_state(gen.get_state())
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+        torch.cuda.manual_seed(int(seed))
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
+
+
+def _stable_eval_seed(base_seed: int, probe_tag: str, sample_name: str, run_idx: int) -> int:
+    digest = hashlib.md5(f"{probe_tag}:{sample_name}:{run_idx}".encode("utf-8")).hexdigest()
+    offset = int(digest[:8], 16)
+    return int(base_seed) + offset
+
+
+def _get_metric_statistics(values: np.ndarray, replication_times: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    mean = np.mean(values, axis=0)
+    std = np.std(values, axis=0)
+    conf_interval = 1.96 * std / np.sqrt(max(replication_times, 1))
+    return mean, std, conf_interval
+
+
+def _infer_meta_tag(meta_paths) -> str:
+    if not meta_paths:
+        return "meta"
+    first = str(meta_paths[0])
+    stem = Path(first).stem
+    if stem.endswith("_min"):
+        stem = stem[:-4]
+    return stem or "meta"
 
 
 def _to_device(obj: Any, device: torch.device):
@@ -113,6 +145,25 @@ def _to_device(obj: Any, device: torch.device):
     if isinstance(obj, (list, tuple)):
         return type(obj)(_to_device(v, device) for v in obj)
     return obj
+
+
+def _slice_single_sample_batch(batch: Dict, sample_idx: int) -> Dict:
+    sample_batch: Dict = {}
+    batch_size = len(batch["name"])
+    for key, value in batch.items():
+        if torch.is_tensor(value):
+            if value.ndim > 0 and value.shape[0] == batch_size:
+                sample_batch[key] = value[sample_idx : sample_idx + 1]
+            else:
+                sample_batch[key] = value
+        elif isinstance(value, list):
+            if len(value) == batch_size:
+                sample_batch[key] = [value[sample_idx]]
+            else:
+                sample_batch[key] = value
+        else:
+            sample_batch[key] = value
+    return sample_batch
 
 
 def _copy_traj_fields(batch: Dict, model_batch: Dict):
@@ -289,6 +340,113 @@ def _average_traj_metrics(run_metrics: List[Dict]) -> Dict:
     return result
 
 
+def _moving_average_same(x: np.ndarray, window: int) -> np.ndarray:
+    if window <= 1:
+        return x.copy()
+    kernel = np.ones(window, dtype=np.float32) / float(window)
+    return np.convolve(x, kernel, mode="same")
+
+
+def _calculate_skating_ratio_from_joints(joints_xyz: np.ndarray) -> float:
+    """HumanML3D-compatible skating ratio using the same thresholds as OmniControl."""
+    if joints_xyz.ndim != 3 or joints_xyz.shape[0] < 2:
+        return float("nan")
+    fps = 20.0
+    thresh_height = 0.05
+    thresh_vel = 0.50
+    avg_window = 5
+    if joints_xyz.shape[1] == 22:
+        foot_ids = [10, 11]
+    elif joints_xyz.shape[1] == 21:
+        foot_ids = [15, 20]
+    else:
+        return float("nan")
+
+    feet = joints_xyz[:, foot_ids, :]  # (T, 2, 3)
+    plane_vel = np.linalg.norm(feet[1:, :, [0, 2]] - feet[:-1, :, [0, 2]], axis=-1) * fps  # (T-1, 2)
+    vel_avg = np.stack(
+        [_moving_average_same(plane_vel[:, j], avg_window) for j in range(plane_vel.shape[1])],
+        axis=1,
+    )
+    feet_height = feet[:, :, 1]  # (T, 2)
+    feet_contact = np.logical_and(feet_height[:-1] < thresh_height, feet_height[1:] < thresh_height)  # (T-1, 2)
+    skating = np.logical_and(feet_contact, plane_vel > thresh_vel)
+    skating = np.logical_and(skating, vel_avg > thresh_vel)
+    skating = np.logical_or(skating[:, 0], skating[:, 1])  # (T-1,)
+    return float(skating.mean()) if skating.size > 0 else float("nan")
+
+
+def _compute_omni_control_metrics(
+    decoded_generated: torch.Tensor,   # (T_pred, 263)
+    batch: Dict,
+    sample_idx: int,
+) -> Dict:
+    """OmniControl / MotionLCM-compatible pelvis-control metrics."""
+    with torch.no_grad():
+        pred_traj_xyz = extract_root_trajectory_263_torch(decoded_generated[None, :])[0].cpu()  # (T_pred, 3)
+
+    traj_len = (int(batch["traj_length"][sample_idx].item())
+                if "traj_length" in batch else batch["traj"][sample_idx].shape[0])
+    gt_traj_xyz = batch["traj"][sample_idx][:traj_len].float().cpu()
+    mask = batch["traj_mask"][sample_idx][:traj_len].float().cpu() > 0
+
+    T = min(pred_traj_xyz.shape[0], gt_traj_xyz.shape[0])
+    pred_traj_xyz = pred_traj_xyz[:T]
+    gt_traj_xyz = gt_traj_xyz[:T]
+    mask = mask[:T]
+    n_masked = int(mask.sum().item())
+
+    result: Dict = {"control_T": T, "control_masked_ratio": float(n_masked / max(T, 1))}
+    if n_masked > 0:
+        dist_error = (pred_traj_xyz - gt_traj_xyz).norm(dim=-1)[mask].numpy()
+        mean_error = float(dist_error.mean())
+        result["control_l2_dist"] = mean_error
+        result["traj_fail_20cm"] = float(1.0 - float((dist_error <= 0.2).all()))
+        result["traj_fail_50cm"] = float(1.0 - float((dist_error <= 0.5).all()))
+        result["kps_fail_20cm"] = float((dist_error > 0.2).mean())
+        result["kps_fail_50cm"] = float((dist_error > 0.5).mean())
+        result["kps_mean_err_m"] = mean_error
+    else:
+        for key in (
+            "control_l2_dist",
+            "traj_fail_20cm",
+            "traj_fail_50cm",
+            "kps_fail_20cm",
+            "kps_fail_50cm",
+            "kps_mean_err_m",
+        ):
+            result[key] = float("nan")
+
+    try:
+        joints_np = recover_joint_positions_263(decoded_generated.detach().cpu().numpy(), joints_num=22)
+        result["skating_ratio"] = _calculate_skating_ratio_from_joints(joints_np)
+    except Exception:
+        result["skating_ratio"] = float("nan")
+
+    return result
+
+
+def _average_control_metrics(run_metrics: List[Dict]) -> Dict:
+    """Average OmniControl-compatible scalar metrics across multiple runs."""
+    if len(run_metrics) == 1:
+        return run_metrics[0].copy()
+    result: Dict = {}
+    for key in (
+        "control_l2_dist",
+        "skating_ratio",
+        "traj_fail_20cm",
+        "traj_fail_50cm",
+        "kps_fail_20cm",
+        "kps_fail_50cm",
+        "kps_mean_err_m",
+    ):
+        vals = [r[key] for r in run_metrics if key in r and r[key] == r[key]]
+        if vals:
+            result[key] = float(np.mean(vals))
+            result[f"{key}_std"] = float(np.std(vals))
+    return result
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Forward control loss (training-equivalent active-window XZ loss)
 # From eval_control_loss.py — runs model() forward pass, not generate()
@@ -301,11 +459,16 @@ def _compute_fwd_ctrl_loss_per_sample(
     traj_length: torch.Tensor,
     vae,
     device: torch.device,
+    train_mode: int = 3,
     chunk_size_tokens: Optional[int] = None,
     token_to_frame: int = 4,
 ) -> List[Dict]:
-    """Active-window XZ control loss per sample, matching train_ldf forward logic."""
+    """XZ control loss per sample, matching train_ldf::_compute_control_loss_xz semantics."""
     out = []
+    use_active_window = train_mode in (1, 2, 5, 6)
+    detach_past = train_mode in (2, 4)
+    relative_disp = train_mode in (5, 6)
+    relative_disp_gt_anchor = train_mode == 6
     for i in range(len(pred_list)):
         pred_latent_full = pred_list[i].to(device)
         t_tok = pred_latent_full.size(0)
@@ -315,19 +478,27 @@ def _compute_fwd_ctrl_loss_per_sample(
             start_f = 0 if start_tok == 0 else 4 * start_tok - 3
             end_f = t_tok * token_to_frame
         else:
+            start_tok = 0
             start_f = 0
             end_f = None
 
-        decoded = vae.decode(pred_latent_full.unsqueeze(0))[0].float()
+        if detach_past and start_tok > 0:
+            latent_for_decode = torch.cat(
+                [pred_latent_full[:start_tok].detach(), pred_latent_full[start_tok:]], dim=0
+            )
+        else:
+            latent_for_decode = pred_latent_full
+
+        decoded = vae.decode(latent_for_decode.unsqueeze(0))[0].float()
         l_motion = decoded.size(0)
         l_gt_total = min(int(traj_length[i].item()), traj.shape[1])
 
-        if end_f is None:
-            pred_sl = slice(0, l_motion)
-            gt_sl   = slice(0, l_gt_total)
-        else:
+        if use_active_window and end_f is not None:
             pred_sl = slice(min(start_f, l_motion), min(end_f, l_motion))
             gt_sl   = slice(min(start_f, l_gt_total), min(end_f, l_gt_total))
+        else:
+            pred_sl = slice(0, l_motion)
+            gt_sl   = slice(0, l_gt_total)
 
         l = min(pred_sl.stop - pred_sl.start, gt_sl.stop - gt_sl.start)
         if l <= 0:
@@ -341,12 +512,97 @@ def _compute_fwd_ctrl_loss_per_sample(
 
         pred_xz = pred_traj[..., [0, 2]]
         gt_xz   = gt_traj[..., [0, 2]]
+
+        if relative_disp:
+            if relative_disp_gt_anchor:
+                gt_anchor = gt_xz[:, 0:1, :].detach()
+                pred_xz   = pred_xz - pred_xz[:, 0:1, :].detach()
+                gt_xz     = gt_xz   - gt_anchor
+            else:
+                anchor  = pred_xz[:, 0:1, :].detach()
+                pred_xz = pred_xz - anchor
+                gt_xz   = gt_xz   - gt_xz[:, 0:1, :]
+
         sq_err  = ((pred_xz - gt_xz) ** 2).sum(dim=-1)
         n_valid = float(mask.sum().item())
         loss_val = float((mask * sq_err).sum().item() / n_valid) if n_valid > 0 else float("nan")
 
         out.append({"loss": loss_val, "n_valid": n_valid, "window_len": l})
     return out
+
+
+def _iter_deterministic_time_steps(valid_len: int, chunk_size: int, mode: str = "mean_chunk_windows") -> List[float]:
+    valid_len = int(valid_len)
+    if valid_len <= 0:
+        return []
+    if mode == "last_window":
+        return [float((valid_len - 1) / chunk_size)]
+
+    end_indices = list(range(1, valid_len + 1, chunk_size))
+    if end_indices[-1] != valid_len:
+        end_indices.append(valid_len)
+    return [float((end_idx - 1) / chunk_size) for end_idx in end_indices]
+
+
+def _compute_deterministic_fwd_ctrl_loss_sample(
+    model,
+    sample_batch: Dict,
+    vae,
+    device: torch.device,
+    train_mode: int,
+    chunk_size_tokens: Optional[int] = None,
+    window_mode: str = "mean_chunk_windows",
+) -> Dict:
+    valid_len = int(sample_batch["token_length"][0].item())
+    time_steps = _iter_deterministic_time_steps(valid_len, model.chunk_size, mode=window_mode)
+    if not time_steps:
+        return {"loss": float("nan"), "loss_std": float("nan"), "n_valid": 0.0, "window_len": 0.0, "num_windows": 0}
+
+    losses = []
+    n_valids = []
+    win_lens = []
+    for t in time_steps:
+        model_batch = _build_model_batch(sample_batch, device)
+        model_batch["_time_steps_override"] = torch.tensor([t], device=device, dtype=torch.float32)
+        with torch.no_grad():
+            fwd_out = model(model_batch)
+        if "control_aux" not in fwd_out:
+            continue
+        pred_list = fwd_out["control_aux"]["pred_x0_latent_list"]
+        stats = _compute_fwd_ctrl_loss_per_sample(
+            pred_list=pred_list,
+            traj=model_batch["traj"],
+            traj_mask=model_batch["traj_mask"],
+            traj_length=model_batch["traj_length"],
+            vae=vae,
+            device=device,
+            train_mode=train_mode,
+            chunk_size_tokens=chunk_size_tokens,
+        )
+        if not stats:
+            continue
+        stat = stats[0]
+        if stat["loss"] == stat["loss"]:
+            losses.append(stat["loss"])
+        n_valids.append(stat["n_valid"])
+        win_lens.append(stat["window_len"])
+
+    if not losses:
+        return {
+            "loss": float("nan"),
+            "loss_std": float("nan"),
+            "n_valid": float(np.mean(n_valids)) if n_valids else 0.0,
+            "window_len": float(np.mean(win_lens)) if win_lens else 0.0,
+            "num_windows": len(time_steps),
+        }
+
+    return {
+        "loss": float(np.mean(losses)),
+        "loss_std": float(np.std(losses)),
+        "n_valid": float(np.mean(n_valids)) if n_valids else 0.0,
+        "window_len": float(np.mean(win_lens)) if win_lens else 0.0,
+        "num_windows": len(time_steps),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -434,6 +690,9 @@ def main():
         override_args[key.strip()] = value.strip()
     cfg = load_config(config_path=args.config, override_args=override_args if override_args else None)
 
+    if args.meta_paths is not None:
+        cfg.config.data.test_meta_paths = list(args.meta_paths)
+
     if args.batch_size is not None:
         cfg.config.data.test_bs = args.batch_size
     if args.num_workers is not None:
@@ -447,18 +706,26 @@ def main():
         raise ValueError("No checkpoint provided via --ckpt / cfg.test_ckpt / cfg.resume_ckpt")
 
     save_dir = Path(args.out_dir) if args.out_dir else Path(__file__).parent
-    run_name = f"eval_{cfg.exp_name}_seed{args.seed}"
+    test_meta_paths = cfg.data.get("test_meta_paths", [])
+    probe_tag = args.probe_tag or _infer_meta_tag(test_meta_paths)
+    meta_tag = _infer_meta_tag(test_meta_paths)
+    run_name = f"eval_{cfg.exp_name}_{probe_tag}_{meta_tag}_seed{args.seed}"
     out_root  = save_dir / run_name
     out_root.mkdir(parents=True, exist_ok=True)
 
     print(f"[eval] ckpt     : {ckpt_path}")
     print(f"[eval] out_root : {out_root}")
     print(f"[eval] seed     : {args.seed}")
+    print(f"[eval] probe_tag : {probe_tag}")
+    print(f"[eval] meta_tag : {meta_tag}")
     print(f"[eval] t2m_metric: {run_t2m}")
 
     model = _load_model(cfg, ckpt_path, device=device, use_ema=not args.no_ema)
     vae   = _load_vae(cfg, device=device)
     chunk_size_tokens = getattr(model, "chunk_size", None)
+    control_loss_train_mode = int(cfg.get("control_loss_train_mode", 3))
+    val_cfg = cfg.get("validation", {})
+    fwd_ctrl_window_mode = str(val_cfg.get("eval_forward_control_loss_window_mode", "mean_chunk_windows"))
 
     collate_fn = get_function(cfg.data.collate_fn) if cfg.data.get("collate_fn") else None
 
@@ -496,7 +763,10 @@ def main():
     print(f"[eval] test samples (video + traj): {len(test_dataset)}")
     print(f"[eval] num_runs   : {args.num_runs}")
     if args.forward_control_loss:
-        print(f"[eval] forward_control_loss: ON  (chunk_size={chunk_size_tokens})")
+        print(
+            f"[eval] forward_control_loss: ON  "
+            f"(chunk_size={chunk_size_tokens}, mode={control_loss_train_mode}, window_mode={fwd_ctrl_window_mode})"
+        )
     if args.traj_ablation:
         print(f"[eval] traj_ablation: ON")
     if args.viz_traj:
@@ -506,28 +776,19 @@ def main():
     # PASS 1: test set — video generation + trajectory metrics
     # ══════════════════════════════════════════════════════════════════════════
     traj_records: List[Dict] = []
+    control_run_records: List[List[Dict]] = [[] for _ in range(args.num_runs)]
+    dataset_ids_seen = set()
 
     for bidx, batch in enumerate(test_loader):
         if args.max_batches > 0 and bidx >= args.max_batches:
             break
 
-        batch = _to_device(batch, device)
         batch_size_actual = len(batch["name"])
-
-        # Accumulate per-sample metrics across runs
-        sample_run_metrics: List[List[Dict]] = [[] for _ in range(batch_size_actual)]
-        text_cache: Optional[List[str]] = None
-        # Saved on run 0 for files/rendering/viz
-        decoded_run0:  List[Optional[torch.Tensor]]  = [None] * batch_size_actual
-        pred_xz_run0:  List[Optional[np.ndarray]]    = [None] * batch_size_actual
-        abl_xz_run0:   List[Optional[np.ndarray]]    = [None] * batch_size_actual
-        fwd_stats_batch: Optional[List[Dict]] = None
-        ablation_generated_run0: Optional[List] = None
-
-        # Resolve directories once (outside run loop)
-        sample_root_cache: Dict[int, Any] = {}
         for i in range(batch_size_actual):
-            dataset_id = batch["dataset"][i]
+            sample_batch = _slice_single_sample_batch(batch, i)
+            sample_name = sample_batch["name"][0]
+            dataset_id = sample_batch["dataset"][0]
+            dataset_ids_seen.add(dataset_id)
             sample_root = out_root / dataset_id
             dirs = {
                 "text":         sample_root / "text",
@@ -541,124 +802,114 @@ def main():
                 "composite":    sample_root / "composite",
                 "viz":          sample_root / "traj_viz",
             }
-            for k, d in dirs.items():
-                if k != "viz":
-                    d.mkdir(parents=True, exist_ok=True)
-            sample_root_cache[i] = dirs
+            for key, out_dir in dirs.items():
+                if key != "viz":
+                    out_dir.mkdir(parents=True, exist_ok=True)
 
-        for run_idx in range(args.num_runs):
-            _set_seed(args.seed + run_idx * 100000 + bidx)
+            sample_run_metrics: List[Dict] = []
+            sample_control_run_metrics: List[Dict] = []
+            sample_ablation_run_metrics: List[Dict] = []
+            fwd_stat: Optional[Dict] = None
+            pred_xz_run0: Optional[np.ndarray] = None
+            abl_xz_run0: Optional[np.ndarray] = None
 
-            with torch.no_grad():
-                model_batch = _build_model_batch(batch, device)
-                output = model.generate(model_batch)
+            if args.forward_control_loss and "traj" in sample_batch:
+                try:
+                    fwd_stat = _compute_deterministic_fwd_ctrl_loss_sample(
+                        model=model,
+                        sample_batch=sample_batch,
+                        vae=vae,
+                        device=device,
+                        train_mode=control_loss_train_mode,
+                        chunk_size_tokens=chunk_size_tokens,
+                        window_mode=fwd_ctrl_window_mode,
+                    )
+                except Exception as e:
+                    print(f"[fwd_ctrl_loss] sample={sample_name} deterministic eval failed: {e}")
 
-            generated = output["generated"]
-            if text_cache is None:
-                text_cache = output.get("text", [""] * len(generated))
+            for run_idx in range(args.num_runs):
+                _set_seed(_stable_eval_seed(args.seed, probe_tag, sample_name, run_idx))
 
-            # fwd_ctrl_loss and ablation: run once on run 0
-            if run_idx == 0:
-                if args.forward_control_loss and "traj" in batch:
-                    try:
-                        with torch.no_grad():
-                            fwd_out = model(model_batch)
-                        if "control_aux" in fwd_out:
-                            pred_list = fwd_out["control_aux"]["pred_x0_latent_list"]
-                            fwd_stats_batch = _compute_fwd_ctrl_loss_per_sample(
-                                pred_list=pred_list,
-                                traj=model_batch["traj"],
-                                traj_mask=model_batch["traj_mask"],
-                                traj_length=model_batch["traj_length"],
-                                vae=vae,
-                                device=device,
-                                chunk_size_tokens=chunk_size_tokens,
+                with torch.no_grad():
+                    model_batch = _build_model_batch(sample_batch, device)
+                    output = model.generate(model_batch)
+
+                single_generated = output["generated"][0].detach()
+                decoded_generated = vae.decode(single_generated[None, :].to(device))[0].float().detach().to(device)
+
+                if run_idx == 0:
+                    sample_text = output.get("text", [""])[0]
+                    (dirs["text"] / f"{sample_name}.txt").write_text(sample_text)
+                    np.save(dirs["token"] / f"{sample_name}.npy", single_generated.float().cpu().numpy())
+                    np.save(dirs["feature"] / f"{sample_name}.npy", decoded_generated.float().cpu().numpy())
+
+                    if "traj_features" in sample_batch:
+                        cond = sample_batch["traj_features"][0]
+                        if torch.is_tensor(cond):
+                            cond = cond.detach().cpu().numpy()
+                        cond = np.asarray(cond)
+                        if cond.ndim == 2 and cond.shape[1] >= 2:
+                            np.save(dirs["cond_traj"] / f"{sample_name}.npy", cond[:, :2].astype(np.float32))
+                    elif "traj" in sample_batch:
+                        tr = sample_batch["traj"][0]
+                        if torch.is_tensor(tr):
+                            tr = tr.detach().cpu().numpy()
+                        tr = np.asarray(tr)
+                        if tr.ndim == 2 and tr.shape[1] >= 3:
+                            np.save(
+                                dirs["cond_traj"] / f"{sample_name}.npy",
+                                root_to_traj_feats(tr)[:, :2].astype(np.float32),
                             )
-                    except Exception as e:
-                        print(f"[fwd_ctrl_loss] bidx={bidx:05d} failed: {e}")
+                    if "traj_mask" in sample_batch:
+                        m = sample_batch["traj_mask"][0]
+                        if torch.is_tensor(m):
+                            m = m.detach().cpu().numpy()
+                        np.save(dirs["traj_mask"] / f"{sample_name}.npy", np.asarray(m).reshape(-1))
+                    if "feature_text_end" in sample_batch:
+                        frames = sample_batch["feature_text_end"][0]
+                        if torch.is_tensor(frames):
+                            frames = frames.detach().cpu().numpy()
+                        np.save(dirs["frames"] / f"{sample_name}.npy", np.asarray(frames))
+
+                    with torch.no_grad():
+                        pred_xz_run0 = extract_root_trajectory_263_torch(
+                            decoded_generated[None, :]
+                        )[0, :, [0, 2]].cpu().numpy().astype(np.float32)
+                    np.save(dirs["pred_traj"] / f"{sample_name}.npy", pred_xz_run0)
 
                 if args.traj_ablation:
                     try:
                         with torch.no_grad():
-                            mb_no_traj = _build_model_batch(_remove_traj_fields(batch), device)
+                            mb_no_traj = _build_model_batch(_remove_traj_fields(sample_batch), device)
                             out_no = model.generate(mb_no_traj)
-                        ablation_generated_run0 = out_no["generated"]
+                        abl_single = out_no["generated"][0].detach()
+                        abl_decoded = vae.decode(abl_single[None, :].to(device))[0].float().detach().to(device)
+
+                        if run_idx == 0:
+                            with torch.no_grad():
+                                abl_xz_run0 = extract_root_trajectory_263_torch(
+                                    abl_decoded[None, :]
+                                )[0, :, [0, 2]].cpu().numpy().astype(np.float32)
+
+                        if "traj" in sample_batch and "traj_mask" in sample_batch:
+                            sample_ablation_run_metrics.append(
+                                _compute_traj_metrics(
+                                    abl_decoded, sample_batch, 0, seg_size=args.seg_size
+                                )
+                            )
                     except Exception as e:
-                        print(f"[traj_ablation] bidx={bidx:05d} failed: {e}")
+                        print(f"[traj_ablation] sample={sample_name} run={run_idx} failed: {e}")
 
-            for i in range(len(generated)):
-                sample_name = batch["name"][i]
-                dirs = sample_root_cache[i]
-
-                single_generated  = generated[i].detach()
-                decoded_generated = vae.decode(single_generated[None, :].to(device))[0].float().detach().to(device)
-
-                # Files: save only on run 0
-                if run_idx == 0:
-                    decoded_run0[i] = decoded_generated
-                    sample_text = text_cache[i] if text_cache and i < len(text_cache) else ""
-                    (dirs["text"] / f"{sample_name}.txt").write_text(sample_text)
-                    np.save(dirs["token"]   / f"{sample_name}.npy", single_generated.float().cpu().numpy())
-                    np.save(dirs["feature"] / f"{sample_name}.npy", decoded_generated.float().cpu().numpy())
-
-                    if "traj_features" in batch:
-                        cond = batch["traj_features"][i]
-                        if torch.is_tensor(cond): cond = cond.detach().cpu().numpy()
-                        cond = np.asarray(cond)
-                        if cond.ndim == 2 and cond.shape[1] >= 2:
-                            np.save(dirs["cond_traj"] / f"{sample_name}.npy", cond[:, :2].astype(np.float32))
-                    elif "traj" in batch:
-                        tr = batch["traj"][i]
-                        if torch.is_tensor(tr): tr = tr.detach().cpu().numpy()
-                        tr = np.asarray(tr)
-                        if tr.ndim == 2 and tr.shape[1] >= 3:
-                            np.save(dirs["cond_traj"] / f"{sample_name}.npy",
-                                    root_to_traj_feats(tr)[:, :2].astype(np.float32))
-                    if "traj_mask" in batch:
-                        m = batch["traj_mask"][i]
-                        if torch.is_tensor(m): m = m.detach().cpu().numpy()
-                        np.save(dirs["traj_mask"] / f"{sample_name}.npy", np.asarray(m).reshape(-1))
-                    if "feature_text_end" in batch:
-                        frames = batch["feature_text_end"][i]
-                        if torch.is_tensor(frames): frames = frames.detach().cpu().numpy()
-                        np.save(dirs["frames"] / f"{sample_name}.npy", np.asarray(frames))
-
-                    with torch.no_grad():
-                        pred_xz_np = extract_root_trajectory_263_torch(
-                            decoded_generated[None, :]
-                        )[0, :, [0, 2]].cpu().numpy().astype(np.float32)
-                    pred_xz_run0[i] = pred_xz_np
-                    np.save(dirs["pred_traj"] / f"{sample_name}.npy", pred_xz_np)
-
-                # Traj metrics: every run
-                if "traj" in batch and "traj_mask" in batch:
-                    rec = _compute_traj_metrics(decoded_generated, batch, i, seg_size=args.seg_size)
-                    sample_run_metrics[i].append(rec)
-
-        # ── Ablation XZ (run 0) ───────────────────────────────────────────────
-        if ablation_generated_run0 is not None:
-            for i in range(len(ablation_generated_run0)):
-                abl_single  = ablation_generated_run0[i].detach()
-                abl_decoded = vae.decode(abl_single[None, :].to(device))[0].float().detach().to(device)
-                with torch.no_grad():
-                    abl_xz_run0[i] = extract_root_trajectory_263_torch(
-                        abl_decoded[None, :]
-                    )[0, :, [0, 2]].cpu().numpy().astype(np.float32)
-
-        # ── Build final per-sample record (averaged across runs) ──────────────
-        feature_dir = sample_root_cache[0]["feature"] if batch_size_actual > 0 else None
-        video_dir   = sample_root_cache[0]["video"]   if batch_size_actual > 0 else None
-
-        for i in range(batch_size_actual):
-            sample_name = batch["name"][i]
-            dirs = sample_root_cache[i]
-            feature_dir = dirs["feature"]
-            video_dir   = dirs["video"]
-            composite_dir = dirs["composite"]
+                if "traj" in sample_batch and "traj_mask" in sample_batch:
+                    rec = _compute_traj_metrics(decoded_generated, sample_batch, 0, seg_size=args.seg_size)
+                    sample_run_metrics.append(rec)
+                    control_rec = _compute_omni_control_metrics(decoded_generated, sample_batch, 0)
+                    sample_control_run_metrics.append(control_rec)
+                    control_run_records[run_idx].append(control_rec)
 
             rec: Dict = {"name": sample_name, "num_runs": args.num_runs}
-            if sample_run_metrics[i]:
-                rec.update(_average_traj_metrics(sample_run_metrics[i]))
+            if sample_run_metrics:
+                rec.update(_average_traj_metrics(sample_run_metrics))
 
                 # Console: per-sample summary
                 seg_str = "  ".join(
@@ -678,35 +929,54 @@ def main():
                 if pfx:
                     print(f"    pfx_mse : {'  '.join(pfx)}")
 
-            # fwd_ctrl_loss (run 0)
-            if fwd_stats_batch is not None and i < len(fwd_stats_batch):
-                fwd = fwd_stats_batch[i]
-                rec["fwd_ctrl_loss"] = fwd["loss"]
-                rec["fwd_n_valid"]   = fwd["n_valid"]
-                rec["fwd_win_len"]   = fwd["window_len"]
-                print(f"    fwd_ctrl_loss={fwd['loss']:.6f}  n_valid={fwd['n_valid']:.0f}"
-                      f"  win={fwd['window_len']}")
+            if sample_control_run_metrics:
+                rec.update(_average_control_metrics(sample_control_run_metrics))
+                print(
+                    "    control : "
+                    f"L2={rec.get('control_l2_dist', float('nan')):.4f}  "
+                    f"skate={rec.get('skating_ratio', float('nan')):.4f}  "
+                    f"traj_fail20={rec.get('traj_fail_20cm', float('nan')):.4f}  "
+                    f"traj_fail50={rec.get('traj_fail_50cm', float('nan')):.4f}"
+                )
 
-            # ablation (run 0)
-            if ablation_generated_run0 is not None and i < len(ablation_generated_run0):
-                abl_single  = ablation_generated_run0[i].detach()
-                abl_decoded = vae.decode(abl_single[None, :].to(device))[0].float().detach().to(device)
-                if "traj" in batch and "traj_mask" in batch:
-                    abl_rec = _compute_traj_metrics(abl_decoded, batch, i, seg_size=args.seg_size)
-                    rec["ablation_ade"] = abl_rec.get("ade", float("nan"))
-                    rec["ablation_fde"] = abl_rec.get("fde", float("nan"))
-                    rec["ablation_mse"] = abl_rec.get("mse", float("nan"))
-                    print(f"    ablation: ADE={rec['ablation_ade']:.4f}"
-                          f"  FDE={rec['ablation_fde']:.4f}"
-                          f"  [ControlNet Δ ADE={rec.get('ade', float('nan')) - rec['ablation_ade']:+.4f}]")
+            # fwd_ctrl_loss averaged across runs
+            if fwd_stat is not None:
+                rec["fwd_ctrl_loss"] = fwd_stat.get("loss", float("nan"))
+                rec["fwd_ctrl_loss_std"] = fwd_stat.get("loss_std", float("nan"))
+                rec["fwd_n_valid"] = fwd_stat.get("n_valid", float("nan"))
+                rec["fwd_win_len"] = fwd_stat.get("window_len", float("nan"))
+                rec["fwd_num_windows"] = fwd_stat.get("num_windows", 0)
+                print(f"    fwd_ctrl_loss={rec.get('fwd_ctrl_loss', float('nan')):.6f}"
+                      f" ±{rec.get('fwd_ctrl_loss_std', float('nan')):.6f}"
+                      f"  n_valid={rec.get('fwd_n_valid', float('nan')):.0f}"
+                      f"  win={rec.get('fwd_win_len', float('nan')):.0f}"
+                      f"  windows={rec.get('fwd_num_windows', 0)}")
+
+            if sample_ablation_run_metrics:
+                abl_avg = _average_traj_metrics(sample_ablation_run_metrics)
+                rec["ablation_ade"] = abl_avg.get("ade", float("nan"))
+                rec["ablation_fde"] = abl_avg.get("fde", float("nan"))
+                rec["ablation_mse"] = abl_avg.get("mse", float("nan"))
+                if "ade_std" in abl_avg:
+                    rec["ablation_ade_std"] = abl_avg["ade_std"]
+                if "fde_std" in abl_avg:
+                    rec["ablation_fde_std"] = abl_avg["fde_std"]
+                if "mse_std" in abl_avg:
+                    rec["ablation_mse_std"] = abl_avg["mse_std"]
+                abl_ade_std_str = (
+                    f"±{rec['ablation_ade_std']:.4f}" if "ablation_ade_std" in rec else ""
+                )
+                print(f"    ablation: ADE={rec['ablation_ade']:.4f}{abl_ade_std_str}"
+                      f"  FDE={rec['ablation_fde']:.4f}"
+                      f"  [ControlNet Δ ADE={rec.get('ade', float('nan')) - rec['ablation_ade']:+.4f}]")
 
             # viz_traj (uses run 0 decoded)
-            if args.viz_traj and "traj" in batch and pred_xz_run0[i] is not None:
+            if args.viz_traj and "traj" in sample_batch and pred_xz_run0 is not None:
                 dirs["viz"].mkdir(parents=True, exist_ok=True)
-                traj_len_v = (int(batch["traj_length"][i].item())
-                              if "traj_length" in batch else batch["traj"][i].shape[0])
-                gt_xz_plot = batch["traj"][i][:traj_len_v, [0, 2]].float().cpu().numpy()
-                msk_plot   = batch["traj_mask"][i].cpu().numpy() if "traj_mask" in batch else None
+                traj_len_v = (int(sample_batch["traj_length"][0].item())
+                              if "traj_length" in sample_batch else sample_batch["traj"][0].shape[0])
+                gt_xz_plot = sample_batch["traj"][0][:traj_len_v, [0, 2]].float().cpu().numpy()
+                msk_plot   = sample_batch["traj_mask"][0].cpu().numpy() if "traj_mask" in sample_batch else None
                 title_extra = f"  ADE={rec.get('ade', float('nan')):.4f}"
                 if "ade_std" in rec:
                     title_extra += f"±{rec['ade_std']:.4f}"
@@ -715,8 +985,8 @@ def main():
                 _plot_traj_xz(
                     name=sample_name,
                     gt_xz=gt_xz_plot,
-                    pred_xz=pred_xz_run0[i],
-                    pred_no_traj_xz=abl_xz_run0[i],
+                    pred_xz=pred_xz_run0,
+                    pred_no_traj_xz=abl_xz_run0,
                     traj_mask=msk_plot,
                     output_path=str(dirs["viz"] / f"{sample_name}.png"),
                     title_extra=title_extra,
@@ -724,30 +994,39 @@ def main():
 
             traj_records.append(rec)
 
-        # Render videos for this batch (uses files from run 0)
-        if cfg.test_setting.render:
+    # Render videos once per dataset after all sample files are written.
+    if cfg.test_setting.render:
+        for dataset_id in sorted(dataset_ids_seen):
+            sample_root = out_root / dataset_id
+            dirs = {
+                "text":         sample_root / "text",
+                "feature":      sample_root / "feature",
+                "cond_traj":    sample_root / "traj_xz",
+                "traj_mask":    sample_root / "traj_mask",
+                "video":        sample_root / "video",
+                "composite":    sample_root / "composite",
+                "frames":       sample_root / "frames",
+            }
+            if not dirs["feature"].exists():
+                continue
             try:
                 render_video(
-                    motion_dir=str(feature_dir),
-                    save_dir=str(video_dir),
+                    motion_dir=str(dirs["feature"]),
+                    save_dir=str(dirs["video"]),
                     render_setting=cfg.test_setting,
                     frames_dir=str(dirs["frames"]),
                     traj_mask_dir=str(dirs["traj_mask"]),
                     cond_traj_dir=str(dirs["cond_traj"]),
                 )
                 make_composite_compare_videos(
-                    result_folder=str(video_dir),
-                    compare_folders=(cfg.test_setting.get(test_dataset[0]["dataset"], {})
-                                     .get("compare_folders", None)
-                                     if hasattr(test_dataset[0], "__getitem__") else None),
-                    compare_names=(cfg.test_setting.get(test_dataset[0]["dataset"], {})
-                                   .get("compare_names", None)
-                                   if hasattr(test_dataset[0], "__getitem__") else None),
-                    text_folder=str(text_dir),
-                    save_dir=str(composite_dir),
+                    result_folder=str(dirs["video"]),
+                    compare_folders=cfg.test_setting.get(dataset_id, {}).get("compare_folders", None),
+                    compare_names=cfg.test_setting.get(dataset_id, {}).get("compare_names", None),
+                    text_folder=str(dirs["text"]),
+                    save_dir=str(dirs["composite"]),
                 )
             except Exception as e:
-                print(f"[render] bidx={bidx:05d} render failed (skipping): {e}")
+                print(f"[render] dataset={dataset_id} failed (skipping): {e}")
 
     # ══════════════════════════════════════════════════════════════════════════
     # PASS 2: val set — T2M FID / R-Precision / Diversity (optional)
@@ -850,6 +1129,10 @@ def main():
         if fwd_vals:
             final_metrics["traj/fwd_ctrl_loss_mean"] = float(np.mean(fwd_vals))
             final_metrics["traj/fwd_ctrl_loss_std"]  = float(np.std(fwd_vals))
+            fwd_run_std_vals = [r["fwd_ctrl_loss_std"] for r in valid_traj
+                                if "fwd_ctrl_loss_std" in r and r["fwd_ctrl_loss_std"] == r["fwd_ctrl_loss_std"]]
+            if fwd_run_std_vals:
+                final_metrics["traj/fwd_ctrl_loss_run_std_mean"] = float(np.mean(fwd_run_std_vals))
 
         # Ablation aggregation
         abl_ades = [r["ablation_ade"] for r in valid_traj
@@ -865,6 +1148,38 @@ def main():
                           if "ablation_ade" in r and r["ade"] == r["ade"]]
             final_metrics["traj/ctrl_delta_ADE_mean"] = float(np.mean(delta_ades))
 
+    control_metric_keys = (
+        "control_l2_dist",
+        "skating_ratio",
+        "traj_fail_20cm",
+        "traj_fail_50cm",
+        "kps_fail_20cm",
+        "kps_fail_50cm",
+        "kps_mean_err_m",
+    )
+    control_name_map = {
+        "control_l2_dist": "Control_L2_dist",
+        "skating_ratio": "Skating_Ratio",
+        "traj_fail_20cm": "traj_fail_20cm",
+        "traj_fail_50cm": "traj_fail_50cm",
+        "kps_fail_20cm": "kps_fail_20cm",
+        "kps_fail_50cm": "kps_fail_50cm",
+        "kps_mean_err_m": "kps_mean_err_m",
+    }
+    for key in control_metric_keys:
+        per_run_vals = []
+        for run_recs in control_run_records:
+            vals = [r[key] for r in run_recs if key in r and r[key] == r[key]]
+            if vals:
+                per_run_vals.append(float(np.mean(vals)))
+        if per_run_vals:
+            mean, std, conf = _get_metric_statistics(np.asarray(per_run_vals, dtype=np.float64), len(per_run_vals))
+            out_key = control_name_map[key]
+            final_metrics[f"control/{out_key}_mean"] = float(mean)
+            final_metrics[f"control/{out_key}_std"] = float(std)
+            final_metrics[f"control/{out_key}_conf_interval"] = float(conf)
+            final_metrics[f"control/{out_key}_num_runs"] = int(len(per_run_vals))
+
     # Build output: per-sample entries first, then aggregate summary
     output_dict: Dict = {}
 
@@ -872,10 +1187,12 @@ def main():
     for r in traj_records:
         name = r["name"]
         entry: Dict = {"T": r.get("T", 0)}
-        for k in ("ade", "fde", "mse", "traj_jitter",
-                  "fwd_ctrl_loss", "ablation_ade", "ablation_fde", "ablation_mse"):
-            if k in r:
-                entry[k] = r[k]
+        for k, v in r.items():
+            if k in {"name", "T", "seg_mse", "prefix_mse"} or k.startswith("_"):
+                continue
+            if isinstance(v, dict) or isinstance(v, list):
+                continue
+            entry[k] = v
         if "seg_mse" in r:
             entry["seg_mse"] = {
                 f"[{s*args.seg_size}:{(s+1)*args.seg_size}]": v
@@ -890,6 +1207,7 @@ def main():
 
     # Aggregate summary at the end
     output_dict["summary"] = final_metrics
+    output_dict["probe_tag"] = probe_tag
 
     metrics_path = out_root / "metrics.json"
     metrics_path.write_text(json.dumps(output_dict, indent=2))

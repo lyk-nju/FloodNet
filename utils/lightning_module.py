@@ -165,9 +165,13 @@ class BasicLightningModule(LightningModule):
 
     # NOTE: lightning handles with torch.no_grad() and model.eval() automatically
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        if dataloader_idx == 1:
-            if self.global_step % self.cfg.validation.test_steps == 0:
-                self.test_step(batch, batch_idx)
+        if dataloader_idx >= 1:
+            if (
+                not self.trainer.sanity_checking
+                and self.global_step > 0
+                and self.global_step % self.cfg.validation.test_steps == 0
+            ):
+                self.test_step(batch, batch_idx, test_loader_idx=dataloader_idx - 1)
         else:
             trainable = [p for p in self.model.parameters() if p.requires_grad]
             with self.ema.average_parameters(trainable):
@@ -188,14 +192,18 @@ class BasicLightningModule(LightningModule):
         return
 
     def on_validation_epoch_end(self):
-        if self.global_step % self.cfg.validation.test_steps == 0:
+        if (
+            not self.trainer.sanity_checking
+            and self.global_step > 0
+            and self.global_step % self.cfg.validation.test_steps == 0
+        ):
             self.on_test_epoch_end()
         # metrics
         self.compute_metrics()
 
     # NOTE: lightning handles with torch.no_grad() and model.eval() automatically
-    def test_step(self, batch, batch_idx):
-        self.update_test(batch)
+    def test_step(self, batch, batch_idx, test_loader_idx=0):
+        self.update_test(batch, batch_idx=batch_idx, test_loader_idx=test_loader_idx)
         return
 
     def on_test_epoch_end(self):
@@ -212,7 +220,7 @@ class BasicLightningModule(LightningModule):
     def compute_metrics(self):
         pass
 
-    def update_test(self, batch):
+    def update_test(self, batch, batch_idx=None, test_loader_idx=0):
         pass
 
     def process_test_results(self):

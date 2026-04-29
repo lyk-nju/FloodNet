@@ -100,12 +100,15 @@ def build_traj_emb(
 
     def align_temporal(feats: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
         if feats.shape[1] != seq_len:
-            feats = F.interpolate(
-                feats.permute(0, 2, 1),
-                size=seq_len,
-                mode="linear",
-                align_corners=False,
-            ).permute(0, 2, 1)
+            t_frames = feats.shape[1]
+            # Causal VAE convention: token 0 → frame 0; token k (k≥1) → frames [4k-3, 4k],
+            # representative frame = 4k (last frame of the chunk).
+            # Use exact frame indices instead of uniform interpolation to avoid ~1.5-frame bias.
+            indices = torch.zeros(seq_len, dtype=torch.long, device=feats.device)
+            indices[0] = 0
+            for k in range(1, seq_len):
+                indices[k] = min(4 * k, t_frames - 1)
+            feats = feats[:, indices, :]
         if mask is not None:
             m = mask.to(device=device, dtype=torch.float32)
             if m.shape[1] != seq_len:

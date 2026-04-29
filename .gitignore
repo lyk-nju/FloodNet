@@ -38,3 +38,11 @@ configs/paths.yaml
 
 # cuda
 cuda-ubuntu2004.pin
+
+# eval artifacts
+eval/__pycache__/
+eval/.ipynb_checkpoints/
+eval/eval_*/
+eval/baeline_*/
+eval/baseline_*/
+eval/async_eval/

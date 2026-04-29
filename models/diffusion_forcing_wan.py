@@ -437,15 +437,30 @@ class DiffForcingWanModel(nn.Module):
         batch_size, seq_len, _ = feature.shape
         device = feature.device
 
-        # Randomly use a time step
-        time_steps = []
-        for i in range(batch_size):
-            valid_len = feature_length[i].item()
-            # Random float from 0 to valid_len/chunk_size, not an integer
-            max_time = valid_len / self.chunk_size
-            # max_time = valid_len / self.chunk_size + 1
-            time_steps.append(torch.FloatTensor(1).uniform_(0, max_time).item())
-        time_steps = torch.tensor(time_steps, device=device)  # (B,)
+        time_steps_override = x.get("_time_steps_override", None)
+        if time_steps_override is not None:
+            if not torch.is_tensor(time_steps_override):
+                time_steps = torch.as_tensor(
+                    time_steps_override, device=device, dtype=torch.float32
+                )
+            else:
+                time_steps = time_steps_override.to(device=device, dtype=torch.float32)
+            if time_steps.ndim == 0:
+                time_steps = time_steps.repeat(batch_size)
+            if time_steps.shape[0] != batch_size:
+                raise ValueError(
+                    f"_time_steps_override batch mismatch: got {tuple(time_steps.shape)} "
+                    f"for batch_size={batch_size}"
+                )
+        else:
+            # Randomly use a time step
+            time_steps = []
+            for i in range(batch_size):
+                valid_len = feature_length[i].item()
+                # Random float from 0 to valid_len/chunk_size, not an integer
+                max_time = valid_len / self.chunk_size
+                time_steps.append(torch.FloatTensor(1).uniform_(0, max_time).item())
+            time_steps = torch.tensor(time_steps, device=device)  # (B,)
         noise_level = self._get_noise_levels(device, seq_len, time_steps)  # (B, T)
 
         # Add noise to entire sequence
@@ -477,7 +492,7 @@ class DiffForcingWanModel(nn.Module):
                     text_list, text_end_list
                 ):
                     # Paper: classifier-free guidance — with prob dropout replace text by "" at train time
-                    if np.random.rand() > self.dropout:
+                    if (not self.training) or (np.random.rand() > self.dropout):
                         single_text_end_list = [0] + [
                             min(t, seq_len) for t in single_text_end_list
                         ]
@@ -508,9 +523,12 @@ class DiffForcingWanModel(nn.Module):
                         ]
                     )
             else:
-                all_text_context = [
-                    (u if np.random.rand() > self.dropout else "") for u in text_list
-                ]
+                if self.training:
+                    all_text_context = [
+                        (u if np.random.rand() > self.dropout else "") for u in text_list
+                    ]
+                else:
+                    all_text_context = list(text_list)
                 all_text_context = self.encode_text_with_cache(all_text_context, device)
                 all_text_context = [u.to(self.param_dtype) for u in all_text_context]
         else:
@@ -540,7 +558,11 @@ class DiffForcingWanModel(nn.Module):
         # noise_level ≈ 0) with the model's own x0 prediction (no_grad pass).
         # This exposes the model to its own prediction errors during training,
         # closing the teacher-forcing → generate exposure-bias gap.
-        if self.scheduled_sampling_prob > 0.0 and np.random.rand() < self.scheduled_sampling_prob:
+        if (
+            self.training
+            and self.scheduled_sampling_prob > 0.0
+            and np.random.rand() < self.scheduled_sampling_prob
+        ):
             with torch.no_grad():
                 cn_res_ss = self._controlnet_forward(
                     noisy_feature_input,
@@ -1569,8 +1591,10 @@ class DiffForcingWanModel(nn.Module):
                     #       + w_text * (out_full - out_null_text)
                     #       + w_traj * (out_null_text - out_uncond)
                     pred_uncond = self._uncond_backbone_forward(
-                        noisy_input, t_scaled, text_null_context, model_sl,
-                        None, None,  # truly unconditional: text OFF, traj OFF
+                        noisy_input,
+                        t_scaled,
+                        text_null_context,
+                        model_sl,
                     )
                     predicted_result = [
                         pred_uncond[i]

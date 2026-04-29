@@ -1,4 +1,8 @@
+import json
 import os
+import random
+import hashlib
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -13,6 +17,14 @@ from torch.utils.data import DataLoader
 from torch_ema import ExponentialMovingAverage
 
 from metrics.t2m import T2MMetrics
+from eval.eval_generation_metrics import (
+    _average_control_metrics,
+    _average_traj_metrics,
+    _compute_deterministic_fwd_ctrl_loss_sample,
+    _compute_omni_control_metrics,
+    _compute_traj_metrics,
+    _get_metric_statistics,
+)
 from utils.motion_process import extract_root_trajectory_263_torch
 from utils.initialize import (
     compare_statedict_and_parameters,
@@ -34,6 +46,82 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 class CustomLightningModule(BasicLightningModule):
+    def __init__(self, cfg):
+        self._inline_eval_seen = {}
+        super().__init__(cfg)
+
+    def _get_test_probe_tags(self) -> list[str]:
+        tags = getattr(self, "test_loader_tags", None)
+        if tags:
+            return list(tags)
+        return ["test"]
+
+    def _resolve_test_probe_tag(self, test_loader_idx: int) -> str:
+        tags = self._get_test_probe_tags()
+        if 0 <= test_loader_idx < len(tags):
+            return tags[test_loader_idx]
+        return f"test_loader_{test_loader_idx}"
+
+    def _get_generation_eval_cfg(self):
+        val_cfg = self.cfg.get("validation", {})
+        return {
+            "enabled": bool(val_cfg.get("eval_generation_metrics", True)),
+            "num_runs": int(val_cfg.get("eval_num_runs", 10)),
+            "seg_size": int(val_cfg.get("eval_seg_size", 20)),
+            "forward_ctrl_loss": bool(val_cfg.get("eval_forward_control_loss", True)),
+            "forward_ctrl_window_mode": str(
+                val_cfg.get("eval_forward_control_loss_window_mode", "mean_chunk_windows")
+            ),
+        }
+
+    @staticmethod
+    def _flatten_summary_metrics(summary: dict, prefix: str) -> dict:
+        flat_metrics = {}
+        for key, value in summary.items():
+            log_key = f"{prefix}/{key}"
+            if isinstance(value, list):
+                for idx, item in enumerate(value):
+                    if item is not None:
+                        flat_metrics[f"{log_key}/slot_{idx}"] = float(item)
+            else:
+                flat_metrics[log_key] = float(value)
+        return flat_metrics
+
+    @staticmethod
+    def _stable_eval_seed(base_seed: int, probe_tag: str, sample_name: str, run_idx: int) -> int:
+        digest = hashlib.md5(f"{probe_tag}:{sample_name}:{run_idx}".encode("utf-8")).hexdigest()
+        offset = int(digest[:8], 16)
+        return int(base_seed) + offset
+
+    @staticmethod
+    def _seed_eval_locally(seed: int, device: torch.device | str):
+        random.seed(seed)
+        np.random.seed(seed % (2**32))
+        gen = torch.Generator()
+        gen.manual_seed(int(seed))
+        torch.random.set_rng_state(gen.get_state())
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(int(seed))
+
+    @staticmethod
+    def _slice_single_sample_batch(batch, sample_idx: int):
+        sample_batch = {}
+        batch_size = len(batch["name"])
+        for key, value in batch.items():
+            if torch.is_tensor(value):
+                if value.ndim > 0 and value.shape[0] == batch_size:
+                    sample_batch[key] = value[sample_idx : sample_idx + 1]
+                else:
+                    sample_batch[key] = value
+            elif isinstance(value, list):
+                if len(value) == batch_size:
+                    sample_batch[key] = [value[sample_idx]]
+                else:
+                    sample_batch[key] = value
+            else:
+                sample_batch[key] = value
+        return sample_batch
+
     @staticmethod
     def _compute_control_loss_xz(
         pred_list,
@@ -240,6 +328,9 @@ class CustomLightningModule(BasicLightningModule):
             named_buffers=self.model.named_buffers(),
         )
 
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        super().on_train_batch_end(outputs, batch, batch_idx)
+
     def train(self, mode: bool = True):
         super().train(mode)
         # VAE is a frozen decoder used only for L_control; keep it in eval mode regardless
@@ -354,126 +445,206 @@ class CustomLightningModule(BasicLightningModule):
         for key, value in t2m_output.items():
             self.log(f"metrics/t2m_metrics/{key}", value, sync_dist=True)
 
-    def update_test(self, batch):
+    def on_validation_epoch_end(self):
+        if (
+            not self.trainer.sanity_checking
+            and self.global_step > 0
+            and self.global_step % self.cfg.validation.test_steps == 0
+        ):
+            self.on_test_epoch_end()
+            self._inline_eval_seen.clear()
+        self.compute_metrics()
+
+    def update_test(self, batch, batch_idx=None, test_loader_idx=0):
         # Fix seed for reproducible test generation, but save/restore the training RNG so
         # that training noise stays i.i.d. when the training loop resumes after validation.
-        import random
         _py   = random.getstate()
         _np   = np.random.get_state()
         _cpu  = torch.random.get_rng_state()
         _cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-        seed_everything(self.cfg.seed)
+        eval_cfg = self._get_generation_eval_cfg()
+        eval_num_runs = max(eval_cfg["num_runs"], 1)
+        eval_seg_size = eval_cfg["seg_size"]
+        do_eval_metrics = eval_cfg["enabled"] and "traj" in batch and "traj_mask" in batch
+        probe_tag = self._resolve_test_probe_tag(test_loader_idx)
+        step_tag = f"step_{int(self.global_step):06d}"
         try:
-            with self.ema.average_parameters([p for p in self.model.parameters() if p.requires_grad]):
-                model_batch = batch.copy()
-                model_batch["feature"] = batch["token"]
-                model_batch["feature_length"] = batch["token_length"]
-                if "token_text_end" in batch:
-                    model_batch["feature_text_end"] = batch["token_text_end"]
-                self._copy_traj_fields_to_model_batch(batch, model_batch)
-                output = self.model.generate(model_batch)
-            generated = output["generated"]
-            text = output["text"]
-            # Save motion
-            generated_id = batch["name"]  # [batch_size]
-            dataset_id = batch["dataset"]  # [batch_size]
-            step_tag = f"step_{int(self.global_step):06d}"
-    
-            # Decode motion to latent space
-            # NOTE: inside the to() function, if will check current_tensor.device == target_device, then run this in each loop is fine.
-            for i in range(len(generated)):
-                single_generated = generated[i]
-                single_generated_id = generated_id[i]
-                single_dataset_id = dataset_id[i]
-                single_text = text[i]
-                text_dir = f"{self.cfg.save_dir}/{single_dataset_id}/text/{step_tag}"
-                token_dir = f"{self.cfg.save_dir}/{single_dataset_id}/token/{step_tag}"
-                feature_dir = f"{self.cfg.save_dir}/{single_dataset_id}/feature/{step_tag}"
-                cond_traj_dir = f"{self.cfg.save_dir}/{single_dataset_id}/traj_xz/{step_tag}"
-                traj_mask_dir = f"{self.cfg.save_dir}/{single_dataset_id}/traj_mask/{step_tag}"
-                frames_dir = f"{self.cfg.save_dir}/{single_dataset_id}/frames/{step_tag}"
-                if "feature_text_end" in batch:
-                    single_feature_text_end = batch["feature_text_end"][i]
-                    frames = np.array(single_feature_text_end)
-                else:
-                    frames = None
-                try:
+            local_payloads = []
+            for sample_idx in range(len(batch["name"])):
+                sample_batch = self._slice_single_sample_batch(batch, sample_idx)
+                sample_name = sample_batch["name"][0]
+                sample_dataset_id = sample_batch["dataset"][0]
+                sample_text = ""
+                token_run0 = None
+                feature_run0 = None
+                traj_xz = None
+                traj_mask = None
+                frames = None
+                traj_runs = []
+                control_runs = []
+                fwd_stat = None
+
+                if "feature_text_end" in sample_batch:
+                    frames = np.asarray(sample_batch["feature_text_end"][0])
+
+                if eval_cfg["forward_ctrl_loss"] and "traj" in sample_batch:
+                    try:
+                        fwd_stat = _compute_deterministic_fwd_ctrl_loss_sample(
+                            model=self.model,
+                            sample_batch=sample_batch,
+                            vae=self.vae,
+                            device=self.device,
+                            train_mode=int(self.cfg.get("control_loss_train_mode", 3)),
+                            chunk_size_tokens=getattr(self.model, "chunk_size", None),
+                            window_mode=eval_cfg["forward_ctrl_window_mode"],
+                        )
+                    except Exception as e:
+                        rank_zero_info(
+                            f"[inline fwd_ctrl_loss] sample={sample_name} deterministic eval failed: {e}"
+                        )
+
+                for run_idx in range(eval_num_runs):
+                    sample_seed = self._stable_eval_seed(
+                        self.cfg.seed, probe_tag, sample_name, run_idx
+                    )
+                    self._seed_eval_locally(sample_seed, self.device)
+                    with self.ema.average_parameters([p for p in self.model.parameters() if p.requires_grad]):
+                        model_batch = sample_batch.copy()
+                        model_batch["feature"] = sample_batch["token"]
+                        model_batch["feature_length"] = sample_batch["token_length"]
+                        if "token_text_end" in sample_batch:
+                            model_batch["feature_text_end"] = sample_batch["token_text_end"]
+                        self._copy_traj_fields_to_model_batch(sample_batch, model_batch)
+                        output = self.model.generate(model_batch)
+
+                    single_generated = output["generated"][0]
                     decoded_single_generated = self.vae.decode(
                         single_generated[None, :].to(self.device)
-                    )[0]
-                    os.makedirs(text_dir, exist_ok=True)
-                    with open(
-                        f"{text_dir}/{single_generated_id}.txt",
-                        "w",
-                    ) as f:
-                        f.write(single_text)
-                    os.makedirs(token_dir, exist_ok=True)
-                    np.save(
-                        f"{token_dir}/{single_generated_id}.npy",
-                        single_generated.float().cpu().numpy(),
-                    )
-                    os.makedirs(feature_dir, exist_ok=True)
-                    np.save(
-                        f"{feature_dir}/{single_generated_id}.npy",
-                        decoded_single_generated.float().cpu().numpy(),
-                    )
-    
-                    # Save conditioning trajectory (T,2)=[x,z] for visualization (red overlay).
-                    # Prefer frame-level traj_features (T,4)=[x,z,cos,sin]; else build from root traj xyz.
-                    L_feat = int(decoded_single_generated.shape[0])
-                    traj_xz = None
-                    if "traj_features" in batch:
-                        cond = batch["traj_features"][i]
-                        if torch.is_tensor(cond):
-                            cond = cond.detach().cpu().numpy()
-                        cond = np.asarray(cond)
-                        if cond.ndim == 2 and cond.shape[1] >= 2:
-                            traj_xz = cond[:L_feat, :2].astype(np.float32)
-                        else:
-                            rank_zero_info(
-                                f"Skip traj_xz for {single_generated_id}: "
-                                f"traj_features bad shape {cond.shape}"
+                    )[0].float().detach()
+
+                    if run_idx == 0:
+                        sample_text = output["text"][0]
+                        token_run0 = single_generated.float().cpu().numpy()
+                        feature_run0 = decoded_single_generated.cpu().numpy()
+
+                        L_feat = int(decoded_single_generated.shape[0])
+                        if "traj_features" in sample_batch:
+                            cond = sample_batch["traj_features"][0]
+                            if torch.is_tensor(cond):
+                                cond = cond.detach().cpu().numpy()
+                            cond = np.asarray(cond)
+                            if cond.ndim == 2 and cond.shape[1] >= 2:
+                                traj_xz = cond[:L_feat, :2].astype(np.float32)
+                        if traj_xz is None and "traj" in sample_batch:
+                            tr = sample_batch["traj"][0]
+                            if torch.is_tensor(tr):
+                                tr = tr.detach().cpu().numpy()
+                            tr = np.asarray(tr)[:L_feat]
+                            if tr.ndim == 2 and tr.shape[1] >= 3:
+                                traj_xz = root_to_traj_feats(tr)[:, :2].astype(np.float32)
+                        if "traj_mask" in sample_batch:
+                            traj_mask_i = sample_batch["traj_mask"][0]
+                            if torch.is_tensor(traj_mask_i):
+                                traj_mask_i = traj_mask_i.detach().cpu().numpy()
+                            traj_mask = np.asarray(traj_mask_i).reshape(-1)[:L_feat]
+
+                    if do_eval_metrics:
+                        traj_runs.append(
+                            _compute_traj_metrics(
+                                decoded_single_generated, sample_batch, 0, seg_size=eval_seg_size
                             )
-                    if traj_xz is None and "traj" in batch:
-                        tr = batch["traj"][i]
-                        if torch.is_tensor(tr):
-                            tr = tr.detach().cpu().numpy()
-                        tr = np.asarray(tr)[:L_feat]
-                        if tr.ndim == 2 and tr.shape[1] >= 3:
-                            traj_xz = root_to_traj_feats(tr)[:, :2].astype(
-                                np.float32
-                            )
-                    if traj_xz is not None:
-                        os.makedirs(cond_traj_dir, exist_ok=True)
-                        np.save(
-                            f"{cond_traj_dir}/{single_generated_id}.npy",
-                            traj_xz,
                         )
-    
-                    # Save traj_mask (if provided by dataset) so we can mask the root trajectory in visualization.
-                    if "traj_mask" in batch:
-                        traj_mask_i = batch["traj_mask"][i]
-                        if torch.is_tensor(traj_mask_i):
-                            traj_mask_i = traj_mask_i.detach().cpu().numpy()
-                        traj_mask_i = np.asarray(traj_mask_i).reshape(-1)[:L_feat]
-                        os.makedirs(traj_mask_dir, exist_ok=True)
-                        np.save(
-                            f"{traj_mask_dir}/{single_generated_id}.npy",
-                            traj_mask_i,
+                        control_runs.append(
+                            _compute_omni_control_metrics(decoded_single_generated, sample_batch, 0)
                         )
-                    # Save text_end if available
-                    if frames is not None:
-                        os.makedirs(frames_dir, exist_ok=True)
-                        np.save(
-                            f"{frames_dir}/{single_generated_id}.npy",
-                            frames,
+
+                rec = None
+                if do_eval_metrics:
+                    rec = {"name": sample_name, "num_runs": eval_num_runs, "probe_tag": probe_tag}
+                    if traj_runs:
+                        rec.update(_average_traj_metrics(traj_runs))
+                    if control_runs:
+                        rec.update(_average_control_metrics(control_runs))
+                    if fwd_stat is not None:
+                        rec["fwd_ctrl_loss"] = fwd_stat.get("loss", float("nan"))
+                        rec["fwd_ctrl_loss_std"] = fwd_stat.get("loss_std", float("nan"))
+                        rec["fwd_n_valid"] = fwd_stat.get("n_valid", float("nan"))
+                        rec["fwd_win_len"] = fwd_stat.get("window_len", float("nan"))
+                        rec["fwd_num_windows"] = fwd_stat.get("num_windows", 0)
+                    rec["_traj_runs"] = traj_runs
+                    rec["_control_runs"] = control_runs
+
+                local_payloads.append(
+                    {
+                        "name": sample_name,
+                        "dataset_id": sample_dataset_id,
+                        "text": sample_text,
+                        "token": token_run0,
+                        "feature": feature_run0,
+                        "traj_xz": traj_xz,
+                        "traj_mask": traj_mask,
+                        "frames": frames,
+                        "record": rec,
+                    }
+                )
+
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                gathered_payloads = [None] * torch.distributed.get_world_size()
+                torch.distributed.all_gather_object(gathered_payloads, local_payloads)
+                all_payloads = [
+                    payload
+                    for rank_payloads in gathered_payloads
+                    for payload in (rank_payloads or [])
+                ]
+            else:
+                all_payloads = local_payloads
+
+            if self.trainer.global_rank == 0:
+                seen = self._inline_eval_seen.setdefault((probe_tag, step_tag), set())
+                for payload in all_payloads:
+                    single_generated_id = payload["name"]
+                    single_dataset_id = payload["dataset_id"]
+                    dedupe_key = (single_dataset_id, single_generated_id)
+                    if dedupe_key in seen:
+                        continue
+                    seen.add(dedupe_key)
+
+                    text_dir = f"{self.cfg.save_dir}/{single_dataset_id}/text/{probe_tag}/{step_tag}"
+                    token_dir = f"{self.cfg.save_dir}/{single_dataset_id}/token/{probe_tag}/{step_tag}"
+                    feature_dir = f"{self.cfg.save_dir}/{single_dataset_id}/feature/{probe_tag}/{step_tag}"
+                    cond_traj_dir = f"{self.cfg.save_dir}/{single_dataset_id}/traj_xz/{probe_tag}/{step_tag}"
+                    traj_mask_dir = f"{self.cfg.save_dir}/{single_dataset_id}/traj_mask/{probe_tag}/{step_tag}"
+                    frames_dir = f"{self.cfg.save_dir}/{single_dataset_id}/frames/{probe_tag}/{step_tag}"
+                    metrics_dir = f"{self.cfg.save_dir}/{single_dataset_id}/metrics/{probe_tag}/{step_tag}"
+
+                    try:
+                        os.makedirs(text_dir, exist_ok=True)
+                        with open(f"{text_dir}/{single_generated_id}.txt", "w") as f:
+                            f.write(payload["text"])
+                        os.makedirs(token_dir, exist_ok=True)
+                        np.save(f"{token_dir}/{single_generated_id}.npy", payload["token"])
+                        os.makedirs(feature_dir, exist_ok=True)
+                        np.save(f"{feature_dir}/{single_generated_id}.npy", payload["feature"])
+
+                        if payload["traj_xz"] is not None:
+                            os.makedirs(cond_traj_dir, exist_ok=True)
+                            np.save(f"{cond_traj_dir}/{single_generated_id}.npy", payload["traj_xz"])
+                        if payload["traj_mask"] is not None:
+                            os.makedirs(traj_mask_dir, exist_ok=True)
+                            np.save(f"{traj_mask_dir}/{single_generated_id}.npy", payload["traj_mask"])
+                        if payload["frames"] is not None:
+                            os.makedirs(frames_dir, exist_ok=True)
+                            np.save(f"{frames_dir}/{single_generated_id}.npy", payload["frames"])
+                        if payload["record"] is not None:
+                            os.makedirs(metrics_dir, exist_ok=True)
+                            with open(f"{metrics_dir}/{single_generated_id}.json", "w") as f:
+                                json.dump(payload["record"], f, indent=2)
+                    except Exception as e:
+                        rank_zero_info(
+                            f"Error in saving motion {single_generated_id} of dataset {single_dataset_id}: {e}"
                         )
-                except Exception as e:
-                    rank_zero_info(
-                        f"Error in saving motion {single_generated_id} of dataset {single_dataset_id}: {e}"
-                    )
-    
-            return {"output": output}
+
+            return {"output": None}
         finally:
             # Restore training RNG state unconditionally (even if generate() raises).
             random.setstate(_py)
@@ -484,63 +655,182 @@ class CustomLightningModule(BasicLightningModule):
 
     def process_test_results(self):
         for dataset_id in os.listdir(self.cfg.save_dir):
-            feature_root = f"{self.cfg.save_dir}/{dataset_id}/feature"
+            feature_root = Path(self.cfg.save_dir) / dataset_id / "feature"
             if not os.path.exists(feature_root):
                 continue
             step_tag = f"step_{int(self.global_step):06d}"
-            feature_dir = f"{feature_root}/{step_tag}"
-            if not os.path.exists(feature_dir):
-                continue
-            video_step_dir = f"{self.cfg.save_dir}/{dataset_id}/video/{step_tag}"
-            composite_step_dir = (
-                f"{self.cfg.save_dir}/{dataset_id}/composite/{step_tag}"
-            )
-            frames_dir = f"{self.cfg.save_dir}/{dataset_id}/frames/{step_tag}"
-            traj_mask_dir = f"{self.cfg.save_dir}/{dataset_id}/traj_mask/{step_tag}"
-            cond_traj_dir = f"{self.cfg.save_dir}/{dataset_id}/traj_xz/{step_tag}"
-            text_dir = f"{self.cfg.save_dir}/{dataset_id}/text/{step_tag}"
-            # render video and save
-            if self.cfg.test_setting.render:
-                render_video(
-                    motion_dir=feature_dir,
-                    save_dir=video_step_dir,
-                    render_setting=self.cfg.test_setting,
-                    frames_dir=frames_dir,
-                    traj_mask_dir=traj_mask_dir,
-                    cond_traj_dir=cond_traj_dir,
-                )
-
-                # Create composite videos
-                make_composite_compare_videos(
-                    result_folder=video_step_dir,
-                    compare_folders=self.cfg.test_setting.get(dataset_id, {}).get(
-                        "compare_folders", None
-                    ),
-                    compare_names=self.cfg.test_setting.get(dataset_id, {}).get(
-                        "compare_names", None
-                    ),
-                    text_folder=text_dir,
-                    save_dir=composite_step_dir,
-                )
-
-                # wandb log video
-                if (
-                    not self.cfg.debug
-                    and self.logger is not None
-                    and isinstance(self.logger, WandbLogger)
-                ):
-                    video_to_log = []
-                    for video_path in sorted(os.listdir(composite_step_dir)):
-                        video_to_log.append(
-                            wandb.Video(
-                                f"{composite_step_dir}/{video_path}",
-                                format="gif",
-                            )
-                        )
-                    wandb.log(
-                        {f"{dataset_id}_video": video_to_log},
-                        step=self.global_step,
+            for probe_tag in self._get_test_probe_tags():
+                feature_dir = feature_root / probe_tag / step_tag
+                if not feature_dir.exists():
+                    continue
+                metrics_dir = Path(self.cfg.save_dir) / dataset_id / "metrics" / probe_tag / step_tag
+                video_step_dir = Path(self.cfg.save_dir) / dataset_id / "video" / probe_tag / step_tag
+                composite_step_dir = Path(self.cfg.save_dir) / dataset_id / "composite" / probe_tag / step_tag
+                frames_dir = Path(self.cfg.save_dir) / dataset_id / "frames" / probe_tag / step_tag
+                traj_mask_dir = Path(self.cfg.save_dir) / dataset_id / "traj_mask" / probe_tag / step_tag
+                cond_traj_dir = Path(self.cfg.save_dir) / dataset_id / "traj_xz" / probe_tag / step_tag
+                text_dir = Path(self.cfg.save_dir) / dataset_id / "text" / probe_tag / step_tag
+                # render video and save
+                if self.cfg.test_setting.render:
+                    render_video(
+                        motion_dir=str(feature_dir),
+                        save_dir=str(video_step_dir),
+                        render_setting=self.cfg.test_setting,
+                        frames_dir=str(frames_dir),
+                        traj_mask_dir=str(traj_mask_dir),
+                        cond_traj_dir=str(cond_traj_dir),
                     )
+
+                    # Create composite videos
+                    make_composite_compare_videos(
+                        result_folder=str(video_step_dir),
+                        compare_folders=self.cfg.test_setting.get(dataset_id, {}).get(
+                            "compare_folders", None
+                        ),
+                        compare_names=self.cfg.test_setting.get(dataset_id, {}).get(
+                            "compare_names", None
+                        ),
+                        text_folder=str(text_dir),
+                        save_dir=str(composite_step_dir),
+                    )
+
+                    # wandb log video
+                    if (
+                        not self.cfg.debug
+                        and self.logger is not None
+                        and isinstance(self.logger, WandbLogger)
+                    ):
+                        video_to_log = []
+                        for video_path in sorted(os.listdir(composite_step_dir)):
+                            video_to_log.append(
+                                wandb.Video(
+                                    str(composite_step_dir / video_path),
+                                    format="gif",
+                                )
+                            )
+                        wandb.log(
+                            {f"{dataset_id}_{probe_tag}_video": video_to_log},
+                            step=self.global_step,
+                        )
+
+                if not metrics_dir.exists():
+                    continue
+                sample_records = []
+                for metric_file in sorted(os.listdir(metrics_dir)):
+                    if not metric_file.endswith(".json"):
+                        continue
+                    with open(metrics_dir / metric_file, "r") as f:
+                        sample_records.append(json.load(f))
+                if not sample_records:
+                    continue
+
+                summary = {}
+                valid_traj = [r for r in sample_records if "ade" in r and r["ade"] == r["ade"]]
+                if valid_traj:
+                    ades = [r["ade"] for r in valid_traj]
+                    fdes = [r["fde"] for r in valid_traj]
+                    mses = [r["mse"] for r in valid_traj]
+                    summary["traj/ADE_mean"] = float(np.mean(ades))
+                    summary["traj/ADE_std"] = float(np.std(ades))
+                    summary["traj/FDE_mean"] = float(np.mean(fdes))
+                    summary["traj/FDE_std"] = float(np.std(fdes))
+                    summary["traj/MSE_mean"] = float(np.mean(mses))
+                    summary["traj/MSE_std"] = float(np.std(mses))
+                    summary["traj/n_samples"] = len(valid_traj)
+
+                    max_segs = max(len(r.get("seg_mse", [])) for r in valid_traj)
+                    seg_means = []
+                    for s in range(max_segs):
+                        vals = [r["seg_mse"][s] for r in valid_traj
+                                if s < len(r.get("seg_mse", [])) and r["seg_mse"][s] is not None]
+                        seg_means.append(float(np.mean(vals)) if vals else None)
+                    summary["traj/seg_mse_per_slot"] = seg_means
+
+                    max_pfx = max(len(r.get("prefix_mse", [])) for r in valid_traj)
+                    pfx_means = []
+                    for s in range(max_pfx):
+                        vals = [r["prefix_mse"][s] for r in valid_traj
+                                if s < len(r.get("prefix_mse", [])) and r["prefix_mse"][s] is not None]
+                        pfx_means.append(float(np.mean(vals)) if vals else None)
+                    summary["traj/prefix_mse_per_slot"] = pfx_means
+
+                    jitter_vals = [r["traj_jitter"] for r in valid_traj
+                                   if "traj_jitter" in r and r["traj_jitter"] == r["traj_jitter"]]
+                    if jitter_vals:
+                        summary["traj/jitter_mean"] = float(np.mean(jitter_vals))
+                        summary["traj/jitter_std"] = float(np.std(jitter_vals))
+
+                    fwd_vals = [r["fwd_ctrl_loss"] for r in valid_traj
+                                if "fwd_ctrl_loss" in r and r["fwd_ctrl_loss"] == r["fwd_ctrl_loss"]]
+                    if fwd_vals:
+                        summary["traj/fwd_ctrl_loss_mean"] = float(np.mean(fwd_vals))
+                        summary["traj/fwd_ctrl_loss_std"] = float(np.std(fwd_vals))
+                        fwd_run_std_vals = [r["fwd_ctrl_loss_std"] for r in valid_traj
+                                            if "fwd_ctrl_loss_std" in r and r["fwd_ctrl_loss_std"] == r["fwd_ctrl_loss_std"]]
+                        if fwd_run_std_vals:
+                            summary["traj/fwd_ctrl_loss_run_std_mean"] = float(np.mean(fwd_run_std_vals))
+
+                control_metric_keys = (
+                    "control_l2_dist",
+                    "skating_ratio",
+                    "traj_fail_20cm",
+                    "traj_fail_50cm",
+                    "kps_fail_20cm",
+                    "kps_fail_50cm",
+                    "kps_mean_err_m",
+                )
+                control_name_map = {
+                    "control_l2_dist": "Control_L2_dist",
+                    "skating_ratio": "Skating_Ratio",
+                    "traj_fail_20cm": "traj_fail_20cm",
+                    "traj_fail_50cm": "traj_fail_50cm",
+                    "kps_fail_20cm": "kps_fail_20cm",
+                    "kps_fail_50cm": "kps_fail_50cm",
+                    "kps_mean_err_m": "kps_mean_err_m",
+                }
+                max_runs = max(len(r.get("_control_runs", [])) for r in sample_records)
+                for key in control_metric_keys:
+                    per_run_vals = []
+                    for run_idx in range(max_runs):
+                        vals = []
+                        for r in sample_records:
+                            control_runs = r.get("_control_runs", [])
+                            if run_idx < len(control_runs):
+                                v = control_runs[run_idx].get(key, float("nan"))
+                                if v == v:
+                                    vals.append(v)
+                        if vals:
+                            per_run_vals.append(float(np.mean(vals)))
+                    if per_run_vals:
+                        mean, std, conf = _get_metric_statistics(np.asarray(per_run_vals, dtype=np.float64), len(per_run_vals))
+                        out_key = control_name_map[key]
+                        summary[f"control/{out_key}_mean"] = float(mean)
+                        summary[f"control/{out_key}_std"] = float(std)
+                        summary[f"control/{out_key}_conf_interval"] = float(conf)
+                        summary[f"control/{out_key}_num_runs"] = int(len(per_run_vals))
+
+                summary_path = metrics_dir / "summary.json"
+                with open(summary_path, "w") as f:
+                    json.dump({"summary": summary, "samples": sample_records}, f, indent=2)
+
+                rank_zero_info(
+                    f"[eval][{dataset_id}][{probe_tag}][{step_tag}] "
+                    f"ADE={summary.get('traj/ADE_mean', float('nan')):.4f} "
+                    f"FDE={summary.get('traj/FDE_mean', float('nan')):.4f} "
+                    f"ControlL2={summary.get('control/Control_L2_dist_mean', float('nan')):.4f}"
+                )
+
+                flat_metrics = {}
+                for key, value in summary.items():
+                    log_key = f"eval/{probe_tag}/{dataset_id}/{key}"
+                    if isinstance(value, list):
+                        for idx, item in enumerate(value):
+                            if item is not None:
+                                flat_metrics[f"{log_key}/slot_{idx}"] = float(item)
+                    else:
+                        flat_metrics[log_key] = float(value)
+                if flat_metrics and self.logger is not None:
+                    self.logger.log_metrics(flat_metrics, step=self.global_step)
 
 
 def main():
@@ -588,12 +878,6 @@ def main():
     val_dataset = instantiate(
         cfg.data.get("val_target", cfg.data.target), cfg=cfg.config, split="val"
     )
-    test_dataset = instantiate(
-        cfg.data.get("test_target", cfg.data.target), cfg=cfg.config, split="test"
-    )
-    rank_zero_info(
-        f"Train dataset: {len(train_dataset) if train_dataset is not None else 0}, Val dataset: {len(val_dataset) if val_dataset is not None else 0}, Test dataset: {len(test_dataset)}"
-    )
 
     train_dataloader = (
         DataLoader(
@@ -619,19 +903,50 @@ def main():
         prefetch_factor=8,
         collate_fn=collate_fn,
     )
-    test_dataloader = DataLoader(
-        test_dataset,
-        batch_size=cfg.data.test_bs,
-        shuffle=False,
-        drop_last=False,
-        num_workers=cfg.data.num_workers,
-        persistent_workers=False,
-        prefetch_factor=8,
-        collate_fn=collate_fn,
+
+    def build_test_probe_loaders():
+        probe_cfg = cfg.data.get("test_probe_meta_paths", None)
+        probe_specs = []
+        if probe_cfg:
+            for probe_tag, meta_paths in probe_cfg.items():
+                probe_specs.append((str(probe_tag), list(meta_paths)))
+        else:
+            probe_specs.append(("test", list(cfg.data.test_meta_paths)))
+
+        loaders = []
+        tags = []
+        total_probe_samples = 0
+        test_target = cfg.data.get("test_target", cfg.data.target)
+        for probe_tag, meta_paths in probe_specs:
+            probe_cfg_obj = OmegaConf.create(OmegaConf.to_container(cfg.config, resolve=False))
+            OmegaConf.update(probe_cfg_obj, "data.test_meta_paths", meta_paths)
+            probe_dataset = instantiate(test_target, cfg=probe_cfg_obj, split="test")
+            probe_loader = DataLoader(
+                probe_dataset,
+                batch_size=cfg.data.test_bs,
+                shuffle=False,
+                drop_last=False,
+                num_workers=cfg.data.num_workers,
+                persistent_workers=False,
+                prefetch_factor=8,
+                collate_fn=collate_fn,
+            )
+            loaders.append(probe_loader)
+            tags.append(probe_tag)
+            total_probe_samples += len(probe_dataset)
+            rank_zero_info(f"Test probe[{probe_tag}]: {len(probe_dataset)} samples")
+        return loaders, tags, total_probe_samples
+
+    test_probe_loaders, test_loader_tags, total_probe_samples = build_test_probe_loaders()
+    rank_zero_info(
+        f"Train dataset: {len(train_dataset) if train_dataset is not None else 0}, "
+        f"Val dataset: {len(val_dataset) if val_dataset is not None else 0}, "
+        f"Test probe samples: {total_probe_samples}"
     )
 
     # lightning module, model is inside the lightning module
     model = CustomLightningModule(cfg=cfg.config)
+    model.test_loader_tags = test_loader_tags
 
     callbacks = []
     checkpoint_callback = ModelCheckpoint(
@@ -666,11 +981,14 @@ def main():
         check_val_every_n_epoch=None,
     )
 
+    rank_zero_info("Validation test mode: inline")
+    val_dataloaders = [val_dataloader] + test_probe_loaders
+
     if cfg.train:
         trainer.fit(
             model,
             train_dataloader,
-            val_dataloaders=[val_dataloader, test_dataloader],
+            val_dataloaders=val_dataloaders,
             ckpt_path=cfg.resume_ckpt,
             weights_only=False,
         )
@@ -681,7 +999,7 @@ def main():
             seed_everything(cfg.seed + i)
             trainer.validate(
                 model,
-                dataloaders=[val_dataloader, test_dataloader],
+                dataloaders=val_dataloaders,
                 ckpt_path=cfg.test_ckpt,
                 weights_only=False,
             )
