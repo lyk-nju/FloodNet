@@ -247,7 +247,7 @@ def _compute_traj_metrics(
     sample_idx: int,
     seg_size: int,
 ) -> Dict:
-    """Return dict with ADE, FDE, MSE, seg_mse list, prefix_mse list."""
+    """Return dict with time-aligned traj metrics plus path-only spatial metrics."""
     with torch.no_grad():
         pred_traj_xyz = extract_root_trajectory_263_torch(
             decoded_generated[None, :]
@@ -275,6 +275,17 @@ def _compute_traj_metrics(
         result["fde"] = float(l2_t[last_idx].item())
     else:
         result["ade"] = result["fde"] = result["mse"] = float("nan")
+
+    # ── Path-only spatial metrics: ignore time-step alignment ─────────────────
+    mask_bool = mask > 0
+    if int(mask_bool.sum().item()) > 0:
+        pred_path = pred_xz[mask_bool].numpy().astype(np.float32)
+        gt_path = gt_xz[mask_bool].numpy().astype(np.float32)
+        path_metrics = _compute_path_only_metrics(pred_path, gt_path)
+        result.update(path_metrics)
+    else:
+        result["path_arc_ade"] = float("nan")
+        result["path_chamfer"] = float("nan")
 
     # ── Segment MSE: non-overlapping windows of seg_size frames ──────────────
     seg_mse: List[Optional[float]] = []
@@ -322,7 +333,7 @@ def _average_traj_metrics(run_metrics: List[Dict]) -> Dict:
         result["T"] = run_metrics[0]["T"]
     if "masked_ratio" in run_metrics[0]:
         result["masked_ratio"] = run_metrics[0]["masked_ratio"]
-    for key in ("ade", "fde", "mse", "traj_jitter"):
+    for key in ("ade", "fde", "mse", "traj_jitter", "path_arc_ade", "path_chamfer"):
         vals = [r[key] for r in run_metrics if key in r and r[key] == r[key]]
         if vals:
             result[key]             = float(np.mean(vals))
@@ -345,6 +356,62 @@ def _moving_average_same(x: np.ndarray, window: int) -> np.ndarray:
         return x.copy()
     kernel = np.ones(window, dtype=np.float32) / float(window)
     return np.convolve(x, kernel, mode="same")
+
+
+def _resample_polyline_by_arclen(points: np.ndarray, num_samples: int) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError(f"Expected path points with shape (T,2), got {points.shape}")
+    if len(points) == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    num_samples = max(int(num_samples), 1)
+    if len(points) == 1:
+        return np.repeat(points[:1], num_samples, axis=0)
+
+    seg_lens = np.linalg.norm(points[1:] - points[:-1], axis=1)
+    cumlen = np.concatenate([np.zeros((1,), dtype=np.float32), np.cumsum(seg_lens, dtype=np.float32)], axis=0)
+    total_len = float(cumlen[-1])
+    if total_len < 1e-8:
+        return np.repeat(points[:1], num_samples, axis=0)
+
+    targets = np.linspace(0.0, total_len, num_samples, dtype=np.float32)
+    x = np.interp(targets, cumlen, points[:, 0])
+    z = np.interp(targets, cumlen, points[:, 1])
+    return np.stack([x, z], axis=-1).astype(np.float32)
+
+
+def _compute_path_only_metrics(pred_path: np.ndarray, gt_path: np.ndarray) -> Dict:
+    """
+    Spatial-only path similarity.
+
+    path_arc_ade:
+        Compare the two paths after arc-length reparameterization, so timing/speed
+        differences are removed but path order is preserved.
+    path_chamfer:
+        Symmetric Chamfer distance between resampled path point sets, focusing on
+        spatial coverage regardless of local timing/phase.
+    """
+    pred_path = np.asarray(pred_path, dtype=np.float32)
+    gt_path = np.asarray(gt_path, dtype=np.float32)
+    if pred_path.ndim != 2 or gt_path.ndim != 2 or pred_path.shape[1] != 2 or gt_path.shape[1] != 2:
+        return {"path_arc_ade": float("nan"), "path_chamfer": float("nan")}
+    if len(pred_path) == 0 or len(gt_path) == 0:
+        return {"path_arc_ade": float("nan"), "path_chamfer": float("nan")}
+
+    num_samples = int(min(max(len(pred_path), len(gt_path)), 256))
+    pred_arc = _resample_polyline_by_arclen(pred_path, num_samples)
+    gt_arc = _resample_polyline_by_arclen(gt_path, num_samples)
+
+    diff = pred_arc - gt_arc
+    path_arc_ade = float(np.linalg.norm(diff, axis=-1).mean())
+
+    dmat = np.linalg.norm(pred_arc[:, None, :] - gt_arc[None, :, :], axis=-1)
+    path_chamfer = float(0.5 * (dmat.min(axis=1).mean() + dmat.min(axis=0).mean()))
+
+    return {
+        "path_arc_ade": path_arc_ade,
+        "path_chamfer": path_chamfer,
+    }
 
 
 def _calculate_skating_ratio_from_joints(joints_xyz: np.ndarray) -> float:
@@ -1122,6 +1189,17 @@ def main():
         if jitter_vals:
             final_metrics["traj/jitter_mean"] = float(np.mean(jitter_vals))
             final_metrics["traj/jitter_std"]  = float(np.std(jitter_vals))
+
+        path_arc_ades = [r["path_arc_ade"] for r in valid_traj
+                         if "path_arc_ade" in r and r["path_arc_ade"] == r["path_arc_ade"]]
+        if path_arc_ades:
+            final_metrics["path/arc_ADE_mean"] = float(np.mean(path_arc_ades))
+            final_metrics["path/arc_ADE_std"] = float(np.std(path_arc_ades))
+        path_chamfers = [r["path_chamfer"] for r in valid_traj
+                         if "path_chamfer" in r and r["path_chamfer"] == r["path_chamfer"]]
+        if path_chamfers:
+            final_metrics["path/chamfer_mean"] = float(np.mean(path_chamfers))
+            final_metrics["path/chamfer_std"] = float(np.std(path_chamfers))
 
         # Forward control loss aggregation
         fwd_vals = [r["fwd_ctrl_loss"] for r in valid_traj

@@ -273,7 +273,8 @@ class CustomLightningModule(BasicLightningModule):
 
         # metric models
         self.recover_dim = self.cfg.metrics.dim
-        self.t2m_metrics = T2MMetrics(self.cfg.metrics.t2m)
+        self.t2m_enabled = bool(self.cfg.get("t2m_metric", False))
+        self.t2m_metrics = T2MMetrics(self.cfg.metrics.t2m) if self.t2m_enabled else None
 
     def on_load_checkpoint(self, checkpoint):
         ckpt_keys = set(checkpoint["state_dict"].keys())
@@ -390,6 +391,8 @@ class CustomLightningModule(BasicLightningModule):
         return out
 
     def update_metrics(self, batch):
+        if not self.t2m_enabled or self.t2m_metrics is None:
+            return
         with self.ema.average_parameters([p for p in self.model.parameters() if p.requires_grad]):
             model_batch = batch.copy()
             model_batch["feature"] = batch["token"]
@@ -441,6 +444,8 @@ class CustomLightningModule(BasicLightningModule):
         return
 
     def compute_metrics(self):
+        if not self.t2m_enabled or self.t2m_metrics is None:
+            return
         t2m_output = self.t2m_metrics.compute(sanity_flag=self.trainer.sanity_checking)
         for key, value in t2m_output.items():
             self.log(f"metrics/t2m_metrics/{key}", value, sync_dist=True)
@@ -466,6 +471,7 @@ class CustomLightningModule(BasicLightningModule):
         eval_num_runs = max(eval_cfg["num_runs"], 1)
         eval_seg_size = eval_cfg["seg_size"]
         do_eval_metrics = eval_cfg["enabled"] and "traj" in batch and "traj_mask" in batch
+        generation_num_runs = eval_num_runs if do_eval_metrics else 1
         probe_tag = self._resolve_test_probe_tag(test_loader_idx)
         step_tag = f"step_{int(self.global_step):06d}"
         try:
@@ -487,7 +493,7 @@ class CustomLightningModule(BasicLightningModule):
                 if "feature_text_end" in sample_batch:
                     frames = np.asarray(sample_batch["feature_text_end"][0])
 
-                if eval_cfg["forward_ctrl_loss"] and "traj" in sample_batch:
+                if do_eval_metrics and eval_cfg["forward_ctrl_loss"] and "traj" in sample_batch:
                     try:
                         fwd_stat = _compute_deterministic_fwd_ctrl_loss_sample(
                             model=self.model,
@@ -503,7 +509,7 @@ class CustomLightningModule(BasicLightningModule):
                             f"[inline fwd_ctrl_loss] sample={sample_name} deterministic eval failed: {e}"
                         )
 
-                for run_idx in range(eval_num_runs):
+                for run_idx in range(generation_num_runs):
                     sample_seed = self._stable_eval_seed(
                         self.cfg.seed, probe_tag, sample_name, run_idx
                     )
@@ -760,6 +766,18 @@ class CustomLightningModule(BasicLightningModule):
                         summary["traj/jitter_mean"] = float(np.mean(jitter_vals))
                         summary["traj/jitter_std"] = float(np.std(jitter_vals))
 
+                    path_arc_ades = [r["path_arc_ade"] for r in valid_traj
+                                     if "path_arc_ade" in r and r["path_arc_ade"] == r["path_arc_ade"]]
+                    if path_arc_ades:
+                        summary["path/arc_ADE_mean"] = float(np.mean(path_arc_ades))
+                        summary["path/arc_ADE_std"] = float(np.std(path_arc_ades))
+
+                    path_chamfers = [r["path_chamfer"] for r in valid_traj
+                                     if "path_chamfer" in r and r["path_chamfer"] == r["path_chamfer"]]
+                    if path_chamfers:
+                        summary["path/chamfer_mean"] = float(np.mean(path_chamfers))
+                        summary["path/chamfer_std"] = float(np.std(path_chamfers))
+
                     fwd_vals = [r["fwd_ctrl_loss"] for r in valid_traj
                                 if "fwd_ctrl_loss" in r and r["fwd_ctrl_loss"] == r["fwd_ctrl_loss"]]
                     if fwd_vals:
@@ -817,6 +835,7 @@ class CustomLightningModule(BasicLightningModule):
                     f"[eval][{dataset_id}][{probe_tag}][{step_tag}] "
                     f"ADE={summary.get('traj/ADE_mean', float('nan')):.4f} "
                     f"FDE={summary.get('traj/FDE_mean', float('nan')):.4f} "
+                    f"PathArc={summary.get('path/arc_ADE_mean', float('nan')):.4f} "
                     f"ControlL2={summary.get('control/Control_L2_dist_mean', float('nan')):.4f}"
                 )
 
