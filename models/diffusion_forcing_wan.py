@@ -5,10 +5,16 @@ import torch
 import torch.nn as nn
 
 from .tools.t5 import T5EncoderModel
-from utils.traj_batch import root_to_traj_feats
 from .tools.traj_encoder import LocalTrajEncoder, TrajEncoder
 from .tools.wan_model import WanModel
 from .tools.wan_controlnet import WanControlNet
+
+try:
+    from FloodNet.utils.traj_batch import build_traj_emb_from_batch
+    from FloodNet.utils.traj_stream_buffer import TrajStreamBuffer
+except ImportError:  # pragma: no cover - script entrypoints use top-level imports
+    from utils.traj_batch import build_traj_emb_from_batch
+    from utils.traj_stream_buffer import TrajStreamBuffer
 
 
 def _expand_precomputed_caption_keys(emb: dict) -> dict:
@@ -53,6 +59,11 @@ class DiffForcingWanModel(nn.Module):
         use_precomputed_text_emb=False,
         precomputed_text_emb_path=None,
         scheduled_sampling_prob=0.0,
+        self_forcing_enabled=False,
+        self_forcing_stride_tokens=1,
+        self_forcing_detach_between_steps=True,
+        self_forcing_k_schedule=((0.0, 2), (0.4, 3), (0.7, 5)),
+        self_forcing_start_step=None,
     ):
         super().__init__()
         if traj_encoder_in_dim is not None:
@@ -85,6 +96,36 @@ class DiffForcingWanModel(nn.Module):
             use_traj_emb_cache = bool(use_traj_kv_cache)
         self.use_traj_emb_cache = use_traj_emb_cache
         self.scheduled_sampling_prob = float(scheduled_sampling_prob)
+        self.self_forcing_enabled = bool(self_forcing_enabled)
+        self.self_forcing_stride_tokens = int(self_forcing_stride_tokens)
+        self.self_forcing_detach_between_steps = bool(
+            self_forcing_detach_between_steps
+        )
+        self.self_forcing_k_schedule = [
+            (float(p), int(k)) for p, k in self_forcing_k_schedule
+        ]
+        if self_forcing_start_step is not None:
+            warnings.warn(
+                "`self_forcing_start_step` is deprecated and ignored. "
+                "When self_forcing_enabled=True, self-forcing now starts from the first step.",
+                stacklevel=2,
+            )
+
+        if self.self_forcing_stride_tokens != 1:
+            raise ValueError(
+                "v1 self-forcing only supports self_forcing_stride_tokens == 1"
+            )
+        if self.self_forcing_enabled and not self.self_forcing_detach_between_steps:
+            raise NotImplementedError(
+                "v1 self-forcing only supports detach_between_steps=True"
+            )
+        if self.self_forcing_enabled and self.prediction_type not in ("vel", "x0"):
+            raise ValueError(
+                "self-forcing only supports prediction_type in {'vel', 'x0'}"
+            )
+        if not self.self_forcing_k_schedule:
+            raise ValueError("self_forcing_k_schedule must not be empty")
+        self.self_forcing_k_schedule.sort(key=lambda x: x[0])
 
         self.text_dim = 4096
         self.text_len = text_len
@@ -169,8 +210,6 @@ class DiffForcingWanModel(nn.Module):
             in_dim=self.traj_in_dim, hidden_dim=64, out_dim=self.traj_out_dim
         )
         self.param_dtype = torch.float32
-        self._traj_stream_version = 0
-        self._traj_emb_cache = {}
 
         if self.freeze_backbone:
             for p in self.model.parameters():
@@ -307,83 +346,12 @@ class DiffForcingWanModel(nn.Module):
         x = x.permute(0, 2, 1, 3, 4).contiguous().view(x.size(0), x.size(2), -1)
         return x
 
-    def _build_traj_emb(self, x, seq_len, device, training_dropout=False):
+    def _build_traj_emb(self, x, seq_len, device):
         if self.traj_encoder is None:
             return None
-
-        # Prefer frame-level traj_features if present; else derive from traj xyz.
-        if "traj_features" in x and x["traj_features"] is not None:
-            feats_frame = x["traj_features"].to(device)  # (B, T_frame, 4)
-        elif "traj" in x and x["traj"] is not None:
-            feats_frame = root_to_traj_feats(x["traj"].to(device))
-        else:
-            return None
-
-        # Frame-level mask.
-        mask_frame = None
-        if "traj_mask" in x and x["traj_mask"] is not None:
-            mask_frame = x["traj_mask"].to(device=device, dtype=torch.float32)
-        elif "token_mask" in x and x["token_mask"] is not None:
-            # Build frame mask with causal VAE convention:
-            #   token 0 → frame 0; token k (k≥1) → frames [4k-3, 4k]
-            tm = x["token_mask"].to(device=device, dtype=torch.float32)
-            B_tm, N_tm = tm.shape
-            tf = feats_frame.shape[1]
-            mask_frame = tm.new_zeros(B_tm, tf)
-            mask_frame[:, 0] = tm[:, 0]
-            for k in range(1, N_tm):
-                sf = 4 * k - 3
-                ef = min(4 * k + 1, tf)
-                if sf < tf:
-                    mask_frame[:, sf:ef] = tm[:, k : k + 1].expand(-1, ef - sf)
-        if mask_frame is not None:
-            tf = feats_frame.shape[1]
-            if mask_frame.shape[1] < tf:
-                pad = mask_frame.new_zeros(mask_frame.shape[0], tf - mask_frame.shape[1])
-                mask_frame = torch.cat([mask_frame, pad], dim=1)
-            mask_frame = mask_frame[:, :tf]
-            feats_frame = feats_frame * mask_frame.unsqueeze(-1).to(dtype=feats_frame.dtype)
-
-        # If traj_features is already token-level (B, seq_len, 4), skip local 4-frame encoder.
-        # Otherwise, treat it as frame-level (B, T_frame, 4) and compress 4 frames per token.
-        if feats_frame.shape[1] == seq_len:
-            feats_tok = feats_frame
-        else:
-            # Causal VAE convention: N tokens → 4*(N-1)+1 frames
-            #   token 0 → frame 0 only
-            #   token k (k≥1) → frames [4k-3, 4k]
-            total_causal = 4 * (seq_len - 1) + 1 if seq_len > 1 else 1
-            tf = feats_frame.shape[1]
-            if tf < total_causal:
-                pad = feats_frame.new_zeros(
-                    feats_frame.shape[0], total_causal - tf, feats_frame.shape[2]
-                )
-                feats_frame = torch.cat([feats_frame, pad], dim=1)
-            feats_frame = feats_frame[:, :total_causal, :]
-            # Token 0: repeat frame 0 four times (causal seed frame)
-            tok0 = feats_frame[:, 0:1, :].unsqueeze(2).expand(-1, -1, 4, -1)  # (B,1,4,C)
-            if seq_len > 1:
-                # Tokens 1..seq_len-1: frames [1, 4*(seq_len-1)] in consecutive groups of 4
-                rest = feats_frame[:, 1:, :].reshape(
-                    feats_frame.shape[0], seq_len - 1, 4, feats_frame.shape[2]
-                )  # (B, seq_len-1, 4, C)
-                feats_4 = torch.cat([tok0, rest], dim=1)  # (B, seq_len, 4, C)
-            else:
-                feats_4 = tok0  # (B, 1, 4, C)
-            if self.local_traj_encoder is None:
-                return None
-            feats_tok = self.local_traj_encoder(feats_4)  # (B, seq_len, 4)
-
-        # Token-level mask (gate at token granularity).
-        if "token_mask" in x and x["token_mask"] is not None:
-            tm = x["token_mask"].to(device=device, dtype=torch.float32)
-            if tm.shape[1] < seq_len:
-                pad = tm.new_zeros(tm.shape[0], seq_len - tm.shape[1])
-                tm = torch.cat([tm, pad], dim=1)
-            tm = tm[:, :seq_len]
-            feats_tok = feats_tok * tm.unsqueeze(-1).to(dtype=feats_tok.dtype)
-
-        return self.traj_encoder(feats_tok)
+        return build_traj_emb_from_batch(
+            x, seq_len, device, self.local_traj_encoder, self.traj_encoder
+        )
 
     def _get_traj_seq_lens(self, x, seq_len, device):
         # Prefer feature_length (= token_length) — exact, no rounding error.
@@ -404,6 +372,237 @@ class DiffForcingWanModel(nn.Module):
             tl = x["traj_length"].to(device=device, dtype=torch.long)
             return ((tl + 2) // 4 + 1).clamp(min=0, max=seq_len)
         return None
+
+    def _prepare_text_context(self, x, seq_len, device):
+        if self.use_text_cond and "text" in x:
+            text_list = x["text"]  # List[str] or List[List[str]]
+            if isinstance(text_list[0], list):
+                text_end_list = x["feature_text_end"]
+                all_text_context = []
+                for single_text_list, single_text_end_list in zip(
+                    text_list, text_end_list
+                ):
+                    if (not self.training) or (np.random.rand() > self.dropout):
+                        single_text_end_list = [0] + [
+                            min(t, seq_len) for t in single_text_end_list
+                        ]
+                    else:
+                        single_text_list = [""]
+                        single_text_end_list = [0, seq_len]
+                    single_text_length_list = [
+                        t - b
+                        for t, b in zip(
+                            single_text_end_list[1:], single_text_end_list[:-1]
+                        )
+                    ]
+                    single_text_context = self.encode_text_with_cache(
+                        single_text_list, device
+                    )
+                    single_text_context = [
+                        u.to(self.param_dtype) for u in single_text_context
+                    ]
+                    for u, duration in zip(
+                        single_text_context, single_text_length_list
+                    ):
+                        all_text_context.extend([u for _ in range(duration)])
+                    all_text_context.extend(
+                        [
+                            single_text_context[-1]
+                            for _ in range(seq_len - single_text_end_list[-1])
+                        ]
+                    )
+            else:
+                if self.training:
+                    all_text_context = [
+                        (u if np.random.rand() > self.dropout else "") for u in text_list
+                    ]
+                else:
+                    all_text_context = list(text_list)
+                all_text_context = self.encode_text_with_cache(all_text_context, device)
+                all_text_context = [u.to(self.param_dtype) for u in all_text_context]
+        else:
+            all_text_context = [""] * x["feature"].shape[0]
+            all_text_context = self.encode_text_with_cache(all_text_context, device)
+            all_text_context = [u.to(self.param_dtype) for u in all_text_context]
+        return all_text_context
+
+    def _sample_traj_dropout_decision(self, device):
+        traj_dropped = False
+        if self.training:
+            drop = torch.empty(1, device=device).uniform_()
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.broadcast(drop, src=0)
+            traj_dropped = drop.item() < self.traj_dropout
+        return traj_dropped
+
+    def _prepare_traj_condition(
+        self, x, seq_len, device, traj_dropped_override=None
+    ):
+        traj_emb = None
+        traj_seq_lens = None
+        if traj_dropped_override is None:
+            traj_dropped = self._sample_traj_dropout_decision(device)
+        else:
+            traj_dropped = bool(traj_dropped_override)
+
+        if not traj_dropped:
+            traj_emb = self._build_traj_emb(x, seq_len, device)
+            traj_seq_lens = self._get_traj_seq_lens(x, seq_len, device)
+
+        return traj_emb, traj_seq_lens, traj_dropped
+
+    def _build_window_inputs(self, clean_feature, feature_length, time_steps):
+        batch_size, seq_len, _ = clean_feature.shape
+        device = clean_feature.device
+
+        noise_level = self._get_noise_levels(device, seq_len, time_steps)
+        noisy_feature, noise = self.add_noise(clean_feature, noise_level)
+
+        feature = self.preprocess(clean_feature)
+        noisy_feature = self.preprocess(noisy_feature)
+        noise = self.preprocess(noise)
+
+        feature_ref = []
+        noise_ref = []
+        noisy_feature_input = []
+        end_indices = []
+        for i in range(batch_size):
+            end_index = int(self.chunk_size * time_steps[i].item()) + 1
+            valid_len = int(feature_length[i].item())
+            end_index = min(valid_len, end_index)
+            feature_ref.append(feature[i, :, :end_index, ...])
+            noise_ref.append(noise[i, :, :end_index, ...])
+            noisy_feature_input.append(noisy_feature[i, :, :end_index, ...])
+            end_indices.append(end_index)
+
+        return noise_level, feature_ref, noise_ref, noisy_feature_input, end_indices
+
+    def _run_single_window_forward(
+        self,
+        x,
+        clean_feature,
+        time_steps,
+        all_text_context,
+        traj_emb,
+        traj_seq_lens,
+        traj_dropped,
+        enable_scheduled_sampling=True,
+    ):
+        feature_length = x["feature_length"]
+        batch_size, seq_len, _ = clean_feature.shape
+        device = clean_feature.device
+
+        (
+            noise_level,
+            feature_ref,
+            noise_ref,
+            noisy_feature_input,
+            end_indices,
+        ) = self._build_window_inputs(clean_feature, feature_length, time_steps)
+
+        if (
+            enable_scheduled_sampling
+            and self.training
+            and self.scheduled_sampling_prob > 0.0
+            and np.random.rand() < self.scheduled_sampling_prob
+        ):
+            with torch.no_grad():
+                cn_res_ss = self._controlnet_forward(
+                    noisy_feature_input,
+                    noise_level * self.time_embedding_scale,
+                    all_text_context,
+                    seq_len,
+                    traj_emb,
+                    traj_seq_lens,
+                )
+                pred_ss = self.model(
+                    noisy_feature_input,
+                    noise_level * self.time_embedding_scale,
+                    all_text_context,
+                    seq_len,
+                    y=None,
+                    traj_emb=None,
+                    traj_seq_lens=None,
+                    controlnet_residuals=cn_res_ss,
+                )
+            for b in range(batch_size):
+                t_len = noisy_feature_input[b].shape[1]
+                ctx_len = t_len - self.chunk_size
+                if ctx_len <= 0:
+                    continue
+                if self.prediction_type == "vel":
+                    x0_hat = (pred_ss[b] + noise_ref[b]).detach()
+                elif self.prediction_type == "x0":
+                    x0_hat = pred_ss[b].detach()
+                else:
+                    continue
+                noisy_feature_input[b] = torch.cat(
+                    [x0_hat[:, :ctx_len], noisy_feature_input[b][:, ctx_len:]], dim=1
+                )
+
+        controlnet_residuals = self._controlnet_forward(
+            noisy_feature_input,
+            noise_level * self.time_embedding_scale,
+            all_text_context,
+            seq_len,
+            traj_emb,
+            traj_seq_lens,
+        )
+        predicted_result = self.model(
+            noisy_feature_input,
+            noise_level * self.time_embedding_scale,
+            all_text_context,
+            seq_len,
+            y=None,
+            traj_emb=None,
+            traj_seq_lens=None,
+            controlnet_residuals=controlnet_residuals,
+        )
+
+        loss = 0.0
+        x0_latent_list = []
+        for b in range(batch_size):
+            if self.prediction_type == "vel":
+                vel = feature_ref[b] - noise_ref[b]
+                squared_error = (
+                    predicted_result[b][:, -self.chunk_size :, ...]
+                    - vel[:, -self.chunk_size :, ...]
+                ) ** 2
+            elif self.prediction_type == "x0":
+                squared_error = (
+                    predicted_result[b][:, -self.chunk_size :, ...]
+                    - feature_ref[b][:, -self.chunk_size :, ...]
+                ) ** 2
+            elif self.prediction_type == "noise":
+                squared_error = (
+                    predicted_result[b][:, -self.chunk_size :, ...]
+                    - noise_ref[b][:, -self.chunk_size :, ...]
+                ) ** 2
+                x0_latent_list.append(None)
+            else:
+                raise ValueError(
+                    f"Unsupported prediction_type={self.prediction_type!r}"
+                )
+            sample_loss = squared_error.mean()
+            loss += sample_loss
+            if self.prediction_type == "vel":
+                pred_x0 = predicted_result[b] + noise_ref[b]
+                x0_latent_list.append(pred_x0[:, :, 0, 0].permute(1, 0))
+            elif self.prediction_type == "x0":
+                pred_x0 = predicted_result[b]
+                x0_latent_list.append(pred_x0[:, :, 0, 0].permute(1, 0))
+        loss = loss / batch_size
+
+        pred_x0_latent_list = None
+        if ("traj" in x) and (self.prediction_type in ("vel", "x0")) and not traj_dropped:
+            pred_x0_latent_list = x0_latent_list
+
+        return {
+            "loss": loss,
+            "pred_x0_latent_list": pred_x0_latent_list,
+            "x0_latent_list": x0_latent_list,
+            "end_indices": end_indices,
+        }
 
     def _get_noise_levels(self, device, seq_len, time_steps):
         """Get noise levels (Paper: vectorized schedule).
@@ -461,205 +660,117 @@ class DiffForcingWanModel(nn.Module):
                 max_time = valid_len / self.chunk_size
                 time_steps.append(torch.FloatTensor(1).uniform_(0, max_time).item())
             time_steps = torch.tensor(time_steps, device=device)  # (B,)
-        noise_level = self._get_noise_levels(device, seq_len, time_steps)  # (B, T)
+        all_text_context = self._prepare_text_context(x, seq_len, device)
+        traj_emb, traj_seq_lens, traj_dropped = self._prepare_traj_condition(
+            x, seq_len, device
+        )
 
-        # Add noise to entire sequence
-        noisy_feature, noise = self.add_noise(feature, noise_level)  # (B, T, D)
-
-        feature = self.preprocess(feature)  # (B, C, T, 1, 1)
-        noisy_feature = self.preprocess(noisy_feature)  # (B, C, T, 1, 1)
-        noise = self.preprocess(noise)  # (B, C, T, 1, 1)
-
-        feature_ref = []
-        noise_ref = []
-        noisy_feature_input = []
-        for i in range(batch_size):
-            t = time_steps[i].item()
-            end_index = int(self.chunk_size * t) + 1
-            valid_len = feature_length[i].item()
-            end_index = min(valid_len, end_index)
-            feature_ref.append(feature[i, :, :end_index, ...])
-            noise_ref.append(noise[i, :, :end_index, ...])
-            noisy_feature_input.append(noisy_feature[i, :, :end_index, ...])
-
-        # Encode text condition (using cache)
-        if self.use_text_cond and "text" in x:
-            text_list = x["text"]  # List[str] or List[List[str]]
-            if isinstance(text_list[0], list):
-                text_end_list = x["feature_text_end"]
-                all_text_context = []
-                for single_text_list, single_text_end_list in zip(
-                    text_list, text_end_list
-                ):
-                    # Paper: classifier-free guidance — with prob dropout replace text by "" at train time
-                    if (not self.training) or (np.random.rand() > self.dropout):
-                        single_text_end_list = [0] + [
-                            min(t, seq_len) for t in single_text_end_list
-                        ]
-                    else:
-                        single_text_list = [""]
-                        single_text_end_list = [0, seq_len]
-                    single_text_length_list = [
-                        t - b
-                        for t, b in zip(
-                            single_text_end_list[1:], single_text_end_list[:-1]
-                        )
-                    ]
-                    single_text_context = self.encode_text_with_cache(
-                        single_text_list, device
-                    )
-                    single_text_context = [
-                        u.to(self.param_dtype) for u in single_text_context
-                    ]
-                    # Paper: frame-wise text conditioning — one embedding per frame so each motion frame attends only to "the text prompt active at that time"
-                    for u, duration in zip(
-                        single_text_context, single_text_length_list
-                    ):
-                        all_text_context.extend([u for _ in range(duration)])
-                    all_text_context.extend(
-                        [
-                            single_text_context[-1]
-                            for _ in range(seq_len - single_text_end_list[-1])
-                        ]
-                    )
-            else:
-                if self.training:
-                    all_text_context = [
-                        (u if np.random.rand() > self.dropout else "") for u in text_list
-                    ]
-                else:
-                    all_text_context = list(text_list)
-                all_text_context = self.encode_text_with_cache(all_text_context, device)
-                all_text_context = [u.to(self.param_dtype) for u in all_text_context]
-        else:
-            all_text_context = [""] * batch_size
-            all_text_context = self.encode_text_with_cache(all_text_context, device)
-            all_text_context = [u.to(self.param_dtype) for u in all_text_context]
-
-        traj_emb = None
-        traj_seq_lens = None
-        traj_dropped = False  # True when dropout zeroed out traj condition this step
-        if self.training:
-            # DDP: all ranks must make the SAME dropout decision each step.
-            # Sample on rank 0, broadcast to all other ranks; independent per-rank
-            # sampling causes ranks to disagree on which params are used → DDP
-            # all-reduce deadlock → "Resource temporarily unavailable".
-            drop = torch.empty(1, device=device).uniform_()
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                torch.distributed.broadcast(drop, src=0)
-            traj_dropped = drop.item() < self.traj_dropout
-
-        if not traj_dropped:
-            traj_emb = self._build_traj_emb(x, seq_len, device, training_dropout=False)
-            traj_seq_lens = self._get_traj_seq_lens(x, seq_len, device)
-
-        # ── Scheduled Sampling ──────────────────────────────────────────────
-        # With probability ss_prob, replace context tokens (active-window prefix,
-        # noise_level ≈ 0) with the model's own x0 prediction (no_grad pass).
-        # This exposes the model to its own prediction errors during training,
-        # closing the teacher-forcing → generate exposure-bias gap.
-        if (
-            self.training
-            and self.scheduled_sampling_prob > 0.0
-            and np.random.rand() < self.scheduled_sampling_prob
-        ):
-            with torch.no_grad():
-                cn_res_ss = self._controlnet_forward(
-                    noisy_feature_input,
-                    noise_level * self.time_embedding_scale,
-                    all_text_context,
-                    seq_len,
-                    traj_emb,
-                    traj_seq_lens,
-                )
-                pred_ss = self.model(
-                    noisy_feature_input,
-                    noise_level * self.time_embedding_scale,
-                    all_text_context,
-                    seq_len,
-                    y=None,
-                    traj_emb=None,
-                    traj_seq_lens=None,
-                    controlnet_residuals=cn_res_ss,
-                )
-            # Replace context tokens (prefix before active window) with x0_hat.
-            for b in range(batch_size):
-                t_len = noisy_feature_input[b].shape[1]  # end_index for this sample
-                ctx_len = t_len - self.chunk_size        # tokens before active window
-                if ctx_len <= 0:
-                    continue
-                if self.prediction_type == "vel":
-                    # vel = x0 - noise  →  x0_hat = pred_vel + noise
-                    x0_hat = (pred_ss[b] + noise_ref[b]).detach()
-                elif self.prediction_type == "x0":
-                    x0_hat = pred_ss[b].detach()
-                else:
-                    continue  # "noise" type: skip SS for this sample
-                noisy_feature_input[b] = torch.cat(
-                    [x0_hat[:, :ctx_len], noisy_feature_input[b][:, ctx_len:]], dim=1
-                )
-        # ────────────────────────────────────────────────────────────────────
-
-        # Through WanModel
-        controlnet_residuals = self._controlnet_forward(
-            noisy_feature_input,
-            noise_level * self.time_embedding_scale,
+        single_result = self._run_single_window_forward(
+            x,
+            feature,
+            time_steps,
             all_text_context,
-            seq_len,
             traj_emb,
             traj_seq_lens,
+            traj_dropped,
+            enable_scheduled_sampling=True,
         )
-        predicted_result = self.model(
-            noisy_feature_input,
-            noise_level * self.time_embedding_scale,
-            all_text_context,
-            seq_len,
-            y=None,
-            traj_emb=None,
-            traj_seq_lens=None,
-            controlnet_residuals=controlnet_residuals,
-        )  # (B, C, T, 1, 1)
 
-        loss = 0.0
-        # Paper: only compute loss on active window [m(t), n(t)) (last chunk_size positions)
-        for b in range(batch_size):
-            if self.prediction_type == "vel":
-                vel = feature_ref[b] - noise_ref[b]  # (C, input_length, 1, 1)
-                squared_error = (
-                    predicted_result[b][:, -self.chunk_size :, ...]
-                    - vel[:, -self.chunk_size :, ...]
-                ) ** 2
-            elif self.prediction_type == "x0":
-                squared_error = (
-                    predicted_result[b][:, -self.chunk_size :, ...]
-                    - feature_ref[b][:, -self.chunk_size :, ...]
-                ) ** 2
-            elif self.prediction_type == "noise":
-                squared_error = (
-                    predicted_result[b][:, -self.chunk_size :, ...]
-                    - noise_ref[b][:, -self.chunk_size :, ...]
-                ) ** 2
-            sample_loss = squared_error.mean()
-            loss += sample_loss
-        loss = loss / batch_size
-
-        loss_dict = {"total": loss, "mse": loss}
-
-        # MotionLCM-style control loss: prepare pred_x0_latent for decoding (train_ldf will add L_control).
-        # Skip when traj was dropped this step — L_control without traj conditioning is meaningless.
-        if ("traj" in x) and (self.prediction_type in ("vel", "x0")) and not traj_dropped:
-            pred_x0_latent_list = []
-            for b in range(batch_size):
-                if self.prediction_type == "vel":
-                    pred_x0 = predicted_result[b] + noise_ref[b]
-                else:
-                    pred_x0 = predicted_result[b]
-                # (C, T, 1, 1) -> (T, C) for VAE decode
-                p = pred_x0[:, :, 0, 0].permute(1, 0)
-                pred_x0_latent_list.append(p)
-            loss_dict["control_aux"] = {"pred_x0_latent_list": pred_x0_latent_list}
-
+        loss_dict = {"total": single_result["loss"], "mse": single_result["loss"]}
+        if single_result["pred_x0_latent_list"] is not None:
+            loss_dict["control_aux"] = {
+                "pred_x0_latent_list": single_result["pred_x0_latent_list"]
+            }
         return loss_dict
+
+    def _run_cfg_denoising_step(
+        self,
+        noisy_input: list,
+        t_scaled: torch.Tensor,
+        text_cond_ctx: list,
+        text_null_ctx: list,
+        traj_emb,
+        traj_seq_lens,
+        seq_len: int,
+        batch_size: int,
+    ) -> list:
+        """Unified CFG denoising step shared by generate / stream_generate / stream_generate_step.
+
+        Handles three modes transparently:
+          - 2-batch text CFG (cfg_scale_text != 1) + optional separated traj CFG
+          - Single-batch with post-hoc null-text forward (cfg_scale_text != 1, no 2b context)
+          - Unconditioned (cfg_scale_text == 1)
+        Returns a list of per-sample predicted tensors (C, T, 1, 1).
+        """
+        ctx_2b = (
+            self._build_cfg_2b_text(text_cond_ctx, text_null_ctx, batch_size, seq_len)
+            if self.cfg_scale_text != 1.0
+            else None
+        )
+
+        if ctx_2b is not None:
+            noisy_2b = list(noisy_input) + list(noisy_input)
+            t_2b = torch.cat([t_scaled, t_scaled], dim=0)
+            traj_2b = (
+                torch.cat([traj_emb, traj_emb], dim=0) if traj_emb is not None else None
+            )
+            traj_sl_2b = (
+                torch.cat([traj_seq_lens, traj_seq_lens], dim=0)
+                if traj_seq_lens is not None
+                else None
+            )
+            residuals = self._controlnet_forward(
+                noisy_2b, t_2b, ctx_2b, seq_len, traj_2b, traj_sl_2b
+            )
+            pred_2b = self.model(
+                noisy_2b, t_2b, ctx_2b, seq_len,
+                y=None, traj_emb=None, traj_seq_lens=None, controlnet_residuals=residuals,
+            )
+            if self.cfg_scale_traj > 0.0:
+                # Separated CFG:
+                #   out = out_uncond
+                #       + w_text * (out_full - out_null_text)
+                #       + w_traj * (out_null_text - out_uncond)
+                pred_uncond = self._uncond_backbone_forward(
+                    noisy_input, t_scaled, text_null_ctx, seq_len
+                )
+                return [
+                    pred_uncond[i]
+                    + self.cfg_scale_text * (pred_2b[i] - pred_2b[i + batch_size])
+                    + self.cfg_scale_traj * (pred_2b[i + batch_size] - pred_uncond[i])
+                    for i in range(batch_size)
+                ]
+            else:
+                return [
+                    self.cfg_scale_text * pred_2b[i]
+                    - (self.cfg_scale_text - 1) * pred_2b[i + batch_size]
+                    for i in range(batch_size)
+                ]
+        else:
+            residuals = self._controlnet_forward(
+                noisy_input, t_scaled, text_cond_ctx, seq_len, traj_emb, traj_seq_lens
+            )
+            pred = self.model(
+                noisy_input, t_scaled, text_cond_ctx, seq_len,
+                y=None, traj_emb=None, traj_seq_lens=None, controlnet_residuals=residuals,
+            )
+            if self.cfg_scale_text != 1.0:
+                # Re-compute ControlNet residuals with null text so the uncond branch is
+                # truly unconditioned (Bug fix: reusing cond residuals made CFG uncond
+                # branch not truly null).
+                residuals_null = self._controlnet_forward(
+                    noisy_input, t_scaled, text_null_ctx, seq_len, traj_emb, traj_seq_lens
+                )
+                pred_null = self.model(
+                    noisy_input, t_scaled, text_null_ctx, seq_len,
+                    y=None, traj_emb=None, traj_seq_lens=None,
+                    controlnet_residuals=residuals_null,
+                )
+                return [
+                    self.cfg_scale_text * pv - (self.cfg_scale_text - 1) * pvn
+                    for pv, pvn in zip(pred, pred_null)
+                ]
+            return pred
 
     def generate(self, x, num_denoise_steps=None):
         """
@@ -761,7 +872,7 @@ class DiffForcingWanModel(nn.Module):
         text_null_context = [u.to(self.param_dtype) for u in text_null_context]
 
         gen_seq_len = seq_len + self.chunk_size
-        traj_emb = self._build_traj_emb(x, gen_seq_len, device, training_dropout=False)
+        traj_emb = self._build_traj_emb(x, gen_seq_len, device)
         traj_seq_lens = self._get_traj_seq_lens(x, gen_seq_len, device)
 
         # Progressively advance from t=0 to t=max_t
@@ -784,111 +895,11 @@ class DiffForcingWanModel(nn.Module):
 
             gen_sl = seq_len + self.chunk_size
             t_scaled = noise_level * self.time_embedding_scale
-            ctx_2b = (
-                self._build_cfg_2b_text(
-                    all_text_context, text_null_context, batch_size, gen_sl
-                )
-                if self.cfg_scale_text != 1.0
-                else None
+            predicted_result = self._run_cfg_denoising_step(
+                noisy_input, t_scaled,
+                all_text_context, text_null_context,
+                traj_emb, traj_seq_lens, gen_sl, batch_size,
             )
-            if ctx_2b is not None:
-                noisy_2b = list(noisy_input) + list(noisy_input)
-                t_2b = torch.cat([t_scaled, t_scaled], dim=0)
-                traj_cn_2b = (
-                    torch.cat([traj_emb, traj_emb], dim=0)
-                    if traj_emb is not None
-                    else None
-                )
-                traj_sl_2b = (
-                    torch.cat([traj_seq_lens, traj_seq_lens], dim=0)
-                    if traj_seq_lens is not None
-                    else None
-                )
-                controlnet_residuals = self._controlnet_forward(
-                    noisy_2b,
-                    t_2b,
-                    ctx_2b,
-                    gen_sl,
-                    traj_cn_2b,
-                    traj_sl_2b,
-                )
-                pred_2b = self.model(
-                    noisy_2b,
-                    t_2b,
-                    ctx_2b,
-                    gen_sl,
-                    y=None,
-                    traj_emb=None,
-                    traj_seq_lens=None,
-                    controlnet_residuals=controlnet_residuals,
-                )
-                if self.cfg_scale_traj > 0.0:
-                    # Separated CFG: reuse 2-batch (out_full, out_null_text);
-                    # one extra backbone forward for out_uncond (text OFF, traj OFF).
-                    # Formula:
-                    #   out = out_uncond
-                    #       + w_text * (out_full - out_null_text)
-                    #       + w_traj * (out_null_text - out_uncond)
-                    pred_uncond = self._uncond_backbone_forward(
-                        noisy_input, t_scaled, text_null_context, gen_sl,
-                    )
-                    predicted_result = [
-                        pred_uncond[i]
-                        + self.cfg_scale_text * (pred_2b[i] - pred_2b[i + batch_size])
-                        + self.cfg_scale_traj * (pred_2b[i + batch_size] - pred_uncond[i])
-                        for i in range(batch_size)
-                    ]
-                else:
-                    predicted_result = [
-                        self.cfg_scale_text * pred_2b[i]
-                        - (self.cfg_scale_text - 1) * pred_2b[i + batch_size]
-                        for i in range(batch_size)
-                    ]
-            else:
-                controlnet_residuals = self._controlnet_forward(
-                    noisy_input,
-                    t_scaled,
-                    all_text_context,
-                    gen_sl,
-                    traj_emb,
-                    traj_seq_lens,
-                )
-                predicted_result = self.model(
-                    noisy_input,
-                    t_scaled,
-                    all_text_context,
-                    gen_sl,
-                    y=None,
-                    traj_emb=None,
-                    traj_seq_lens=None,
-                    controlnet_residuals=controlnet_residuals,
-                )
-                if self.cfg_scale_text != 1.0:
-                    # Re-compute ControlNet residuals with null text so the uncond
-                    # branch is truly unconditioned on text (Bug fix: previously
-                    # reused cond residuals, making CFG uncond branch not truly null).
-                    controlnet_residuals_null = self._controlnet_forward(
-                        noisy_input,
-                        t_scaled,
-                        text_null_context,
-                        gen_sl,
-                        traj_emb,
-                        traj_seq_lens,
-                    )
-                    predicted_result_null = self.model(
-                        noisy_input,
-                        t_scaled,
-                        text_null_context,
-                        gen_sl,
-                        y=None,
-                        traj_emb=None,
-                        traj_seq_lens=None,
-                        controlnet_residuals=controlnet_residuals_null,
-                    )
-                    predicted_result = [
-                        self.cfg_scale_text * pv - (self.cfg_scale_text - 1) * pvn
-                        for pv, pvn in zip(predicted_result, predicted_result_null)
-                    ]
 
             for i in range(batch_size):
                 predicted_result_i = predicted_result[i]  # (C, input_length, 1, 1)
@@ -1035,7 +1046,7 @@ class DiffForcingWanModel(nn.Module):
         gen_seq_len = seq_len + self.chunk_size
         traj_emb = None
         traj_seq_lens = None
-        traj_emb = self._build_traj_emb(x, gen_seq_len, device, training_dropout=False)
+        traj_emb = self._build_traj_emb(x, gen_seq_len, device)
         traj_seq_lens = self._get_traj_seq_lens(x, gen_seq_len, device)
 
         commit_index = 0
@@ -1059,111 +1070,11 @@ class DiffForcingWanModel(nn.Module):
 
             gen_sl = seq_len + self.chunk_size
             t_scaled = noise_level * self.time_embedding_scale
-            ctx_2b = (
-                self._build_cfg_2b_text(
-                    all_text_context, text_null_context, batch_size, gen_sl
-                )
-                if self.cfg_scale_text != 1.0
-                else None
+            predicted_result = self._run_cfg_denoising_step(
+                noisy_input, t_scaled,
+                all_text_context, text_null_context,
+                traj_emb, traj_seq_lens, gen_sl, batch_size,
             )
-            if ctx_2b is not None:
-                noisy_2b = list(noisy_input) + list(noisy_input)
-                t_2b = torch.cat([t_scaled, t_scaled], dim=0)
-                traj_cn_2b = (
-                    torch.cat([traj_emb, traj_emb], dim=0)
-                    if traj_emb is not None
-                    else None
-                )
-                traj_sl_2b = (
-                    torch.cat([traj_seq_lens, traj_seq_lens], dim=0)
-                    if traj_seq_lens is not None
-                    else None
-                )
-                controlnet_residuals = self._controlnet_forward(
-                    noisy_2b,
-                    t_2b,
-                    ctx_2b,
-                    gen_sl,
-                    traj_cn_2b,
-                    traj_sl_2b,
-                )
-                pred_2b = self.model(
-                    noisy_2b,
-                    t_2b,
-                    ctx_2b,
-                    gen_sl,
-                    y=None,
-                    traj_emb=None,
-                    traj_seq_lens=None,
-                    controlnet_residuals=controlnet_residuals,
-                )
-                if self.cfg_scale_traj > 0.0:
-                    # Separated CFG: reuse 2-batch (out_full, out_null_text);
-                    # one extra backbone forward for out_uncond (text OFF, traj OFF).
-                    # Formula:
-                    #   out = out_uncond
-                    #       + w_text * (out_full - out_null_text)
-                    #       + w_traj * (out_null_text - out_uncond)
-                    pred_uncond = self._uncond_backbone_forward(
-                        noisy_input, t_scaled, text_null_context, gen_sl,
-                    )
-                    predicted_result = [
-                        pred_uncond[i]
-                        + self.cfg_scale_text * (pred_2b[i] - pred_2b[i + batch_size])
-                        + self.cfg_scale_traj * (pred_2b[i + batch_size] - pred_uncond[i])
-                        for i in range(batch_size)
-                    ]
-                else:
-                    predicted_result = [
-                        self.cfg_scale_text * pred_2b[i]
-                        - (self.cfg_scale_text - 1) * pred_2b[i + batch_size]
-                        for i in range(batch_size)
-                    ]
-            else:
-                controlnet_residuals = self._controlnet_forward(
-                    noisy_input,
-                    t_scaled,
-                    all_text_context,
-                    gen_sl,
-                    traj_emb,
-                    traj_seq_lens,
-                )
-                predicted_result = self.model(
-                    noisy_input,
-                    t_scaled,
-                    all_text_context,
-                    gen_sl,
-                    y=None,
-                    traj_emb=None,
-                    traj_seq_lens=None,
-                    controlnet_residuals=controlnet_residuals,
-                )
-                if self.cfg_scale_text != 1.0:
-                    # Re-compute ControlNet residuals with null text so the uncond
-                    # branch is truly unconditioned on text (Bug fix: previously
-                    # reused cond residuals, making CFG uncond branch not truly null).
-                    controlnet_residuals_null = self._controlnet_forward(
-                        noisy_input,
-                        t_scaled,
-                        text_null_context,
-                        gen_sl,
-                        traj_emb,
-                        traj_seq_lens,
-                    )
-                    predicted_result_null = self.model(
-                        noisy_input,
-                        t_scaled,
-                        text_null_context,
-                        gen_sl,
-                        y=None,
-                        traj_emb=None,
-                        traj_seq_lens=None,
-                        controlnet_residuals=controlnet_residuals_null,
-                    )
-                    predicted_result = [
-                        self.cfg_scale_text * pv - (self.cfg_scale_text - 1) * pvn
-                        for pv, pvn in zip(predicted_result, predicted_result_null)
-                    ]
 
             for i in range(batch_size):
                 predicted_result_i = predicted_result[i]  # (C, input_length, 1, 1)
@@ -1240,229 +1151,13 @@ class DiffForcingWanModel(nn.Module):
         )
         self.generated = self.preprocess(self.generated)  # (B, C, T, 1, 1)
         self.commit_index = 0
-        # Trajectory buffer for streaming: (B, seq_len*2+chunk_size, 3); clear so reset() stops conditioning on old traj
-        self.traj_buffer = None
-        self.traj_features_buffer = None
-        self.token_mask_buffer = None
-        self._traj_stream_version = 0
-        self._traj_emb_cache = {}
-
-    def _stream_update_traj_buffers(self, x, device):
-        if self.traj_encoder is None:
-            return
-        buf_len = self.seq_len * 2 + self.chunk_size
-        if self.commit_index >= buf_len:
-            return
-        wrote = False
-        no_traj_input = ("traj" not in x or x["traj"] is None) and (
-            "traj_features" not in x or x["traj_features"] is None
+        self._traj_buf = TrajStreamBuffer(
+            batch_size=batch_size,
+            buf_len=self.seq_len * 2 + self.chunk_size,
+            local_traj_encoder=self.local_traj_encoder,
+            traj_encoder=self.traj_encoder,
+            use_emb_cache=self.use_traj_emb_cache,
         )
-        if no_traj_input:
-            if (
-                self.traj_buffer is not None
-                or self.traj_features_buffer is not None
-                or self.token_mask_buffer is not None
-            ):
-                self.traj_buffer = None
-                self.traj_features_buffer = None
-                self.token_mask_buffer = None
-                self._traj_stream_version += 1
-                self._traj_emb_cache = {}
-            return
-
-        if "traj_features" in x and x["traj_features"] is not None:
-            tf = x["traj_features"]
-            if isinstance(tf, np.ndarray):
-                tf = torch.from_numpy(tf).float().to(device)
-            if tf.dim() == 2:
-                tf = tf.unsqueeze(0)
-            if tf.dim() == 3 and tf.size(0) == self.batch_size:
-                self.traj_buffer = None
-                if self.traj_features_buffer is None:
-                    self.traj_features_buffer = torch.zeros(
-                        self.batch_size, buf_len, tf.size(-1), device=device, dtype=tf.dtype
-                    )
-                else:
-                    self.traj_features_buffer = self.traj_features_buffer.to(device)
-                k = max(0, min(tf.size(1), buf_len - self.commit_index))
-                self.traj_features_buffer[:, self.commit_index :, :] = 0
-                if k > 0:
-                    self.traj_features_buffer[:, self.commit_index : self.commit_index + k, :] = tf[:, :k, :]
-                    wrote = True
-
-                token_mask = x.get("token_mask")
-                if token_mask is not None:
-                    tm = token_mask
-                    if isinstance(tm, np.ndarray):
-                        tm = torch.from_numpy(tm).float().to(device)
-                    if tm.dim() == 1:
-                        tm = tm.unsqueeze(0)
-                    if tm.dim() == 2 and tm.size(0) == self.batch_size:
-                        if self.token_mask_buffer is None:
-                            self.token_mask_buffer = torch.zeros(
-                                self.batch_size, buf_len, device=device, dtype=tm.dtype
-                            )
-                        else:
-                            self.token_mask_buffer = self.token_mask_buffer.to(device)
-                        self.token_mask_buffer[:, self.commit_index :] = 0
-                        if k > 0:
-                            self.token_mask_buffer[:, self.commit_index : self.commit_index + k] = tm[:, :k]
-                elif k > 0:
-                    if self.token_mask_buffer is None:
-                        self.token_mask_buffer = torch.zeros(
-                            self.batch_size, buf_len, device=device, dtype=tf.dtype
-                        )
-                    else:
-                        self.token_mask_buffer = self.token_mask_buffer.to(device)
-                    self.token_mask_buffer[:, self.commit_index :] = 0
-                    self.token_mask_buffer[:, self.commit_index : self.commit_index + k] = 1
-
-        if "traj" in x and x["traj"] is not None:
-            traj_in = x["traj"]
-            if isinstance(traj_in, np.ndarray):
-                traj_in = torch.from_numpy(traj_in).float().to(device)
-            if traj_in.dim() == 2:
-                traj_in = traj_in.unsqueeze(0)
-            if traj_in.dim() == 1:
-                traj_in = traj_in.unsqueeze(0).unsqueeze(0)
-            if traj_in.dim() == 3 and traj_in.size(0) == self.batch_size:
-                self.traj_features_buffer = None
-                if self.traj_buffer is None:
-                    self.traj_buffer = torch.zeros(
-                        self.batch_size, buf_len, 3, device=device, dtype=torch.float32
-                    )
-                else:
-                    self.traj_buffer = self.traj_buffer.to(device)
-                k = max(0, min(traj_in.size(1), buf_len - self.commit_index))
-                self.traj_buffer[:, self.commit_index :, :] = 0
-                if k > 0:
-                    self.traj_buffer[:, self.commit_index : self.commit_index + k, :] = traj_in[:, :k, :].to(device)
-                    wrote = True
-                if self.token_mask_buffer is None:
-                    self.token_mask_buffer = torch.zeros(
-                        self.batch_size, buf_len, device=device, dtype=torch.float32
-                    )
-                else:
-                    self.token_mask_buffer = self.token_mask_buffer.to(device)
-                self.token_mask_buffer[:, self.commit_index :] = 0
-                tm = x.get("token_mask")
-                if tm is not None:
-                    if isinstance(tm, np.ndarray):
-                        tm = torch.from_numpy(tm).float().to(device)
-                    if tm.dim() == 1:
-                        tm = tm.unsqueeze(0)
-                    if tm.dim() == 2 and tm.size(0) == self.batch_size and k > 0:
-                        self.token_mask_buffer[:, self.commit_index : self.commit_index + k] = tm[:, :k]
-                elif k > 0:
-                    self.token_mask_buffer[:, self.commit_index : self.commit_index + k] = 1
-
-        if wrote:
-            self._traj_stream_version += 1
-            self._traj_emb_cache = {}
-
-    def _expand_traj_tokens_to_causal_frames(self, traj_tokens):
-        if traj_tokens.size(1) <= 1:
-            return traj_tokens[:, :1, :]
-        alpha = traj_tokens.new_tensor([0.25, 0.5, 0.75, 1.0]).view(1, 1, 4, 1)
-        prev_tok = traj_tokens[:, :-1, :]
-        next_tok = traj_tokens[:, 1:, :]
-        interp = prev_tok.unsqueeze(2) + (next_tok - prev_tok).unsqueeze(2) * alpha
-        interp = interp.reshape(traj_tokens.shape[0], -1, traj_tokens.shape[-1])
-        return torch.cat([traj_tokens[:, :1, :], interp], dim=1)
-
-    def _stream_build_traj_emb(self, x, end_index, device):
-        if self.traj_encoder is None:
-            return None
-        ctx_len = min(end_index, self.seq_len)
-        start_t = max(0, end_index - self.seq_len)
-
-        if self.traj_features_buffer is not None:
-            key = ("feat", start_t, end_index, self._traj_stream_version)
-            if self.use_traj_emb_cache and key in self._traj_emb_cache:
-                return self._traj_emb_cache[key]
-            feats = self.traj_features_buffer[:, start_t:end_index, :]
-            mask = None
-            if self.token_mask_buffer is not None:
-                mask = self.token_mask_buffer[:, start_t:end_index]
-            if feats.size(1) < ctx_len:
-                pad_len = ctx_len - feats.size(1)
-                feats = torch.cat([torch.zeros(self.batch_size, pad_len, feats.size(-1), device=device, dtype=feats.dtype), feats], dim=1)
-                if mask is not None:
-                    mask = torch.cat([torch.zeros(self.batch_size, pad_len, device=device, dtype=mask.dtype), mask], dim=1)
-            if mask is not None:
-                feats = feats * mask.unsqueeze(-1).to(dtype=feats.dtype)
-            emb = self.traj_encoder(feats)
-            if self.use_traj_emb_cache:
-                self._traj_emb_cache[key] = emb
-            return emb
-
-        if self.traj_buffer is not None:
-            key = ("xyz", start_t, end_index, self._traj_stream_version)
-            if self.use_traj_emb_cache and key in self._traj_emb_cache:
-                return self._traj_emb_cache[key]
-            traj_slice = self.traj_buffer[:, start_t:end_index, :]
-            mask = None
-            if self.token_mask_buffer is not None:
-                mask = self.token_mask_buffer[:, start_t:end_index]
-            if traj_slice.size(1) < ctx_len:
-                pad_len = ctx_len - traj_slice.size(1)
-                traj_slice = torch.cat(
-                    [
-                        torch.zeros(self.batch_size, pad_len, 3, device=traj_slice.device, dtype=traj_slice.dtype),
-                        traj_slice,
-                    ],
-                    dim=1,
-                )
-                if mask is not None:
-                    mask = torch.cat(
-                        [
-                            torch.zeros(self.batch_size, pad_len, device=device, dtype=mask.dtype),
-                            mask,
-                        ],
-                        dim=1,
-                    )
-
-            traj_slice = traj_slice.clone()
-            if mask is not None:
-                valid = mask > 0
-                first_valid = valid.to(dtype=torch.long).argmax(dim=1)
-                anchor = traj_slice[
-                    torch.arange(self.batch_size, device=device),
-                    first_valid,
-                ]
-            else:
-                anchor = traj_slice[:, 0, :]
-            traj_slice = traj_slice - anchor.unsqueeze(1)
-            if mask is not None:
-                traj_slice = traj_slice * mask.unsqueeze(-1).to(dtype=traj_slice.dtype)
-
-            traj_frames = self._expand_traj_tokens_to_causal_frames(traj_slice)
-            feats_frame = root_to_traj_feats(traj_frames)  # (B, T_frames, 4)
-            # Apply the same LocalTrajEncoder grouping as the training path (_build_traj_emb).
-            # Causal VAE: N tokens → 4*(N-1)+1 frames; group frames into (B, ctx_len, 4, 4).
-            total_causal = 4 * (ctx_len - 1) + 1 if ctx_len > 1 else 1
-            tf = feats_frame.shape[1]
-            if tf < total_causal:
-                pad = feats_frame.new_zeros(feats_frame.shape[0], total_causal - tf, feats_frame.shape[2])
-                feats_frame = torch.cat([feats_frame, pad], dim=1)
-            feats_frame = feats_frame[:, :total_causal, :]
-            tok0 = feats_frame[:, 0:1, :].unsqueeze(2).expand(-1, -1, 4, -1)  # (B,1,4,4)
-            if ctx_len > 1:
-                rest = feats_frame[:, 1:, :].reshape(feats_frame.shape[0], ctx_len - 1, 4, feats_frame.shape[2])
-                feats_4 = torch.cat([tok0, rest], dim=1)  # (B, ctx_len, 4, 4)
-            else:
-                feats_4 = tok0
-            if self.local_traj_encoder is None:
-                return None
-            feats_tok = self.local_traj_encoder(feats_4)  # (B, ctx_len, 4)
-            if mask is not None:
-                feats_tok = feats_tok * mask.unsqueeze(-1).to(dtype=feats_tok.dtype)
-            emb = self.traj_encoder(feats_tok)
-            if self.use_traj_emb_cache:
-                self._traj_emb_cache[key] = emb
-            return emb
-
-        return self._build_traj_emb(x, ctx_len, device, training_dropout=False)
 
     @torch.no_grad()
     def stream_generate_step(self, x, first_chunk=True):
@@ -1479,7 +1174,7 @@ class DiffForcingWanModel(nn.Module):
         device = next(self.parameters()).device
         if first_chunk:
             self.generated = self.generated.to(device)
-        self._stream_update_traj_buffers(x, device)
+        self._traj_buf.update(x, self.commit_index, device)
 
         # Encode text condition (using cache)
         if self.use_text_cond and "text" in x:
@@ -1532,7 +1227,7 @@ class DiffForcingWanModel(nn.Module):
                     self.text_condition_list[i][:end_index][-self.seq_len :]
                 )  # (T, D, 4096)
 
-            traj_emb = self._stream_build_traj_emb(x, end_index, device)
+            traj_emb = self._traj_buf.build_traj_emb(end_index, self.seq_len, device)
             traj_seq_lens = (
                 torch.full(
                     (self.batch_size,),
@@ -1545,111 +1240,11 @@ class DiffForcingWanModel(nn.Module):
             )
             model_sl = min(end_index, self.seq_len)
             t_scaled = noise_level * self.time_embedding_scale
-            ctx_2b = (
-                self._build_cfg_2b_text(
-                    text_condition, text_null_context, self.batch_size, model_sl
-                )
-                if self.cfg_scale_text != 1.0
-                else None
+            predicted_result = self._run_cfg_denoising_step(
+                noisy_input, t_scaled,
+                text_condition, text_null_context,
+                traj_emb, traj_seq_lens, model_sl, self.batch_size,
             )
-            if ctx_2b is not None:
-                noisy_2b = list(noisy_input) + list(noisy_input)
-                t_2b = torch.cat([t_scaled, t_scaled], dim=0)
-                traj_cn_2b = (
-                    torch.cat([traj_emb, traj_emb], dim=0)
-                    if traj_emb is not None
-                    else None
-                )
-                traj_sl_2b = (
-                    torch.cat([traj_seq_lens, traj_seq_lens], dim=0)
-                    if traj_seq_lens is not None
-                    else None
-                )
-                controlnet_residuals = self._controlnet_forward(
-                    noisy_2b,
-                    t_2b,
-                    ctx_2b,
-                    model_sl,
-                    traj_cn_2b,
-                    traj_sl_2b,
-                )
-                pred_2b = self.model(
-                    noisy_2b,
-                    t_2b,
-                    ctx_2b,
-                    model_sl,
-                    y=None,
-                    traj_emb=None,
-                    traj_seq_lens=None,
-                    controlnet_residuals=controlnet_residuals,
-                )
-                if self.cfg_scale_traj > 0.0:
-                    # Separated CFG: reuse 2-batch (out_full, out_null_text);
-                    # one extra backbone forward for out_uncond (text OFF, traj OFF).
-                    # Formula:
-                    #   out = out_uncond
-                    #       + w_text * (out_full - out_null_text)
-                    #       + w_traj * (out_null_text - out_uncond)
-                    pred_uncond = self._uncond_backbone_forward(
-                        noisy_input,
-                        t_scaled,
-                        text_null_context,
-                        model_sl,
-                    )
-                    predicted_result = [
-                        pred_uncond[i]
-                        + self.cfg_scale_text * (pred_2b[i] - pred_2b[i + self.batch_size])
-                        + self.cfg_scale_traj * (pred_2b[i + self.batch_size] - pred_uncond[i])
-                        for i in range(self.batch_size)
-                    ]
-                else:
-                    predicted_result = [
-                        self.cfg_scale_text * pred_2b[i]
-                        - (self.cfg_scale_text - 1) * pred_2b[i + self.batch_size]
-                        for i in range(self.batch_size)
-                    ]
-            else:
-                controlnet_residuals = self._controlnet_forward(
-                    noisy_input,
-                    t_scaled,
-                    text_condition,
-                    model_sl,
-                    traj_emb,
-                    traj_seq_lens,
-                )
-                predicted_result = self.model(
-                    noisy_input,
-                    t_scaled,
-                    text_condition,
-                    model_sl,
-                    y=None,
-                    traj_emb=None,
-                    traj_seq_lens=None,
-                    controlnet_residuals=controlnet_residuals,
-                )
-                if self.cfg_scale_text != 1.0:
-                    controlnet_residuals_null = self._controlnet_forward(
-                        noisy_input,
-                        t_scaled,
-                        text_null_context,
-                        model_sl,
-                        traj_emb,
-                        traj_seq_lens,
-                    )
-                    predicted_result_null = self.model(
-                        noisy_input,
-                        t_scaled,
-                        text_null_context,
-                        model_sl,
-                        y=None,
-                        traj_emb=None,
-                        traj_seq_lens=None,
-                        controlnet_residuals=controlnet_residuals_null,
-                    )
-                    predicted_result = [
-                        self.cfg_scale_text * pv - (self.cfg_scale_text - 1) * pvn
-                        for pv, pvn in zip(predicted_result, predicted_result_null)
-                    ]
 
             for i in range(self.batch_size):
                 predicted_result_i = predicted_result[i]  # (C, input_length, 1, 1)
@@ -1722,49 +1317,7 @@ class DiffForcingWanModel(nn.Module):
                 ],
                 dim=2,
             )
-            if self.traj_buffer is not None:
-                self.traj_buffer = torch.cat(
-                    [
-                        self.traj_buffer[:, self.seq_len :, :],
-                        torch.zeros(
-                            self.batch_size,
-                            self.seq_len,
-                            3,
-                            device=device,
-                            dtype=self.traj_buffer.dtype,
-                        ),
-                    ],
-                    dim=1,
-                )
-            if self.traj_features_buffer is not None:
-                self.traj_features_buffer = torch.cat(
-                    [
-                        self.traj_features_buffer[:, self.seq_len :, :],
-                        torch.zeros(
-                            self.batch_size,
-                            self.seq_len,
-                            self.traj_features_buffer.size(-1),
-                            device=device,
-                            dtype=self.traj_features_buffer.dtype,
-                        ),
-                    ],
-                    dim=1,
-                )
-            if self.token_mask_buffer is not None:
-                self.token_mask_buffer = torch.cat(
-                    [
-                        self.token_mask_buffer[:, self.seq_len :],
-                        torch.zeros(
-                            self.batch_size,
-                            self.seq_len,
-                            device=device,
-                            dtype=self.token_mask_buffer.dtype,
-                        ),
-                    ],
-                    dim=1,
-                )
-            self._traj_stream_version += 1
-            self._traj_emb_cache = {}
+            self._traj_buf.roll(self.seq_len, device)
             self.current_step -= self.seq_len * self.num_denoise_steps / self.chunk_size
             self.commit_index -= self.seq_len
             for i in range(self.batch_size):

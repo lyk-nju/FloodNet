@@ -43,7 +43,7 @@ logger:
 trainer: # lightning trainer
     max_steps: 360000
     accelerator: gpu
-    devices: [4]
+    devices: [0]
     log_every_n_steps: 100
     precision: bf16-mixed
 # Set to true to run T2M FID/R-Precision on val_meta_paths during eval.
@@ -51,9 +51,9 @@ trainer: # lightning trainer
 t2m_metric: false
 
 validation:
-    validation_steps: 2
-    test_steps: 2000
-    save_every_n_steps: 2000
+    validation_steps: 8000
+    test_steps: 1000
+    save_every_n_steps: 1000
     save_top_k: 100
     eval_generation_metrics: true
     eval_num_runs: 10
@@ -100,15 +100,15 @@ data:
     target: datasets.humanml3d.HumanML3DDataset
     collate_fn: datasets.humanml3d.collate_fn
     train_bs: 8
-    val_bs: 64
+    val_bs: 16
     test_bs: 1
     num_workers: 4
     # mask_ratio: [0.2,0.3]       
     mask_ratio: 1.0
 
     train_meta_paths:
-        - ${dirs.raw_data}/HumanML3D/train.txt
-        # - ${dirs.raw_data}/HumanML3D/test_min.txt
+        # - ${dirs.raw_data}/HumanML3D/train.txt
+        - ${dirs.raw_data}/HumanML3D/test_min.txt
         # - ${dirs.raw_data}/HumanML3D/val.txt
     val_meta_paths:
         - ${dirs.raw_data}/HumanML3D/val.txt
@@ -155,6 +155,13 @@ model:
         scheduled_sampling_prob: 0.0
         cfg_scale_traj: 3.0
         cfg_scale_text: 5.0
+        self_forcing_enabled: true
+        self_forcing_stride_tokens: 1
+        self_forcing_detach_between_steps: true
+        # Thresholds are phase progress over [resume_ckpt.global_step, trainer.max_steps].
+        self_forcing_k_schedule:
+            - [0.0, 2]
+            - [0.8, 3]
 
 # control_loss_train_mode selects gradient strategy for the XZ control loss:
 #   1 — active window, absolute coords, no detach   (gradient → ALL tokens via cumsum)
@@ -163,7 +170,7 @@ model:
 #   4 — full sequence, absolute coords, detach past (full coverage loss, gradient → active window only)
 #   5 — active window, relative displacement, pred anchor  (loss = |e[t]-e[0]|², fixed offset → zero loss)
 #   6 — active window, relative displacement, GT anchor    (loss = |pred_rel[t]-gt_rel[t]|², true disp error)
-control_loss_train_mode: 2
+control_loss_train_mode: 1
 
 resume_reset_optimizer: true
 optimizer:

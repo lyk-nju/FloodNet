@@ -1,10 +1,6 @@
-import json
 import os
-import random
-import hashlib
-from pathlib import Path
+import time
 
-import numpy as np
 import torch
 import wandb
 from lightning import Trainer, seed_everything
@@ -17,15 +13,8 @@ from torch.utils.data import DataLoader
 from torch_ema import ExponentialMovingAverage
 
 from metrics.t2m import T2MMetrics
-from eval.eval_generation_metrics import (
-    _average_control_metrics,
-    _average_traj_metrics,
-    _compute_deterministic_fwd_ctrl_loss_sample,
-    _compute_omni_control_metrics,
-    _compute_traj_metrics,
-    _get_metric_statistics,
-)
-from utils.motion_process import extract_root_trajectory_263_torch
+from eval.inline_eval_runner import run_inline_generation_eval
+from eval.inline_eval_summary import process_inline_generation_results
 from utils.initialize import (
     compare_statedict_and_parameters,
     get_function,
@@ -35,10 +24,13 @@ from utils.initialize import (
     save_config_and_codes,
 )
 from utils.lightning_module import BasicLightningModule
-from utils.traj_batch import root_to_traj_feats
-from utils.visualize import (  # evaluate_video
-    make_composite_compare_videos,
-    render_video,
+from utils.training import (
+    build_checkpoint_step_info,
+    build_step_semantics,
+    compute_control_loss_xz,
+    load_resume_step_offset,
+    resolve_runtime_scheduler_steps,
+    resolve_runtime_max_steps,
 )
 
 # Set tokenizers parallelism to false to avoid warnings in multiprocessing
@@ -48,7 +40,40 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 class CustomLightningModule(BasicLightningModule):
     def __init__(self, cfg):
         self._inline_eval_seen = {}
+        self._self_forcing_runtime_validated = False
+        self._resume_step_offset = 0
         super().__init__(cfg)
+        self.automatic_optimization = not bool(
+            getattr(self.model, "self_forcing_enabled", False)
+        )
+
+    def _build_step_semantics(self, phase_step: int | None = None):
+        trainer = getattr(self, "trainer", None)
+        trainer_max_steps = getattr(trainer, "max_steps", None) if trainer is not None else None
+        return build_step_semantics(
+            phase_step=self._get_phase_global_step() if phase_step is None else int(phase_step),
+            trainer_max_steps=trainer_max_steps,
+            resume_step_offset=self._resume_step_offset,
+            self_forcing_enabled=bool(getattr(self.model, "self_forcing_enabled", False)),
+        )
+
+    def _get_phase_global_step(self) -> int:
+        return int(self.global_step)
+
+    def _get_effective_global_step(self):
+        return self._build_step_semantics().absolute_step
+
+    def _get_checkpoint_step_value(self):
+        return build_checkpoint_step_info(
+            self._build_step_semantics(),
+            include_next_step=True,
+        ).metric_value
+
+    def _get_step_tag(self):
+        return build_checkpoint_step_info(
+            self._build_step_semantics(),
+            include_next_step=False,
+        ).step_tag
 
     def _get_test_probe_tags(self) -> list[str]:
         tags = getattr(self, "test_loader_tags", None)
@@ -74,169 +99,121 @@ class CustomLightningModule(BasicLightningModule):
             ),
         }
 
-    @staticmethod
-    def _flatten_summary_metrics(summary: dict, prefix: str) -> dict:
-        flat_metrics = {}
-        for key, value in summary.items():
-            log_key = f"{prefix}/{key}"
-            if isinstance(value, list):
-                for idx, item in enumerate(value):
-                    if item is not None:
-                        flat_metrics[f"{log_key}/slot_{idx}"] = float(item)
-            else:
-                flat_metrics[log_key] = float(value)
-        return flat_metrics
+    def _build_self_forcing_runtime(self):
+        semantics = self._build_step_semantics()
+        runtime_metrics = {
+            "self_forcing/enabled": 1.0,
+            "self_forcing/active": 1.0,
+            "self_forcing/progress": float(semantics.progress),
+            "self_forcing/k": 0.0,
+            "self_forcing/phase_step": float(semantics.phase_step),
+            "self_forcing/absolute_step": float(semantics.absolute_step),
+            "self_forcing/resume_step_offset": float(semantics.resume_step_offset),
+            "self_forcing/phase_total_steps": float(semantics.phase_total_steps),
+            "self_forcing/absolute_target_step": float(semantics.absolute_target_step),
+        }
+        return semantics, runtime_metrics
 
-    @staticmethod
-    def _stable_eval_seed(base_seed: int, probe_tag: str, sample_name: str, run_idx: int) -> int:
-        digest = hashlib.md5(f"{probe_tag}:{sample_name}:{run_idx}".encode("utf-8")).hexdigest()
-        offset = int(digest[:8], 16)
-        return int(base_seed) + offset
+    def _build_model_batch(self, batch, is_training=True):
+        model_batch = batch.copy()
+        model_batch["feature"] = batch["token"]
+        model_batch["feature_length"] = batch["token_length"]
+        if "token_text_end" in batch:
+            model_batch["feature_text_end"] = batch["token_text_end"]
+        self._copy_traj_fields_to_model_batch(batch, model_batch)
+        return model_batch
 
-    @staticmethod
-    def _seed_eval_locally(seed: int, device: torch.device | str):
-        random.seed(seed)
-        np.random.seed(seed % (2**32))
-        gen = torch.Generator()
-        gen.manual_seed(int(seed))
-        torch.random.set_rng_state(gen.get_state())
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(int(seed))
+    def _validate_self_forcing_runtime(self):
+        if self._self_forcing_runtime_validated:
+            return
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return
+        accumulate_grad_batches = int(
+            getattr(trainer, "accumulate_grad_batches", 1)
+        )
+        if accumulate_grad_batches != 1:
+            raise NotImplementedError(
+                "self-forcing manual optimization does not yet support "
+                f"accumulate_grad_batches={accumulate_grad_batches}. Set it to 1."
+            )
+        gradient_clip_val = getattr(trainer, "gradient_clip_val", None)
+        if gradient_clip_val is not None and float(gradient_clip_val) > 0:
+            raise NotImplementedError(
+                "self-forcing manual optimization does not yet support Lightning "
+                f"gradient clipping (gradient_clip_val={gradient_clip_val})."
+            )
+        self._self_forcing_runtime_validated = True
 
-    @staticmethod
-    def _slice_single_sample_batch(batch, sample_idx: int):
-        sample_batch = {}
-        batch_size = len(batch["name"])
-        for key, value in batch.items():
-            if torch.is_tensor(value):
-                if value.ndim > 0 and value.shape[0] == batch_size:
-                    sample_batch[key] = value[sample_idx : sample_idx + 1]
-                else:
-                    sample_batch[key] = value
-            elif isinstance(value, list):
-                if len(value) == batch_size:
-                    sample_batch[key] = [value[sample_idx]]
-                else:
-                    sample_batch[key] = value
-            else:
-                sample_batch[key] = value
-        return sample_batch
-
-    @staticmethod
-    def _compute_control_loss_xz(
-        pred_list,
-        traj,
-        traj_mask,
-        traj_length,
-        vae,
-        device,
-        train_mode: int = 3,
-        chunk_size_tokens: int | None = None,
-        token_to_frame: int = 4,
+    def _log_training_step_outputs(
+        self, loss_dict, optimizer, net_start_time, extra_metrics=None
     ):
-        """
-        XZ-plane trajectory control loss.  Behaviour is selected by train_mode:
-
-          Mode 1 — active window, absolute coords, NO detach
-                   Loss only on active window frames; gradient flows to ALL tokens
-                   via cumsum (position[t] = Σvel[0..t]).
-          Mode 2 — active window, absolute coords, detach past tokens
-                   Past latents are detached before VAE decode; gradient is
-                   confined to active window tokens, but absolute position has
-                   a fixed offset from the detached past (old '20260419' style).
-          Mode 3 — full sequence, absolute coords, NO detach  [DEFAULT]
-                   Every frame compared; each token gets balanced gradient from
-                   all future positions it affects.  Proven to converge (20260402).
-          Mode 4 — full sequence, absolute coords, detach past tokens
-                   Full comparison coverage but gradient only flows through the
-                   active window tokens (past frames contribute to loss value,
-                   not to gradient).
-          Mode 5 — active window, relative displacement, pred anchor
-                   Both shifted by pred's first frame; loss = |e[t]-e[0]|².
-                   A fixed absolute offset gives zero loss (known limitation).
-          Mode 6 — active window, relative displacement, GT anchor
-                   pred shifted by pred's first frame, gt shifted by gt's first
-                   frame; loss = |pred_rel[t]-gt_rel[t]|² — true displacement
-                   error, decoupled from absolute position.
-        """
-        # Derive booleans from mode for readability
-        use_active_window = train_mode in (1, 2, 5, 6) # slice to active window for comparison
-        detach_past       = train_mode in (2, 4)        # detach past latents before decode
-        relative_disp     = train_mode in (5, 6)        # subtract anchor frame
-        relative_disp_gt_anchor = train_mode == 6       # use GT anchor (fixes Mode 5 bug)
-
-        loss_control = 0.0
-        n_valid = 0.0
-        for i in range(len(pred_list)):
-            pred_latent_full = pred_list[i].to(device)  # (T_token, z_dim)
-            t_tok = pred_latent_full.size(0)
-
-            # Active-window token/frame bounds (always computed; used conditionally)
-            if chunk_size_tokens is not None and t_tok > chunk_size_tokens:
-                start_tok = t_tok - chunk_size_tokens
-                start_f   = 0 if start_tok == 0 else 4 * start_tok - 3
-                end_f     = t_tok * token_to_frame
-            else:
-                start_tok = 0
-                start_f   = 0
-                end_f     = None
-
-            # Optionally detach past latents so gradient stays in active window
-            if detach_past and start_tok > 0:
-                latent_for_decode = torch.cat(
-                    [pred_latent_full[:start_tok].detach(), pred_latent_full[start_tok:]], dim=0
+        net_end_time = time.time()
+        data_time = (
+            self.batch_ready_time - self.last_batch_end_time
+            if self.last_batch_end_time is not None
+            else 0.0
+        )
+        net_time = net_end_time - net_start_time
+        batch_size = self.cfg.data.train_bs
+        self.log(
+            "lr",
+            optimizer.param_groups[0]["lr"],
+            on_step=True,
+            prog_bar=True,
+            batch_size=batch_size,
+        )
+        self.log(
+            "data_time", data_time, on_step=True, prog_bar=True, batch_size=batch_size
+        )
+        self.log(
+            "net_time", net_time, on_step=True, prog_bar=True, batch_size=batch_size
+        )
+        self.log(
+            "ckpt_absolute_step",
+            float(self._get_checkpoint_step_value()),
+            on_step=True,
+            prog_bar=False,
+            batch_size=batch_size,
+        )
+        if extra_metrics:
+            for key, value in extra_metrics.items():
+                self.log(
+                    key,
+                    float(value),
+                    on_step=True,
+                    prog_bar=False,
+                    batch_size=batch_size,
                 )
-            else:
-                latent_for_decode = pred_latent_full
+        for key, value in loss_dict.items():
+            self.log(
+                f"train_loss/{key}",
+                value.item(),
+                on_step=True,
+                on_epoch=True,
+                prog_bar=True,
+                sync_dist=True,
+                batch_size=batch_size,
+            )
 
-            decoded   = vae.decode(latent_for_decode.unsqueeze(0))[0].float()
-            L_motion  = decoded.size(0)
-            L_gt_total = min(int(traj_length[i].item()), traj.shape[1])
-
-            # Frame slice to compare
-            if use_active_window and end_f is not None:
-                pred_sl = slice(min(start_f, L_motion),   min(end_f, L_motion))
-                gt_sl   = slice(min(start_f, L_gt_total), min(end_f, L_gt_total))
-            else:
-                pred_sl = slice(0, L_motion)
-                gt_sl   = slice(0, L_gt_total)
-
-            L = min(pred_sl.stop - pred_sl.start, gt_sl.stop - gt_sl.start)
-            if L <= 0:
-                continue
-
-            pred_traj_full = extract_root_trajectory_263_torch(decoded.unsqueeze(0))
-            pred_traj = pred_traj_full[:, pred_sl, :][:, :L, :]
-            gt_traj   = traj[i, gt_sl, :][:L].unsqueeze(0).to(pred_traj.device, dtype=pred_traj.dtype)
-            mask      = traj_mask[i, gt_sl][:L].unsqueeze(0).to(pred_traj.device, dtype=pred_traj.dtype)
-
-            pred_xz = pred_traj[..., [0, 2]]
-            gt_xz   = gt_traj[...,  [0, 2]]
-
-            if relative_disp:
-                if relative_disp_gt_anchor:
-                    # Mode 6: both pred and gt anchored to GT first frame.
-                    # loss = ||(pred[t]-pred[0]) - (gt[t]-gt[0])||^2
-                    # which equals ||pred_rel[t] - gt_rel[t]||^2 — true relative
-                    # displacement error, decoupled from absolute position.
-                    gt_anchor = gt_xz[:, 0:1, :].detach()
-                    pred_xz   = pred_xz - pred_xz[:, 0:1, :].detach()
-                    gt_xz     = gt_xz   - gt_anchor
-                else:
-                    # Mode 5: pred anchored to its own first frame (pred anchor).
-                    # loss = ||(e[t] - e[0])||^2 — measures error change, not error
-                    # itself; a fixed offset has zero loss (known design limitation).
-                    anchor  = pred_xz[:, 0:1, :].detach()
-                    pred_xz = pred_xz - anchor
-                    gt_xz   = gt_xz   - gt_xz[:, 0:1, :]
-
-            sq_err = ((pred_xz - gt_xz) ** 2).sum(dim=-1)
-            loss_control = loss_control + (mask * sq_err).sum()
-            n_valid += mask.sum().item()
-
-        if n_valid <= 0:
+    def _compute_control_loss_for_pred_list(self, pred_list, batch):
+        if pred_list is None or "traj" not in batch:
             return None
-        return loss_control / n_valid
+        traj = batch["traj"]
+        traj_mask = batch["traj_mask"]
+        traj_length = batch["traj_length"]
+        train_mode = self.cfg.get("control_loss_train_mode", 3)
+        chunk_size_tokens = getattr(self.model, "chunk_size", None)
+        return compute_control_loss_xz(
+            pred_list,
+            traj,
+            traj_mask,
+            traj_length,
+            self.vae,
+            self.device,
+            train_mode=train_mode,
+            chunk_size_tokens=chunk_size_tokens,
+        )
 
     def initialize_metrics(self):
         # vae
@@ -277,6 +254,12 @@ class CustomLightningModule(BasicLightningModule):
         self.t2m_metrics = T2MMetrics(self.cfg.metrics.t2m) if self.t2m_enabled else None
 
     def on_load_checkpoint(self, checkpoint):
+        # super() not called: we handle state_dict / EMA / optimizer restore manually
+        # so that ControlNet re-init and new-param EMA reset work correctly.
+        self._resume_step_offset = int(checkpoint.get("global_step", 0))
+        rank_zero_info(
+            f"[resume] loaded checkpoint global_step={self._resume_step_offset}"
+        )
         ckpt_keys = set(checkpoint["state_dict"].keys())
         controlnet_missing = not any(k.startswith("controlnet.") for k in ckpt_keys)
         strict = not controlnet_missing
@@ -352,36 +335,51 @@ class CustomLightningModule(BasicLightningModule):
             model_batch["traj_features"] = batch["traj_features"]
             # traj_features is frame-level; length is traj_length and mask is traj_mask/token_mask
 
-    def _step(self, batch, is_training=True):
-        # Create a copy and replace motion fields with token fields
-        model_batch = batch.copy()
-        model_batch["feature"] = batch["token"]
-        model_batch["feature_length"] = batch["token_length"]
-        if "token_text_end" in batch:
-            model_batch["feature_text_end"] = batch["token_text_end"]
-        self._copy_traj_fields_to_model_batch(batch, model_batch)
+    def _step(self, batch, is_training=True, model_batch=None):
+        if model_batch is None:
+            model_batch = self._build_model_batch(batch, is_training=is_training)
         out = self.model(model_batch)
 
         # MotionLCM-style control loss: explicit trajectory alignment in motion space
         if "control_aux" in out and "traj" in batch:
             control_weight = self.cfg.model.params.get("control_loss_weight", 1.0)
             if control_weight > 0:
-                pred_list = out["control_aux"]["pred_x0_latent_list"]
-                traj = batch["traj"]
-                traj_mask = batch["traj_mask"]
-                traj_length = batch["traj_length"]
-                train_mode = self.cfg.get("control_loss_train_mode", 3)
-                chunk_size_tokens = getattr(self.model, "chunk_size", None)
-                loss_control = self._compute_control_loss_xz(
-                    pred_list,
-                    traj,
-                    traj_mask,
-                    traj_length,
-                    self.vae,
-                    self.device,
-                    train_mode=train_mode,
-                    chunk_size_tokens=chunk_size_tokens,
-                )
+                control_aux = out["control_aux"]
+                if "pred_x0_latent_list_steps" in control_aux:
+                    step_weights = [
+                        float(w)
+                        for w in control_aux.get(
+                            "step_weights",
+                            [1.0] * len(control_aux["pred_x0_latent_list_steps"]),
+                        )
+                    ]
+                    weighted_control = None
+                    total_step_weight = 0.0
+                    for pred_list, step_weight in zip(
+                        control_aux["pred_x0_latent_list_steps"], step_weights
+                    ):
+                        if pred_list is None:
+                            continue
+                        step_loss = self._compute_control_loss_for_pred_list(
+                            pred_list, batch
+                        )
+                        if step_loss is None:
+                            continue
+                        if weighted_control is None:
+                            weighted_control = step_loss * step_weight
+                        else:
+                            weighted_control = weighted_control + step_loss * step_weight
+                        total_step_weight += step_weight
+                    loss_control = (
+                        weighted_control / total_step_weight
+                        if weighted_control is not None and total_step_weight > 0
+                        else None
+                    )
+                else:
+                    pred_list = control_aux["pred_x0_latent_list"]
+                    loss_control = self._compute_control_loss_for_pred_list(
+                        pred_list, batch
+                    )
                 if loss_control is not None:
                     out["total"] = out["total"] + control_weight * loss_control
                     out["control"] = loss_control
@@ -389,6 +387,183 @@ class CustomLightningModule(BasicLightningModule):
         if "control_aux" in out:
             del out["control_aux"]
         return out
+
+    def _run_standard_training_step(self, batch, batch_idx):
+        return super().training_step(batch, batch_idx)
+
+    def _log_self_forcing_metrics(self, runtime_metrics):
+        log_every_n_steps = max(
+            1, int(getattr(getattr(self, "trainer", None), "log_every_n_steps", 100))
+        )
+        if int(runtime_metrics["self_forcing/phase_step"]) % log_every_n_steps == 0:
+            rank_zero_info(
+                "[self_forcing] "
+                f"phase_step={int(runtime_metrics['self_forcing/phase_step'])} "
+                f"absolute_step={int(runtime_metrics['self_forcing/absolute_step'])} "
+                f"resume_step_offset={int(runtime_metrics['self_forcing/resume_step_offset'])} "
+                f"phase_total_steps={int(runtime_metrics['self_forcing/phase_total_steps'])} "
+                f"absolute_target_step={int(runtime_metrics['self_forcing/absolute_target_step'])} "
+                f"active={int(runtime_metrics['self_forcing/active'])} "
+                f"progress={runtime_metrics['self_forcing/progress']:.6f}"
+            )
+
+    def _resolve_self_forcing_k(self, progress):
+        k = int(self.model.self_forcing_k_schedule[0][1])
+        for threshold, candidate_k in self.model.self_forcing_k_schedule:
+            if progress >= threshold:
+                k = int(candidate_k)
+            else:
+                break
+        return max(1, k)
+
+    def _prepare_self_forcing_plan(self, feature_length, device, progress):
+        target_k = self._resolve_self_forcing_k(progress)
+        min_k_supported = int(feature_length.min().item()) - self.model.chunk_size + 1
+        if min_k_supported < 1:
+            raise ValueError(
+                "self-forcing requires feature_length >= chunk_size for every sample"
+            )
+        effective_k = min(target_k, min_k_supported)
+
+        max_start = feature_length.to(device=device, dtype=torch.long) - effective_k + 1
+        start_end_indices = []
+        for b in range(feature_length.shape[0]):
+            low = int(self.model.chunk_size)
+            high = int(max_start[b].item())
+            if high < low:
+                raise ValueError(
+                    f"Invalid self-forcing start range for sample {b}: "
+                    f"low={low}, high={high}, valid_len={int(feature_length[b].item())}, "
+                    f"effective_k={effective_k}"
+                )
+            if high == low:
+                start_end_indices.append(low)
+            else:
+                start_end_indices.append(
+                    int(torch.randint(low, high + 1, (1,), device=device).item())
+                )
+        start_end_indices = torch.tensor(
+            start_end_indices, device=device, dtype=torch.long
+        )
+        phase_offset = float(
+            torch.empty(1, device=device).uniform_(0.0, 1.0 / self.model.chunk_size).item()
+        )
+        return effective_k, start_end_indices, phase_offset
+
+    def _run_self_forcing_rollout(self, model_batch, progress):
+        feature = model_batch["feature"]
+        feature_length = model_batch["feature_length"]
+        _, seq_len, _ = feature.shape
+        device = feature.device
+        all_text_context = self.model._prepare_text_context(model_batch, seq_len, device)
+        traj_dropped = self.model._sample_traj_dropout_decision(device)
+        effective_k, start_end_indices, phase_offset = self._prepare_self_forcing_plan(
+            feature_length, device, progress
+        )
+        traj_emb, traj_seq_lens, _ = self.model._prepare_traj_condition(
+            model_batch, seq_len, device, traj_dropped_override=traj_dropped
+        )
+
+        current_feature = feature.clone()
+        final_step_result = None
+        for step_idx in range(effective_k):
+            end_indices = start_end_indices + step_idx
+            time_steps = (
+                (end_indices.to(dtype=torch.float32) - 1.0) / self.model.chunk_size
+                + phase_offset
+            )
+            is_final_step = step_idx == effective_k - 1
+            if is_final_step:
+                final_step_result = self.model._run_single_window_forward(
+                    model_batch,
+                    current_feature,
+                    time_steps,
+                    all_text_context,
+                    traj_emb,
+                    traj_seq_lens,
+                    traj_dropped,
+                    enable_scheduled_sampling=False,
+                )
+                break
+
+            with torch.no_grad():
+                rollout_result = self.model._run_single_window_forward(
+                    model_batch,
+                    current_feature,
+                    time_steps,
+                    all_text_context,
+                    traj_emb,
+                    traj_seq_lens,
+                    traj_dropped,
+                    enable_scheduled_sampling=False,
+                )
+
+            next_feature = current_feature.clone()
+            for b in range(feature.shape[0]):
+                replace_idx = int(end_indices[b].item()) - self.model.chunk_size
+                replacement = rollout_result["x0_latent_list"][b][replace_idx]
+                next_feature[b, replace_idx, :] = replacement.detach().to(
+                    device=current_feature.device, dtype=current_feature.dtype
+                )
+            current_feature = next_feature
+
+        if final_step_result is None:
+            raise RuntimeError(
+                f"self-forcing expected at least one supervised step, got effective_k={effective_k}"
+            )
+        return final_step_result, effective_k
+
+    def _finalize_self_forcing_loss(self, final_step_result, batch):
+        step_diff_loss = final_step_result["loss"]
+        total_loss = step_diff_loss
+        step_control_loss = None
+        control_weight = float(self.cfg.model.params.get("control_loss_weight", 1.0))
+        if control_weight > 0.0 and "traj" in batch:
+            step_control_loss = self._compute_control_loss_for_pred_list(
+                final_step_result["pred_x0_latent_list"], batch
+            )
+            if step_control_loss is not None:
+                total_loss = total_loss + control_weight * step_control_loss
+        return total_loss, step_diff_loss, step_control_loss
+
+    def _run_self_forcing_training_step(self, batch):
+        self._validate_self_forcing_runtime()
+        net_start_time = time.time()
+        semantics, runtime_metrics = self._build_self_forcing_runtime()
+        model_batch = self._build_model_batch(batch, is_training=True)
+        optimizer = self.optimizers()
+        lr_scheduler = self.lr_schedulers()
+        self._log_self_forcing_metrics(runtime_metrics)
+
+        optimizer.zero_grad(set_to_none=True)
+        final_step_result, effective_k = self._run_self_forcing_rollout(
+            model_batch, semantics.progress
+        )
+        runtime_metrics["self_forcing/k"] = float(effective_k)
+        total_loss, step_diff_loss, step_control_loss = self._finalize_self_forcing_loss(
+            final_step_result, batch
+        )
+
+        self.manual_backward(total_loss)
+        optimizer.step()
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+
+        loss_dict = {"total": total_loss.detach(), "mse": step_diff_loss.detach()}
+        if step_control_loss is not None:
+            loss_dict["control"] = step_control_loss.detach()
+        self._log_training_step_outputs(
+            loss_dict,
+            optimizer,
+            net_start_time,
+            extra_metrics=runtime_metrics,
+        )
+        return total_loss
+
+    def training_step(self, batch, batch_idx):
+        if not getattr(self.model, "self_forcing_enabled", False):
+            return self._run_standard_training_step(batch, batch_idx)
+        return self._run_self_forcing_training_step(batch)
 
     def update_metrics(self, batch):
         if not self.t2m_enabled or self.t2m_metrics is None:
@@ -461,395 +636,48 @@ class CustomLightningModule(BasicLightningModule):
         self.compute_metrics()
 
     def update_test(self, batch, batch_idx=None, test_loader_idx=0):
-        # Fix seed for reproducible test generation, but save/restore the training RNG so
-        # that training noise stays i.i.d. when the training loop resumes after validation.
-        _py   = random.getstate()
-        _np   = np.random.get_state()
-        _cpu  = torch.random.get_rng_state()
-        _cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-        eval_cfg = self._get_generation_eval_cfg()
-        eval_num_runs = max(eval_cfg["num_runs"], 1)
-        eval_seg_size = eval_cfg["seg_size"]
-        do_eval_metrics = eval_cfg["enabled"] and "traj" in batch and "traj_mask" in batch
-        generation_num_runs = eval_num_runs if do_eval_metrics else 1
-        probe_tag = self._resolve_test_probe_tag(test_loader_idx)
-        step_tag = f"step_{int(self.global_step):06d}"
-        try:
-            local_payloads = []
-            for sample_idx in range(len(batch["name"])):
-                sample_batch = self._slice_single_sample_batch(batch, sample_idx)
-                sample_name = sample_batch["name"][0]
-                sample_dataset_id = sample_batch["dataset"][0]
-                sample_text = ""
-                token_run0 = None
-                feature_run0 = None
-                traj_xz = None
-                traj_mask = None
-                frames = None
-                traj_runs = []
-                control_runs = []
-                fwd_stat = None
-
-                if "feature_text_end" in sample_batch:
-                    frames = np.asarray(sample_batch["feature_text_end"][0])
-
-                if do_eval_metrics and eval_cfg["forward_ctrl_loss"] and "traj" in sample_batch:
-                    try:
-                        fwd_stat = _compute_deterministic_fwd_ctrl_loss_sample(
-                            model=self.model,
-                            sample_batch=sample_batch,
-                            vae=self.vae,
-                            device=self.device,
-                            train_mode=int(self.cfg.get("control_loss_train_mode", 3)),
-                            chunk_size_tokens=getattr(self.model, "chunk_size", None),
-                            window_mode=eval_cfg["forward_ctrl_window_mode"],
-                        )
-                    except Exception as e:
-                        rank_zero_info(
-                            f"[inline fwd_ctrl_loss] sample={sample_name} deterministic eval failed: {e}"
-                        )
-
-                for run_idx in range(generation_num_runs):
-                    sample_seed = self._stable_eval_seed(
-                        self.cfg.seed, probe_tag, sample_name, run_idx
-                    )
-                    self._seed_eval_locally(sample_seed, self.device)
-                    with self.ema.average_parameters([p for p in self.model.parameters() if p.requires_grad]):
-                        model_batch = sample_batch.copy()
-                        model_batch["feature"] = sample_batch["token"]
-                        model_batch["feature_length"] = sample_batch["token_length"]
-                        if "token_text_end" in sample_batch:
-                            model_batch["feature_text_end"] = sample_batch["token_text_end"]
-                        self._copy_traj_fields_to_model_batch(sample_batch, model_batch)
-                        output = self.model.generate(model_batch)
-
-                    single_generated = output["generated"][0]
-                    decoded_single_generated = self.vae.decode(
-                        single_generated[None, :].to(self.device)
-                    )[0].float().detach()
-
-                    if run_idx == 0:
-                        sample_text = output["text"][0]
-                        token_run0 = single_generated.float().cpu().numpy()
-                        feature_run0 = decoded_single_generated.cpu().numpy()
-
-                        L_feat = int(decoded_single_generated.shape[0])
-                        if "traj_features" in sample_batch:
-                            cond = sample_batch["traj_features"][0]
-                            if torch.is_tensor(cond):
-                                cond = cond.detach().cpu().numpy()
-                            cond = np.asarray(cond)
-                            if cond.ndim == 2 and cond.shape[1] >= 2:
-                                traj_xz = cond[:L_feat, :2].astype(np.float32)
-                        if traj_xz is None and "traj" in sample_batch:
-                            tr = sample_batch["traj"][0]
-                            if torch.is_tensor(tr):
-                                tr = tr.detach().cpu().numpy()
-                            tr = np.asarray(tr)[:L_feat]
-                            if tr.ndim == 2 and tr.shape[1] >= 3:
-                                traj_xz = root_to_traj_feats(tr)[:, :2].astype(np.float32)
-                        if "traj_mask" in sample_batch:
-                            traj_mask_i = sample_batch["traj_mask"][0]
-                            if torch.is_tensor(traj_mask_i):
-                                traj_mask_i = traj_mask_i.detach().cpu().numpy()
-                            traj_mask = np.asarray(traj_mask_i).reshape(-1)[:L_feat]
-
-                    if do_eval_metrics:
-                        traj_runs.append(
-                            _compute_traj_metrics(
-                                decoded_single_generated, sample_batch, 0, seg_size=eval_seg_size
-                            )
-                        )
-                        control_runs.append(
-                            _compute_omni_control_metrics(decoded_single_generated, sample_batch, 0)
-                        )
-
-                rec = None
-                if do_eval_metrics:
-                    rec = {"name": sample_name, "num_runs": eval_num_runs, "probe_tag": probe_tag}
-                    if traj_runs:
-                        rec.update(_average_traj_metrics(traj_runs))
-                    if control_runs:
-                        rec.update(_average_control_metrics(control_runs))
-                    if fwd_stat is not None:
-                        rec["fwd_ctrl_loss"] = fwd_stat.get("loss", float("nan"))
-                        rec["fwd_ctrl_loss_std"] = fwd_stat.get("loss_std", float("nan"))
-                        rec["fwd_n_valid"] = fwd_stat.get("n_valid", float("nan"))
-                        rec["fwd_win_len"] = fwd_stat.get("window_len", float("nan"))
-                        rec["fwd_num_windows"] = fwd_stat.get("num_windows", 0)
-                    rec["_traj_runs"] = traj_runs
-                    rec["_control_runs"] = control_runs
-
-                local_payloads.append(
-                    {
-                        "name": sample_name,
-                        "dataset_id": sample_dataset_id,
-                        "text": sample_text,
-                        "token": token_run0,
-                        "feature": feature_run0,
-                        "traj_xz": traj_xz,
-                        "traj_mask": traj_mask,
-                        "frames": frames,
-                        "record": rec,
-                    }
-                )
-
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                gathered_payloads = [None] * torch.distributed.get_world_size()
-                torch.distributed.all_gather_object(gathered_payloads, local_payloads)
-                all_payloads = [
-                    payload
-                    for rank_payloads in gathered_payloads
-                    for payload in (rank_payloads or [])
-                ]
-            else:
-                all_payloads = local_payloads
-
-            if self.trainer.global_rank == 0:
-                seen = self._inline_eval_seen.setdefault((probe_tag, step_tag), set())
-                for payload in all_payloads:
-                    single_generated_id = payload["name"]
-                    single_dataset_id = payload["dataset_id"]
-                    dedupe_key = (single_dataset_id, single_generated_id)
-                    if dedupe_key in seen:
-                        continue
-                    seen.add(dedupe_key)
-
-                    text_dir = f"{self.cfg.save_dir}/{single_dataset_id}/text/{probe_tag}/{step_tag}"
-                    token_dir = f"{self.cfg.save_dir}/{single_dataset_id}/token/{probe_tag}/{step_tag}"
-                    feature_dir = f"{self.cfg.save_dir}/{single_dataset_id}/feature/{probe_tag}/{step_tag}"
-                    cond_traj_dir = f"{self.cfg.save_dir}/{single_dataset_id}/traj_xz/{probe_tag}/{step_tag}"
-                    traj_mask_dir = f"{self.cfg.save_dir}/{single_dataset_id}/traj_mask/{probe_tag}/{step_tag}"
-                    frames_dir = f"{self.cfg.save_dir}/{single_dataset_id}/frames/{probe_tag}/{step_tag}"
-                    metrics_dir = f"{self.cfg.save_dir}/{single_dataset_id}/metrics/{probe_tag}/{step_tag}"
-
-                    try:
-                        os.makedirs(text_dir, exist_ok=True)
-                        with open(f"{text_dir}/{single_generated_id}.txt", "w") as f:
-                            f.write(payload["text"])
-                        os.makedirs(token_dir, exist_ok=True)
-                        np.save(f"{token_dir}/{single_generated_id}.npy", payload["token"])
-                        os.makedirs(feature_dir, exist_ok=True)
-                        np.save(f"{feature_dir}/{single_generated_id}.npy", payload["feature"])
-
-                        if payload["traj_xz"] is not None:
-                            os.makedirs(cond_traj_dir, exist_ok=True)
-                            np.save(f"{cond_traj_dir}/{single_generated_id}.npy", payload["traj_xz"])
-                        if payload["traj_mask"] is not None:
-                            os.makedirs(traj_mask_dir, exist_ok=True)
-                            np.save(f"{traj_mask_dir}/{single_generated_id}.npy", payload["traj_mask"])
-                        if payload["frames"] is not None:
-                            os.makedirs(frames_dir, exist_ok=True)
-                            np.save(f"{frames_dir}/{single_generated_id}.npy", payload["frames"])
-                        if payload["record"] is not None:
-                            os.makedirs(metrics_dir, exist_ok=True)
-                            with open(f"{metrics_dir}/{single_generated_id}.json", "w") as f:
-                                json.dump(payload["record"], f, indent=2)
-                    except Exception as e:
-                        rank_zero_info(
-                            f"Error in saving motion {single_generated_id} of dataset {single_dataset_id}: {e}"
-                        )
-
-            return {"output": None}
-        finally:
-            # Restore training RNG state unconditionally (even if generate() raises).
-            random.setstate(_py)
-            np.random.set_state(_np)
-            torch.random.set_rng_state(_cpu)
-            if _cuda is not None:
-                torch.cuda.set_rng_state_all(_cuda)
+        return run_inline_generation_eval(
+            self,
+            batch,
+            batch_idx=batch_idx,
+            test_loader_idx=test_loader_idx,
+        )
 
     def process_test_results(self):
-        for dataset_id in os.listdir(self.cfg.save_dir):
-            feature_root = Path(self.cfg.save_dir) / dataset_id / "feature"
-            if not os.path.exists(feature_root):
-                continue
-            step_tag = f"step_{int(self.global_step):06d}"
-            for probe_tag in self._get_test_probe_tags():
-                feature_dir = feature_root / probe_tag / step_tag
-                if not feature_dir.exists():
-                    continue
-                metrics_dir = Path(self.cfg.save_dir) / dataset_id / "metrics" / probe_tag / step_tag
-                video_step_dir = Path(self.cfg.save_dir) / dataset_id / "video" / probe_tag / step_tag
-                composite_step_dir = Path(self.cfg.save_dir) / dataset_id / "composite" / probe_tag / step_tag
-                frames_dir = Path(self.cfg.save_dir) / dataset_id / "frames" / probe_tag / step_tag
-                traj_mask_dir = Path(self.cfg.save_dir) / dataset_id / "traj_mask" / probe_tag / step_tag
-                cond_traj_dir = Path(self.cfg.save_dir) / dataset_id / "traj_xz" / probe_tag / step_tag
-                text_dir = Path(self.cfg.save_dir) / dataset_id / "text" / probe_tag / step_tag
-                # render video and save
-                if self.cfg.test_setting.render:
-                    render_video(
-                        motion_dir=str(feature_dir),
-                        save_dir=str(video_step_dir),
-                        render_setting=self.cfg.test_setting,
-                        frames_dir=str(frames_dir),
-                        traj_mask_dir=str(traj_mask_dir),
-                        cond_traj_dir=str(cond_traj_dir),
-                    )
+        process_inline_generation_results(self)
 
-                    # Create composite videos
-                    make_composite_compare_videos(
-                        result_folder=str(video_step_dir),
-                        compare_folders=self.cfg.test_setting.get(dataset_id, {}).get(
-                            "compare_folders", None
-                        ),
-                        compare_names=self.cfg.test_setting.get(dataset_id, {}).get(
-                            "compare_names", None
-                        ),
-                        text_folder=str(text_dir),
-                        save_dir=str(composite_step_dir),
-                    )
 
-                    # wandb log video
-                    if (
-                        not self.cfg.debug
-                        and self.logger is not None
-                        and isinstance(self.logger, WandbLogger)
-                    ):
-                        video_to_log = []
-                        for video_path in sorted(os.listdir(composite_step_dir)):
-                            video_to_log.append(
-                                wandb.Video(
-                                    str(composite_step_dir / video_path),
-                                    format="gif",
-                                )
-                            )
-                        wandb.log(
-                            {f"{dataset_id}_{probe_tag}_video": video_to_log},
-                            step=self.global_step,
-                        )
+def _build_test_probe_loaders(cfg, collate_fn):
+    probe_cfg = cfg.data.get("test_probe_meta_paths", None)
+    probe_specs = []
+    if probe_cfg:
+        for probe_tag, meta_paths in probe_cfg.items():
+            probe_specs.append((str(probe_tag), list(meta_paths)))
+    else:
+        probe_specs.append(("test", list(cfg.data.test_meta_paths)))
 
-                if not metrics_dir.exists():
-                    continue
-                sample_records = []
-                for metric_file in sorted(os.listdir(metrics_dir)):
-                    if not metric_file.endswith(".json"):
-                        continue
-                    with open(metrics_dir / metric_file, "r") as f:
-                        sample_records.append(json.load(f))
-                if not sample_records:
-                    continue
-
-                summary = {}
-                valid_traj = [r for r in sample_records if "ade" in r and r["ade"] == r["ade"]]
-                if valid_traj:
-                    ades = [r["ade"] for r in valid_traj]
-                    fdes = [r["fde"] for r in valid_traj]
-                    mses = [r["mse"] for r in valid_traj]
-                    summary["traj/ADE_mean"] = float(np.mean(ades))
-                    summary["traj/ADE_std"] = float(np.std(ades))
-                    summary["traj/FDE_mean"] = float(np.mean(fdes))
-                    summary["traj/FDE_std"] = float(np.std(fdes))
-                    summary["traj/MSE_mean"] = float(np.mean(mses))
-                    summary["traj/MSE_std"] = float(np.std(mses))
-                    summary["traj/n_samples"] = len(valid_traj)
-
-                    max_segs = max(len(r.get("seg_mse", [])) for r in valid_traj)
-                    seg_means = []
-                    for s in range(max_segs):
-                        vals = [r["seg_mse"][s] for r in valid_traj
-                                if s < len(r.get("seg_mse", [])) and r["seg_mse"][s] is not None]
-                        seg_means.append(float(np.mean(vals)) if vals else None)
-                    summary["traj/seg_mse_per_slot"] = seg_means
-
-                    max_pfx = max(len(r.get("prefix_mse", [])) for r in valid_traj)
-                    pfx_means = []
-                    for s in range(max_pfx):
-                        vals = [r["prefix_mse"][s] for r in valid_traj
-                                if s < len(r.get("prefix_mse", [])) and r["prefix_mse"][s] is not None]
-                        pfx_means.append(float(np.mean(vals)) if vals else None)
-                    summary["traj/prefix_mse_per_slot"] = pfx_means
-
-                    jitter_vals = [r["traj_jitter"] for r in valid_traj
-                                   if "traj_jitter" in r and r["traj_jitter"] == r["traj_jitter"]]
-                    if jitter_vals:
-                        summary["traj/jitter_mean"] = float(np.mean(jitter_vals))
-                        summary["traj/jitter_std"] = float(np.std(jitter_vals))
-
-                    path_arc_ades = [r["path_arc_ade"] for r in valid_traj
-                                     if "path_arc_ade" in r and r["path_arc_ade"] == r["path_arc_ade"]]
-                    if path_arc_ades:
-                        summary["path/arc_ADE_mean"] = float(np.mean(path_arc_ades))
-                        summary["path/arc_ADE_std"] = float(np.std(path_arc_ades))
-
-                    path_chamfers = [r["path_chamfer"] for r in valid_traj
-                                     if "path_chamfer" in r and r["path_chamfer"] == r["path_chamfer"]]
-                    if path_chamfers:
-                        summary["path/chamfer_mean"] = float(np.mean(path_chamfers))
-                        summary["path/chamfer_std"] = float(np.std(path_chamfers))
-
-                    fwd_vals = [r["fwd_ctrl_loss"] for r in valid_traj
-                                if "fwd_ctrl_loss" in r and r["fwd_ctrl_loss"] == r["fwd_ctrl_loss"]]
-                    if fwd_vals:
-                        summary["traj/fwd_ctrl_loss_mean"] = float(np.mean(fwd_vals))
-                        summary["traj/fwd_ctrl_loss_std"] = float(np.std(fwd_vals))
-                        fwd_run_std_vals = [r["fwd_ctrl_loss_std"] for r in valid_traj
-                                            if "fwd_ctrl_loss_std" in r and r["fwd_ctrl_loss_std"] == r["fwd_ctrl_loss_std"]]
-                        if fwd_run_std_vals:
-                            summary["traj/fwd_ctrl_loss_run_std_mean"] = float(np.mean(fwd_run_std_vals))
-
-                control_metric_keys = (
-                    "control_l2_dist",
-                    "skating_ratio",
-                    "traj_fail_20cm",
-                    "traj_fail_50cm",
-                    "kps_fail_20cm",
-                    "kps_fail_50cm",
-                    "kps_mean_err_m",
-                )
-                control_name_map = {
-                    "control_l2_dist": "Control_L2_dist",
-                    "skating_ratio": "Skating_Ratio",
-                    "traj_fail_20cm": "traj_fail_20cm",
-                    "traj_fail_50cm": "traj_fail_50cm",
-                    "kps_fail_20cm": "kps_fail_20cm",
-                    "kps_fail_50cm": "kps_fail_50cm",
-                    "kps_mean_err_m": "kps_mean_err_m",
-                }
-                max_runs = max(len(r.get("_control_runs", [])) for r in sample_records)
-                for key in control_metric_keys:
-                    per_run_vals = []
-                    for run_idx in range(max_runs):
-                        vals = []
-                        for r in sample_records:
-                            control_runs = r.get("_control_runs", [])
-                            if run_idx < len(control_runs):
-                                v = control_runs[run_idx].get(key, float("nan"))
-                                if v == v:
-                                    vals.append(v)
-                        if vals:
-                            per_run_vals.append(float(np.mean(vals)))
-                    if per_run_vals:
-                        mean, std, conf = _get_metric_statistics(np.asarray(per_run_vals, dtype=np.float64), len(per_run_vals))
-                        out_key = control_name_map[key]
-                        summary[f"control/{out_key}_mean"] = float(mean)
-                        summary[f"control/{out_key}_std"] = float(std)
-                        summary[f"control/{out_key}_conf_interval"] = float(conf)
-                        summary[f"control/{out_key}_num_runs"] = int(len(per_run_vals))
-
-                summary_path = metrics_dir / "summary.json"
-                with open(summary_path, "w") as f:
-                    json.dump({"summary": summary, "samples": sample_records}, f, indent=2)
-
-                rank_zero_info(
-                    f"[eval][{dataset_id}][{probe_tag}][{step_tag}] "
-                    f"ADE={summary.get('traj/ADE_mean', float('nan')):.4f} "
-                    f"FDE={summary.get('traj/FDE_mean', float('nan')):.4f} "
-                    f"PathArc={summary.get('path/arc_ADE_mean', float('nan')):.4f} "
-                    f"ControlL2={summary.get('control/Control_L2_dist_mean', float('nan')):.4f}"
-                )
-
-                flat_metrics = {}
-                for key, value in summary.items():
-                    log_key = f"eval/{probe_tag}/{dataset_id}/{key}"
-                    if isinstance(value, list):
-                        for idx, item in enumerate(value):
-                            if item is not None:
-                                flat_metrics[f"{log_key}/slot_{idx}"] = float(item)
-                    else:
-                        flat_metrics[log_key] = float(value)
-                if flat_metrics and self.logger is not None:
-                    self.logger.log_metrics(flat_metrics, step=self.global_step)
+    loaders, tags = [], []
+    total_probe_samples = 0
+    test_target = cfg.data.get("test_target", cfg.data.target)
+    for probe_tag, meta_paths in probe_specs:
+        probe_cfg_obj = OmegaConf.create(OmegaConf.to_container(cfg.config, resolve=False))
+        OmegaConf.update(probe_cfg_obj, "data.test_meta_paths", meta_paths)
+        probe_dataset = instantiate(test_target, cfg=probe_cfg_obj, split="test")
+        probe_loader = DataLoader(
+            probe_dataset,
+            batch_size=cfg.data.test_bs,
+            shuffle=False,
+            drop_last=False,
+            num_workers=cfg.data.num_workers,
+            persistent_workers=False,
+            prefetch_factor=8,
+            collate_fn=collate_fn,
+        )
+        loaders.append(probe_loader)
+        tags.append(probe_tag)
+        total_probe_samples += len(probe_dataset)
+        rank_zero_info(f"Test probe[{probe_tag}]: {len(probe_dataset)} samples")
+    return loaders, tags, total_probe_samples
 
 
 def main():
@@ -923,58 +751,72 @@ def main():
         collate_fn=collate_fn,
     )
 
-    def build_test_probe_loaders():
-        probe_cfg = cfg.data.get("test_probe_meta_paths", None)
-        probe_specs = []
-        if probe_cfg:
-            for probe_tag, meta_paths in probe_cfg.items():
-                probe_specs.append((str(probe_tag), list(meta_paths)))
-        else:
-            probe_specs.append(("test", list(cfg.data.test_meta_paths)))
+    test_probe_loaders, test_loader_tags, total_probe_samples = _build_test_probe_loaders(
+        cfg, collate_fn
+    )
 
-        loaders = []
-        tags = []
-        total_probe_samples = 0
-        test_target = cfg.data.get("test_target", cfg.data.target)
-        for probe_tag, meta_paths in probe_specs:
-            probe_cfg_obj = OmegaConf.create(OmegaConf.to_container(cfg.config, resolve=False))
-            OmegaConf.update(probe_cfg_obj, "data.test_meta_paths", meta_paths)
-            probe_dataset = instantiate(test_target, cfg=probe_cfg_obj, split="test")
-            probe_loader = DataLoader(
-                probe_dataset,
-                batch_size=cfg.data.test_bs,
-                shuffle=False,
-                drop_last=False,
-                num_workers=cfg.data.num_workers,
-                persistent_workers=False,
-                prefetch_factor=8,
-                collate_fn=collate_fn,
-            )
-            loaders.append(probe_loader)
-            tags.append(probe_tag)
-            total_probe_samples += len(probe_dataset)
-            rank_zero_info(f"Test probe[{probe_tag}]: {len(probe_dataset)} samples")
-        return loaders, tags, total_probe_samples
-
-    test_probe_loaders, test_loader_tags, total_probe_samples = build_test_probe_loaders()
     rank_zero_info(
         f"Train dataset: {len(train_dataset) if train_dataset is not None else 0}, "
         f"Val dataset: {len(val_dataset) if val_dataset is not None else 0}, "
         f"Test probe samples: {total_probe_samples}"
     )
+    
+    trainer_absolute_max_steps = int(cfg.trainer.max_steps)
+    trainer_runtime_max_steps = trainer_absolute_max_steps
+    model_self_forcing_enabled = bool(
+        cfg.config.model.params.get("self_forcing_enabled", False)
+    )
+    resume_step_offset = 0
+    if cfg.train and model_self_forcing_enabled and cfg.resume_ckpt:
+        resume_step_offset = load_resume_step_offset(cfg.resume_ckpt)
+        trainer_runtime_max_steps = resolve_runtime_max_steps(
+            trainer_absolute_max_steps,
+            resume_step_offset,
+            self_forcing_enabled=model_self_forcing_enabled,
+        )
+        rank_zero_info(
+            "[self_forcing runtime] "
+            f"resume_step_offset={resume_step_offset} "
+            f"absolute_target_step={trainer_absolute_max_steps} "
+            f"phase_max_steps={trainer_runtime_max_steps}"
+        )
+    scheduler_training_steps = int(
+        OmegaConf.to_container(
+            cfg.config.lr_scheduler.params,
+            resolve=True,
+        )["num_training_steps"]
+    )
+    runtime_scheduler_steps = resolve_runtime_scheduler_steps(
+        scheduler_training_steps,
+        absolute_target_step=trainer_absolute_max_steps,
+        runtime_max_steps=trainer_runtime_max_steps,
+    )
+    if runtime_scheduler_steps != scheduler_training_steps:
+        OmegaConf.update(
+            cfg.config,
+            "lr_scheduler.params.num_training_steps",
+            int(runtime_scheduler_steps),
+        )
+        rank_zero_info(
+            "[self_forcing runtime] "
+            f"lr_scheduler.num_training_steps={runtime_scheduler_steps} "
+            f"(was {scheduler_training_steps})"
+        )
 
     # lightning module, model is inside the lightning module
     model = CustomLightningModule(cfg=cfg.config)
     model.test_loader_tags = test_loader_tags
+    model._resume_step_offset = int(resume_step_offset)
 
     callbacks = []
     checkpoint_callback = ModelCheckpoint(
         dirpath=cfg.save_dir,
-        filename="step_{step}",
+        filename="step_{ckpt_absolute_step:06.0f}",
         every_n_train_steps=cfg.validation.save_every_n_steps,
         save_top_k=cfg.validation.save_top_k,
-        monitor="step",
+        monitor="ckpt_absolute_step",
         mode="max",
+        auto_insert_metric_name=False,
         save_last=True,
         save_on_train_epoch_end=False,
     )
@@ -987,9 +829,11 @@ def main():
         if isinstance(cfg.trainer.devices, int)
         else len(cfg.trainer.devices)
     )
+    trainer_kwargs = OmegaConf.to_container(cfg.trainer, resolve=True)
+    trainer_kwargs["max_steps"] = trainer_runtime_max_steps
 
     trainer = Trainer(
-        **cfg.trainer,
+        **trainer_kwargs,
         logger=logger,
         strategy=DDPStrategy(find_unused_parameters=True)
         if num_devices > 1

@@ -39,6 +39,13 @@ class BasicLightningModule(LightningModule):
         # metric
         self.initialize_metrics()
 
+    def _get_effective_global_step(self):
+        return int(self.global_step)
+
+    def _get_checkpoint_step_value(self):
+        # Checkpoints are emitted after the optimizer update for the current batch.
+        return int(self._get_effective_global_step()) + 1
+
     def configure_optimizers(self):
         optim_target = self.cfg.optimizer.target
         if len(optim_target.split(".")) == 1:
@@ -131,6 +138,13 @@ class BasicLightningModule(LightningModule):
         )
         self.log(
             "net_time", net_time, on_step=True, prog_bar=True, batch_size=batch_size
+        )
+        self.log(
+            "ckpt_absolute_step",
+            float(self._get_checkpoint_step_value()),
+            on_step=True,
+            prog_bar=False,
+            batch_size=batch_size,
         )
         for key, value in loss_dict.items():
             self.log(
