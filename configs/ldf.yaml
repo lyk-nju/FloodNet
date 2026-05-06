@@ -1,7 +1,7 @@
 exp_name: ldf # Experiment names
 seed: 1234 # Seed value
 debug: false
-train: true
+train: false
 
 dirs:
     deps: /data1/yuankai/text2Motion/FloodDiffusion/deps
@@ -9,10 +9,11 @@ dirs:
     raw_data: /data1/yuankai/text2Motion/FloodDiffusion/raw_data
 
 save_dir: ./outputs
-resume_ckpt: "/home/yuankai/Text2Motion/FloodNet/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt"
-test_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt
-# resume_ckpt: "/home/yuankai/Text2Motion/FloodNet/outputs/20260421_105641_ldf/step_step=244000.ckpt"
-# test_ckpt: "/home/yuankai/Text2Motion/FloodNet/outputs/20260421_105641_ldf/step_step=244000.ckpt"
+resume_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20260506_012427_ldf/step_240000.ckpt
+test_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20260506_012427_ldf/step_240000.ckpt
+
+# resume_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt
+# test_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt
 # resume_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20260415_114956_ldf/step_step=245000.ckpt
 # test_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20260415_114956_ldf/step_step=245000.ckpt
 
@@ -41,19 +42,19 @@ logger:
         entity: "${wandb_info.entity}"
 
 trainer: # lightning trainer
-    max_steps: 360000
+    max_steps: 260000
     accelerator: gpu
-    devices: [0]
+    devices: [0,1,2,3,4]
     log_every_n_steps: 100
     precision: bf16-mixed
 # Set to true to run T2M FID/R-Precision on val_meta_paths during eval.
 # Can also be enabled via --t2m_metric CLI flag.
-t2m_metric: false
+t2m_metric: true
 
 validation:
-    validation_steps: 8000
-    test_steps: 1000
-    save_every_n_steps: 1000
+    validation_steps: 3000
+    test_steps: 3000
+    save_every_n_steps: 3000
     save_top_k: 100
     eval_generation_metrics: true
     eval_num_runs: 10
@@ -100,15 +101,15 @@ data:
     target: datasets.humanml3d.HumanML3DDataset
     collate_fn: datasets.humanml3d.collate_fn
     train_bs: 8
-    val_bs: 16
+    val_bs: 32
     test_bs: 1
     num_workers: 4
     # mask_ratio: [0.2,0.3]       
     mask_ratio: 1.0
 
     train_meta_paths:
-        # - ${dirs.raw_data}/HumanML3D/train.txt
-        - ${dirs.raw_data}/HumanML3D/test_min.txt
+        - ${dirs.raw_data}/HumanML3D/train.txt
+        # - ${dirs.raw_data}/HumanML3D/test_min.txt
         # - ${dirs.raw_data}/HumanML3D/val.txt
     val_meta_paths:
         - ${dirs.raw_data}/HumanML3D/val.txt
@@ -161,7 +162,11 @@ model:
         # Thresholds are phase progress over [resume_ckpt.global_step, trainer.max_steps].
         self_forcing_k_schedule:
             - [0.0, 2]
-            - [0.8, 3]
+
+# Diagnostic: when true, run the rollout forward but skip the self-pred
+# substitution.  Used to isolate whether the bug lives in the substituted
+# value (set true → behaves like K=1) or in the dual-forward path itself.
+self_forcing_disable_replace: true
 
 # control_loss_train_mode selects gradient strategy for the XZ control loss:
 #   1 — active window, absolute coords, no detach   (gradient → ALL tokens via cumsum)
@@ -185,5 +190,5 @@ optimizer:
 lr_scheduler:
     target: diffusers.optimization.get_cosine_schedule_with_warmup
     params:
-        num_warmup_steps: 2000
+        num_warmup_steps: 1000
         num_training_steps: ${trainer.max_steps}

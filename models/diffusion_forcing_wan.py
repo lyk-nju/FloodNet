@@ -531,7 +531,13 @@ class DiffForcingWanModel(nn.Module):
                 if ctx_len <= 0:
                     continue
                 if self.prediction_type == "vel":
-                    x0_hat = (pred_ss[b] + noise_ref[b]).detach()
+                    # Same low-β stability issue as the self-forcing rollout:
+                    # use z = noisy_x + β·vel instead of vel + ε.  See the
+                    # comment in _run_single_window_forward for details.
+                    beta_b = noise_level[b, :t_len].view(1, -1, 1, 1)
+                    x0_hat = (
+                        noisy_feature_input[b] + beta_b * pred_ss[b]
+                    ).detach()
                 elif self.prediction_type == "x0":
                     x0_hat = pred_ss[b].detach()
                 else:
@@ -562,6 +568,7 @@ class DiffForcingWanModel(nn.Module):
         loss = 0.0
         x0_latent_list = []
         for b in range(batch_size):
+            t_b = noisy_feature_input[b].shape[1]
             if self.prediction_type == "vel":
                 vel = feature_ref[b] - noise_ref[b]
                 squared_error = (
@@ -586,7 +593,14 @@ class DiffForcingWanModel(nn.Module):
             sample_loss = squared_error.mean()
             loss += sample_loss
             if self.prediction_type == "vel":
-                pred_x0 = predicted_result[b] + noise_ref[b]
+                # Recover x0 via z = noisy_x + β·vel.  This is numerically
+                # stable at all β: at β→0 it reduces to z = noisy_x = z (clean),
+                # whereas `pred_vel + ε` collapses to z + ε because the model
+                # cannot predict ε from a near-clean input.  Critical for
+                # self-forcing rollout, which extracts pred_x0 at the
+                # leftmost active position where β ≈ 1/cs is small.
+                beta_b = noise_level[b, :t_b].view(1, -1, 1, 1)
+                pred_x0 = noisy_feature_input[b] + beta_b * predicted_result[b]
                 x0_latent_list.append(pred_x0[:, :, 0, 0].permute(1, 0))
             elif self.prediction_type == "x0":
                 pred_x0 = predicted_result[b]
@@ -907,28 +921,31 @@ class DiffForcingWanModel(nn.Module):
                     predicted_vel = predicted_result_i[:, start_index:end_index, ...]
                     generated[i, :, start_index:end_index, ...] += predicted_vel * dt
                 elif self.prediction_type == "x0":
-                    predicted_vel = (
-                        predicted_result_i[:, start_index:end_index, ...]
-                        - generated[i, :, start_index:end_index, ...]
-                    ) / (
+                    nl = (
                         noise_level[i, start_index:end_index]
                         .unsqueeze(0)
                         .unsqueeze(-1)
                         .unsqueeze(-1)
+                        .clamp(min=1e-6)
                     )
+                    predicted_vel = (
+                        predicted_result_i[:, start_index:end_index, ...]
+                        - generated[i, :, start_index:end_index, ...]
+                    ) / nl
                     generated[i, :, start_index:end_index, ...] += predicted_vel * dt
                 elif self.prediction_type == "noise":
-                    predicted_vel = (
-                        generated[i, :, start_index:end_index, ...]
-                        - predicted_result_i[:, start_index:end_index, ...]
-                    ) / (
+                    denom = (
                         1
                         + dt
                         - noise_level[i, start_index:end_index]
                         .unsqueeze(0)
                         .unsqueeze(-1)
                         .unsqueeze(-1)
-                    )
+                    ).clamp(min=1e-6)
+                    predicted_vel = (
+                        generated[i, :, start_index:end_index, ...]
+                        - predicted_result_i[:, start_index:end_index, ...]
+                    ) / denom
                     generated[i, :, start_index:end_index, ...] += predicted_vel * dt
 
         generated = self.postprocess(generated)  # (B, T, C)

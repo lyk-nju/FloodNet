@@ -517,7 +517,12 @@ class DiffForcingWanModel(nn.Module):
             pred_x0_latent_list = []
             for b in range(batch_size):
                 if self.prediction_type == "vel":
-                    pred_x0 = predicted_result[b] + noise_ref[b]
+                    # Use z = noisy_x + β·vel (numerically stable at all β);
+                    # `vel + ε` collapses to z + ε at low β because the model
+                    # cannot recover ε from a near-clean input.
+                    t_b = noisy_feature_input[b].shape[1]
+                    beta_b = noise_level[b, :t_b].view(1, -1, 1, 1)
+                    pred_x0 = noisy_feature_input[b] + beta_b * predicted_result[b]
                 else:
                     pred_x0 = predicted_result[b]
                 p = pred_x0[:, :, 0, 0].permute(1, 0)

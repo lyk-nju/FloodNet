@@ -43,22 +43,41 @@ class CustomLightningModule(BasicLightningModule):
         self._self_forcing_runtime_validated = False
         self._resume_step_offset = 0
         super().__init__(cfg)
-        self.automatic_optimization = not bool(
-            getattr(self.model, "self_forcing_enabled", False)
+        # Must set AFTER super().__init__() because LightningModule.__init__
+        # forces automatic_optimization=True; setting it before is silently
+        # overwritten and crashes self.manual_backward at runtime.
+        self_forcing_enabled = bool(
+            cfg.model.params.get("self_forcing_enabled", False)
         )
+        self.automatic_optimization = not self_forcing_enabled
 
     def _build_step_semantics(self, phase_step: int | None = None):
         trainer = getattr(self, "trainer", None)
         trainer_max_steps = getattr(trainer, "max_steps", None) if trainer is not None else None
+        # `trainer.max_steps` is absolute (Lightning compares it against the
+        # absolute `global_step`).  For phase-relative semantics we need the
+        # phase length, so subtract the resume offset here.
+        sf_enabled = bool(getattr(self.model, "self_forcing_enabled", False))
+        if (
+            sf_enabled
+            and trainer_max_steps is not None
+            and int(trainer_max_steps) > 0
+        ):
+            phase_total = int(trainer_max_steps) - int(self._resume_step_offset)
+            trainer_max_steps = max(1, phase_total)
         return build_step_semantics(
             phase_step=self._get_phase_global_step() if phase_step is None else int(phase_step),
             trainer_max_steps=trainer_max_steps,
             resume_step_offset=self._resume_step_offset,
-            self_forcing_enabled=bool(getattr(self.model, "self_forcing_enabled", False)),
+            self_forcing_enabled=sf_enabled,
         )
 
     def _get_phase_global_step(self) -> int:
-        return int(self.global_step)
+        # Lightning restores `global_step` to the ckpt's absolute value on
+        # resume (e.g. 240000).  For self-forcing schedule progress we need
+        # the *phase-relative* step (steps trained since this phase started),
+        # so subtract the resume offset.
+        return max(0, int(self.global_step) - int(self._resume_step_offset))
 
     def _get_effective_global_step(self):
         return self._build_step_semantics().absolute_step
@@ -66,7 +85,7 @@ class CustomLightningModule(BasicLightningModule):
     def _get_checkpoint_step_value(self):
         return build_checkpoint_step_info(
             self._build_step_semantics(),
-            include_next_step=True,
+            include_next_step=False,
         ).metric_value
 
     def _get_step_tag(self):
@@ -136,12 +155,6 @@ class CustomLightningModule(BasicLightningModule):
             raise NotImplementedError(
                 "self-forcing manual optimization does not yet support "
                 f"accumulate_grad_batches={accumulate_grad_batches}. Set it to 1."
-            )
-        gradient_clip_val = getattr(trainer, "gradient_clip_val", None)
-        if gradient_clip_val is not None and float(gradient_clip_val) > 0:
-            raise NotImplementedError(
-                "self-forcing manual optimization does not yet support Lightning "
-                f"gradient clipping (gradient_clip_val={gradient_clip_val})."
             )
         self._self_forcing_runtime_validated = True
 
@@ -418,7 +431,15 @@ class CustomLightningModule(BasicLightningModule):
 
     def _prepare_self_forcing_plan(self, feature_length, device, progress):
         target_k = self._resolve_self_forcing_k(progress)
-        min_k_supported = int(feature_length.min().item()) - self.model.chunk_size + 1
+        # Cross-rank consensus on effective_k so DDP ranks run the same number
+        # of rollout steps (shortest valid sequence wins).
+        min_k_local = int(feature_length.min().item()) - self.model.chunk_size + 1
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            tmp = torch.tensor([min_k_local], device=device, dtype=torch.long)
+            torch.distributed.all_reduce(tmp, op=torch.distributed.ReduceOp.MIN)
+            min_k_supported = int(tmp.item())
+        else:
+            min_k_supported = min_k_local
         if min_k_supported < 1:
             raise ValueError(
                 "self-forcing requires feature_length >= chunk_size for every sample"
@@ -426,9 +447,16 @@ class CustomLightningModule(BasicLightningModule):
         effective_k = min(target_k, min_k_supported)
 
         max_start = feature_length.to(device=device, dtype=torch.long) - effective_k + 1
+        # Mix self-forcing with standard supervision so the t < 1 regime
+        # (very short prefixes) keeps getting gradient updates.  Otherwise
+        # ControlNet drifts on the early-time regime that inference still
+        # exercises.  ``low = 1`` matches the standard `forward` end_index
+        # range; samples with start < chunk_size simply fall back to a
+        # standard supervised step (rollout has no effect when replace_idx
+        # would land before position 0).
         start_end_indices = []
         for b in range(feature_length.shape[0]):
-            low = int(self.model.chunk_size)
+            low = 1
             high = int(max_start[b].item())
             if high < low:
                 raise ValueError(
@@ -445,9 +473,13 @@ class CustomLightningModule(BasicLightningModule):
         start_end_indices = torch.tensor(
             start_end_indices, device=device, dtype=torch.long
         )
-        phase_offset = float(
-            torch.empty(1, device=device).uniform_(0.0, 1.0 / self.model.chunk_size).item()
-        )
+        # Per-sample fractional time offset (matches standard `forward`).
+        # Sharing a single scalar across the batch correlates noise schedules
+        # for every sample and collapses effective batch diversity.
+        batch_size = int(feature_length.shape[0])
+        phase_offset = torch.empty(
+            batch_size, device=device, dtype=torch.float32
+        ).uniform_(0.0, 1.0 / self.model.chunk_size)
         return effective_k, start_end_indices, phase_offset
 
     def _run_self_forcing_rollout(self, model_batch, progress):
@@ -498,14 +530,42 @@ class CustomLightningModule(BasicLightningModule):
                     enable_scheduled_sampling=False,
                 )
 
+            # Diagnostic: when self_forcing_disable_replace is set, we still
+            # run the rollout forward (so any side-effect of the extra forward
+            # pass remains), but skip the substitution entirely.  K=2 with this
+            # flag should behave identically to K=1.  If FID still degrades
+            # with this flag on, the bug is in the dual-forward path itself
+            # (e.g. RNG / autograd state).  If FID is restored, the bug is in
+            # the substituted value.
+            disable_replace = bool(
+                self.cfg.get("self_forcing_disable_replace", False)
+            )
             next_feature = current_feature.clone()
-            for b in range(feature.shape[0]):
-                replace_idx = int(end_indices[b].item()) - self.model.chunk_size
-                replacement = rollout_result["x0_latent_list"][b][replace_idx]
-                next_feature[b, replace_idx, :] = replacement.detach().to(
-                    device=current_feature.device, dtype=current_feature.dtype
-                )
+            replace_diffs = []
+            if not disable_replace:
+                for b in range(feature.shape[0]):
+                    # When start < chunk_size (early-time short-prefix samples),
+                    # replace_idx < 0 means there is no past token to roll out;
+                    # this sample degenerates to a plain supervised step.
+                    replace_idx = int(end_indices[b].item()) - self.model.chunk_size
+                    if replace_idx < 0:
+                        continue
+                    pred_seq = rollout_result["x0_latent_list"][b]
+                    if replace_idx >= pred_seq.shape[0]:
+                        continue
+                    replacement = pred_seq[replace_idx].detach().to(
+                        device=current_feature.device, dtype=current_feature.dtype
+                    )
+                    gt_token = current_feature[b, replace_idx, :]
+                    replace_diffs.append(
+                        (replacement - gt_token).abs().mean().item()
+                    )
+                    next_feature[b, replace_idx, :] = replacement
             current_feature = next_feature
+            if replace_diffs:
+                self._self_forcing_last_replace_diff = float(
+                    sum(replace_diffs) / len(replace_diffs)
+                )
 
         if final_step_result is None:
             raise RuntimeError(
@@ -540,11 +600,26 @@ class CustomLightningModule(BasicLightningModule):
             model_batch, semantics.progress
         )
         runtime_metrics["self_forcing/k"] = float(effective_k)
+        replace_diff = getattr(self, "_self_forcing_last_replace_diff", None)
+        if replace_diff is not None:
+            runtime_metrics["self_forcing/replace_abs_diff"] = float(replace_diff)
+            self._self_forcing_last_replace_diff = None
         total_loss, step_diff_loss, step_control_loss = self._finalize_self_forcing_loss(
             final_step_result, batch
         )
 
         self.manual_backward(total_loss)
+        trainable = [p for p in self.model.parameters() if p.requires_grad]
+        # Honour trainer.gradient_clip_val if user sets it; otherwise fall back to
+        # a conservative default (manual_optimization disables Lightning's auto
+        # clipping, so without this self-forcing has zero clipping).
+        clip_val = getattr(getattr(self, "trainer", None), "gradient_clip_val", None)
+        if clip_val is None or float(clip_val) <= 0:
+            clip_val = float(self.cfg.get("self_forcing_grad_clip", 1.0))
+        else:
+            clip_val = float(clip_val)
+        grad_norm = torch.nn.utils.clip_grad_norm_(trainable, clip_val)
+        runtime_metrics["self_forcing/grad_norm"] = float(grad_norm)
         optimizer.step()
         if lr_scheduler is not None:
             lr_scheduler.step()
@@ -762,14 +837,19 @@ def main():
     )
     
     trainer_absolute_max_steps = int(cfg.trainer.max_steps)
-    trainer_runtime_max_steps = trainer_absolute_max_steps
+    # Lightning restores `global_step` to the ckpt's absolute value on resume
+    # and compares it against `trainer.max_steps` (also absolute).  We must
+    # therefore keep the trainer's max_steps at the absolute target.  The
+    # *phase length* (= absolute - offset) is only used to scale the LR
+    # scheduler horizon and self-forcing schedule progress.
     model_self_forcing_enabled = bool(
         cfg.config.model.params.get("self_forcing_enabled", False)
     )
     resume_step_offset = 0
+    phase_max_steps = trainer_absolute_max_steps
     if cfg.train and model_self_forcing_enabled and cfg.resume_ckpt:
         resume_step_offset = load_resume_step_offset(cfg.resume_ckpt)
-        trainer_runtime_max_steps = resolve_runtime_max_steps(
+        phase_max_steps = resolve_runtime_max_steps(
             trainer_absolute_max_steps,
             resume_step_offset,
             self_forcing_enabled=model_self_forcing_enabled,
@@ -778,7 +858,7 @@ def main():
             "[self_forcing runtime] "
             f"resume_step_offset={resume_step_offset} "
             f"absolute_target_step={trainer_absolute_max_steps} "
-            f"phase_max_steps={trainer_runtime_max_steps}"
+            f"phase_max_steps={phase_max_steps}"
         )
     scheduler_training_steps = int(
         OmegaConf.to_container(
@@ -789,7 +869,7 @@ def main():
     runtime_scheduler_steps = resolve_runtime_scheduler_steps(
         scheduler_training_steps,
         absolute_target_step=trainer_absolute_max_steps,
-        runtime_max_steps=trainer_runtime_max_steps,
+        runtime_max_steps=phase_max_steps,
     )
     if runtime_scheduler_steps != scheduler_training_steps:
         OmegaConf.update(
@@ -830,7 +910,9 @@ def main():
         else len(cfg.trainer.devices)
     )
     trainer_kwargs = OmegaConf.to_container(cfg.trainer, resolve=True)
-    trainer_kwargs["max_steps"] = trainer_runtime_max_steps
+    # Keep absolute max_steps for Lightning (it compares global_step which is
+    # restored to ckpt's absolute value on resume).
+    trainer_kwargs["max_steps"] = trainer_absolute_max_steps
 
     trainer = Trainer(
         **trainer_kwargs,
@@ -848,6 +930,13 @@ def main():
     val_dataloaders = [val_dataloader] + test_probe_loaders
 
     if cfg.train:
+        if not cfg.debug:
+            trainer.validate(
+                model,
+                dataloaders=val_dataloaders,
+                ckpt_path=cfg.resume_ckpt if cfg.resume_ckpt else None,
+                weights_only=False,
+            )
         trainer.fit(
             model,
             train_dataloader,

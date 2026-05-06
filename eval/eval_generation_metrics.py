@@ -71,6 +71,17 @@ def parse_args():
     # T2M flag
     parser.add_argument("--t2m_metric", action="store_true",
                         help="Run T2M FID/R-Precision on val_meta_paths (slow, needs large val set).")
+    # Parallel T2M sharding
+    parser.add_argument("--skip_test_pass", action="store_true",
+                        help="Skip Pass 1 (test set video/traj) and only run the T2M val pass.")
+    parser.add_argument("--val_num_shards", type=int, default=1,
+                        help="Total number of shards for parallel T2M evaluation.")
+    parser.add_argument("--val_shard_idx", type=int, default=0,
+                        help="Index of this shard (0 .. val_num_shards-1).")
+    parser.add_argument("--t2m_shards_save_dir", type=str, default=None,
+                        help="Save per-shard embeddings (.npz) here instead of computing FID.")
+    parser.add_argument("--t2m_merge_dir", type=str, default=None,
+                        help="Load t2m_shard_*.npz files from this dir, merge, compute FID, and exit.")
     # Segment MSE
     parser.add_argument("--seg_size", type=int, default=20,
                         help="Frame window size for segment / prefix MSE (default 20).")
@@ -742,6 +753,65 @@ def _plot_traj_xz(
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _save_t2m_shard(t2m_metrics, args) -> None:
+    shard_dir = Path(args.t2m_shards_save_dir)
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    shard_path = shard_dir / f"t2m_shard_{args.val_shard_idx}_of_{args.val_num_shards}.npz"
+
+    rec = np.concatenate([e.numpy() for e in t2m_metrics.recmotion_embeddings], axis=0)
+    gt  = np.concatenate([e.numpy() for e in t2m_metrics.gtmotion_embeddings],  axis=0)
+    txt_list = t2m_metrics.text_embeddings
+    txt = (np.concatenate([e.numpy() for e in txt_list], axis=0)
+           if txt_list else np.zeros((0, rec.shape[-1]), dtype=np.float32))
+
+    np.savez(shard_path, recmotion=rec, gtmotion=gt, text=txt)
+    print(f"[eval] Saved shard {args.val_shard_idx}/{args.val_num_shards} "
+          f"({len(rec)} samples) → {shard_path}")
+
+
+def _run_t2m_merge(args, cfg) -> None:
+    from pathlib import Path as _Path
+    merge_dir = _Path(args.t2m_merge_dir)
+    shard_files = sorted(merge_dir.glob("t2m_shard_*_of_*.npz"))
+    if not shard_files:
+        raise ValueError(f"No t2m_shard_*.npz files found in {merge_dir}")
+
+    print(f"[merge] Found {len(shard_files)} shard files in {merge_dir}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    t2m_metrics = T2MMetrics(cfg.metrics.t2m)
+    t2m_metrics.to(device)
+
+    for sf in shard_files:
+        data = np.load(sf)
+        rec_arr = data["recmotion"]   # (N, D)
+        gt_arr  = data["gtmotion"]
+        txt_arr = data["text"]        # (N, D) or (0, D)
+        n = rec_arr.shape[0]
+        for i in range(n):
+            t2m_metrics.recmotion_embeddings.append(torch.from_numpy(rec_arr[i : i + 1]))
+            t2m_metrics.gtmotion_embeddings.append(torch.from_numpy(gt_arr[i : i + 1]))
+        if t2m_metrics.evaluate_text and txt_arr.shape[0] > 0:
+            for i in range(txt_arr.shape[0]):
+                t2m_metrics.text_embeddings.append(torch.from_numpy(txt_arr[i : i + 1]))
+        print(f"  loaded {sf.name}: {n} samples")
+
+    total = len(t2m_metrics.recmotion_embeddings)
+    print(f"[merge] Total samples: {total}")
+
+    t2m_results = t2m_metrics.compute(sanity_flag=False)
+    t2m_results = {k: (v.item() if hasattr(v, "item") else v) for k, v in t2m_results.items()}
+
+    results_path = merge_dir / "t2m_results.json"
+    results_path.write_text(json.dumps(t2m_results, indent=2))
+
+    print("\n" + "=" * 60)
+    print("T2M Metrics (merged from shards)")
+    print("=" * 60)
+    for k, v in t2m_results.items():
+        print(f"  {k}: {v}")
+    print(f"\nSaved → {results_path}")
+
+
 def main():
     args = parse_args()
     _set_seed(args.seed)
@@ -767,6 +837,11 @@ def main():
 
     # Resolve whether to run T2M (CLI flag OR yaml key)
     run_t2m = args.t2m_metric or bool(cfg.config.get("t2m_metric", False))
+
+    # ── Merge mode: load shard embeddings → compute FID, then exit ────────────
+    if args.t2m_merge_dir:
+        _run_t2m_merge(args, cfg)
+        return
 
     ckpt_path = args.ckpt or getattr(cfg, "test_ckpt", None) or getattr(cfg, "resume_ckpt", None)
     if ckpt_path is None:
@@ -797,25 +872,30 @@ def main():
     collate_fn = get_function(cfg.data.collate_fn) if cfg.data.get("collate_fn") else None
 
     # ── Test dataset (video gen + traj metrics) ───────────────────────────────
-    test_dataset = instantiate(
-        cfg.data.get("test_target", cfg.data.target), cfg=cfg.config, split="test"
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=cfg.data.test_bs,
-        shuffle=False,
-        drop_last=False,
-        num_workers=cfg.data.num_workers,
-        persistent_workers=False,
-        collate_fn=collate_fn,
-    )
+    if not args.skip_test_pass:
+        test_dataset = instantiate(
+            cfg.data.get("test_target", cfg.data.target), cfg=cfg.config, split="test"
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=cfg.data.test_bs,
+            shuffle=False,
+            drop_last=False,
+            num_workers=cfg.data.num_workers,
+            persistent_workers=False,
+            collate_fn=collate_fn,
+        )
 
     # ── Val dataset (T2M FID, only when run_t2m) ──────────────────────────────
     if run_t2m:
-        t2m_metrics = T2MMetrics(cfg.metrics.t2m)
+        t2m_metrics = T2MMetrics(cfg.metrics.t2m).to(device)
         val_dataset = instantiate(
             cfg.data.get("val_target", cfg.data.target), cfg=cfg.config, split="val"
         )
+        if args.val_num_shards > 1:
+            indices = list(range(args.val_shard_idx, len(val_dataset), args.val_num_shards))
+            val_dataset = torch.utils.data.Subset(val_dataset, indices)
+            print(f"[eval] val shard {args.val_shard_idx}/{args.val_num_shards}: {len(val_dataset)} samples")
         val_loader = DataLoader(
             val_dataset,
             batch_size=cfg.data.val_bs,
@@ -827,7 +907,8 @@ def main():
         )
         print(f"[eval] val samples (for T2M FID): {len(val_dataset)}")
 
-    print(f"[eval] test samples (video + traj): {len(test_dataset)}")
+    if not args.skip_test_pass:
+        print(f"[eval] test samples (video + traj): {len(test_dataset)}")
     print(f"[eval] num_runs   : {args.num_runs}")
     if args.forward_control_loss:
         print(
@@ -846,7 +927,9 @@ def main():
     control_run_records: List[List[Dict]] = [[] for _ in range(args.num_runs)]
     dataset_ids_seen = set()
 
-    for bidx, batch in enumerate(test_loader):
+    if args.skip_test_pass:
+        print("[eval] Skipping Pass 1 (test set) as requested.")
+    for bidx, batch in enumerate([] if args.skip_test_pass else test_loader):
         if args.max_batches > 0 and bidx >= args.max_batches:
             break
 
@@ -1139,9 +1222,12 @@ def main():
                         text_tokens=[text_tokens_single],
                     )
 
-        t2m_results = t2m_metrics.compute(sanity_flag=False)
-        t2m_results = {k: (v.item() if hasattr(v, "item") else v)
-                       for k, v in t2m_results.items()}
+        if args.t2m_shards_save_dir:
+            _save_t2m_shard(t2m_metrics, args)
+        else:
+            t2m_results = t2m_metrics.compute(sanity_flag=False)
+            t2m_results = {k: (v.item() if hasattr(v, "item") else v)
+                           for k, v in t2m_results.items()}
 
     # ══════════════════════════════════════════════════════════════════════════
     # Aggregate & save
@@ -1298,7 +1384,8 @@ def main():
     print("Evaluation Summary")
     print("=" * 60)
     print(f"  seed          : {args.seed}")
-    print(f"  test samples  : {len(test_dataset)}")
+    if not args.skip_test_pass:
+        print(f"  test samples  : {len(test_dataset)}")
     if run_t2m:
         print(f"  val samples   : {len(val_dataset)}")
     print(f"  metrics saved : {metrics_path}")
