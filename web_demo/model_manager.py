@@ -16,6 +16,7 @@ import numpy as np
 from torch_ema import ExponentialMovingAverage
 from utils.initialize import instantiate, load_config, compare_statedict_and_parameters
 from utils.motion_process import StreamJointRecovery263
+from utils.stream_rollout import build_stream_step_model_input
 
 
 class FrameBuffer:
@@ -556,10 +557,10 @@ class ModelManager:
                         step_start = time.time()
                         
                         # Generate one token (produces 4 frames from VAE)
-                        x = {"text": [self.current_text]}
                         traj_input = self._build_stream_traj_input()
-                        if traj_input is not None:
-                            x.update(traj_input)
+                        x = build_stream_step_model_input(
+                            self.current_text, traj_input=traj_input
+                        )
                         
                         # Generate from model (1 token)
                         # Note: denoise_steps is set in init_generated, not here

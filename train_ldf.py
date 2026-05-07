@@ -273,6 +273,41 @@ class CustomLightningModule(BasicLightningModule):
         rank_zero_info(
             f"[resume] loaded checkpoint global_step={self._resume_step_offset}"
         )
+        # When the ckpt was saved under automatic_optimization=True but we now
+        # resume under manual_optimization=False (self-forcing), Lightning
+        # reads `global_step` from the *manual* counter, which is missing in
+        # the ckpt (defaults to 0).  Result: self.global_step = 0 forever
+        # until it climbs past 240000, so phase_step / ckpt naming get stuck.
+        # Mirror the auto-counter's progress into the manual counter to keep
+        # `self.global_step` consistent across the auto→manual switch.
+        if not self.automatic_optimization:
+            try:
+                fit_loop = checkpoint["loops"]["fit_loop"]
+                auto_progress = (
+                    fit_loop["epoch_loop.automatic_optimization.optim_progress"]
+                    ["optimizer"]["step"]
+                )
+                completed = int(auto_progress["total"]["completed"])
+                ready = int(auto_progress["total"]["ready"])
+                manual_key = "epoch_loop.manual_optimization.optim_step_progress"
+                manual_progress = fit_loop.setdefault(
+                    manual_key,
+                    {"total": {"ready": 0, "completed": 0},
+                     "current": {"ready": 0, "completed": 0}},
+                )
+                if int(manual_progress["total"]["completed"]) < completed:
+                    manual_progress["total"]["ready"] = ready
+                    manual_progress["total"]["completed"] = completed
+                    rank_zero_info(
+                        f"[resume] mirrored auto→manual optim_step_progress "
+                        f"completed={completed} (was 0); keeps self.global_step "
+                        f"aligned with ckpt"
+                    )
+            except (KeyError, TypeError) as exc:
+                rank_zero_info(
+                    f"[resume] could not mirror auto→manual progress ({exc!r}); "
+                    f"global_step may start from 0"
+                )
         ckpt_keys = set(checkpoint["state_dict"].keys())
         controlnet_missing = not any(k.startswith("controlnet.") for k in ckpt_keys)
         strict = not controlnet_missing
@@ -729,14 +764,20 @@ def _build_test_probe_loaders(cfg, collate_fn):
         for probe_tag, meta_paths in probe_cfg.items():
             probe_specs.append((str(probe_tag), list(meta_paths)))
     else:
-        probe_specs.append(("test", list(cfg.data.test_meta_paths)))
+        test_meta_paths = cfg.data.get("test_meta_paths", None)
+        if test_meta_paths is not None:
+            probe_specs.append(("test", list(test_meta_paths)))
+        else:
+            # No meta paths (e.g. GenerateDataset): use dataset directly with split="test"
+            probe_specs.append(("test", None))
 
     loaders, tags = [], []
     total_probe_samples = 0
     test_target = cfg.data.get("test_target", cfg.data.target)
     for probe_tag, meta_paths in probe_specs:
         probe_cfg_obj = OmegaConf.create(OmegaConf.to_container(cfg.config, resolve=False))
-        OmegaConf.update(probe_cfg_obj, "data.test_meta_paths", meta_paths)
+        if meta_paths is not None:
+            OmegaConf.update(probe_cfg_obj, "data.test_meta_paths", meta_paths)
         probe_dataset = instantiate(test_target, cfg=probe_cfg_obj, split="test")
         probe_loader = DataLoader(
             probe_dataset,
@@ -931,12 +972,13 @@ def main():
 
     if cfg.train:
         if not cfg.debug:
-            trainer.validate(
-                model,
-                dataloaders=val_dataloaders,
-                ckpt_path=cfg.resume_ckpt if cfg.resume_ckpt else None,
-                weights_only=False,
-            )
+            pass
+            # trainer.validate(
+            #     model,
+            #     dataloaders=val_dataloaders,
+            #     ckpt_path=cfg.resume_ckpt if cfg.resume_ckpt else None,
+            #     weights_only=False,
+            # )
         trainer.fit(
             model,
             train_dataloader,

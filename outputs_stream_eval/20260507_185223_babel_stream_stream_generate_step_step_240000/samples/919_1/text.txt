@@ -1,0 +1,2 @@
+[0] end=48: walk forward
+[1] end=105: sit down

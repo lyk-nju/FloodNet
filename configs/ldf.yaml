@@ -1,7 +1,7 @@
 exp_name: ldf # Experiment names
 seed: 1234 # Seed value
 debug: false
-train: false
+train: true
 
 dirs:
     deps: /data1/yuankai/text2Motion/FloodDiffusion/deps
@@ -9,11 +9,11 @@ dirs:
     raw_data: /data1/yuankai/text2Motion/FloodDiffusion/raw_data
 
 save_dir: ./outputs
-resume_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20260506_012427_ldf/step_240000.ckpt
-test_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20260506_012427_ldf/step_240000.ckpt
+# resume_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20260506_012427_ldf/step_240000.ckpt
+# test_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20260506_012427_ldf/step_240000.ckpt
 
-# resume_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt
-# test_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt
+resume_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt
+test_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt
 # resume_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20260415_114956_ldf/step_step=245000.ckpt
 # test_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20260415_114956_ldf/step_step=245000.ckpt
 
@@ -44,12 +44,12 @@ logger:
 trainer: # lightning trainer
     max_steps: 260000
     accelerator: gpu
-    devices: [0,1,2,3,4]
+    devices: [4]
     log_every_n_steps: 100
     precision: bf16-mixed
 # Set to true to run T2M FID/R-Precision on val_meta_paths during eval.
 # Can also be enabled via --t2m_metric CLI flag.
-t2m_metric: true
+t2m_metric: false
 
 validation:
     validation_steps: 3000
@@ -148,7 +148,7 @@ model:
         # Trajectory condition encoder (used by ControlNet)
         traj_encoder_in_dim: 4
         traj_out_dim: 64
-        traj_dropout: 0.1
+        traj_dropout: 0.0
         use_traj_emb_cache: true
 
         # Explicit motion-space control loss
@@ -161,12 +161,12 @@ model:
         self_forcing_detach_between_steps: true
         # Thresholds are phase progress over [resume_ckpt.global_step, trainer.max_steps].
         self_forcing_k_schedule:
-            - [0.0, 2]
+            - [0.0, 1]
 
 # Diagnostic: when true, run the rollout forward but skip the self-pred
 # substitution.  Used to isolate whether the bug lives in the substituted
 # value (set true → behaves like K=1) or in the dual-forward path itself.
-self_forcing_disable_replace: true
+self_forcing_disable_replace: false
 
 # control_loss_train_mode selects gradient strategy for the XZ control loss:
 #   1 — active window, absolute coords, no detach   (gradient → ALL tokens via cumsum)
@@ -181,9 +181,9 @@ resume_reset_optimizer: true
 optimizer:
     target: AdamW
     params:
-        lr: 1e-4
+        lr: 1e-3
         betas: [0.9, 0.999]
-        weight_decay: 0.01
+        weight_decay: 0.0
         eps: 1e-8
 
 

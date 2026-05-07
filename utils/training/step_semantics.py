@@ -81,11 +81,18 @@ def build_step_semantics(
         if trainer_max_steps is not None and int(trainer_max_steps) > 0
         else 1
     )
+    # `phase_step` is always phase-relative (= lightning global_step minus the
+    # resume offset). The absolute step (used for checkpoint naming / logging)
+    # should match Lightning's global_step in *both* SF and non-SF resume
+    # cases, otherwise checkpoints saved after a non-SF resume collapse to the
+    # same filename (e.g. 5000/10000/15000 instead of 245000/250000/255000).
+    absolute_step = int(resume_step_offset) + int(phase_step)
     if self_forcing_enabled:
-        absolute_step = int(resume_step_offset) + int(phase_step)
+        # SF mode: trainer.max_steps was rewritten to a phase-relative length,
+        # so the absolute target adds the resume offset back.
         absolute_target_step = int(resume_step_offset) + phase_total_steps
     else:
-        absolute_step = int(phase_step)
+        # Non-SF mode: trainer.max_steps is already an absolute target.
         absolute_target_step = phase_total_steps
     progress = min(1.0, float(phase_step) / float(max(phase_total_steps, 1)))
     return StepSemantics(

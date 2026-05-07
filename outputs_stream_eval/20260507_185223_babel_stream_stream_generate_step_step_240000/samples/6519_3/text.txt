@@ -1,0 +1,2 @@
+[0] end=40: walk backwards
+[1] end=119: walk in place

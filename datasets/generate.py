@@ -5,11 +5,12 @@ from typing import Dict, List
 import numpy as np
 import torch
 from lightning.pytorch.utilities import rank_zero_info
-from omegaconf import OmegaConf
+from omegaconf import ListConfig, OmegaConf
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from utils.initialize import instantiate
+from utils.motion_process import extract_root_trajectory_263
+from utils.traj_batch import root_to_traj_feats, smooth_root_xz
 
 
 class LengthMismatchError(Exception):
@@ -23,6 +24,13 @@ class GenerateDataset(Dataset):
         self.num_samples = cfg.data.num_samples
         self.dim = cfg.data.dim
         self.token_dim = cfg.data.token_dim
+        if self.split in ("val", "test"):
+            self.mask_ratio = cfg.data.get("val_mask_ratio", 1.0)
+        else:
+            self.mask_ratio = cfg.data.get("mask_ratio", 1.0)
+        self.feature_fps = float(cfg.data.get("feature_fps", 20))
+        self.token_fps = float(cfg.data.get("token_fps", 5))
+        self.smooth_traj_sigma = float(cfg.data.get("smooth_traj_sigma", 0.0))
         if self.split == "train":
             self.dataset = []
         elif self.split == "val":
@@ -40,15 +48,19 @@ class GenerateDataset(Dataset):
             data = {}
             data["name"] = f"sample_{i}"
             data["dataset"] = "generate"
-            data["text"] = self.pool_text[i]
-            text_length = self.pool_length[i]
-            text_end = [sum(text_length[:j+1]) for j in range(len(text_length))]
-            data["feature_text_end"] = [int(t * self.cfg.data.feature_fps + 0.5) for t in text_end]
-            data["token_text_end"] = [int(t * self.cfg.data.token_fps + 0.5) for t in text_end]
-            data["feature_length"] = data["feature_text_end"][-1]
-            data["token_length"] = data["token_text_end"][-1]
-            data["feature"] = np.zeros((data["feature_length"], self.dim))
-            data["token"] = np.zeros((data["token_length"], self.token_dim))
+            data["text_data"] = self.build_text_data(
+                self.pool_text[i], self.pool_length[i]
+            )
+            feature_text_end = [
+                int(text_dict["to_tag"] * self.feature_fps + 0.5)
+                for text_dict in data["text_data"]
+            ]
+            token_text_end = [
+                int(text_dict["to_tag"] * self.token_fps + 0.5)
+                for text_dict in data["text_data"]
+            ]
+            data["feature_length"] = feature_text_end[-1] if feature_text_end else 0
+            data["token_length"] = token_text_end[-1] if token_text_end else 0
             dataset.append(data)
         return dataset
 
@@ -57,7 +69,103 @@ class GenerateDataset(Dataset):
 
     def __getitem__(self, idx):
         data = self.dataset[idx]
-        return data
+        return self._process(data)
+
+    def _process(self, data):
+        output = {}
+        output["dataset"] = data["dataset"]
+        output["name"] = data["name"]
+
+        feature_length = int(data["feature_length"])
+        token_length = int(data["token_length"])
+        feature = np.zeros((feature_length, self.dim), dtype=np.float32)
+        token = np.zeros((token_length, self.token_dim), dtype=np.float32)
+
+        output["feature"] = feature
+        output["feature_length"] = feature_length
+        output["token"] = token
+        output["token_length"] = token_length
+
+        if self.dim == 263:
+            traj = extract_root_trajectory_263(feature)
+        else:
+            traj = np.zeros((feature_length, 3), dtype=np.float32)
+        output["traj"] = traj
+        output["traj_length"] = len(traj)
+
+        token_mask = self.sample_token_mask(token_length)
+        output["token_mask"] = token_mask
+        output["traj_mask"] = self.expand_token_mask_to_traj(token_mask, len(traj))
+
+        if self.smooth_traj_sigma > 0.0:
+            traj_xz_smooth = smooth_root_xz(
+                traj[:, [0, 2]], sigma=self.smooth_traj_sigma
+            )
+            traj_xyz_for_cond = traj.copy()
+            traj_xyz_for_cond[:, 0] = traj_xz_smooth[:, 0]
+            traj_xyz_for_cond[:, 2] = traj_xz_smooth[:, 1]
+        else:
+            traj_xyz_for_cond = traj
+        output["traj_features"] = root_to_traj_feats(traj_xyz_for_cond)
+
+        output["text"] = [d["caption"] for d in data["text_data"]]
+        text_token_lists = [d["tokens"] for d in data["text_data"]]
+        output["text_tokens"] = next(
+            (tokens for tokens in reversed(text_token_lists) if len(tokens) > 0),
+            [],
+        )
+        output["feature_text_end"] = [
+            int(d["to_tag"] * self.feature_fps + 0.5) for d in data["text_data"]
+        ]
+        output["token_text_end"] = [
+            int(d["to_tag"] * self.token_fps + 0.5) for d in data["text_data"]
+        ]
+        return output
+
+    @staticmethod
+    def build_text_data(texts: List[str], durations: List[float]) -> List[Dict]:
+        text_data = []
+        start = 0.0
+        for text, duration in zip(texts, durations):
+            end = start + float(duration)
+            text_data.append(
+                {
+                    "caption": text,
+                    "tokens": text.strip().split(),
+                    "f_tag": start,
+                    "to_tag": end,
+                }
+            )
+            start = end
+        return text_data
+
+    @staticmethod
+    def expand_token_mask_to_traj(token_mask: np.ndarray, traj_length: int) -> np.ndarray:
+        traj_mask = np.zeros(traj_length, dtype=np.float32)
+        if len(token_mask) > 0:
+            traj_mask[0] = token_mask[0]
+        for k in range(1, len(token_mask)):
+            sf = 4 * k - 3
+            ef = min(4 * k + 1, traj_length)
+            if sf < traj_length:
+                traj_mask[sf:ef] = token_mask[k]
+        return traj_mask
+
+    def sample_token_mask(self, token_length: int) -> np.ndarray:
+        if token_length <= 0:
+            return np.zeros((0,), dtype=np.float32)
+        mask = np.zeros(token_length, dtype=np.float32)
+        r = self.mask_ratio
+        if isinstance(r, (list, tuple, ListConfig)) and len(r) == 2:
+            r0, r1 = float(r[0]), float(r[1])
+            keep_ratio = random.uniform(min(r0, r1), max(r0, r1))
+        else:
+            keep_ratio = float(r)
+        keep_ratio = max(0.0, min(1.0, keep_ratio))
+        n_keep = max(1, int(round(token_length * keep_ratio)))
+        indices = random.sample(range(token_length), n_keep)
+        mask[indices] = 1.0
+        return mask
 
     def generate_text(self):
         self.pool_text = [
@@ -306,7 +414,7 @@ def collate_fn(batch):
     keys = batch[0].keys()
 
     for key in keys:
-        if key in ["feature", "token"]:
+        if key in ["feature", "token", "traj", "traj_features"]:
             # Pad sequences
             items = [
                 torch.from_numpy(b[key]) if isinstance(b[key], np.ndarray) else b[key]
@@ -315,7 +423,17 @@ def collate_fn(batch):
             output[key] = torch.nn.utils.rnn.pad_sequence(
                 items, batch_first=True, padding_value=0
             )
-        elif key in ["feature_length", "token_length"]:
+        elif key in ["traj_mask", "token_mask"]:
+            items = [
+                torch.from_numpy(b[key])
+                if isinstance(b[key], np.ndarray)
+                else torch.tensor(b[key], dtype=torch.float32)
+                for b in batch
+            ]
+            output[key] = torch.nn.utils.rnn.pad_sequence(
+                items, batch_first=True, padding_value=0
+            )
+        elif key in ["feature_length", "token_length", "traj_length"]:
             # Stack scalars
             output[key] = torch.tensor([b[key] for b in batch])
         else:

@@ -1,0 +1,78 @@
+{
+  "name": "919_3",
+  "dataset": "BABEL_streamed",
+  "stream_mode": "stream_generate",
+  "num_runs": 1,
+  "T": 57,
+  "masked_ratio": 1.0,
+  "ade": 0.091934086983664,
+  "mse": 0.012458003403847678,
+  "fde": 0.17252226173877716,
+  "path_arc_ade": 0.0767890140414238,
+  "path_chamfer": 0.057626787573099136,
+  "seg_mse": [
+    0.0027889862656593324,
+    0.0045509785413742065,
+    0.033135705134447885
+  ],
+  "traj_jitter": 1.2298017281864304e-05,
+  "prefix_mse": [
+    0.0027889862656593324,
+    0.0036699824035167695
+  ],
+  "control_T": 57,
+  "control_masked_ratio": 1.0,
+  "control_l2_dist": 0.12690450251102448,
+  "traj_fail_20cm": 1.0,
+  "traj_fail_50cm": 0.0,
+  "kps_fail_20cm": 0.19298245614035087,
+  "kps_fail_50cm": 0.0,
+  "kps_mean_err_m": 0.12690450251102448,
+  "skating_ratio": 0.17857142857142858,
+  "stream_root_jump_mean": 0.011208936653149846,
+  "stream_root_jump_max": 0.029142793267965317,
+  "stream_joint_jump_mean": 0.026687342540494034,
+  "stream_num_boundaries": 14.0,
+  "_traj_runs": [
+    {
+      "T": 57,
+      "masked_ratio": 1.0,
+      "ade": 0.091934086983664,
+      "mse": 0.012458003403847678,
+      "fde": 0.17252226173877716,
+      "path_arc_ade": 0.0767890140414238,
+      "path_chamfer": 0.057626787573099136,
+      "seg_mse": [
+        0.0027889862656593324,
+        0.0045509785413742065,
+        0.033135705134447885
+      ],
+      "traj_jitter": 1.2298017281864304e-05,
+      "prefix_mse": [
+        0.0027889862656593324,
+        0.0036699824035167695
+      ]
+    }
+  ],
+  "_control_runs": [
+    {
+      "control_T": 57,
+      "control_masked_ratio": 1.0,
+      "control_l2_dist": 0.12690450251102448,
+      "traj_fail_20cm": 1.0,
+      "traj_fail_50cm": 0.0,
+      "kps_fail_20cm": 0.19298245614035087,
+      "kps_fail_50cm": 0.0,
+      "kps_mean_err_m": 0.12690450251102448,
+      "skating_ratio": 0.17857142857142858
+    }
+  ],
+  "_stream_runs": [
+    {
+      "stream_root_jump_mean": 0.011208936653149846,
+      "stream_root_jump_max": 0.029142793267965317,
+      "stream_joint_jump_mean": 0.026687342540494034,
+      "stream_num_boundaries": 14
+    }
+  ]
+}

@@ -1099,28 +1099,31 @@ class DiffForcingWanModel(nn.Module):
                     predicted_vel = predicted_result_i[:, start_index:end_index, ...]
                     generated[i, :, start_index:end_index, ...] += predicted_vel * dt
                 elif self.prediction_type == "x0":
-                    predicted_vel = (
-                        predicted_result_i[:, start_index:end_index, ...]
-                        - generated[i, :, start_index:end_index, ...]
-                    ) / (
+                    nl = (
                         noise_level[i, start_index:end_index]
                         .unsqueeze(0)
                         .unsqueeze(-1)
                         .unsqueeze(-1)
+                        .clamp(min=1e-6)
                     )
+                    predicted_vel = (
+                        predicted_result_i[:, start_index:end_index, ...]
+                        - generated[i, :, start_index:end_index, ...]
+                    ) / nl
                     generated[i, :, start_index:end_index, ...] += predicted_vel * dt
                 elif self.prediction_type == "noise":
-                    predicted_vel = (
-                        generated[i, :, start_index:end_index, ...]
-                        - predicted_result_i[:, start_index:end_index, ...]
-                    ) / (
+                    denom = (
                         1
                         + dt
                         - noise_level[i, start_index:end_index]
                         .unsqueeze(0)
                         .unsqueeze(-1)
                         .unsqueeze(-1)
-                    )
+                    ).clamp(min=1e-6)
+                    predicted_vel = (
+                        generated[i, :, start_index:end_index, ...]
+                        - predicted_result_i[:, start_index:end_index, ...]
+                    ) / denom
                     generated[i, :, start_index:end_index, ...] += predicted_vel * dt
 
             if commit_index < start_index:
@@ -1285,30 +1288,33 @@ class DiffForcingWanModel(nn.Module):
                         predicted_vel * self.dt
                     )
                 elif self.prediction_type == "x0":
-                    predicted_vel = (
-                        predicted_result_i[:, start_index:end_index, ...]
-                        - self.generated[i, :, start_index:end_index, ...]
-                    ) / (
+                    nl = (
                         noise_level[i, start_index:end_index]
                         .unsqueeze(0)
                         .unsqueeze(-1)
                         .unsqueeze(-1)
+                        .clamp(min=1e-6)
                     )
+                    predicted_vel = (
+                        predicted_result_i[:, start_index:end_index, ...]
+                        - self.generated[i, :, start_index:end_index, ...]
+                    ) / nl
                     self.generated[i, :, start_index:end_index, ...] += (
                         predicted_vel * self.dt
                     )
                 elif self.prediction_type == "noise":
-                    predicted_vel = (
-                        self.generated[i, :, start_index:end_index, ...]
-                        - predicted_result_i[:, start_index:end_index, ...]
-                    ) / (
+                    denom = (
                         1
                         + self.dt
                         - noise_level[i, start_index:end_index]
                         .unsqueeze(0)
                         .unsqueeze(-1)
                         .unsqueeze(-1)
-                    )
+                    ).clamp(min=1e-6)
+                    predicted_vel = (
+                        self.generated[i, :, start_index:end_index, ...]
+                        - predicted_result_i[:, start_index:end_index, ...]
+                    ) / denom
                     self.generated[i, :, start_index:end_index, ...] += (
                         predicted_vel * self.dt
                     )

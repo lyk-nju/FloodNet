@@ -7,15 +7,16 @@ import wandb
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.utilities import rank_zero_info
 
-from .eval_generation_metrics import _get_metric_statistics
 from .inline_eval_artifacts import (
     build_inline_eval_artifact_dirs,
     load_inline_eval_sample_records,
 )
 
 try:
+    from FloodNet.metrics.traj import _get_metric_statistics
     from FloodNet.utils.visualize import make_composite_compare_videos, render_video
 except ImportError:  # pragma: no cover - script entrypoints use top-level imports
+    from metrics.traj import _get_metric_statistics
     from utils.visualize import make_composite_compare_videos, render_video
 
 

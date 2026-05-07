@@ -1,0 +1,69 @@
+dirs:
+  deps: /home/yuankai/Text2Motion/FloodDiffusion/deps
+  outputs: outputs
+  raw_data: /home/yuankai/Text2Motion/FloodDiffusion/raw_data
+wandb_info:
+  key: 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
+  project: FloodNet
+  entity: laiyuankia-nanjing-university
+exp_name: eval_babel_stream
+seed: 1234
+debug: false
+train: false
+test_ckpt: ${dirs.outputs}/20251107_021814_ldf_stream/step_step=240000.ckpt
+test_vae_ckpt: ${dirs.outputs}/vae_1d_z4_step=300000.ckpt
+test_vae:
+  target: models.vae_wan_1d.VAEWanModel
+  ema_decay: 0.99
+  params:
+    input_dim: 263
+    z_dim: 4
+data:
+  target: datasets.babel.BabelDataset
+  collate_fn: datasets.babel.collate_fn
+  test_bs: 1
+  num_workers: 4
+  val_mask_ratio: 1.0
+  test_meta_paths:
+  - ${dirs.raw_data}/BABEL_streamed/test_min_processed.txt
+  feature_path: motions
+  token_path: TOKENS_20251030_085836_vae_wan_z4
+  text_path: texts
+  min_length: 0
+  max_length: 200
+  feature_fps: 20
+  token_fps: 5
+  smooth_traj_sigma: 0.0
+model:
+  target: models.diffusion_forcing_wan.DiffForcingWanModel
+  ema_decay: 0.99
+  params:
+    checkpoint_path: ${dirs.deps}/t5_umt5-xxl-enc-bf16/models_t5_umt5-xxl-enc-bf16.pth
+    tokenizer_path: ${dirs.deps}/t5_umt5-xxl-enc-bf16/google/umt5-xxl
+    input_dim: 4
+    noise_steps: 10
+    freeze_backbone: true
+    traj_encoder_in_dim: 4
+    traj_out_dim: 64
+    traj_dropout: 0.0
+    use_traj_emb_cache: true
+    cfg_scale_traj: 3.0
+    cfg_scale_text: 5.0
+    control_loss_weight: 1.0
+    use_precomputed_text_emb: false
+    scheduled_sampling_prob: 0.0
+    self_forcing_enabled: false
+metrics:
+  dim: 263
+eval:
+  out_dir: ./outputs_stream_eval
+  probe_tag: babel_stream
+  stream_mode: stream_generate
+  num_runs: 1
+  seg_size: 20
+  num_denoise_steps: null
+  compute_offline_baseline: false
+  save_feature_npy: true
+  save_latent_npy: false
+  max_batches: 0
+  max_samples: 0

@@ -1,58 +1,34 @@
-import hashlib
-import random
-
 import numpy as np
 import torch
+import random
 from lightning.pytorch.utilities import rank_zero_info
 
-from .eval_generation_metrics import (
-    _average_control_metrics,
-    _average_traj_metrics,
-    _compute_deterministic_fwd_ctrl_loss_sample,
-    _compute_omni_control_metrics,
-    _compute_traj_metrics,
-)
 from .inline_eval_artifacts import save_inline_eval_payloads
 
 try:
+    from FloodNet.metrics.traj import (
+        _average_control_metrics,
+        _average_traj_metrics,
+        _compute_deterministic_fwd_ctrl_loss_sample,
+        _compute_omni_control_metrics,
+        _compute_traj_metrics,
+        _seed_eval_locally,
+        _slice_single_sample_batch,
+        _stable_eval_seed,
+    )
     from FloodNet.utils.traj_batch import root_to_traj_feats
 except ImportError:  # pragma: no cover - script entrypoints use top-level imports
+    from metrics.traj import (
+        _average_control_metrics,
+        _average_traj_metrics,
+        _compute_deterministic_fwd_ctrl_loss_sample,
+        _compute_omni_control_metrics,
+        _compute_traj_metrics,
+        _seed_eval_locally,
+        _slice_single_sample_batch,
+        _stable_eval_seed,
+    )
     from utils.traj_batch import root_to_traj_feats
-
-
-def _stable_eval_seed(base_seed: int, probe_tag: str, sample_name: str, run_idx: int) -> int:
-    digest = hashlib.md5(f"{probe_tag}:{sample_name}:{run_idx}".encode("utf-8")).hexdigest()
-    offset = int(digest[:8], 16)
-    return int(base_seed) + offset
-
-
-def _seed_eval_locally(seed: int):
-    random.seed(seed)
-    np.random.seed(seed % (2**32))
-    gen = torch.Generator()
-    gen.manual_seed(int(seed))
-    torch.random.set_rng_state(gen.get_state())
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(int(seed))
-
-
-def _slice_single_sample_batch(batch, sample_idx: int):
-    sample_batch = {}
-    batch_size = len(batch["name"])
-    for key, value in batch.items():
-        if torch.is_tensor(value):
-            if value.ndim > 0 and value.shape[0] == batch_size:
-                sample_batch[key] = value[sample_idx : sample_idx + 1]
-            else:
-                sample_batch[key] = value
-        elif isinstance(value, list):
-            if len(value) == batch_size:
-                sample_batch[key] = [value[sample_idx]]
-            else:
-                sample_batch[key] = value
-        else:
-            sample_batch[key] = value
-    return sample_batch
 
 
 def _gather_payloads(local_payloads):
