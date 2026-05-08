@@ -25,10 +25,17 @@ from utils.initialize import (
 )
 from utils.lightning_module import BasicLightningModule
 from utils.training import (
-    build_checkpoint_step_info,
-    build_step_semantics,
+    async_test_mode_enabled,
+    build_model_batch,
+    build_test_probe_loaders,
+    build_test_probe_tags,
+    build_val_dataloaders,
     compute_control_loss_xz,
+    emit_async_test_request,
+    get_module_checkpoint_step_info,
+    get_module_step_semantics,
     load_resume_step_offset,
+    maybe_launch_async_eval_watcher,
     resolve_runtime_scheduler_steps,
     resolve_runtime_max_steps,
 )
@@ -51,75 +58,8 @@ class CustomLightningModule(BasicLightningModule):
         )
         self.automatic_optimization = not self_forcing_enabled
 
-    def _build_step_semantics(self, phase_step: int | None = None):
-        trainer = getattr(self, "trainer", None)
-        trainer_max_steps = getattr(trainer, "max_steps", None) if trainer is not None else None
-        # `trainer.max_steps` is absolute (Lightning compares it against the
-        # absolute `global_step`).  For phase-relative semantics we need the
-        # phase length, so subtract the resume offset here.
-        sf_enabled = bool(getattr(self.model, "self_forcing_enabled", False))
-        if (
-            sf_enabled
-            and trainer_max_steps is not None
-            and int(trainer_max_steps) > 0
-        ):
-            phase_total = int(trainer_max_steps) - int(self._resume_step_offset)
-            trainer_max_steps = max(1, phase_total)
-        return build_step_semantics(
-            phase_step=self._get_phase_global_step() if phase_step is None else int(phase_step),
-            trainer_max_steps=trainer_max_steps,
-            resume_step_offset=self._resume_step_offset,
-            self_forcing_enabled=sf_enabled,
-        )
-
-    def _get_phase_global_step(self) -> int:
-        # Lightning restores `global_step` to the ckpt's absolute value on
-        # resume (e.g. 240000).  For self-forcing schedule progress we need
-        # the *phase-relative* step (steps trained since this phase started),
-        # so subtract the resume offset.
-        return max(0, int(self.global_step) - int(self._resume_step_offset))
-
-    def _get_effective_global_step(self):
-        return self._build_step_semantics().absolute_step
-
-    def _get_checkpoint_step_value(self):
-        return build_checkpoint_step_info(
-            self._build_step_semantics(),
-            include_next_step=False,
-        ).metric_value
-
-    def _get_step_tag(self):
-        return build_checkpoint_step_info(
-            self._build_step_semantics(),
-            include_next_step=False,
-        ).step_tag
-
-    def _get_test_probe_tags(self) -> list[str]:
-        tags = getattr(self, "test_loader_tags", None)
-        if tags:
-            return list(tags)
-        return ["test"]
-
-    def _resolve_test_probe_tag(self, test_loader_idx: int) -> str:
-        tags = self._get_test_probe_tags()
-        if 0 <= test_loader_idx < len(tags):
-            return tags[test_loader_idx]
-        return f"test_loader_{test_loader_idx}"
-
-    def _get_generation_eval_cfg(self):
-        val_cfg = self.cfg.get("validation", {})
-        return {
-            "enabled": bool(val_cfg.get("eval_generation_metrics", True)),
-            "num_runs": int(val_cfg.get("eval_num_runs", 10)),
-            "seg_size": int(val_cfg.get("eval_seg_size", 20)),
-            "forward_ctrl_loss": bool(val_cfg.get("eval_forward_control_loss", True)),
-            "forward_ctrl_window_mode": str(
-                val_cfg.get("eval_forward_control_loss_window_mode", "mean_chunk_windows")
-            ),
-        }
-
     def _build_self_forcing_runtime(self):
-        semantics = self._build_step_semantics()
+        semantics = get_module_step_semantics(self)
         runtime_metrics = {
             "self_forcing/enabled": 1.0,
             "self_forcing/active": 1.0,
@@ -132,15 +72,6 @@ class CustomLightningModule(BasicLightningModule):
             "self_forcing/absolute_target_step": float(semantics.absolute_target_step),
         }
         return semantics, runtime_metrics
-
-    def _build_model_batch(self, batch, is_training=True):
-        model_batch = batch.copy()
-        model_batch["feature"] = batch["token"]
-        model_batch["feature_length"] = batch["token_length"]
-        if "token_text_end" in batch:
-            model_batch["feature_text_end"] = batch["token_text_end"]
-        self._copy_traj_fields_to_model_batch(batch, model_batch)
-        return model_batch
 
     def _validate_self_forcing_runtime(self):
         if self._self_forcing_runtime_validated:
@@ -184,7 +115,7 @@ class CustomLightningModule(BasicLightningModule):
         )
         self.log(
             "ckpt_absolute_step",
-            float(self._get_checkpoint_step_value()),
+            float(get_module_checkpoint_step_info(self).metric_value),
             on_step=True,
             prog_bar=False,
             batch_size=batch_size,
@@ -362,6 +293,7 @@ class CustomLightningModule(BasicLightningModule):
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         super().on_train_batch_end(outputs, batch, batch_idx)
+        emit_async_test_request(self)
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -371,21 +303,9 @@ class CustomLightningModule(BasicLightningModule):
             self.vae.eval()
         return self
 
-    @staticmethod
-    def _copy_traj_fields_to_model_batch(batch, model_batch):
-        if "traj" in batch:
-            model_batch["traj"] = batch["traj"]
-            model_batch["traj_length"] = batch["traj_length"]
-            model_batch["traj_mask"] = batch["traj_mask"]
-        if "token_mask" in batch:
-            model_batch["token_mask"] = batch["token_mask"]
-        if "traj_features" in batch:
-            model_batch["traj_features"] = batch["traj_features"]
-            # traj_features is frame-level; length is traj_length and mask is traj_mask/token_mask
-
     def _step(self, batch, is_training=True, model_batch=None):
         if model_batch is None:
-            model_batch = self._build_model_batch(batch, is_training=is_training)
+            model_batch = build_model_batch(batch)
         out = self.model(model_batch)
 
         # MotionLCM-style control loss: explicit trajectory alignment in motion space
@@ -625,7 +545,7 @@ class CustomLightningModule(BasicLightningModule):
         self._validate_self_forcing_runtime()
         net_start_time = time.time()
         semantics, runtime_metrics = self._build_self_forcing_runtime()
-        model_batch = self._build_model_batch(batch, is_training=True)
+        model_batch = build_model_batch(batch)
         optimizer = self.optimizers()
         lr_scheduler = self.lr_schedulers()
         self._log_self_forcing_metrics(runtime_metrics)
@@ -679,12 +599,7 @@ class CustomLightningModule(BasicLightningModule):
         if not self.t2m_enabled or self.t2m_metrics is None:
             return
         with self.ema.average_parameters([p for p in self.model.parameters() if p.requires_grad]):
-            model_batch = batch.copy()
-            model_batch["feature"] = batch["token"]
-            model_batch["feature_length"] = batch["token_length"]
-            if "token_text_end" in batch:
-                model_batch["feature_text_end"] = batch["token_text_end"]
-            self._copy_traj_fields_to_model_batch(batch, model_batch)
+            model_batch = build_model_batch(batch)
             output = self.model.generate(model_batch)
         generated = output["generated"]
         ground_truth_token = batch["token"]
@@ -736,12 +651,15 @@ class CustomLightningModule(BasicLightningModule):
             self.log(f"metrics/t2m_metrics/{key}", value, sync_dist=True)
 
     def on_validation_epoch_end(self):
-        if (
-            not self.trainer.sanity_checking
-            and self.global_step > 0
-            and self.global_step % self.cfg.validation.test_steps == 0
-        ):
-            self.on_test_epoch_end()
+        if not async_test_mode_enabled(self.cfg):
+            if (
+                not self.trainer.sanity_checking
+                and self.global_step > 0
+                and self.global_step % self.cfg.validation.test_steps == 0
+            ):
+                self.on_test_epoch_end()
+                self._inline_eval_seen.clear()
+        else:
             self._inline_eval_seen.clear()
         self.compute_metrics()
 
@@ -755,45 +673,6 @@ class CustomLightningModule(BasicLightningModule):
 
     def process_test_results(self):
         process_inline_generation_results(self)
-
-
-def _build_test_probe_loaders(cfg, collate_fn):
-    probe_cfg = cfg.data.get("test_probe_meta_paths", None)
-    probe_specs = []
-    if probe_cfg:
-        for probe_tag, meta_paths in probe_cfg.items():
-            probe_specs.append((str(probe_tag), list(meta_paths)))
-    else:
-        test_meta_paths = cfg.data.get("test_meta_paths", None)
-        if test_meta_paths is not None:
-            probe_specs.append(("test", list(test_meta_paths)))
-        else:
-            # No meta paths (e.g. GenerateDataset): use dataset directly with split="test"
-            probe_specs.append(("test", None))
-
-    loaders, tags = [], []
-    total_probe_samples = 0
-    test_target = cfg.data.get("test_target", cfg.data.target)
-    for probe_tag, meta_paths in probe_specs:
-        probe_cfg_obj = OmegaConf.create(OmegaConf.to_container(cfg.config, resolve=False))
-        if meta_paths is not None:
-            OmegaConf.update(probe_cfg_obj, "data.test_meta_paths", meta_paths)
-        probe_dataset = instantiate(test_target, cfg=probe_cfg_obj, split="test")
-        probe_loader = DataLoader(
-            probe_dataset,
-            batch_size=cfg.data.test_bs,
-            shuffle=False,
-            drop_last=False,
-            num_workers=cfg.data.num_workers,
-            persistent_workers=False,
-            prefetch_factor=8,
-            collate_fn=collate_fn,
-        )
-        loaders.append(probe_loader)
-        tags.append(probe_tag)
-        total_probe_samples += len(probe_dataset)
-        rank_zero_info(f"Test probe[{probe_tag}]: {len(probe_dataset)} samples")
-    return loaders, tags, total_probe_samples
 
 
 def main():
@@ -811,6 +690,7 @@ def main():
         f"Save dir: {save_dir}, current working dir: {os.getcwd()}, exp_name: {cfg.exp_name}"
     )
     save_config_and_codes(cfg, cfg.save_dir)
+    maybe_launch_async_eval_watcher(cfg, save_dir)
 
     logger = None
     if not cfg.debug:
@@ -867,9 +747,20 @@ def main():
         collate_fn=collate_fn,
     )
 
-    test_probe_loaders, test_loader_tags, total_probe_samples = _build_test_probe_loaders(
-        cfg, collate_fn
-    )
+    async_test_mode = async_test_mode_enabled(cfg)
+    if async_test_mode:
+        test_probe_loaders = []
+        test_loader_tags = build_test_probe_tags(cfg)
+        total_probe_samples = 0
+        rank_zero_info(
+            "Async test mode enabled: skip building test probe loaders inside training."
+        )
+    else:
+        (
+            test_probe_loaders,
+            test_loader_tags,
+            total_probe_samples,
+        ) = build_test_probe_loaders(cfg, collate_fn)
 
     rank_zero_info(
         f"Train dataset: {len(train_dataset) if train_dataset is not None else 0}, "
@@ -967,8 +858,9 @@ def main():
         check_val_every_n_epoch=None,
     )
 
-    rank_zero_info("Validation test mode: inline")
-    val_dataloaders = [val_dataloader] + test_probe_loaders
+    val_dataloaders = build_val_dataloaders(
+        cfg, val_dataloader, test_probe_loaders
+    )
 
     if cfg.train:
         if not cfg.debug:

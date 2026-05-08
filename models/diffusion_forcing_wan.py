@@ -566,7 +566,30 @@ class DiffForcingWanModel(nn.Module):
         )
 
         loss = 0.0
-        x0_latent_list = []
+        # Two lists with different x0-recovery formulas, each tuned to its
+        # consumer (both formulas are mathematically valid; they differ only in
+        # how prediction error δ propagates):
+        #
+        #   loss_x0_list  (Formula 1, "z = pred_vel + ε"):
+        #     error  = δ           (β-independent, fully exposes the model's
+        #                           velocity-prediction error)
+        #     ∂x0/∂pred_vel = 1    (full-strength gradient at every position)
+        #     → used by control loss so the gradient signal is not damped at
+        #       low β, where Formula 2 would let noisy_x carry the loss with
+        #       almost no gradient flowing back into the model.
+        #
+        #   sf_x0_list  (Formula 2, "z = noisy_x + β·pred_vel"):
+        #     error  = β·δ         (low-variance estimate of z, especially
+        #                           important at low β)
+        #     ∂x0/∂pred_vel = β    (β-attenuated gradient — irrelevant here,
+        #                           because SF rollout consumes the *value*
+        #                           after .detach())
+        #     → used by self-forcing rollout to substitute the chunk's
+        #       leftmost token where β ≈ 1/cs is small; Formula 1 there
+        #       collapses to z + ε (pure noise injection) and corrupts the
+        #       next rollout step's context.
+        loss_x0_list = []
+        sf_x0_list = []
         for b in range(batch_size):
             t_b = noisy_feature_input[b].shape[1]
             if self.prediction_type == "vel":
@@ -585,7 +608,8 @@ class DiffForcingWanModel(nn.Module):
                     predicted_result[b][:, -self.chunk_size :, ...]
                     - noise_ref[b][:, -self.chunk_size :, ...]
                 ) ** 2
-                x0_latent_list.append(None)
+                loss_x0_list.append(None)
+                sf_x0_list.append(None)
             else:
                 raise ValueError(
                     f"Unsupported prediction_type={self.prediction_type!r}"
@@ -593,28 +617,32 @@ class DiffForcingWanModel(nn.Module):
             sample_loss = squared_error.mean()
             loss += sample_loss
             if self.prediction_type == "vel":
-                # Recover x0 via z = noisy_x + β·vel.  This is numerically
-                # stable at all β: at β→0 it reduces to z = noisy_x = z (clean),
-                # whereas `pred_vel + ε` collapses to z + ε because the model
-                # cannot predict ε from a near-clean input.  Critical for
-                # self-forcing rollout, which extracts pred_x0 at the
-                # leftmost active position where β ≈ 1/cs is small.
+                # Formula 1 — full-gradient estimate, for control loss.
+                pred_x0_loss = predicted_result[b] + noise_ref[b]
+                loss_x0_list.append(pred_x0_loss[:, :, 0, 0].permute(1, 0))
+                # Formula 2 — low-variance estimate, for SF rollout.
                 beta_b = noise_level[b, :t_b].view(1, -1, 1, 1)
-                pred_x0 = noisy_feature_input[b] + beta_b * predicted_result[b]
-                x0_latent_list.append(pred_x0[:, :, 0, 0].permute(1, 0))
+                pred_x0_sf = noisy_feature_input[b] + beta_b * predicted_result[b]
+                sf_x0_list.append(pred_x0_sf[:, :, 0, 0].permute(1, 0))
             elif self.prediction_type == "x0":
+                # x0-prediction: model directly outputs z, so the two formulas
+                # coincide. Share the same tensor for both consumers.
                 pred_x0 = predicted_result[b]
-                x0_latent_list.append(pred_x0[:, :, 0, 0].permute(1, 0))
+                latent = pred_x0[:, :, 0, 0].permute(1, 0)
+                loss_x0_list.append(latent)
+                sf_x0_list.append(latent)
         loss = loss / batch_size
 
         pred_x0_latent_list = None
         if ("traj" in x) and (self.prediction_type in ("vel", "x0")) and not traj_dropped:
-            pred_x0_latent_list = x0_latent_list
+            pred_x0_latent_list = loss_x0_list
 
         return {
             "loss": loss,
+            # Consumed by control loss → Formula 1 (full-gradient).
             "pred_x0_latent_list": pred_x0_latent_list,
-            "x0_latent_list": x0_latent_list,
+            # Consumed by self-forcing rollout → Formula 2 (low-variance).
+            "x0_latent_list": sf_x0_list,
             "end_indices": end_indices,
         }
 

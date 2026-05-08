@@ -1,0 +1,5 @@
+segments: 6519_3, 6519_4
+[0] end=40: walk backwards
+[1] end=124: walk in place
+[2] end=203: walk in place
+[3] end=267: jog in place

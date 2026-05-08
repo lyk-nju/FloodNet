@@ -1,0 +1,13 @@
+exp_name: pretokenize_babel_all
+
+data:
+    target: datasets.babel.BabelDataset
+    test_meta_paths:
+        - ${dirs.raw_data}/BABEL_streamed/all.txt
+    text_path: "texts"
+
+model:
+    params:
+        checkpoint_path: "${dirs.deps}/t5_umt5-xxl-enc-bf16/models_t5_umt5-xxl-enc-bf16.pth"
+        tokenizer_path: "${dirs.deps}/t5_umt5-xxl-enc-bf16/google/umt5-xxl"
+        text_len: 512

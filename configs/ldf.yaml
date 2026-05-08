@@ -54,6 +54,7 @@ t2m_metric: false
 validation:
     validation_steps: 3000
     test_steps: 3000
+    test_mode: inline  # inline | async
     save_every_n_steps: 3000
     save_top_k: 100
     eval_generation_metrics: true

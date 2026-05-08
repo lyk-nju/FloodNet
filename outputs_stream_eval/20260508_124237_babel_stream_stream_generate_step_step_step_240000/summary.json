@@ -1,0 +1,504 @@
+{
+  "probe_tag": "babel_stream",
+  "ckpt": "outputs/20251107_021814_ldf_stream/step_step=240000.ckpt",
+  "vae_ckpt": "outputs/vae_1d_z4_step=300000.ckpt",
+  "stream_mode": "stream_generate_step",
+  "num_samples": 4,
+  "num_runs": 1,
+  "summary": {
+    "traj/ADE_mean": 1.2456989729197674,
+    "traj/ADE_std": 0.459397699480717,
+    "traj/FDE_mean": 1.841776117682457,
+    "traj/FDE_std": 0.9185800749371209,
+    "traj/MSE_mean": 2.3154732597420393,
+    "traj/MSE_std": 1.334086465979194,
+    "traj/n_samples": 4,
+    "traj/seg_mse_per_slot": [
+      0.03183461464941502,
+      0.5883891850709915,
+      1.4737320844943707,
+      1.8654709815979003,
+      2.2333324352900186,
+      2.975982475280762,
+      3.560294087727865,
+      4.041920185089111,
+      3.70836181640625,
+      6.836666870117187,
+      8.641586303710938,
+      10.121346282958985,
+      10.37987060546875,
+      10.582818603515625
+    ],
+    "traj/prefix_mse_per_slot": [
+      0.03183461464941502,
+      0.3101118981838226,
+      0.7741151597764757,
+      1.046954075495402,
+      1.28422976175944,
+      1.5661885791354708,
+      1.6538078035627093,
+      1.9523218154907227,
+      1.8150200737847222,
+      2.3171847534179686,
+      2.8921303488991477,
+      3.4945648193359373,
+      4.024203725961539
+    ],
+    "traj/jitter_mean": 2.3682390065005166e-05,
+    "traj/jitter_std": 9.89247035036e-06,
+    "path/arc_ADE_mean": 0.9928706511855125,
+    "path/arc_ADE_std": 0.38275696041436297,
+    "path/chamfer_mean": 0.4287479370832443,
+    "path/chamfer_std": 0.2228350729478362,
+    "control/Control_L2_dist_mean": 1.254328191280365,
+    "control/Control_L2_dist_std": 0.0,
+    "control/Control_L2_dist_conf_interval": 0.0,
+    "control/Control_L2_dist_num_runs": 1,
+    "control/Skating_Ratio_mean": 0.1613405766013128,
+    "control/Skating_Ratio_std": 0.0,
+    "control/Skating_Ratio_conf_interval": 0.0,
+    "control/Skating_Ratio_num_runs": 1,
+    "control/traj_fail_20cm_mean": 1.0,
+    "control/traj_fail_20cm_std": 0.0,
+    "control/traj_fail_20cm_conf_interval": 0.0,
+    "control/traj_fail_20cm_num_runs": 1,
+    "control/traj_fail_50cm_mean": 1.0,
+    "control/traj_fail_50cm_std": 0.0,
+    "control/traj_fail_50cm_conf_interval": 0.0,
+    "control/traj_fail_50cm_num_runs": 1,
+    "control/kps_fail_20cm_mean": 0.8435929330920491,
+    "control/kps_fail_20cm_std": 0.0,
+    "control/kps_fail_20cm_conf_interval": 0.0,
+    "control/kps_fail_20cm_num_runs": 1,
+    "control/kps_fail_50cm_mean": 0.7447988211439782,
+    "control/kps_fail_50cm_std": 0.0,
+    "control/kps_fail_50cm_conf_interval": 0.0,
+    "control/kps_fail_50cm_num_runs": 1,
+    "control/kps_mean_err_m_mean": 1.254328191280365,
+    "control/kps_mean_err_m_std": 0.0,
+    "control/kps_mean_err_m_conf_interval": 0.0,
+    "control/kps_mean_err_m_num_runs": 1,
+    "stream_boundary/root_jump_mean": 0.031202360073335714,
+    "stream_boundary/root_jump_std": 0.016293462672204426,
+    "stream_boundary/root_jump_max_mean": 0.06504361890256405,
+    "stream_boundary/root_jump_max_std": 0.011755294404832336,
+    "stream_boundary/joint_jump_mean": 0.04101081480891566,
+    "stream_boundary/joint_jump_std": 0.018519652693127848,
+    "stream_boundary/n_boundaries_mean": 38.25,
+    "stream_boundary/n_boundaries_std": 18.9917745353087
+  },
+  "samples": [
+    {
+      "name": "11364",
+      "dataset": "BABEL_streamed",
+      "stream_mode": "stream_generate_step",
+      "num_runs": 1,
+      "segment_names": [
+        "11364_1"
+      ],
+      "T": 53,
+      "masked_ratio": 1.0,
+      "ade": 0.49373518745854217,
+      "mse": 0.4038726878616045,
+      "fde": 0.976375162601471,
+      "path_arc_ade": 0.483167439699173,
+      "path_chamfer": 0.17427963018417358,
+      "seg_mse": [
+        0.006673893332481385,
+        0.43490047454833985,
+        0.9672127503615159
+      ],
+      "traj_jitter": 4.004659058409743e-05,
+      "prefix_mse": [
+        0.006673893332481385,
+        0.2207871913909912
+      ],
+      "control_T": 53,
+      "control_masked_ratio": 1.0,
+      "control_l2_dist": 0.5237493515014648,
+      "traj_fail_20cm": 1.0,
+      "traj_fail_50cm": 1.0,
+      "kps_fail_20cm": 0.6037735849056604,
+      "kps_fail_50cm": 0.4716981132075472,
+      "kps_mean_err_m": 0.5237493515014648,
+      "skating_ratio": 0.11538461538461539,
+      "stream_root_jump_mean": 0.05832139904109331,
+      "stream_root_jump_max": 0.07898171991109848,
+      "stream_joint_jump_mean": 0.07170674863916177,
+      "stream_num_boundaries": 13.0,
+      "_traj_runs": [
+        {
+          "T": 53,
+          "masked_ratio": 1.0,
+          "ade": 0.49373518745854217,
+          "mse": 0.4038726878616045,
+          "fde": 0.976375162601471,
+          "path_arc_ade": 0.483167439699173,
+          "path_chamfer": 0.17427963018417358,
+          "seg_mse": [
+            0.006673893332481385,
+            0.43490047454833985,
+            0.9672127503615159
+          ],
+          "traj_jitter": 4.004659058409743e-05,
+          "prefix_mse": [
+            0.006673893332481385,
+            0.2207871913909912
+          ]
+        }
+      ],
+      "_control_runs": [
+        {
+          "control_T": 53,
+          "control_masked_ratio": 1.0,
+          "control_l2_dist": 0.5237493515014648,
+          "traj_fail_20cm": 1.0,
+          "traj_fail_50cm": 1.0,
+          "kps_fail_20cm": 0.6037735849056604,
+          "kps_fail_50cm": 0.4716981132075472,
+          "kps_mean_err_m": 0.5237493515014648,
+          "skating_ratio": 0.11538461538461539
+        }
+      ],
+      "_stream_runs": [
+        {
+          "stream_root_jump_mean": 0.05832139904109331,
+          "stream_root_jump_max": 0.07898171991109848,
+          "stream_joint_jump_mean": 0.07170674863916177,
+          "stream_num_boundaries": 13
+        }
+      ]
+    },
+    {
+      "name": "9797",
+      "dataset": "BABEL_streamed",
+      "stream_mode": "stream_generate_step",
+      "num_runs": 1,
+      "segment_names": [
+        "9797_1",
+        "9797_2",
+        "9797_3"
+      ],
+      "T": 133,
+      "masked_ratio": 1.0,
+      "ade": 1.279451298534422,
+      "mse": 2.127193135426457,
+      "fde": 2.0480778217315674,
+      "path_arc_ade": 1.0923010110855103,
+      "path_chamfer": 0.48202037811279297,
+      "seg_mse": [
+        0.009024180471897125,
+        0.620620584487915,
+        1.3517911911010743,
+        1.8586315155029296,
+        2.814838409423828,
+        4.569395065307617,
+        4.494667053222656
+      ],
+      "traj_jitter": 2.0250858142389916e-05,
+      "prefix_mse": [
+        0.009024180471897125,
+        0.3148223638534546,
+        0.6604786554972331,
+        0.9600168228149414,
+        1.3309811401367186,
+        1.8707169850667318
+      ],
+      "control_T": 133,
+      "control_masked_ratio": 1.0,
+      "control_l2_dist": 1.280782699584961,
+      "traj_fail_20cm": 1.0,
+      "traj_fail_50cm": 1.0,
+      "kps_fail_20cm": 0.8646616541353384,
+      "kps_fail_50cm": 0.8120300751879699,
+      "kps_mean_err_m": 1.280782699584961,
+      "skating_ratio": 0.18181818181818182,
+      "stream_root_jump_mean": 0.02327174692023122,
+      "stream_root_jump_max": 0.06902284175157547,
+      "stream_joint_jump_mean": 0.0327108019370247,
+      "stream_num_boundaries": 33.0,
+      "_traj_runs": [
+        {
+          "T": 133,
+          "masked_ratio": 1.0,
+          "ade": 1.279451298534422,
+          "mse": 2.127193135426457,
+          "fde": 2.0480778217315674,
+          "path_arc_ade": 1.0923010110855103,
+          "path_chamfer": 0.48202037811279297,
+          "seg_mse": [
+            0.009024180471897125,
+            0.620620584487915,
+            1.3517911911010743,
+            1.8586315155029296,
+            2.814838409423828,
+            4.569395065307617,
+            4.494667053222656
+          ],
+          "traj_jitter": 2.0250858142389916e-05,
+          "prefix_mse": [
+            0.009024180471897125,
+            0.3148223638534546,
+            0.6604786554972331,
+            0.9600168228149414,
+            1.3309811401367186,
+            1.8707169850667318
+          ]
+        }
+      ],
+      "_control_runs": [
+        {
+          "control_T": 133,
+          "control_masked_ratio": 1.0,
+          "control_l2_dist": 1.280782699584961,
+          "traj_fail_20cm": 1.0,
+          "traj_fail_50cm": 1.0,
+          "kps_fail_20cm": 0.8646616541353384,
+          "kps_fail_50cm": 0.8120300751879699,
+          "kps_mean_err_m": 1.280782699584961,
+          "skating_ratio": 0.18181818181818182
+        }
+      ],
+      "_stream_runs": [
+        {
+          "stream_root_jump_mean": 0.02327174692023122,
+          "stream_root_jump_max": 0.06902284175157547,
+          "stream_joint_jump_mean": 0.0327108019370247,
+          "stream_num_boundaries": 33
+        }
+      ]
+    },
+    {
+      "name": "919",
+      "dataset": "BABEL_streamed",
+      "stream_mode": "stream_generate_step",
+      "num_runs": 1,
+      "segment_names": [
+        "919_1",
+        "919_3"
+      ],
+      "T": 164,
+      "masked_ratio": 1.0,
+      "ade": 1.5056019294552687,
+      "mse": 2.582875693716654,
+      "fde": 1.0835591554641724,
+      "path_arc_ade": 0.8572975993156433,
+      "path_chamfer": 0.2939845323562622,
+      "seg_mse": [
+        0.08115595579147339,
+        1.159498405456543,
+        2.9359905242919924,
+        2.8886667251586915,
+        3.542005920410156,
+        3.7662044525146485,
+        3.6198490142822264,
+        2.9014326095581056,
+        1.42388916015625
+      ],
+      "traj_jitter": 1.3457435670716222e-05,
+      "prefix_mse": [
+        0.08115595579147339,
+        0.6203271865844726,
+        1.3922149658203125,
+        1.7663278579711914,
+        2.1214634704589845,
+        2.3955869038899738,
+        2.570481654575893,
+        2.611850357055664
+      ],
+      "control_T": 164,
+      "control_masked_ratio": 1.0,
+      "control_l2_dist": 1.5080598592758179,
+      "traj_fail_20cm": 1.0,
+      "traj_fail_50cm": 1.0,
+      "kps_fail_20cm": 0.9512195121951219,
+      "kps_fail_50cm": 0.8841463414634146,
+      "kps_mean_err_m": 1.5080598592758179,
+      "skating_ratio": 0.09815950920245399,
+      "stream_root_jump_mean": 0.015304459306473912,
+      "stream_root_jump_max": 0.0465422198176384,
+      "stream_joint_jump_mean": 0.022396961317920103,
+      "stream_num_boundaries": 41.0,
+      "_traj_runs": [
+        {
+          "T": 164,
+          "masked_ratio": 1.0,
+          "ade": 1.5056019294552687,
+          "mse": 2.582875693716654,
+          "fde": 1.0835591554641724,
+          "path_arc_ade": 0.8572975993156433,
+          "path_chamfer": 0.2939845323562622,
+          "seg_mse": [
+            0.08115595579147339,
+            1.159498405456543,
+            2.9359905242919924,
+            2.8886667251586915,
+            3.542005920410156,
+            3.7662044525146485,
+            3.6198490142822264,
+            2.9014326095581056,
+            1.42388916015625
+          ],
+          "traj_jitter": 1.3457435670716222e-05,
+          "prefix_mse": [
+            0.08115595579147339,
+            0.6203271865844726,
+            1.3922149658203125,
+            1.7663278579711914,
+            2.1214634704589845,
+            2.3955869038899738,
+            2.570481654575893,
+            2.611850357055664
+          ]
+        }
+      ],
+      "_control_runs": [
+        {
+          "control_T": 164,
+          "control_masked_ratio": 1.0,
+          "control_l2_dist": 1.5080598592758179,
+          "traj_fail_20cm": 1.0,
+          "traj_fail_50cm": 1.0,
+          "kps_fail_20cm": 0.9512195121951219,
+          "kps_fail_50cm": 0.8841463414634146,
+          "kps_mean_err_m": 1.5080598592758179,
+          "skating_ratio": 0.09815950920245399
+        }
+      ],
+      "_stream_runs": [
+        {
+          "stream_root_jump_mean": 0.015304459306473912,
+          "stream_root_jump_max": 0.0465422198176384,
+          "stream_joint_jump_mean": 0.022396961317920103,
+          "stream_num_boundaries": 41
+        }
+      ]
+    },
+    {
+      "name": "6519",
+      "dataset": "BABEL_streamed",
+      "stream_mode": "stream_generate_step",
+      "num_runs": 1,
+      "segment_names": [
+        "6519_3",
+        "6519_4"
+      ],
+      "T": 265,
+      "masked_ratio": 1.0,
+      "ade": 1.7040074762308373,
+      "mse": 4.147951521963443,
+      "fde": 3.259092330932617,
+      "path_arc_ade": 1.5387165546417236,
+      "path_chamfer": 0.7647072076797485,
+      "seg_mse": [
+        0.030484429001808165,
+        0.1385372757911682,
+        0.6399338722229004,
+        0.8491147041320801,
+        0.34315297603607176,
+        0.5923479080200196,
+        2.566366195678711,
+        5.1824077606201175,
+        5.99283447265625,
+        6.836666870117187,
+        8.641586303710938,
+        10.121346282958985,
+        10.37987060546875,
+        10.582818603515625
+      ],
+      "traj_jitter": 2.0974675862817094e-05,
+      "prefix_mse": [
+        0.030484429001808165,
+        0.08451085090637207,
+        0.2696518580118815,
+        0.41451754570007326,
+        0.4002446746826172,
+        0.43226184844970705,
+        0.7371339525495256,
+        1.2927932739257812,
+        1.8150200737847222,
+        2.3171847534179686,
+        2.8921303488991477,
+        3.4945648193359373,
+        4.024203725961539
+      ],
+      "control_T": 265,
+      "control_masked_ratio": 1.0,
+      "control_l2_dist": 1.7047208547592163,
+      "traj_fail_20cm": 1.0,
+      "traj_fail_50cm": 1.0,
+      "kps_fail_20cm": 0.9547169811320755,
+      "kps_fail_50cm": 0.8113207547169812,
+      "kps_mean_err_m": 1.7047208547592163,
+      "skating_ratio": 0.25,
+      "stream_root_jump_mean": 0.02791183502554442,
+      "stream_root_jump_max": 0.06562769412994385,
+      "stream_joint_jump_mean": 0.03722874734155608,
+      "stream_num_boundaries": 66.0,
+      "_traj_runs": [
+        {
+          "T": 265,
+          "masked_ratio": 1.0,
+          "ade": 1.7040074762308373,
+          "mse": 4.147951521963443,
+          "fde": 3.259092330932617,
+          "path_arc_ade": 1.5387165546417236,
+          "path_chamfer": 0.7647072076797485,
+          "seg_mse": [
+            0.030484429001808165,
+            0.1385372757911682,
+            0.6399338722229004,
+            0.8491147041320801,
+            0.34315297603607176,
+            0.5923479080200196,
+            2.566366195678711,
+            5.1824077606201175,
+            5.99283447265625,
+            6.836666870117187,
+            8.641586303710938,
+            10.121346282958985,
+            10.37987060546875,
+            10.582818603515625
+          ],
+          "traj_jitter": 2.0974675862817094e-05,
+          "prefix_mse": [
+            0.030484429001808165,
+            0.08451085090637207,
+            0.2696518580118815,
+            0.41451754570007326,
+            0.4002446746826172,
+            0.43226184844970705,
+            0.7371339525495256,
+            1.2927932739257812,
+            1.8150200737847222,
+            2.3171847534179686,
+            2.8921303488991477,
+            3.4945648193359373,
+            4.024203725961539
+          ]
+        }
+      ],
+      "_control_runs": [
+        {
+          "control_T": 265,
+          "control_masked_ratio": 1.0,
+          "control_l2_dist": 1.7047208547592163,
+          "traj_fail_20cm": 1.0,
+          "traj_fail_50cm": 1.0,
+          "kps_fail_20cm": 0.9547169811320755,
+          "kps_fail_50cm": 0.8113207547169812,
+          "kps_mean_err_m": 1.7047208547592163,
+          "skating_ratio": 0.25
+        }
+      ],
+      "_stream_runs": [
+        {
+          "stream_root_jump_mean": 0.02791183502554442,
+          "stream_root_jump_max": 0.06562769412994385,
+          "stream_joint_jump_mean": 0.03722874734155608,
+          "stream_num_boundaries": 66
+        }
+      ]
+    }
+  ]
+}

@@ -17,6 +17,12 @@ try:
         _stable_eval_seed,
     )
     from FloodNet.utils.traj_batch import root_to_traj_feats
+    from FloodNet.utils.training import (
+        build_generation_eval_cfg,
+        build_model_batch,
+        get_module_checkpoint_step_info,
+        resolve_test_probe_tag,
+    )
 except ImportError:  # pragma: no cover - script entrypoints use top-level imports
     from metrics.traj import (
         _average_control_metrics,
@@ -29,6 +35,12 @@ except ImportError:  # pragma: no cover - script entrypoints use top-level impor
         _stable_eval_seed,
     )
     from utils.traj_batch import root_to_traj_feats
+    from utils.training import (
+        build_generation_eval_cfg,
+        build_model_batch,
+        get_module_checkpoint_step_info,
+        resolve_test_probe_tag,
+    )
 
 
 def _gather_payloads(local_payloads):
@@ -51,13 +63,13 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
     cpu_state = torch.random.get_rng_state()
     cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
 
-    eval_cfg = module._get_generation_eval_cfg()
+    eval_cfg = build_generation_eval_cfg(module.cfg)
     eval_num_runs = max(eval_cfg["num_runs"], 1)
     eval_seg_size = eval_cfg["seg_size"]
     do_eval_metrics = eval_cfg["enabled"] and "traj" in batch and "traj_mask" in batch
     generation_num_runs = eval_num_runs if do_eval_metrics else 1
-    probe_tag = module._resolve_test_probe_tag(test_loader_idx)
-    step_tag = module._get_step_tag()
+    probe_tag = resolve_test_probe_tag(module, test_loader_idx)
+    step_tag = get_module_checkpoint_step_info(module).step_tag
 
     try:
         local_payloads = []
@@ -102,10 +114,7 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                 with module.ema.average_parameters(
                     [p for p in module.model.parameters() if p.requires_grad]
                 ):
-                    model_batch = module._build_model_batch(
-                        sample_batch,
-                        is_training=False,
-                    )
+                    model_batch = build_model_batch(sample_batch)
                     output = module.model.generate(model_batch)
 
                 single_generated = output["generated"][0]

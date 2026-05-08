@@ -11,6 +11,7 @@ from utils.initialize import (
     instantiate,
     print_model_size,
 )
+from utils.training.module_step import get_module_checkpoint_step_info
 
 # Set tokenizers parallelism to false to avoid warnings in multiprocessing
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -38,13 +39,6 @@ class BasicLightningModule(LightningModule):
 
         # metric
         self.initialize_metrics()
-
-    def _get_effective_global_step(self):
-        return int(self.global_step)
-
-    def _get_checkpoint_step_value(self):
-        # Checkpoints are emitted after the optimizer update for the current batch.
-        return int(self._get_effective_global_step()) + 1
 
     def configure_optimizers(self):
         optim_target = self.cfg.optimizer.target
@@ -141,7 +135,7 @@ class BasicLightningModule(LightningModule):
         )
         self.log(
             "ckpt_absolute_step",
-            float(self._get_checkpoint_step_value()),
+            float(get_module_checkpoint_step_info(self).metric_value),
             on_step=True,
             prog_bar=False,
             batch_size=batch_size,
