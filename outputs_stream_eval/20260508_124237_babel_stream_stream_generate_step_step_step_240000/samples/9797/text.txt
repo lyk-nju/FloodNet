@@ -1,7 +1,0 @@
-segments: 9797_1, 9797_2, 9797_3
-[0] end=12: stand
-[1] end=40: walk forward
-[2] end=63: walk forward
-[3] end=91: trip
-[4] end=116: trip
-[5] end=133: stand
