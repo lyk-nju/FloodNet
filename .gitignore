@@ -29,6 +29,8 @@ ref/
 test/
 exp_result/
 image/
+sanity/
+models/diffusion_forcing_wan_wrong.py
 
 # web
 server.pid
