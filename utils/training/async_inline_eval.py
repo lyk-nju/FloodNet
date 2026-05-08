@@ -8,10 +8,12 @@ import sys
 import time
 from pathlib import Path
 
+import torch
 from lightning.pytorch.utilities import rank_zero_info
 
 from .inline_eval_runtime import get_test_probe_tags
-from .module_step import get_module_checkpoint_step_info, get_module_step_semantics
+from .module_step import compute_checkpoint_step_info, compute_step_semantics
+from .test_probes import build_test_probe_tags
 
 
 def async_test_mode_enabled(cfg) -> bool:
@@ -46,8 +48,8 @@ def emit_async_test_request(module):
     if test_steps <= 0 or module.global_step % test_steps != 0:
         return
 
-    step_semantics = get_module_step_semantics(module)
-    step_info = get_module_checkpoint_step_info(module)
+    step_semantics = compute_step_semantics(module)
+    step_info = compute_checkpoint_step_info(module)
     step = int(step_semantics.absolute_step)
     ckpt_path = get_async_eval_ckpt_path(module.cfg.save_dir, step)
     request_path = get_async_eval_request_path(module.cfg.save_dir, step)
@@ -116,3 +118,56 @@ def maybe_launch_async_eval_watcher(cfg, save_dir: str):
     )
     atexit.register(proc.terminate)
     return proc
+
+
+def emit_resume_ckpt_eval_request(cfg, save_dir: str, resume_ckpt: str):
+    """Emit an initial async eval request for the resume checkpoint at startup.
+
+    Reads the checkpoint's global_step to set the correct step tag, then
+    writes a request JSON so the watcher evaluates the resume model as a
+    baseline before any training checkpoints are emitted.
+    """
+    if not resume_ckpt:
+        return
+    if int(os.environ.get("RANK", "0")) != 0:
+        return
+    try:
+        ckpt = torch.load(resume_ckpt, map_location="cpu", weights_only=False)
+        global_step = int(ckpt.get("global_step", 0))
+    except Exception as exc:
+        rank_zero_info(
+            f"[async-eval] could not read global_step from resume ckpt ({exc!r}); "
+            f"skipping initial eval request"
+        )
+        return
+
+    request_dir = get_async_eval_root(save_dir) / "requests"
+    request_dir.mkdir(parents=True, exist_ok=True)
+    request_path = request_dir / f"step_{global_step:06d}.json"
+
+    if request_path.exists():
+        return
+
+    run_dir = Path(save_dir).resolve()
+    config_path = get_run_config_path(save_dir, cfg.exp_name).resolve()
+    probe_tags = build_test_probe_tags(cfg)
+
+    payload = {
+        "step": global_step,
+        "step_tag": f"step_{global_step:06d}",
+        "run_dir": str(run_dir),
+        "artifact_root": str(run_dir),
+        "config_path": str(config_path),
+        "ckpt_path": str(Path(resume_ckpt).resolve()),
+        "probe_tags": probe_tags,
+        "created_at": time.time(),
+        "test_mode": "async",
+    }
+    tmp_path = request_path.with_suffix(".json.tmp")
+    with open(tmp_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp_path, request_path)
+    rank_zero_info(
+        f"[async-eval] emitted initial eval request for resume ckpt "
+        f"step={global_step} ckpt={resume_ckpt}"
+    )

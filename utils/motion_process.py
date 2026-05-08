@@ -89,25 +89,6 @@ def extract_root_trajectory_263_torch(feature_263: torch.Tensor) -> torch.Tensor
     return r_pos
 
 
-def extract_root_trajectory_length(feature_263: np.ndarray, xy_only: bool = True) -> float:
-    """Compute the geometric path length of the recovered root trajectory.
-
-    Args:
-        feature_263: (T, 263) motion feature array.
-        xy_only: If True, measure on the ground plane (x, z). If False, use full 3D.
-
-    Returns:
-        Total path length along the trajectory polyline.
-    """
-    traj = extract_root_trajectory_263(feature_263)
-    if traj.shape[0] < 2:
-        return 0.0
-    if xy_only:
-        pts = traj[:, [0, 2]]
-    else:
-        pts = traj
-    diffs = np.diff(pts, axis=0)
-    return float(np.linalg.norm(diffs, axis=1).sum())
 
 
 def extract_root_trajectory_length(feature_263: np.ndarray | torch.Tensor, xy_only: bool = True) -> float:

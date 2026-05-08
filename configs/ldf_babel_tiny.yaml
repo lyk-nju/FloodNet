@@ -140,7 +140,7 @@ model:
         chunk_size: 5
         use_text_cond: True
         text_len: 128
-        dropout: 0.1
+        text_dropout: 0.1
         cfg_scale_text: 5.0
         prediction_type: "vel"
         causal: False

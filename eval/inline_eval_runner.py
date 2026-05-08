@@ -19,8 +19,8 @@ try:
     from FloodNet.utils.traj_batch import root_to_traj_feats
     from FloodNet.utils.training import (
         build_generation_eval_cfg,
-        build_model_batch,
-        get_module_checkpoint_step_info,
+        prepare_model_input,
+        compute_checkpoint_step_info,
         resolve_test_probe_tag,
     )
 except ImportError:  # pragma: no cover - script entrypoints use top-level imports
@@ -37,8 +37,8 @@ except ImportError:  # pragma: no cover - script entrypoints use top-level impor
     from utils.traj_batch import root_to_traj_feats
     from utils.training import (
         build_generation_eval_cfg,
-        build_model_batch,
-        get_module_checkpoint_step_info,
+        prepare_model_input,
+        compute_checkpoint_step_info,
         resolve_test_probe_tag,
     )
 
@@ -69,7 +69,7 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
     do_eval_metrics = eval_cfg["enabled"] and "traj" in batch and "traj_mask" in batch
     generation_num_runs = eval_num_runs if do_eval_metrics else 1
     probe_tag = resolve_test_probe_tag(module, test_loader_idx)
-    step_tag = get_module_checkpoint_step_info(module).step_tag
+    step_tag = compute_checkpoint_step_info(module).step_tag
 
     try:
         local_payloads = []
@@ -114,7 +114,7 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                 with module.ema.average_parameters(
                     [p for p in module.model.parameters() if p.requires_grad]
                 ):
-                    model_batch = build_model_batch(sample_batch)
+                    model_batch = prepare_model_input(sample_batch)
                     output = module.model.generate(model_batch)
 
                 single_generated = output["generated"][0]

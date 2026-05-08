@@ -26,18 +26,17 @@ from utils.initialize import (
 from utils.lightning_module import BasicLightningModule
 from utils.training import (
     async_test_mode_enabled,
-    build_model_batch,
+    prepare_model_input,
     build_test_probe_loaders,
     build_test_probe_tags,
     build_val_dataloaders,
     compute_control_loss_xz,
     emit_async_test_request,
-    get_module_checkpoint_step_info,
-    get_module_step_semantics,
-    load_resume_step_offset,
+    emit_resume_ckpt_eval_request,
+    compute_checkpoint_step_info,
     maybe_launch_async_eval_watcher,
-    resolve_runtime_scheduler_steps,
-    resolve_runtime_max_steps,
+    resolve_self_forcing_runtime_steps,
+    SelfForcingTrainer,
 )
 
 # Set tokenizers parallelism to false to avoid warnings in multiprocessing
@@ -46,8 +45,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 class CustomLightningModule(BasicLightningModule):
     def __init__(self, cfg):
-        self._inline_eval_seen = {}
-        self._self_forcing_runtime_validated = False
+        self._inline_eval_dedup = {}
         self._resume_step_offset = 0
         super().__init__(cfg)
         # Must set AFTER super().__init__() because LightningModule.__init__
@@ -57,39 +55,11 @@ class CustomLightningModule(BasicLightningModule):
             cfg.model.params.get("self_forcing_enabled", False)
         )
         self.automatic_optimization = not self_forcing_enabled
-
-    def _build_self_forcing_runtime(self):
-        semantics = get_module_step_semantics(self)
-        runtime_metrics = {
-            "self_forcing/enabled": 1.0,
-            "self_forcing/active": 1.0,
-            "self_forcing/progress": float(semantics.progress),
-            "self_forcing/k": 0.0,
-            "self_forcing/phase_step": float(semantics.phase_step),
-            "self_forcing/absolute_step": float(semantics.absolute_step),
-            "self_forcing/resume_step_offset": float(semantics.resume_step_offset),
-            "self_forcing/phase_total_steps": float(semantics.phase_total_steps),
-            "self_forcing/absolute_target_step": float(semantics.absolute_target_step),
-        }
-        return semantics, runtime_metrics
-
-    def _validate_self_forcing_runtime(self):
-        if self._self_forcing_runtime_validated:
-            return
-        trainer = getattr(self, "trainer", None)
-        if trainer is None:
-            return
-        accumulate_grad_batches = int(
-            getattr(trainer, "accumulate_grad_batches", 1)
+        self._sf_trainer = (
+            SelfForcingTrainer(self) if self_forcing_enabled else None
         )
-        if accumulate_grad_batches != 1:
-            raise NotImplementedError(
-                "self-forcing manual optimization does not yet support "
-                f"accumulate_grad_batches={accumulate_grad_batches}. Set it to 1."
-            )
-        self._self_forcing_runtime_validated = True
 
-    def _log_training_step_outputs(
+    def _log_step_metrics(
         self, loss_dict, optimizer, net_start_time, extra_metrics=None
     ):
         net_end_time = time.time()
@@ -115,7 +85,7 @@ class CustomLightningModule(BasicLightningModule):
         )
         self.log(
             "ckpt_absolute_step",
-            float(get_module_checkpoint_step_info(self).metric_value),
+            float(compute_checkpoint_step_info(self).metric_value),
             on_step=True,
             prog_bar=False,
             batch_size=batch_size,
@@ -140,7 +110,7 @@ class CustomLightningModule(BasicLightningModule):
                 batch_size=batch_size,
             )
 
-    def _compute_control_loss_for_pred_list(self, pred_list, batch):
+    def _compute_control_loss(self, pred_list, batch):
         if pred_list is None or "traj" not in batch:
             return None
         traj = batch["traj"]
@@ -201,44 +171,14 @@ class CustomLightningModule(BasicLightningModule):
         # super() not called: we handle state_dict / EMA / optimizer restore manually
         # so that ControlNet re-init and new-param EMA reset work correctly.
         self._resume_step_offset = int(checkpoint.get("global_step", 0))
-        rank_zero_info(
-            f"[resume] loaded checkpoint global_step={self._resume_step_offset}"
-        )
-        # When the ckpt was saved under automatic_optimization=True but we now
-        # resume under manual_optimization=False (self-forcing), Lightning
-        # reads `global_step` from the *manual* counter, which is missing in
-        # the ckpt (defaults to 0).  Result: self.global_step = 0 forever
-        # until it climbs past 240000, so phase_step / ckpt naming get stuck.
-        # Mirror the auto-counter's progress into the manual counter to keep
-        # `self.global_step` consistent across the auto→manual switch.
-        if not self.automatic_optimization:
-            try:
-                fit_loop = checkpoint["loops"]["fit_loop"]
-                auto_progress = (
-                    fit_loop["epoch_loop.automatic_optimization.optim_progress"]
-                    ["optimizer"]["step"]
-                )
-                completed = int(auto_progress["total"]["completed"])
-                ready = int(auto_progress["total"]["ready"])
-                manual_key = "epoch_loop.manual_optimization.optim_step_progress"
-                manual_progress = fit_loop.setdefault(
-                    manual_key,
-                    {"total": {"ready": 0, "completed": 0},
-                     "current": {"ready": 0, "completed": 0}},
-                )
-                if int(manual_progress["total"]["completed"]) < completed:
-                    manual_progress["total"]["ready"] = ready
-                    manual_progress["total"]["completed"] = completed
-                    rank_zero_info(
-                        f"[resume] mirrored auto→manual optim_step_progress "
-                        f"completed={completed} (was 0); keeps self.global_step "
-                        f"aligned with ckpt"
-                    )
-            except (KeyError, TypeError) as exc:
-                rank_zero_info(
-                    f"[resume] could not mirror auto→manual progress ({exc!r}); "
-                    f"global_step may start from 0"
-                )
+        # Self-forcing checkpoint housekeeping: mirrors auto→manual optimizer
+        # progress so global_step stays consistent across the switch.
+        if self._sf_trainer is not None:
+            self._resume_step_offset = self._sf_trainer.on_load_checkpoint(checkpoint)
+        else:
+            rank_zero_info(
+                f"[resume] loaded checkpoint global_step={self._resume_step_offset}"
+            )
         ckpt_keys = set(checkpoint["state_dict"].keys())
         controlnet_missing = not any(k.startswith("controlnet.") for k in ckpt_keys)
         strict = not controlnet_missing
@@ -305,7 +245,7 @@ class CustomLightningModule(BasicLightningModule):
 
     def _step(self, batch, is_training=True, model_batch=None):
         if model_batch is None:
-            model_batch = build_model_batch(batch)
+            model_batch = prepare_model_input(batch)
         out = self.model(model_batch)
 
         # MotionLCM-style control loss: explicit trajectory alignment in motion space
@@ -328,7 +268,7 @@ class CustomLightningModule(BasicLightningModule):
                     ):
                         if pred_list is None:
                             continue
-                        step_loss = self._compute_control_loss_for_pred_list(
+                        step_loss = self._compute_control_loss(
                             pred_list, batch
                         )
                         if step_loss is None:
@@ -345,7 +285,7 @@ class CustomLightningModule(BasicLightningModule):
                     )
                 else:
                     pred_list = control_aux["pred_x0_latent_list"]
-                    loss_control = self._compute_control_loss_for_pred_list(
+                    loss_control = self._compute_control_loss(
                         pred_list, batch
                     )
                 if loss_control is not None:
@@ -356,250 +296,19 @@ class CustomLightningModule(BasicLightningModule):
             del out["control_aux"]
         return out
 
-    def _run_standard_training_step(self, batch, batch_idx):
+    def _standard_training_step(self, batch, batch_idx):
         return super().training_step(batch, batch_idx)
 
-    def _log_self_forcing_metrics(self, runtime_metrics):
-        log_every_n_steps = max(
-            1, int(getattr(getattr(self, "trainer", None), "log_every_n_steps", 100))
-        )
-        if int(runtime_metrics["self_forcing/phase_step"]) % log_every_n_steps == 0:
-            rank_zero_info(
-                "[self_forcing] "
-                f"phase_step={int(runtime_metrics['self_forcing/phase_step'])} "
-                f"absolute_step={int(runtime_metrics['self_forcing/absolute_step'])} "
-                f"resume_step_offset={int(runtime_metrics['self_forcing/resume_step_offset'])} "
-                f"phase_total_steps={int(runtime_metrics['self_forcing/phase_total_steps'])} "
-                f"absolute_target_step={int(runtime_metrics['self_forcing/absolute_target_step'])} "
-                f"active={int(runtime_metrics['self_forcing/active'])} "
-                f"progress={runtime_metrics['self_forcing/progress']:.6f}"
-            )
-
-    def _resolve_self_forcing_k(self, progress):
-        k = int(self.model.self_forcing_k_schedule[0][1])
-        for threshold, candidate_k in self.model.self_forcing_k_schedule:
-            if progress >= threshold:
-                k = int(candidate_k)
-            else:
-                break
-        return max(1, k)
-
-    def _prepare_self_forcing_plan(self, feature_length, device, progress):
-        target_k = self._resolve_self_forcing_k(progress)
-        # Cross-rank consensus on effective_k so DDP ranks run the same number
-        # of rollout steps (shortest valid sequence wins).
-        min_k_local = int(feature_length.min().item()) - self.model.chunk_size + 1
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            tmp = torch.tensor([min_k_local], device=device, dtype=torch.long)
-            torch.distributed.all_reduce(tmp, op=torch.distributed.ReduceOp.MIN)
-            min_k_supported = int(tmp.item())
-        else:
-            min_k_supported = min_k_local
-        if min_k_supported < 1:
-            raise ValueError(
-                "self-forcing requires feature_length >= chunk_size for every sample"
-            )
-        effective_k = min(target_k, min_k_supported)
-
-        max_start = feature_length.to(device=device, dtype=torch.long) - effective_k + 1
-        # Mix self-forcing with standard supervision so the t < 1 regime
-        # (very short prefixes) keeps getting gradient updates.  Otherwise
-        # ControlNet drifts on the early-time regime that inference still
-        # exercises.  ``low = 1`` matches the standard `forward` end_index
-        # range; samples with start < chunk_size simply fall back to a
-        # standard supervised step (rollout has no effect when replace_idx
-        # would land before position 0).
-        start_end_indices = []
-        for b in range(feature_length.shape[0]):
-            low = 1
-            high = int(max_start[b].item())
-            if high < low:
-                raise ValueError(
-                    f"Invalid self-forcing start range for sample {b}: "
-                    f"low={low}, high={high}, valid_len={int(feature_length[b].item())}, "
-                    f"effective_k={effective_k}"
-                )
-            if high == low:
-                start_end_indices.append(low)
-            else:
-                start_end_indices.append(
-                    int(torch.randint(low, high + 1, (1,), device=device).item())
-                )
-        start_end_indices = torch.tensor(
-            start_end_indices, device=device, dtype=torch.long
-        )
-        # Per-sample fractional time offset (matches standard `forward`).
-        # Sharing a single scalar across the batch correlates noise schedules
-        # for every sample and collapses effective batch diversity.
-        batch_size = int(feature_length.shape[0])
-        phase_offset = torch.empty(
-            batch_size, device=device, dtype=torch.float32
-        ).uniform_(0.0, 1.0 / self.model.chunk_size)
-        return effective_k, start_end_indices, phase_offset
-
-    def _run_self_forcing_rollout(self, model_batch, progress):
-        feature = model_batch["feature"]
-        feature_length = model_batch["feature_length"]
-        _, seq_len, _ = feature.shape
-        device = feature.device
-        all_text_context = self.model._prepare_text_context(model_batch, seq_len, device)
-        traj_dropped = self.model._sample_traj_dropout_decision(device)
-        effective_k, start_end_indices, phase_offset = self._prepare_self_forcing_plan(
-            feature_length, device, progress
-        )
-        traj_emb, traj_seq_lens, _ = self.model._prepare_traj_condition(
-            model_batch, seq_len, device, traj_dropped_override=traj_dropped
-        )
-
-        current_feature = feature.clone()
-        final_step_result = None
-        for step_idx in range(effective_k):
-            end_indices = start_end_indices + step_idx
-            time_steps = (
-                (end_indices.to(dtype=torch.float32) - 1.0) / self.model.chunk_size
-                + phase_offset
-            )
-            is_final_step = step_idx == effective_k - 1
-            if is_final_step:
-                final_step_result = self.model._run_single_window_forward(
-                    model_batch,
-                    current_feature,
-                    time_steps,
-                    all_text_context,
-                    traj_emb,
-                    traj_seq_lens,
-                    traj_dropped,
-                    enable_scheduled_sampling=False,
-                )
-                break
-
-            with torch.no_grad():
-                rollout_result = self.model._run_single_window_forward(
-                    model_batch,
-                    current_feature,
-                    time_steps,
-                    all_text_context,
-                    traj_emb,
-                    traj_seq_lens,
-                    traj_dropped,
-                    enable_scheduled_sampling=False,
-                )
-
-            # Diagnostic: when self_forcing_disable_replace is set, we still
-            # run the rollout forward (so any side-effect of the extra forward
-            # pass remains), but skip the substitution entirely.  K=2 with this
-            # flag should behave identically to K=1.  If FID still degrades
-            # with this flag on, the bug is in the dual-forward path itself
-            # (e.g. RNG / autograd state).  If FID is restored, the bug is in
-            # the substituted value.
-            disable_replace = bool(
-                self.cfg.get("self_forcing_disable_replace", False)
-            )
-            next_feature = current_feature.clone()
-            replace_diffs = []
-            if not disable_replace:
-                for b in range(feature.shape[0]):
-                    # When start < chunk_size (early-time short-prefix samples),
-                    # replace_idx < 0 means there is no past token to roll out;
-                    # this sample degenerates to a plain supervised step.
-                    replace_idx = int(end_indices[b].item()) - self.model.chunk_size
-                    if replace_idx < 0:
-                        continue
-                    pred_seq = rollout_result["x0_latent_list"][b]
-                    if replace_idx >= pred_seq.shape[0]:
-                        continue
-                    replacement = pred_seq[replace_idx].detach().to(
-                        device=current_feature.device, dtype=current_feature.dtype
-                    )
-                    gt_token = current_feature[b, replace_idx, :]
-                    replace_diffs.append(
-                        (replacement - gt_token).abs().mean().item()
-                    )
-                    next_feature[b, replace_idx, :] = replacement
-            current_feature = next_feature
-            if replace_diffs:
-                self._self_forcing_last_replace_diff = float(
-                    sum(replace_diffs) / len(replace_diffs)
-                )
-
-        if final_step_result is None:
-            raise RuntimeError(
-                f"self-forcing expected at least one supervised step, got effective_k={effective_k}"
-            )
-        return final_step_result, effective_k
-
-    def _finalize_self_forcing_loss(self, final_step_result, batch):
-        step_diff_loss = final_step_result["loss"]
-        total_loss = step_diff_loss
-        step_control_loss = None
-        control_weight = float(self.cfg.model.params.get("control_loss_weight", 1.0))
-        if control_weight > 0.0 and "traj" in batch:
-            step_control_loss = self._compute_control_loss_for_pred_list(
-                final_step_result["pred_x0_latent_list"], batch
-            )
-            if step_control_loss is not None:
-                total_loss = total_loss + control_weight * step_control_loss
-        return total_loss, step_diff_loss, step_control_loss
-
-    def _run_self_forcing_training_step(self, batch):
-        self._validate_self_forcing_runtime()
-        net_start_time = time.time()
-        semantics, runtime_metrics = self._build_self_forcing_runtime()
-        model_batch = build_model_batch(batch)
-        optimizer = self.optimizers()
-        lr_scheduler = self.lr_schedulers()
-        self._log_self_forcing_metrics(runtime_metrics)
-
-        optimizer.zero_grad(set_to_none=True)
-        final_step_result, effective_k = self._run_self_forcing_rollout(
-            model_batch, semantics.progress
-        )
-        runtime_metrics["self_forcing/k"] = float(effective_k)
-        replace_diff = getattr(self, "_self_forcing_last_replace_diff", None)
-        if replace_diff is not None:
-            runtime_metrics["self_forcing/replace_abs_diff"] = float(replace_diff)
-            self._self_forcing_last_replace_diff = None
-        total_loss, step_diff_loss, step_control_loss = self._finalize_self_forcing_loss(
-            final_step_result, batch
-        )
-
-        self.manual_backward(total_loss)
-        trainable = [p for p in self.model.parameters() if p.requires_grad]
-        # Honour trainer.gradient_clip_val if user sets it; otherwise fall back to
-        # a conservative default (manual_optimization disables Lightning's auto
-        # clipping, so without this self-forcing has zero clipping).
-        clip_val = getattr(getattr(self, "trainer", None), "gradient_clip_val", None)
-        if clip_val is None or float(clip_val) <= 0:
-            clip_val = float(self.cfg.get("self_forcing_grad_clip", 1.0))
-        else:
-            clip_val = float(clip_val)
-        grad_norm = torch.nn.utils.clip_grad_norm_(trainable, clip_val)
-        runtime_metrics["self_forcing/grad_norm"] = float(grad_norm)
-        optimizer.step()
-        if lr_scheduler is not None:
-            lr_scheduler.step()
-
-        loss_dict = {"total": total_loss.detach(), "mse": step_diff_loss.detach()}
-        if step_control_loss is not None:
-            loss_dict["control"] = step_control_loss.detach()
-        self._log_training_step_outputs(
-            loss_dict,
-            optimizer,
-            net_start_time,
-            extra_metrics=runtime_metrics,
-        )
-        return total_loss
-
     def training_step(self, batch, batch_idx):
-        if not getattr(self.model, "self_forcing_enabled", False):
-            return self._run_standard_training_step(batch, batch_idx)
-        return self._run_self_forcing_training_step(batch)
+        if self._sf_trainer is not None:
+            return self._sf_trainer.training_step(batch)
+        return self._standard_training_step(batch, batch_idx)
 
     def update_metrics(self, batch):
         if not self.t2m_enabled or self.t2m_metrics is None:
             return
         with self.ema.average_parameters([p for p in self.model.parameters() if p.requires_grad]):
-            model_batch = build_model_batch(batch)
+            model_batch = prepare_model_input(batch)
             output = self.model.generate(model_batch)
         generated = output["generated"]
         ground_truth_token = batch["token"]
@@ -658,9 +367,9 @@ class CustomLightningModule(BasicLightningModule):
                 and self.global_step % self.cfg.validation.test_steps == 0
             ):
                 self.on_test_epoch_end()
-                self._inline_eval_seen.clear()
+                self._inline_eval_dedup.clear()
         else:
-            self._inline_eval_seen.clear()
+            self._inline_eval_dedup.clear()
         self.compute_metrics()
 
     def update_test(self, batch, batch_idx=None, test_loader_idx=0):
@@ -769,39 +478,24 @@ def main():
     )
     
     trainer_absolute_max_steps = int(cfg.trainer.max_steps)
-    # Lightning restores `global_step` to the ckpt's absolute value on resume
-    # and compares it against `trainer.max_steps` (also absolute).  We must
-    # therefore keep the trainer's max_steps at the absolute target.  The
-    # *phase length* (= absolute - offset) is only used to scale the LR
-    # scheduler horizon and self-forcing schedule progress.
     model_self_forcing_enabled = bool(
         cfg.config.model.params.get("self_forcing_enabled", False)
     )
-    resume_step_offset = 0
-    phase_max_steps = trainer_absolute_max_steps
-    if cfg.train and model_self_forcing_enabled and cfg.resume_ckpt:
-        resume_step_offset = load_resume_step_offset(cfg.resume_ckpt)
-        phase_max_steps = resolve_runtime_max_steps(
-            trainer_absolute_max_steps,
-            resume_step_offset,
-            self_forcing_enabled=model_self_forcing_enabled,
-        )
-        rank_zero_info(
-            "[self_forcing runtime] "
-            f"resume_step_offset={resume_step_offset} "
-            f"absolute_target_step={trainer_absolute_max_steps} "
-            f"phase_max_steps={phase_max_steps}"
-        )
     scheduler_training_steps = int(
         OmegaConf.to_container(
             cfg.config.lr_scheduler.params,
             resolve=True,
         )["num_training_steps"]
     )
-    runtime_scheduler_steps = resolve_runtime_scheduler_steps(
+    (
+        resume_step_offset,
+        phase_max_steps,
+        runtime_scheduler_steps,
+    ) = resolve_self_forcing_runtime_steps(
+        trainer_absolute_max_steps,
+        cfg.resume_ckpt if cfg.train else None,
+        model_self_forcing_enabled,
         scheduler_training_steps,
-        absolute_target_step=trainer_absolute_max_steps,
-        runtime_max_steps=phase_max_steps,
     )
     if runtime_scheduler_steps != scheduler_training_steps:
         OmegaConf.update(

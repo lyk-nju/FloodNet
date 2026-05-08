@@ -8,7 +8,7 @@ def _get_module_phase_step(module) -> int:
     return max(0, int(module.global_step) - resume_step_offset)
 
 
-def get_module_step_semantics(module, phase_step: int | None = None):
+def compute_step_semantics(module, phase_step: int | None = None):
     trainer = getattr(module, "trainer", None)
     trainer_max_steps = (
         getattr(trainer, "max_steps", None) if trainer is not None else None
@@ -30,8 +30,8 @@ def get_module_step_semantics(module, phase_step: int | None = None):
     )
 
 
-def get_module_checkpoint_step_info(module, *, include_next_step: bool = False):
+def compute_checkpoint_step_info(module, *, include_next_step: bool = False):
     return build_checkpoint_step_info(
-        get_module_step_semantics(module),
+        compute_step_semantics(module),
         include_next_step=include_next_step,
     )

@@ -25,7 +25,7 @@ def save_inline_eval_payloads(module, payloads, probe_tag, step_tag):
     if module.trainer.global_rank != 0:
         return
 
-    seen = module._inline_eval_seen.setdefault((probe_tag, step_tag), set())
+    seen = module._inline_eval_dedup.setdefault((probe_tag, step_tag), set())
     for payload in payloads:
         sample_id = payload["name"]
         dataset_id = payload["dataset_id"]

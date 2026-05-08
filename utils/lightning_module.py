@@ -11,7 +11,7 @@ from utils.initialize import (
     instantiate,
     print_model_size,
 )
-from utils.training.module_step import get_module_checkpoint_step_info
+from utils.training.module_step import compute_checkpoint_step_info
 
 # Set tokenizers parallelism to false to avoid warnings in multiprocessing
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -135,7 +135,7 @@ class BasicLightningModule(LightningModule):
         )
         self.log(
             "ckpt_absolute_step",
-            float(get_module_checkpoint_step_info(self).metric_value),
+            float(compute_checkpoint_step_info(self).metric_value),
             on_step=True,
             prog_bar=False,
             batch_size=batch_size,

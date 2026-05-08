@@ -15,16 +15,16 @@ from .inline_eval_artifacts import (
 try:
     from FloodNet.metrics.traj import _get_metric_statistics
     from FloodNet.utils.training import (
-        get_module_checkpoint_step_info,
-        get_module_step_semantics,
+        compute_checkpoint_step_info,
+        compute_step_semantics,
         get_test_probe_tags,
     )
     from FloodNet.utils.visualize import make_composite_compare_videos, render_video
 except ImportError:  # pragma: no cover - script entrypoints use top-level imports
     from metrics.traj import _get_metric_statistics
     from utils.training import (
-        get_module_checkpoint_step_info,
-        get_module_step_semantics,
+        compute_checkpoint_step_info,
+        compute_step_semantics,
         get_test_probe_tags,
     )
     from utils.visualize import make_composite_compare_videos, render_video
@@ -207,7 +207,7 @@ def _render_probe_outputs(module, dataset_id, probe_tag, artifact_dirs):
             )
         wandb.log(
             {f"{dataset_id}_{probe_tag}_video": video_to_log},
-            step=get_module_step_semantics(module).absolute_step,
+            step=compute_step_semantics(module).absolute_step,
         )
 
 
@@ -233,12 +233,12 @@ def _log_probe_summary(module, dataset_id, probe_tag, step_tag, summary):
     if flat_metrics and module.logger is not None:
         module.logger.log_metrics(
             flat_metrics,
-            step=get_module_step_semantics(module).absolute_step,
+            step=compute_step_semantics(module).absolute_step,
         )
 
 
 def process_inline_generation_results(module):
-    step_tag = get_module_checkpoint_step_info(module).step_tag
+    step_tag = compute_checkpoint_step_info(module).step_tag
     for dataset_id in os.listdir(module.cfg.save_dir):
         feature_root = Path(module.cfg.save_dir) / dataset_id / "feature"
         if not os.path.exists(feature_root):

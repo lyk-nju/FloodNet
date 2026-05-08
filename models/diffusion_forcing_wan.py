@@ -43,7 +43,7 @@ class DiffForcingWanModel(nn.Module):
         noise_steps=10,
         use_text_cond=True,
         text_len=512,
-        dropout=0.1,
+        text_dropout=0.1,
         cfg_scale_text=5.0,
         cfg_scale_traj=0.0,
         prediction_type="vel",  # "vel", "x0", "noise"
@@ -79,7 +79,7 @@ class DiffForcingWanModel(nn.Module):
         self.chunk_size = chunk_size
         self.noise_steps = noise_steps
         self.use_text_cond = use_text_cond
-        self.dropout = dropout
+        self.text_dropout = text_dropout
         self.cfg_scale_text = cfg_scale_text
         self.cfg_scale_traj = float(cfg_scale_traj)
         self.prediction_type = prediction_type
@@ -238,10 +238,10 @@ class DiffForcingWanModel(nn.Module):
             traj_seq_lens=traj_seq_lens,
         )
 
-    def _build_cfg_2b_text(
+    def _concat_text_for_cfg(
         self, text_context, text_null_per_sample, batch_size, model_seq_len
     ):
-        """Build text context list for MotionLCM-style 2B CFG (cond || uncond).
+        """Build text context list for MotionLCM-style double-batch CFG (cond || uncond).
 
         WanModel/WanControlNet accept either one global caption per sample (len == B)
         or frame-aligned captions (len == B * model_seq_len). Returns None if the
@@ -382,7 +382,7 @@ class DiffForcingWanModel(nn.Module):
                 for single_text_list, single_text_end_list in zip(
                     text_list, text_end_list
                 ):
-                    if (not self.training) or (np.random.rand() > self.dropout):
+                    if (not self.training) or (np.random.rand() > self.text_dropout):
                         single_text_end_list = [0] + [
                             min(t, seq_len) for t in single_text_end_list
                         ]
@@ -414,7 +414,7 @@ class DiffForcingWanModel(nn.Module):
             else:
                 if self.training:
                     all_text_context = [
-                        (u if np.random.rand() > self.dropout else "") for u in text_list
+                        (u if np.random.rand() > self.text_dropout else "") for u in text_list
                     ]
                 else:
                     all_text_context = list(text_list)
@@ -426,7 +426,7 @@ class DiffForcingWanModel(nn.Module):
             all_text_context = [u.to(self.param_dtype) for u in all_text_context]
         return all_text_context
 
-    def _sample_traj_dropout_decision(self, device):
+    def _decide_traj_dropout(self, device):
         traj_dropped = False
         if self.training:
             drop = torch.empty(1, device=device).uniform_()
@@ -441,7 +441,7 @@ class DiffForcingWanModel(nn.Module):
         traj_emb = None
         traj_seq_lens = None
         if traj_dropped_override is None:
-            traj_dropped = self._sample_traj_dropout_decision(device)
+            traj_dropped = self._decide_traj_dropout(device)
         else:
             traj_dropped = bool(traj_dropped_override)
 
@@ -451,7 +451,7 @@ class DiffForcingWanModel(nn.Module):
 
         return traj_emb, traj_seq_lens, traj_dropped
 
-    def _build_window_inputs(self, clean_feature, feature_length, time_steps):
+    def _slice_diffusion_window(self, clean_feature, feature_length, time_steps):
         batch_size, seq_len, _ = clean_feature.shape
         device = clean_feature.device
 
@@ -477,7 +477,7 @@ class DiffForcingWanModel(nn.Module):
 
         return noise_level, feature_ref, noise_ref, noisy_feature_input, end_indices
 
-    def _run_single_window_forward(
+    def _forward_single_window(
         self,
         x,
         clean_feature,
@@ -498,7 +498,7 @@ class DiffForcingWanModel(nn.Module):
             noise_ref,
             noisy_feature_input,
             end_indices,
-        ) = self._build_window_inputs(clean_feature, feature_length, time_steps)
+        ) = self._slice_diffusion_window(clean_feature, feature_length, time_steps)
 
         if (
             enable_scheduled_sampling
@@ -533,7 +533,7 @@ class DiffForcingWanModel(nn.Module):
                 if self.prediction_type == "vel":
                     # Same low-β stability issue as the self-forcing rollout:
                     # use z = noisy_x + β·vel instead of vel + ε.  See the
-                    # comment in _run_single_window_forward for details.
+                    # comment in _forward_single_window for details.
                     beta_b = noise_level[b, :t_len].view(1, -1, 1, 1)
                     x0_hat = (
                         noisy_feature_input[b] + beta_b * pred_ss[b]
@@ -707,7 +707,7 @@ class DiffForcingWanModel(nn.Module):
             x, seq_len, device
         )
 
-        single_result = self._run_single_window_forward(
+        single_result = self._forward_single_window(
             x,
             feature,
             time_steps,
@@ -725,7 +725,7 @@ class DiffForcingWanModel(nn.Module):
             }
         return loss_dict
 
-    def _run_cfg_denoising_step(
+    def _denoise_with_cfg(
         self,
         noisy_input: list,
         t_scaled: torch.Tensor,
@@ -740,32 +740,32 @@ class DiffForcingWanModel(nn.Module):
 
         Handles three modes transparently:
           - 2-batch text CFG (cfg_scale_text != 1) + optional separated traj CFG
-          - Single-batch with post-hoc null-text forward (cfg_scale_text != 1, no 2b context)
+          - Single-batch with post-hoc null-text forward (cfg_scale_text != 1, no double-batch context)
           - Unconditioned (cfg_scale_text == 1)
         Returns a list of per-sample predicted tensors (C, T, 1, 1).
         """
-        ctx_2b = (
-            self._build_cfg_2b_text(text_cond_ctx, text_null_ctx, batch_size, seq_len)
+        ctx_double = (
+            self._concat_text_for_cfg(text_cond_ctx, text_null_ctx, batch_size, seq_len)
             if self.cfg_scale_text != 1.0
             else None
         )
 
-        if ctx_2b is not None:
-            noisy_2b = list(noisy_input) + list(noisy_input)
-            t_2b = torch.cat([t_scaled, t_scaled], dim=0)
-            traj_2b = (
+        if ctx_double is not None:
+            noisy_double = list(noisy_input) + list(noisy_input)
+            t_double = torch.cat([t_scaled, t_scaled], dim=0)
+            traj_double = (
                 torch.cat([traj_emb, traj_emb], dim=0) if traj_emb is not None else None
             )
-            traj_sl_2b = (
+            traj_sl_double = (
                 torch.cat([traj_seq_lens, traj_seq_lens], dim=0)
                 if traj_seq_lens is not None
                 else None
             )
             residuals = self._controlnet_forward(
-                noisy_2b, t_2b, ctx_2b, seq_len, traj_2b, traj_sl_2b
+                noisy_double, t_double, ctx_double, seq_len, traj_double, traj_sl_double
             )
-            pred_2b = self.model(
-                noisy_2b, t_2b, ctx_2b, seq_len,
+            pred_double = self.model(
+                noisy_double, t_double, ctx_double, seq_len,
                 y=None, traj_emb=None, traj_seq_lens=None, controlnet_residuals=residuals,
             )
             if self.cfg_scale_traj > 0.0:
@@ -778,14 +778,14 @@ class DiffForcingWanModel(nn.Module):
                 )
                 return [
                     pred_uncond[i]
-                    + self.cfg_scale_text * (pred_2b[i] - pred_2b[i + batch_size])
-                    + self.cfg_scale_traj * (pred_2b[i + batch_size] - pred_uncond[i])
+                    + self.cfg_scale_text * (pred_double[i] - pred_double[i + batch_size])
+                    + self.cfg_scale_traj * (pred_double[i + batch_size] - pred_uncond[i])
                     for i in range(batch_size)
                 ]
             else:
                 return [
-                    self.cfg_scale_text * pred_2b[i]
-                    - (self.cfg_scale_text - 1) * pred_2b[i + batch_size]
+                    self.cfg_scale_text * pred_double[i]
+                    - (self.cfg_scale_text - 1) * pred_double[i + batch_size]
                     for i in range(batch_size)
                 ]
         else:
@@ -937,7 +937,7 @@ class DiffForcingWanModel(nn.Module):
 
             gen_sl = seq_len + self.chunk_size
             t_scaled = noise_level * self.time_embedding_scale
-            predicted_result = self._run_cfg_denoising_step(
+            predicted_result = self._denoise_with_cfg(
                 noisy_input, t_scaled,
                 all_text_context, text_null_context,
                 traj_emb, traj_seq_lens, gen_sl, batch_size,
@@ -1115,7 +1115,7 @@ class DiffForcingWanModel(nn.Module):
 
             gen_sl = seq_len + self.chunk_size
             t_scaled = noise_level * self.time_embedding_scale
-            predicted_result = self._run_cfg_denoising_step(
+            predicted_result = self._denoise_with_cfg(
                 noisy_input, t_scaled,
                 all_text_context, text_null_context,
                 traj_emb, traj_seq_lens, gen_sl, batch_size,
@@ -1288,7 +1288,7 @@ class DiffForcingWanModel(nn.Module):
             )
             model_sl = min(end_index, self.seq_len)
             t_scaled = noise_level * self.time_embedding_scale
-            predicted_result = self._run_cfg_denoising_step(
+            predicted_result = self._denoise_with_cfg(
                 noisy_input, t_scaled,
                 text_condition, text_null_context,
                 traj_emb, traj_seq_lens, model_sl, self.batch_size,

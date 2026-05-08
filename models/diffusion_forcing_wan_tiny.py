@@ -105,6 +105,8 @@ class DiffForcingWanModel(nn.Module):
         kwargs.pop("controlnet_init_from_backbone", None)
         if "dropout" in kwargs:
             drop_out = kwargs.pop("dropout")
+        if "text_dropout" in kwargs:
+            drop_out = kwargs.pop("text_dropout")
         if "traj_dropout" in kwargs:
             traj_drop_out = kwargs.pop("traj_dropout")
         if kwargs:

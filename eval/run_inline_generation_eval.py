@@ -68,7 +68,7 @@ def main():
 
     model = CustomLightningModule(cfg=cfg.config)
     model.test_loader_tags = test_loader_tags
-    model._resume_step_offset = int(load_resume_step_offset(cfg.config.resume_ckpt))
+    model._resume_step_offset = int(load_resume_step_offset(args.ckpt))
 
     accelerator = args.accelerator or (
         "gpu" if torch.cuda.is_available() and args.devices > 0 else "cpu"
