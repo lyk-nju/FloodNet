@@ -129,10 +129,12 @@ def _run_inline_mode(args, run_dir: Path, config_path: Path, project_root: Path)
     print(f"[eval-watcher|inline] config={config_path}")
     print(f"[eval-watcher|inline] request_dir={request_dir}")
 
+    training_done_marker = async_root / "training_done"
+
     while True:
         pending = _iter_inline_requests(request_dir, state, args.min_request_age_sec)
         if not pending:
-            if args.once:
+            if args.once or training_done_marker.exists():
                 print("[eval-watcher|inline] no pending requests; exit.")
                 return
             time.sleep(args.poll_interval_sec)
@@ -325,6 +327,8 @@ def _run_generation_mode(args, run_dir: Path, config_path: Path, project_root: P
     state_path = async_root / "watcher_state.json"
     state = _load_state(state_path)
 
+    training_done_marker = async_root / "training_done"
+
     print(f"[eval-watcher|generation] run_dir={run_dir}")
     print(f"[eval-watcher|generation] config={config_path}")
     print(f"[eval-watcher|generation] probes={probe_specs}")
@@ -334,7 +338,7 @@ def _run_generation_mode(args, run_dir: Path, config_path: Path, project_root: P
             run_dir, state, args.min_ckpt_age_sec
         )
         if not pending:
-            if args.once:
+            if args.once or training_done_marker.exists():
                 print("[eval-watcher|generation] no pending checkpoints; exit.")
                 return
             time.sleep(args.poll_interval_sec)

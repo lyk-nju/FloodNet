@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import time
 
 import torch
@@ -400,6 +401,8 @@ def main():
     )
     save_config_and_codes(cfg, cfg.save_dir)
     maybe_launch_async_eval_watcher(cfg, save_dir)
+    if cfg.train and cfg.resume_ckpt:
+        emit_resume_ckpt_eval_request(cfg, save_dir, cfg.resume_ckpt)
 
     logger = None
     if not cfg.debug:
@@ -587,6 +590,14 @@ def main():
 
     if not cfg.debug and logger is not None:
         wandb.finish()
+
+    # Signal the async eval watcher that training is done so it can exit
+    # gracefully after processing remaining requests.
+    if async_test_mode:
+        done_marker = Path(save_dir) / "async_eval" / "training_done"
+        done_marker.parent.mkdir(parents=True, exist_ok=True)
+        done_marker.touch()
+        rank_zero_info("[async-eval] training_done marker written")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import atexit
 import json
 import os
 import subprocess
@@ -116,7 +115,6 @@ def maybe_launch_async_eval_watcher(cfg, save_dir: str):
     rank_zero_info(
         f"[async-eval] watcher launched pid={proc.pid} device={eval_device} log={log_path}"
     )
-    atexit.register(proc.terminate)
     return proc
 
 
