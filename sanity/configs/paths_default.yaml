@@ -1,0 +1,9 @@
+dirs:
+    deps: deps
+    outputs: outputs
+    raw_data: raw_data
+
+wandb_info:
+    key: ""  # Your WandB API key
+    project: "your_project_name"
+    entity: "your_wandb_entity"

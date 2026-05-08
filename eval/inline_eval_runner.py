@@ -3,7 +3,7 @@ import torch
 import random
 from lightning.pytorch.utilities import rank_zero_info
 
-from .inline_eval_artifacts import save_inline_eval_payloads
+from .inline_eval_summary import save_inline_eval_payloads
 
 try:
     from FloodNet.metrics.traj import (

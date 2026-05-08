@@ -91,7 +91,7 @@ def maybe_launch_async_eval_watcher(cfg, save_dir: str):
         return None
     if int(os.environ.get("RANK", "0")) != 0:
         return None
-    watcher_script = Path(__file__).parents[2] / "eval" / "watch_inline_generation.py"
+    watcher_script = Path(__file__).parents[2] / "eval" / "eval_watcher.py"
     eval_device = str(cfg.get("async_eval_device", "0"))
     log_path = Path(save_dir) / "async_eval" / "watcher.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)

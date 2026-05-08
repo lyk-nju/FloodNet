@@ -6,7 +6,7 @@ then a merge step loads all shards and computes the final FID / R-Precision / Di
 
 Usage:
     cd /home/yuankai/Text2Motion/FloodNet
-    conda run -n flooddiffusion python eval/run_t2m_parallel.py \\
+    conda run -n flooddiffusion python eval/run_t2m_metrics.py \\
         --config configs/ldf.yaml \\
         --ckpt outputs/20260506_012427_ldf/last.ckpt \\
         --gpu_ids 0 1 2 3 4 \\
