@@ -85,14 +85,39 @@ def emit_eval_request(module):
         )
 
 
+def _check_pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
 def launch_eval_watcher(cfg, save_dir: str):
     if not is_async_eval(cfg):
         return None
     if int(os.environ.get("RANK", "0")) != 0:
         return None
+
+    async_root = Path(save_dir) / "async_eval"
+    pidfile = async_root / "watcher.pid"
+
+    # Single-instance: if a watcher is already alive for this run_dir, reuse it.
+    if pidfile.exists():
+        try:
+            stale_pid = int(pidfile.read_text().strip())
+            if _check_pid_alive(stale_pid):
+                rank_zero_info(
+                    f"[async-eval] watcher already running pid={stale_pid}; skip launch."
+                )
+                return None
+            pidfile.unlink(missing_ok=True)
+        except (ValueError, OSError):
+            pidfile.unlink(missing_ok=True)
+
     watcher_script = Path(__file__).parents[2] / "eval" / "eval_watcher.py"
     eval_device = str(cfg.get("async_eval_device", "0"))
-    log_path = Path(save_dir) / "async_eval" / "watcher.log"
+    log_path = async_root / "watcher.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = eval_device
@@ -112,6 +137,7 @@ def launch_eval_watcher(cfg, save_dir: str):
         stderr=subprocess.STDOUT,
         start_new_session=True,
     )
+    pidfile.write_text(str(proc.pid))
     rank_zero_info(
         f"[async-eval] watcher launched pid={proc.pid} device={eval_device} log={log_path}"
     )

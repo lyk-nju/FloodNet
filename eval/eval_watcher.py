@@ -458,8 +458,8 @@ def parse_args():
     parser.add_argument(
         "--idle_timeout_min",
         type=float,
-        default=120.0,
-        help="Exit if idle (no new requests) for this many minutes. 0 = never timeout.",
+        default=0.0,
+        help="Exit if idle for this many minutes. 0 = never timeout (rely on training_done marker).",
     )
     parser.add_argument("--cuda_visible_devices", type=str, default=None)
     # Generation-mode options
@@ -478,6 +478,11 @@ def main():
     run_dir = Path(args.run_dir).resolve()
     if not run_dir.exists():
         raise FileNotFoundError(f"run_dir does not exist: {run_dir}")
+
+    # Clean up pidfile when watcher exits.
+    pidfile = run_dir / "async_eval" / "watcher.pid"
+    import atexit
+    atexit.register(lambda: pidfile.unlink(missing_ok=True))
 
     config_path = (
         Path(args.config).resolve() if args.config else _discover_config(run_dir)
