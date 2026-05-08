@@ -42,18 +42,26 @@ class SelfForcingTrainer:
         self._module = module
         self._preconditions_checked = False
         self._last_replace_diff: float | None = None
-
-        # Resolve gradient clip value once.
-        clip_val = getattr(getattr(module, "trainer", None), "gradient_clip_val", None)
-        if clip_val is None or float(clip_val) <= 0:
-            clip_val = float(module.cfg.get("self_forcing_grad_clip", 1.0))
-        else:
-            clip_val = float(clip_val)
-        self._grad_clip_val = clip_val
+        self._grad_clip_val: float | None = None  # resolved lazily
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def _resolve_grad_clip(self) -> float:
+        if self._grad_clip_val is not None:
+            return self._grad_clip_val
+        trainer = getattr(self._module, "trainer", None)
+        try:
+            clip_val = getattr(trainer, "gradient_clip_val", None)
+        except RuntimeError:
+            clip_val = None  # trainer not attached yet
+        if clip_val is None or float(clip_val) <= 0:
+            clip_val = float(self._module.cfg.get("self_forcing_grad_clip", 1.0))
+        else:
+            clip_val = float(clip_val)
+        self._grad_clip_val = clip_val
+        return clip_val
 
     def training_step(self, batch: dict) -> torch.Tensor:
         """Execute one complete self-forcing training step."""
@@ -83,7 +91,7 @@ class SelfForcingTrainer:
 
         module.manual_backward(total_loss)
         trainable = [p for p in module.model.parameters() if p.requires_grad]
-        grad_norm = torch.nn.utils.clip_grad_norm_(trainable, self._grad_clip_val)
+        grad_norm = torch.nn.utils.clip_grad_norm_(trainable, self._resolve_grad_clip())
         runtime_metrics["self_forcing/grad_norm"] = float(grad_norm)
         optimizer.step()
         if lr_scheduler is not None:
