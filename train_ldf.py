@@ -400,8 +400,9 @@ def main():
         f"Save dir: {save_dir}, current working dir: {os.getcwd()}, exp_name: {cfg.exp_name}"
     )
     save_config_and_codes(cfg, cfg.save_dir)
+    async_test_mode = async_test_mode_enabled(cfg)
     maybe_launch_async_eval_watcher(cfg, save_dir)
-    if cfg.train and cfg.resume_ckpt:
+    if cfg.train and cfg.resume_ckpt and async_test_mode:
         emit_resume_ckpt_eval_request(cfg, save_dir, cfg.resume_ckpt)
 
     logger = None
@@ -459,7 +460,6 @@ def main():
         collate_fn=collate_fn,
     )
 
-    async_test_mode = async_test_mode_enabled(cfg)
     if async_test_mode:
         test_probe_loaders = []
         test_loader_tags = build_test_probe_tags(cfg)

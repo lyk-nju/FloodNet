@@ -130,15 +130,24 @@ def _run_inline_mode(args, run_dir: Path, config_path: Path, project_root: Path)
     print(f"[eval-watcher|inline] request_dir={request_dir}")
 
     training_done_marker = async_root / "training_done"
+    last_activity = time.time()
 
     while True:
         pending = _iter_inline_requests(request_dir, state, args.min_request_age_sec)
         if not pending:
+            idle_sec = time.time() - last_activity
             if args.once or training_done_marker.exists():
                 print("[eval-watcher|inline] no pending requests; exit.")
                 return
+            if args.idle_timeout_min > 0 and idle_sec > args.idle_timeout_min * 60:
+                print(
+                    f"[eval-watcher|inline] idle for {idle_sec:.0f}s "
+                    f"(timeout={args.idle_timeout_min}min); exit."
+                )
+                return
             time.sleep(args.poll_interval_sec)
             continue
+        last_activity = time.time()
 
         for step, request_path, payload in pending:
             request_key = str(request_path.resolve())
@@ -328,6 +337,7 @@ def _run_generation_mode(args, run_dir: Path, config_path: Path, project_root: P
     state = _load_state(state_path)
 
     training_done_marker = async_root / "training_done"
+    last_activity = time.time()
 
     print(f"[eval-watcher|generation] run_dir={run_dir}")
     print(f"[eval-watcher|generation] config={config_path}")
@@ -338,11 +348,19 @@ def _run_generation_mode(args, run_dir: Path, config_path: Path, project_root: P
             run_dir, state, args.min_ckpt_age_sec
         )
         if not pending:
+            idle_sec = time.time() - last_activity
             if args.once or training_done_marker.exists():
                 print("[eval-watcher|generation] no pending checkpoints; exit.")
                 return
+            if args.idle_timeout_min > 0 and idle_sec > args.idle_timeout_min * 60:
+                print(
+                    f"[eval-watcher|generation] idle for {idle_sec:.0f}s "
+                    f"(timeout={args.idle_timeout_min}min); exit."
+                )
+                return
             time.sleep(args.poll_interval_sec)
             continue
+        last_activity = time.time()
 
         for step, ckpt_path in pending:
             ckpt_key = str(ckpt_path.resolve())
@@ -437,6 +455,12 @@ def parse_args():
     parser.add_argument("--devices", type=int, default=1)
     parser.add_argument("--accelerator", type=str, default=None)
     parser.add_argument("--once", action="store_true")
+    parser.add_argument(
+        "--idle_timeout_min",
+        type=float,
+        default=120.0,
+        help="Exit if idle (no new requests) for this many minutes. 0 = never timeout.",
+    )
     parser.add_argument("--cuda_visible_devices", type=str, default=None)
     # Generation-mode options
     parser.add_argument("--num_runs", type=int, default=None)
