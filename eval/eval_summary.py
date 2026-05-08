@@ -10,7 +10,7 @@ from lightning.pytorch.utilities import rank_zero_info
 try:
     from FloodNet.metrics.traj import _get_metric_statistics
     from FloodNet.utils.training import (
-        compute_checkpoint_step_info,
+        ckpt_step_info,
         compute_step_semantics,
         get_test_probe_tags,
     )
@@ -18,7 +18,7 @@ try:
 except ImportError:  # pragma: no cover - script entrypoints use top-level imports
     from metrics.traj import _get_metric_statistics
     from utils.training import (
-        compute_checkpoint_step_info,
+        ckpt_step_info,
         compute_step_semantics,
         get_test_probe_tags,
     )
@@ -233,7 +233,7 @@ def _log_probe_summary(module, dataset_id, probe_tag, step_tag, summary):
 
 
 def process_inline_generation_results(module):
-    step_tag = compute_checkpoint_step_info(module).step_tag
+    step_tag = ckpt_step_info(module).step_tag
     for dataset_id in os.listdir(module.cfg.save_dir):
         feature_root = Path(module.cfg.save_dir) / dataset_id / "feature"
         if not os.path.exists(feature_root):

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .step_semantics import build_checkpoint_step_info, build_step_semantics
+from .step_semantics import _make_step_info, build_step_semantics
 
 
 def _get_module_phase_step(module) -> int:
@@ -30,8 +30,8 @@ def compute_step_semantics(module, phase_step: int | None = None):
     )
 
 
-def compute_checkpoint_step_info(module, *, include_next_step: bool = False):
-    return build_checkpoint_step_info(
+def ckpt_step_info(module, *, include_next_step: bool = False):
+    return _make_step_info(
         compute_step_semantics(module),
         include_next_step=include_next_step,
     )

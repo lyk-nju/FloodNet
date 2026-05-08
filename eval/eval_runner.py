@@ -20,7 +20,7 @@ try:
     from FloodNet.utils.training import (
         build_generation_eval_cfg,
         prepare_model_input,
-        compute_checkpoint_step_info,
+        ckpt_step_info,
         resolve_test_probe_tag,
     )
 except ImportError:  # pragma: no cover - script entrypoints use top-level imports
@@ -38,7 +38,7 @@ except ImportError:  # pragma: no cover - script entrypoints use top-level impor
     from utils.training import (
         build_generation_eval_cfg,
         prepare_model_input,
-        compute_checkpoint_step_info,
+        ckpt_step_info,
         resolve_test_probe_tag,
     )
 
@@ -69,7 +69,7 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
     do_eval_metrics = eval_cfg["enabled"] and "traj" in batch and "traj_mask" in batch
     generation_num_runs = eval_num_runs if do_eval_metrics else 1
     probe_tag = resolve_test_probe_tag(module, test_loader_idx)
-    step_tag = compute_checkpoint_step_info(module).step_tag
+    step_tag = ckpt_step_info(module).step_tag
 
     try:
         local_payloads = []

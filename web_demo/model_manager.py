@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import torch
 import numpy as np
 from torch_ema import ExponentialMovingAverage
-from utils.initialize import instantiate, load_config, compare_statedict_and_parameters
+from utils.initialize import instantiate, load_config
 from utils.motion_process import StreamJointRecovery263
 from utils.stream_rollout import build_stream_step_model_input
 

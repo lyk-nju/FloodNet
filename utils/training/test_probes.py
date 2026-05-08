@@ -25,7 +25,7 @@ def build_val_dataloaders(cfg, val_dataloader, test_probe_loaders):
     return [val_dataloader] + test_probe_loaders
 
 
-def build_test_probe_loaders(cfg, collate_fn):
+def build_probe_loaders(cfg, collate_fn):
     probe_cfg = cfg.data.get("test_probe_meta_paths", None)
     probe_specs = []
     if probe_cfg:

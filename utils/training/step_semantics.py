@@ -49,7 +49,7 @@ def resolve_runtime_max_steps(
     return runtime_max_steps
 
 
-def resolve_runtime_scheduler_steps(
+def resolve_scheduler_steps(
     configured_num_training_steps: int,
     *,
     absolute_target_step: int,
@@ -105,7 +105,7 @@ def build_step_semantics(
     )
 
 
-def build_checkpoint_step_info(
+def _make_step_info(
     semantics: StepSemantics,
     *,
     include_next_step: bool,

@@ -79,7 +79,7 @@ def root_to_traj_feats(traj_xyz, eps: float = _PATH_HEADING_EPS):
         return torch.cat([x_coord, z_coord, cos_yaw, sin_yaw], dim=-1)
 
 
-def group_frames_to_tokens_causal(feats_frame: torch.Tensor, seq_len: int) -> torch.Tensor:
+def frames_to_tokens(feats_frame: torch.Tensor, seq_len: int) -> torch.Tensor:
     """Group frame-level features into per-token 4-frame windows (causal VAE convention).
 
     Causal VAE: N tokens ↔ 4*(N-1)+1 frames.
@@ -105,7 +105,7 @@ def group_frames_to_tokens_causal(feats_frame: torch.Tensor, seq_len: int) -> to
     return tok0                                                         # (B, 1, 4, C)
 
 
-def build_traj_emb_from_batch(
+def encode_traj_batch(
     x: dict,
     seq_len: int,
     device,
@@ -117,7 +117,7 @@ def build_traj_emb_from_batch(
     Pipeline:
       traj_features (B,T,4) or traj xyz (B,T,3)
         → frame-level mask gate
-        → group_frames_to_tokens_causal  [skipped if already token-level]
+        → frames_to_tokens  [skipped if already token-level]
         → local_traj_encoder
         → token-level mask gate
         → traj_encoder
@@ -159,7 +159,7 @@ def build_traj_emb_from_batch(
     if feats_frame.shape[1] == seq_len:
         feats_tok = feats_frame                                        # already token-level
     else:
-        feats_4 = group_frames_to_tokens_causal(feats_frame, seq_len) # (B, seq_len, 4, C)
+        feats_4 = frames_to_tokens(feats_frame, seq_len) # (B, seq_len, 4, C)
         feats_tok = local_traj_encoder(feats_4)                        # (B, seq_len, C)
 
     # --- token-level mask gate ---

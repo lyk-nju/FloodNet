@@ -416,7 +416,7 @@ def _compute_control_loss(pred_list, batch, module):
     )
 
 
-def resolve_self_forcing_runtime_steps(
+def resolve_sf_runtime(
     absolute_target_step: int,
     resume_ckpt: str | None,
     model_self_forcing_enabled: bool,
@@ -429,7 +429,7 @@ def resolve_self_forcing_runtime_steps(
     from .step_semantics import (
         load_resume_step_offset,
         resolve_runtime_max_steps,
-        resolve_runtime_scheduler_steps,
+        resolve_scheduler_steps,
     )
 
     resume_step_offset = 0
@@ -448,7 +448,7 @@ def resolve_self_forcing_runtime_steps(
             f"phase_max_steps={phase_max_steps}"
         )
 
-    runtime_scheduler_steps = resolve_runtime_scheduler_steps(
+    runtime_scheduler_steps = resolve_scheduler_steps(
         configured_num_training_steps,
         absolute_target_step=absolute_target_step,
         runtime_max_steps=phase_max_steps,

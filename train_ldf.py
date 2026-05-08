@@ -17,7 +17,7 @@ from metrics.t2m import T2MMetrics
 from eval.eval_runner import run_inline_generation_eval
 from eval.eval_summary import process_inline_generation_results
 from utils.initialize import (
-    compare_statedict_and_parameters,
+    check_state_dict,
     get_function,
     get_shared_run_time,
     instantiate,
@@ -26,17 +26,17 @@ from utils.initialize import (
 )
 from utils.lightning_module import BasicLightningModule
 from utils.training import (
-    async_test_mode_enabled,
+    is_async_eval,
     prepare_model_input,
-    build_test_probe_loaders,
+    build_probe_loaders,
     build_test_probe_tags,
     build_val_dataloaders,
     compute_control_loss_xz,
-    emit_async_test_request,
-    emit_resume_ckpt_eval_request,
-    compute_checkpoint_step_info,
-    maybe_launch_async_eval_watcher,
-    resolve_self_forcing_runtime_steps,
+    emit_eval_request,
+    emit_resume_eval,
+    ckpt_step_info,
+    launch_eval_watcher,
+    resolve_sf_runtime,
     SelfForcingTrainer,
 )
 
@@ -86,7 +86,7 @@ class CustomLightningModule(BasicLightningModule):
         )
         self.log(
             "ckpt_absolute_step",
-            float(compute_checkpoint_step_info(self).metric_value),
+            float(ckpt_step_info(self).metric_value),
             on_step=True,
             prog_bar=False,
             batch_size=batch_size,
@@ -154,7 +154,7 @@ class CustomLightningModule(BasicLightningModule):
             self.vae.load_state_dict(vae_ckpt["state_dict"], strict=True)
             rank_zero_info(f"Loaded VAE model from {self.cfg.test_vae_ckpt} w/o EMA")
 
-        compare_statedict_and_parameters(
+        check_state_dict(
             state_dict=self.vae.state_dict(),
             named_parameters=self.vae.named_parameters(),
             named_buffers=self.vae.named_buffers(),
@@ -226,7 +226,7 @@ class CustomLightningModule(BasicLightningModule):
                 rank_zero_info("Skip restoring optimizer/scheduler (new cond params)")
             else:
                 rank_zero_info("Skip restoring optimizer/scheduler (resume_reset_optimizer)")
-        compare_statedict_and_parameters(
+        check_state_dict(
             state_dict=self.model.state_dict(),
             named_parameters=self.model.named_parameters(),
             named_buffers=self.model.named_buffers(),
@@ -234,7 +234,7 @@ class CustomLightningModule(BasicLightningModule):
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         super().on_train_batch_end(outputs, batch, batch_idx)
-        emit_async_test_request(self)
+        emit_eval_request(self)
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -361,7 +361,7 @@ class CustomLightningModule(BasicLightningModule):
             self.log(f"metrics/t2m_metrics/{key}", value, sync_dist=True)
 
     def on_validation_epoch_end(self):
-        if not async_test_mode_enabled(self.cfg):
+        if not is_async_eval(self.cfg):
             if (
                 not self.trainer.sanity_checking
                 and self.global_step > 0
@@ -400,10 +400,10 @@ def main():
         f"Save dir: {save_dir}, current working dir: {os.getcwd()}, exp_name: {cfg.exp_name}"
     )
     save_config_and_codes(cfg, cfg.save_dir)
-    async_test_mode = async_test_mode_enabled(cfg)
-    maybe_launch_async_eval_watcher(cfg, save_dir)
+    async_test_mode = is_async_eval(cfg)
+    launch_eval_watcher(cfg, save_dir)
     if cfg.train and cfg.resume_ckpt and async_test_mode:
-        emit_resume_ckpt_eval_request(cfg, save_dir, cfg.resume_ckpt)
+        emit_resume_eval(cfg, save_dir, cfg.resume_ckpt)
 
     logger = None
     if not cfg.debug:
@@ -472,7 +472,7 @@ def main():
             test_probe_loaders,
             test_loader_tags,
             total_probe_samples,
-        ) = build_test_probe_loaders(cfg, collate_fn)
+        ) = build_probe_loaders(cfg, collate_fn)
 
     rank_zero_info(
         f"Train dataset: {len(train_dataset) if train_dataset is not None else 0}, "
@@ -494,7 +494,7 @@ def main():
         resume_step_offset,
         phase_max_steps,
         runtime_scheduler_steps,
-    ) = resolve_self_forcing_runtime_steps(
+    ) = resolve_sf_runtime(
         trainer_absolute_max_steps,
         cfg.resume_ckpt if cfg.train else None,
         model_self_forcing_enabled,

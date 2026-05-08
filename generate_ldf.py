@@ -5,7 +5,7 @@ import torch
 from lightning import seed_everything
 from torch_ema import ExponentialMovingAverage
 
-from utils.initialize import compare_statedict_and_parameters, instantiate, load_config
+from utils.initialize import check_state_dict, instantiate, load_config
 from utils.motion_process import StreamJointRecovery263
 from utils.render_skeleton import get_humanml3d_chains, render_simple_skeleton_video
 from utils.visualize import render_single_video
@@ -39,7 +39,7 @@ def load_model_from_config():
         vae.load_state_dict(vae_ckpt["state_dict"], strict=True)
         print(f"Loaded VAE model from {cfg.test_vae_ckpt} w/o EMA")
 
-    compare_statedict_and_parameters(
+    check_state_dict(
         state_dict=vae.state_dict(),
         named_parameters=vae.named_parameters(),
         named_buffers=vae.named_buffers(),
@@ -85,7 +85,7 @@ def load_model_from_config():
     else:
         print(f"Loaded model from {cfg.test_ckpt} w/o EMA")
 
-    compare_statedict_and_parameters(
+    check_state_dict(
         state_dict=model.state_dict(),
         named_parameters=model.named_parameters(),
         named_buffers=model.named_buffers(),

@@ -11,11 +11,11 @@ import torch
 from lightning.pytorch.utilities import rank_zero_info
 
 from .inline_eval_runtime import get_test_probe_tags
-from .module_step import compute_checkpoint_step_info, compute_step_semantics
+from .module_step import ckpt_step_info, compute_step_semantics
 from .test_probes import build_test_probe_tags
 
 
-def async_test_mode_enabled(cfg) -> bool:
+def is_async_eval(cfg) -> bool:
     return str(cfg.get("validation", {}).get("test_mode", "inline")) == "async"
 
 
@@ -35,11 +35,11 @@ def get_async_eval_request_path(save_dir: str | Path, step: int) -> Path:
     return get_async_eval_root(save_dir) / "requests" / f"step_{step:06d}.json"
 
 
-def emit_async_test_request(module):
+def emit_eval_request(module):
     trainer = getattr(module, "trainer", None)
     if trainer is None:
         return
-    if trainer.sanity_checking or not async_test_mode_enabled(module.cfg):
+    if trainer.sanity_checking or not is_async_eval(module.cfg):
         return
     if module.global_step <= 0:
         return
@@ -48,7 +48,7 @@ def emit_async_test_request(module):
         return
 
     step_semantics = compute_step_semantics(module)
-    step_info = compute_checkpoint_step_info(module)
+    step_info = ckpt_step_info(module)
     step = int(step_semantics.absolute_step)
     ckpt_path = get_async_eval_ckpt_path(module.cfg.save_dir, step)
     request_path = get_async_eval_request_path(module.cfg.save_dir, step)
@@ -85,8 +85,8 @@ def emit_async_test_request(module):
         )
 
 
-def maybe_launch_async_eval_watcher(cfg, save_dir: str):
-    if not async_test_mode_enabled(cfg):
+def launch_eval_watcher(cfg, save_dir: str):
+    if not is_async_eval(cfg):
         return None
     if int(os.environ.get("RANK", "0")) != 0:
         return None
@@ -118,7 +118,7 @@ def maybe_launch_async_eval_watcher(cfg, save_dir: str):
     return proc
 
 
-def emit_resume_ckpt_eval_request(cfg, save_dir: str, resume_ckpt: str):
+def emit_resume_eval(cfg, save_dir: str, resume_ckpt: str):
     """Emit an initial async eval request for the resume checkpoint at startup.
 
     Reads the checkpoint's global_step to set the correct step tag, then

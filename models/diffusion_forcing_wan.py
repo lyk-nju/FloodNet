@@ -10,10 +10,10 @@ from .tools.wan_model import WanModel
 from .tools.wan_controlnet import WanControlNet
 
 try:
-    from FloodNet.utils.traj_batch import build_traj_emb_from_batch
+    from FloodNet.utils.traj_batch import encode_traj_batch
     from FloodNet.utils.traj_stream_buffer import TrajStreamBuffer
 except ImportError:  # pragma: no cover - script entrypoints use top-level imports
-    from utils.traj_batch import build_traj_emb_from_batch
+    from utils.traj_batch import encode_traj_batch
     from utils.traj_stream_buffer import TrajStreamBuffer
 
 
@@ -349,7 +349,7 @@ class DiffForcingWanModel(nn.Module):
     def _build_traj_emb(self, x, seq_len, device):
         if self.traj_encoder is None:
             return None
-        return build_traj_emb_from_batch(
+        return encode_traj_batch(
             x, seq_len, device, self.local_traj_encoder, self.traj_encoder
         )
 

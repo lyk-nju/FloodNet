@@ -2,7 +2,7 @@
 appropriate runner outside the training loop, with GPU isolation.
 
 Supports two modes:
-  --mode inline      Polls for request JSON files emitted by emit_async_test_request.
+  --mode inline      Polls for request JSON files emitted by emit_eval_request.
                      Launches run_eval.py for each pending request.
   --mode generation  Polls for checkpoint files directly.
                      Launches eval_generation_metrics.py for each pending checkpoint.

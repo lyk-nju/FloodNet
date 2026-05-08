@@ -14,7 +14,7 @@ if PROJECT_ROOT not in sys.path:
 
 from train_ldf import CustomLightningModule  # noqa: E402
 from utils.initialize import get_function, load_config  # noqa: E402
-from utils.training import build_test_probe_loaders, load_resume_step_offset  # noqa: E402
+from utils.training import build_probe_loaders, load_resume_step_offset  # noqa: E402
 
 
 def parse_args():
@@ -61,7 +61,7 @@ def main():
     collate_fn = (
         get_function(cfg.data.collate_fn) if cfg.data.get("collate_fn", None) else None
     )
-    test_probe_loaders, test_loader_tags, total_probe_samples = build_test_probe_loaders(
+    test_probe_loaders, test_loader_tags, total_probe_samples = build_probe_loaders(
         cfg, collate_fn
     )
     rank_zero_info(f"[async-inline-eval] total probe samples: {total_probe_samples}")

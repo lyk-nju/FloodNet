@@ -11,11 +11,11 @@ import torch
 
 try:
     from FloodNet.utils.traj_batch import (
-        group_frames_to_tokens_causal,
+        frames_to_tokens,
         root_to_traj_feats,
     )
 except ImportError:  # pragma: no cover - script entrypoints use top-level imports
-    from utils.traj_batch import group_frames_to_tokens_causal, root_to_traj_feats
+    from utils.traj_batch import frames_to_tokens, root_to_traj_feats
 
 
 class TrajStreamBuffer:
@@ -276,7 +276,7 @@ class TrajStreamBuffer:
         # token-level xyz → frame-level via linear interpolation → heading features
         traj_frames = _expand_tokens_to_causal_frames(traj_slice)   # (B, 1+4*(N-1), 3)
         feats_frame = root_to_traj_feats(traj_frames)               # (B, T_frames, 4)
-        feats_4 = group_frames_to_tokens_causal(feats_frame, ctx_len)  # (B, ctx_len, 4, 4)
+        feats_4 = frames_to_tokens(feats_frame, ctx_len)  # (B, ctx_len, 4, 4)
         feats_tok = self.local_traj_encoder(feats_4)                 # (B, ctx_len, 4)
 
         if mask is not None:

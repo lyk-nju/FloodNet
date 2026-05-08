@@ -159,7 +159,7 @@ def print_model_size(model):
     rank_zero_info(f"Non-trainable parameters: {(total_params - trainable_params):,}")
 
 
-def compare_statedict_and_parameters(state_dict, named_parameters, named_buffers):
+def check_state_dict(state_dict, named_parameters, named_buffers):
     """Compare differences between state_dict and parameters"""
     # Get all keys in state_dict
     state_dict_keys = set(state_dict.keys())

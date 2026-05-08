@@ -7,11 +7,11 @@ from lightning.pytorch.utilities import rank_zero_info
 from torch_ema import ExponentialMovingAverage
 
 from utils.initialize import (
-    compare_statedict_and_parameters,
+    check_state_dict,
     instantiate,
     print_model_size,
 )
-from utils.training.module_step import compute_checkpoint_step_info
+from utils.training.module_step import ckpt_step_info
 
 # Set tokenizers parallelism to false to avoid warnings in multiprocessing
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -90,7 +90,7 @@ class BasicLightningModule(LightningModule):
             rank_zero_info("init ema from current model weights")
 
         # Compare state_dict and parameters
-        compare_statedict_and_parameters(
+        check_state_dict(
             state_dict=self.model.state_dict(),
             named_parameters=self.model.named_parameters(),
             named_buffers=self.model.named_buffers(),
@@ -135,7 +135,7 @@ class BasicLightningModule(LightningModule):
         )
         self.log(
             "ckpt_absolute_step",
-            float(compute_checkpoint_step_info(self).metric_value),
+            float(ckpt_step_info(self).metric_value),
             on_step=True,
             prog_bar=False,
             batch_size=batch_size,
