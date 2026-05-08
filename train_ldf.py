@@ -13,8 +13,8 @@ from torch.utils.data import DataLoader
 from torch_ema import ExponentialMovingAverage
 
 from metrics.t2m import T2MMetrics
-from eval.inline_eval_runner import run_inline_generation_eval
-from eval.inline_eval_summary import process_inline_generation_results
+from eval.eval_runner import run_inline_generation_eval
+from eval.eval_summary import process_inline_generation_results
 from utils.initialize import (
     compare_statedict_and_parameters,
     get_function,

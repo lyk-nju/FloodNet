@@ -5,8 +5,8 @@ Reusable trajectory and control metric computation functions.
 
 Shared by:
   - eval/eval_generation_metrics.py  (CLI offline evaluation)
-  - eval/inline_eval_runner.py        (inline training evaluation)
-  - eval/inline_eval_summary.py       (summary aggregation)
+  - eval/eval_runner.py        (inline training evaluation)
+  - eval/eval_summary.py       (summary aggregation)
 """
 import hashlib
 import random

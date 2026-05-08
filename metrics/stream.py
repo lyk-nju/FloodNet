@@ -6,13 +6,13 @@ import numpy as np
 import torch
 
 try:
-    from FloodNet.eval.inline_eval_summary import build_inline_eval_summary
+    from FloodNet.eval.eval_summary import build_eval_summary
     from FloodNet.utils.motion_process import (
         extract_root_trajectory_263_torch,
         recover_joint_positions_263,
     )
 except ImportError:  # pragma: no cover - script entrypoints use top-level imports
-    from eval.inline_eval_summary import build_inline_eval_summary
+    from eval.eval_summary import build_eval_summary
     from utils.motion_process import (
         extract_root_trajectory_263_torch,
         recover_joint_positions_263,
@@ -156,7 +156,7 @@ def compute_stream_vs_offline_metrics(
 def summarize_stream_records(records: Sequence[Dict]) -> Dict:
     if not records:
         return {}
-    summary = build_inline_eval_summary(records)
+    summary = build_eval_summary(records)
 
     def _append_stats(record_key: str, summary_prefix: str):
         vals = [record[record_key] for record in records if record_key in record and record[record_key] == record[record_key]]
