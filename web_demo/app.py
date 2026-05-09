@@ -585,8 +585,7 @@ if __name__ == '__main__':
     parser.add_argument('--port', type=int, default=5000,
                         help='Port to run the server on (default: 5000)')
     args = parser.parse_args()
-    
-    global model_config_path, demo_config_path, traj_mask_cfg
+
     model_config_path = args.config
     demo_config_path = args.demo_config
     traj_mask_cfg = load_traj_mask_cfg(demo_config_path)

@@ -48,15 +48,18 @@ def build_probe_loaders(cfg, collate_fn):
         if meta_paths is not None:
             OmegaConf.update(probe_cfg_obj, "data.test_meta_paths", meta_paths)
         probe_dataset = instantiate(test_target, cfg=probe_cfg_obj, split="test")
+        dl_kwargs = dict(
+            num_workers=cfg.data.num_workers,
+            prefetch_factor=8 if cfg.data.num_workers > 0 else None,
+            persistent_workers=cfg.data.num_workers > 0,
+        )
         probe_loader = DataLoader(
             probe_dataset,
             batch_size=cfg.data.test_bs,
             shuffle=False,
             drop_last=False,
-            num_workers=cfg.data.num_workers,
-            persistent_workers=False,
-            prefetch_factor=8,
             collate_fn=collate_fn,
+            **{k: v for k, v in dl_kwargs.items() if v is not None},
         )
         loaders.append(probe_loader)
         tags.append(probe_tag)

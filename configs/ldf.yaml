@@ -161,6 +161,8 @@ model:
         self_forcing_stride_tokens: 1
         self_forcing_detach_between_steps: true
         # Thresholds are phase progress over [resume_ckpt.global_step, trainer.max_steps].
+        # K=1 is diagnostic mode: rollout forward runs but no self-pred substitution.
+        # For real multi-step self-forcing, raise K (e.g. [0.0, 2], [0.4, 3], [0.7, 5]).
         self_forcing_k_schedule:
             - [0.0, 1]
 

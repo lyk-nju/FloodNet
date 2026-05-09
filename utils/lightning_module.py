@@ -75,7 +75,10 @@ class BasicLightningModule(LightningModule):
         }
 
     def load_state_dict(self, state_dict, strict=True):
-        pass
+        raise NotImplementedError(
+            "Direct load_state_dict is disabled. Use trainer.fit(ckpt_path=...) "
+            "or trainer.validate(ckpt_path=...) which call on_load_checkpoint."
+        )
 
     def on_load_checkpoint(self, checkpoint):
         self.model.load_state_dict(checkpoint["state_dict"], strict=True)

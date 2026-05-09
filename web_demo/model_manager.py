@@ -236,18 +236,14 @@ class ModelManager:
 
             if "ema_state" in checkpoint:
                 n_shadow = len(checkpoint["ema_state"]["shadow_params"])
-                all_params = list(model.parameters())
-                if n_shadow == len(all_params):
-                    ema_params = all_params
-                elif getattr(model, "freeze_backbone", False) and model.controlnet is not None:
-                    ema_params = list(model.controlnet.parameters()) + (
-                        list(model.traj_encoder.parameters()) if model.traj_encoder is not None else []
-                    )
-                else:
-                    ema_params = all_params
+                ema_params = [p for p in model.parameters() if p.requires_grad]
+                if len(ema_params) != n_shadow:
+                    ema_params = list(model.parameters())
                 assert len(ema_params) == n_shadow, (
                     f"EMA shadow_params count ({n_shadow}) does not match "
-                    f"selected param group ({len(ema_params)})."
+                    f"trainable params ({len([p for p in model.parameters() if p.requires_grad])}) "
+                    f"or total params ({len(list(model.parameters()))}). "
+                    "Check freeze settings or EMA checkpoint."
                 )
                 ema = ExponentialMovingAverage(ema_params, decay=cfg.model.ema_decay)
                 ema.load_state_dict(checkpoint["ema_state"])

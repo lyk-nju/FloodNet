@@ -476,16 +476,19 @@ def main():
         cfg.data.get("val_target", cfg.data.target), cfg=cfg.config, split="val"
     )
 
+    dl_kwargs = dict(
+        num_workers=cfg.data.num_workers,
+        prefetch_factor=8 if cfg.data.num_workers > 0 else None,
+        persistent_workers=cfg.data.num_workers > 0,
+    )
     train_dataloader = (
         DataLoader(
             train_dataset,
             batch_size=cfg.data.train_bs,
             shuffle=True,
             drop_last=False,
-            num_workers=cfg.data.num_workers,
-            persistent_workers=True,
-            prefetch_factor=8,
             collate_fn=collate_fn,
+            **{k: v for k, v in dl_kwargs.items() if v is not None},
         )
         if cfg.train
         else None
@@ -495,10 +498,8 @@ def main():
         batch_size=cfg.data.val_bs,
         shuffle=False,
         drop_last=False,
-        num_workers=cfg.data.num_workers,
-        persistent_workers=False,
-        prefetch_factor=8,
         collate_fn=collate_fn,
+        **{k: v for k, v in dl_kwargs.items() if v is not None},
     )
 
     if async_test_mode:
@@ -528,33 +529,42 @@ def main():
     model_self_forcing_enabled = bool(
         cfg.config.model.params.get("self_forcing_enabled", False)
     )
+    lr_params = OmegaConf.to_container(
+        cfg.config.lr_scheduler.params, resolve=True
+    )
     scheduler_training_steps = int(
-        OmegaConf.to_container(
-            cfg.config.lr_scheduler.params,
-            resolve=True,
-        )["num_training_steps"]
+        lr_params.get("num_training_steps", lr_params.get("T_max", 0))
     )
-    (
-        resume_step_offset,
-        phase_max_steps,
-        runtime_scheduler_steps,
-    ) = resolve_sf_runtime(
-        trainer_absolute_max_steps,
-        cfg.resume_ckpt if cfg.train else None,
-        model_self_forcing_enabled,
-        scheduler_training_steps,
-    )
-    if runtime_scheduler_steps != scheduler_training_steps:
-        OmegaConf.update(
-            cfg.config,
-            "lr_scheduler.params.num_training_steps",
-            int(runtime_scheduler_steps),
+    if scheduler_training_steps > 0:
+        (
+            resume_step_offset,
+            phase_max_steps,
+            runtime_scheduler_steps,
+        ) = resolve_sf_runtime(
+            trainer_absolute_max_steps,
+            cfg.resume_ckpt if cfg.train else None,
+            model_self_forcing_enabled,
+            scheduler_training_steps,
         )
-        rank_zero_info(
-            "[self_forcing runtime] "
-            f"lr_scheduler.num_training_steps={runtime_scheduler_steps} "
-            f"(was {scheduler_training_steps})"
-        )
+        if runtime_scheduler_steps != scheduler_training_steps:
+            key = (
+                "num_training_steps"
+                if "num_training_steps" in lr_params
+                else "T_max"
+            )
+            OmegaConf.update(
+                cfg.config,
+                f"lr_scheduler.params.{key}",
+                int(runtime_scheduler_steps),
+            )
+            rank_zero_info(
+                "[self_forcing runtime] "
+                f"lr_scheduler.{key}={runtime_scheduler_steps} "
+                f"(was {scheduler_training_steps})"
+            )
+    else:
+        resume_step_offset = 0
+        runtime_scheduler_steps = 0
 
     ##############################
     # lightning module
