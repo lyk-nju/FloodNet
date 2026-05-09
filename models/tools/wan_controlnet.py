@@ -242,18 +242,40 @@ class WanControlNet(nn.Module):
                 e0 = torch.cat([e0, e0_traj], dim=1)
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
-        # Text context (same as WanModel).
+        # Text context — deduplicate frame-aligned entries (same as WanModel).
         context_lens = torch.tensor(
             [u.size(0) for u in context], dtype=torch.long, device=device
         )
-        context = self.text_embedding(
-            torch.stack(
+        if len(context) > 0:
+            unique_map = {}
+            unique_list = []
+            ctx_indices = []
+            for u in context:
+                key = u.data_ptr()
+                idx = unique_map.get(key)
+                if idx is None:
+                    idx = len(unique_list)
+                    unique_map[key] = idx
+                    unique_list.append(u)
+                ctx_indices.append(idx)
+            unique_stacked = torch.stack(
                 [
                     torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
-                    for u in context
+                    for u in unique_list
                 ]
             )
-        )
+            unique_embedded = self.text_embedding(unique_stacked)
+            if len(unique_list) < len(context):
+                idx_t = torch.tensor(
+                    ctx_indices, device=unique_embedded.device, dtype=torch.long
+                )
+                context = unique_embedded[idx_t]
+            else:
+                context = unique_embedded
+        else:
+            context = torch.empty(
+                0, self.text_len, self.dim, device=device, dtype=torch.float32
+            )
 
         kwargs = dict(
             e=e0,
