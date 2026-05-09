@@ -1,0 +1,169 @@
+# BABEL finetune: resume HumanML3D checkpoint, train on BABEL streaming data.
+# Mirrors ldf.yaml training semantics (ControlNet, self-forcing, control loss).
+exp_name: ldf_babel_ft
+seed: 1234
+debug: false
+train: true
+
+dirs:
+    deps: /data1/yuankai/text2motion/FloodDiffusion/deps
+    outputs: ./outputs
+    raw_data: /data1/yuankai/text2motion/FloodDiffusion/raw_data
+
+save_dir: ./outputs
+resume_ckpt: null  # <- set to your HumanML3D checkpoint, e.g. outputs/.../step_240000.ckpt
+test_ckpt: "${resume_ckpt}"
+test_vae_ckpt: "${dirs.outputs}/vae_1d_z4_step=300000.ckpt"
+test_vae:
+    target: models.vae_wan_1d.VAEWanModel
+    ema_decay: 0.99
+    params:
+        input_dim: 263
+        z_dim: 4
+test_setting:
+    render: true
+    simple: true
+    recover_dim: 263
+    BABEL_streamed:
+        compare_folders:
+            - "${dirs.raw_data}/BABEL_streamed/animations"
+        compare_names:
+            - "Ground Truth"
+val_repeat: 1
+
+logger:
+    wandb:
+        wandb_key: "${wandb_info.key}"
+        project: "${wandb_info.project}"
+        entity: "${wandb_info.entity}"
+
+trainer:
+    max_steps: 320000
+    accelerator: gpu
+    devices: [0]
+    log_every_n_steps: 100
+    precision: bf16-mixed
+
+validation:
+    validation_steps: 5000
+    test_steps: 5000
+    test_mode: inline
+    save_every_n_steps: 5000
+    save_top_k: 100
+    eval_generation_metrics: true
+    eval_num_runs: 10
+    eval_seg_size: 20
+    eval_forward_control_loss: true
+    eval_forward_control_loss_window_mode: mean_chunk_windows
+
+metrics:
+    dim: 263
+    t2m:
+        evaluate_text: true
+        fid_target: "original"
+        metric_mean_path: "${dirs.deps}/t2m/meta/mean.npy"
+        metric_std_path: "${dirs.deps}/t2m/meta/std.npy"
+        wordvectorizer:
+            target: metrics.tools.word_vectorizer.WordVectorizer
+            params:
+                meta_root: "${dirs.deps}/glove"
+                prefix: our_vab
+            max_text_len: 20
+        textencoder:
+            target: metrics.tools.t2m_evaluator.TextEncoderBiGRUCo
+            ckpt: "${dirs.deps}/t2m/humanml3d/text_encoder.pt"
+            params:
+                word_size: 300
+                pos_size: 15
+                hidden_size: 512
+                output_size: 512
+        moveencoder:
+            target: metrics.tools.t2m_evaluator.MovementConvEncoder
+            ckpt: "${dirs.deps}/t2m/humanml3d/movement_encoder.pt"
+            params:
+                input_size: 259
+                hidden_size: 512
+                output_size: 512
+        motionencoder:
+            target: metrics.tools.t2m_evaluator.MotionEncoderBiGRUCo
+            ckpt: "${dirs.deps}/t2m/humanml3d/motion_encoder.pt"
+            params:
+                input_size: 512
+                hidden_size: 1024
+                output_size: 512
+
+data:
+    target: datasets.babel.BabelDataset
+    collate_fn: datasets.babel.collate_fn
+    train_bs: 4
+    val_bs: 4
+    test_bs: 4
+    num_workers: 8
+    mask_ratio: 1.0
+    train_meta_paths:
+        - ${dirs.raw_data}/BABEL_streamed/train_processed.txt
+    val_meta_paths:
+        - ${dirs.raw_data}/BABEL_streamed/val_processed.txt
+    test_meta_paths:
+        - ${dirs.raw_data}/BABEL_streamed/test_min_processed.txt
+    feature_path: "motions"
+    token_path: "TOKENS_20251030_085836_vae_wan_z4"
+    text_path: "texts"
+    random_length: 0
+    min_length: 5
+    max_length: 200
+    feature_fps: 20
+    token_fps: 5
+    stream_mode: true
+
+model:
+    target: models.diffusion_forcing_wan.DiffForcingWanModel
+    ema_decay: 0.99
+    params:
+        checkpoint_path: "${dirs.deps}/t5_umt5-xxl-enc-bf16/models_t5_umt5-xxl-enc-bf16.pth"
+        tokenizer_path: "${dirs.deps}/t5_umt5-xxl-enc-bf16/google/umt5-xxl"
+        input_dim: 4
+        noise_steps: 10
+        freeze_backbone: true
+
+        # Precomputed BABEL text embeddings (avoids live T5)
+        use_precomputed_text_emb: true
+        precomputed_text_emb_path: "${dirs.raw_data}/BABEL_streamed/t5_text_embeddings.pt"
+
+        # Trajectory condition (mirrors ldf.yaml)
+        traj_encoder_in_dim: 4
+        traj_out_dim: 64
+        traj_dropout: 0.0
+        use_traj_emb_cache: true
+
+        # Control loss + CFG (mirrors ldf.yaml)
+        control_loss_weight: 1.0
+        scheduled_sampling_prob: 0.0
+        cfg_scale_traj: 3.0
+        cfg_scale_text: 5.0
+
+        # Self-forcing (mirrors ldf.yaml)
+        self_forcing_enabled: true
+        self_forcing_stride_tokens: 1
+        self_forcing_detach_between_steps: true
+        # K=1: diagnostic mode. Raise K for real multi-step SF rollout.
+        self_forcing_k_schedule:
+            - [0.0, 1]
+
+self_forcing_disable_replace: false
+control_loss_train_mode: 1
+resume_reset_optimizer: true
+
+optimizer:
+    target: AdamW
+    params:
+        lr: 1e-3
+        betas: [0.9, 0.999]
+        weight_decay: 0.0
+        eps: 1e-8
+
+lr_scheduler:
+    target: diffusers.optimization.get_cosine_schedule_with_warmup
+    params:
+        num_warmup_steps: 1000
+        num_training_steps: ${trainer.max_steps}
