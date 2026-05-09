@@ -327,14 +327,10 @@ class CustomLightningModule(BasicLightningModule):
             del out["control_aux"]
         return out
 
-    def _standard_training_step(self, batch, batch_idx):
-        return super().training_step(batch, batch_idx)
-
     def training_step(self, batch, batch_idx):
-        # Route to self-forcing (manual opt) or standard (auto opt) training
         if self._sf_trainer is not None:
             return self._sf_trainer.training_step(batch)
-        return self._standard_training_step(batch, batch_idx)
+        return super().training_step(batch, batch_idx)
 
     def update_metrics(self, batch):
         if not self.t2m_enabled or self.t2m_metrics is None:
