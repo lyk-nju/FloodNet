@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from typing import Dict, Iterable, List, Optional, Set
 
 import torch
@@ -26,6 +27,10 @@ import torch.distributed as dist
 from lightning.pytorch.utilities import rank_zero_info
 from omegaconf import OmegaConf
 from tqdm import tqdm
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 from models.tools.t5 import T5EncoderModel
 from utils.initialize import load_config
@@ -155,6 +160,14 @@ def main():
     )
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument(
+        "--reuse-existing",
+        action="store_true",
+        help=(
+            "If --output already exists, load it and encode only captions missing "
+            "from the existing embeddings, then save the merged table."
+        ),
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -238,6 +251,43 @@ def main():
     if distributed:
         dist.barrier()
 
+    existing_embeddings: Dict[str, torch.Tensor] = {}
+    existing_keys: Set[str] = set()
+    if args.reuse_existing:
+        if distributed:
+            bucket: List[Optional[Set[str]]] = [None]
+            if rank == 0 and os.path.isfile(out_path):
+                existing_blob = torch.load(out_path, map_location="cpu", weights_only=False)
+                existing_embeddings = existing_blob.get("embeddings", {})
+                existing_keys = set(existing_embeddings.keys())
+                bucket[0] = existing_keys
+                _log0(
+                    f"Loaded existing embeddings: {len(existing_keys)} entries from {out_path}",
+                    rank,
+                )
+            dist.broadcast_object_list(bucket, src=0)
+            existing_keys = bucket[0] or set()
+        elif os.path.isfile(out_path):
+            existing_blob = torch.load(out_path, map_location="cpu", weights_only=False)
+            existing_embeddings = existing_blob.get("embeddings", {})
+            existing_keys = set(existing_embeddings.keys())
+            rank_zero_info(
+                f"Loaded existing embeddings: {len(existing_keys)} entries from {out_path}"
+            )
+
+        if existing_keys:
+            before = len(ordered)
+            ordered = [
+                caption
+                for caption in ordered
+                if caption not in existing_keys and caption.strip() not in existing_keys
+            ]
+            _log0(
+                f"Reusing existing embeddings: {before - len(ordered)} covered, "
+                f"{len(ordered)} missing captions to encode.",
+                rank,
+            )
+
     n = len(ordered)
     start = rank * n // world_size
     end = (rank + 1) * n // world_size
@@ -278,7 +328,7 @@ def main():
         dist.gather_object(emb_dict, gather_list, dst=0)
         if rank == 0:
             assert gather_list is not None
-            merged: Dict[str, torch.Tensor] = {}
+            merged: Dict[str, torch.Tensor] = dict(existing_embeddings)
             for part in gather_list:
                 assert part is not None
                 merged.update(part)
@@ -294,15 +344,17 @@ def main():
         dist.barrier()
         dist.destroy_process_group()
     else:
+        merged = dict(existing_embeddings)
+        merged.update(emb_dict)
         payload = {
-            "embeddings": emb_dict,
+            "embeddings": merged,
             "text_dim": 4096,
             "text_len": text_len,
             "checkpoint_path": str(checkpoint_path),
             "tokenizer_path": str(tokenizer_path),
         }
         torch.save(payload, out_path)
-        rank_zero_info(f"Saved {len(emb_dict)} entries to {out_path}")
+        rank_zero_info(f"Saved {len(merged)} entries to {out_path}")
 
 
 if __name__ == "__main__":

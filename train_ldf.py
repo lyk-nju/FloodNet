@@ -257,6 +257,7 @@ class CustomLightningModule(BasicLightningModule):
             named_parameters=self.model.named_parameters(),
             named_buffers=self.model.named_buffers(),
         )
+        self._skip_next_lightning_load_state_dict = True
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         super().on_train_batch_end(outputs, batch, batch_idx)

@@ -4,6 +4,7 @@ import time
 import torch
 from lightning import LightningModule
 from lightning.pytorch.utilities import rank_zero_info
+from torch.nn.modules.module import _IncompatibleKeys
 from torch_ema import ExponentialMovingAverage
 
 from utils.initialize import (
@@ -36,6 +37,7 @@ class BasicLightningModule(LightningModule):
         # logging
         self.last_batch_end_time, self.batch_ready_time = None, None
         self.validation_step_outputs = []
+        self._skip_next_lightning_load_state_dict = False
 
         # metric
         self.initialize_metrics()
@@ -75,10 +77,10 @@ class BasicLightningModule(LightningModule):
         }
 
     def load_state_dict(self, state_dict, strict=True):
-        raise NotImplementedError(
-            "Direct load_state_dict is disabled. Use trainer.fit(ckpt_path=...) "
-            "or trainer.validate(ckpt_path=...) which call on_load_checkpoint."
-        )
+        if self._skip_next_lightning_load_state_dict:
+            self._skip_next_lightning_load_state_dict = False
+            return _IncompatibleKeys([], [])
+        return self.model.load_state_dict(state_dict, strict=strict)
 
     def on_load_checkpoint(self, checkpoint):
         self.model.load_state_dict(checkpoint["state_dict"], strict=True)
@@ -98,6 +100,7 @@ class BasicLightningModule(LightningModule):
             named_parameters=self.model.named_parameters(),
             named_buffers=self.model.named_buffers(),
         )
+        self._skip_next_lightning_load_state_dict = True
 
     def on_save_checkpoint(self, checkpoint):
         checkpoint["ema_state"] = self.ema.state_dict()
