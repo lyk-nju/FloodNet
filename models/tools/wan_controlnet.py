@@ -260,7 +260,10 @@ class WanControlNet(nn.Module):
                 ctx_indices.append(idx)
             unique_stacked = torch.stack(
                 [
-                    torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+                    torch.cat(
+                        [u[: self.text_len],
+                         u.new_zeros(self.text_len - min(u.size(0), self.text_len), u.size(1))]
+                    )
                     for u in unique_list
                 ]
             )
