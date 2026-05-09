@@ -52,8 +52,6 @@ def emit_eval_request(module):
     step = int(step_semantics.absolute_step)
     ckpt_path = get_async_eval_ckpt_path(module.cfg.save_dir, step)
     request_path = get_async_eval_request_path(module.cfg.save_dir, step)
-    if ckpt_path.exists() and request_path.exists():
-        return
 
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
     request_path.parent.mkdir(parents=True, exist_ok=True)

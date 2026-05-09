@@ -53,17 +53,6 @@ def _save_state(state_path: Path, state: dict[str, Any]):
 # Inline mode
 # ------------------------------------------------------------------
 
-def _expected_inline_summaries_exist(
-    artifact_root: Path, step_tag: str, probe_tags: list[str]
-) -> bool:
-    if probe_tags:
-        for probe_tag in probe_tags:
-            pattern = f"*/metrics/{probe_tag}/{step_tag}/summary.json"
-            if not any(artifact_root.glob(pattern)):
-                return False
-        return True
-    return any(artifact_root.glob(f"*/metrics/*/{step_tag}/summary.json"))
-
 
 def _iter_inline_requests(
     request_dir: Path, state: dict[str, Any], min_request_age_sec: float
@@ -161,14 +150,6 @@ def _run_inline_mode(args, run_dir: Path, config_path: Path, project_root: Path)
             )
             step_tag = str(payload.get("step_tag") or f"step_{step:06d}")
             probe_tags = [str(tag) for tag in payload.get("probe_tags", [])]
-            if _expected_inline_summaries_exist(artifact_root, step_tag, probe_tags):
-                state.setdefault("completed", []).append(request_key)
-                _save_state(state_path, state)
-                print(
-                    f"[eval-watcher|inline] results already exist for step={step}; "
-                    f"mark completed."
-                )
-                continue
 
             cmd = _build_inline_eval_command(
                 runner_script=runner_script,

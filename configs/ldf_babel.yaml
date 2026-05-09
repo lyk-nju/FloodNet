@@ -131,6 +131,8 @@ model:
         tokenizer_path: "${dirs.deps}/t5_umt5-xxl-enc-bf16/google/umt5-xxl"
         input_dim: 4
         noise_steps: 10
+        use_precomputed_text_emb: true
+        precomputed_text_emb_path: "${dirs.raw_data}/BABEL_streamed/t5_text_embeddings.pt"
 
 optimizer:
     target: AdamW

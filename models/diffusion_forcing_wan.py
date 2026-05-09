@@ -1264,9 +1264,9 @@ class DiffForcingWanModel(nn.Module):
             end_index = int(self.chunk_size * current_time) + 1
             time_steps = torch.full((self.batch_size,), current_time, device=device)
 
-            noise_level = self._get_noise_levels(device, end_index, time_steps)[
-                :, -self.seq_len :
-            ]  # (B, T)
+            noise_level_full = self._get_noise_levels(device, end_index, time_steps)
+            noise_level = noise_level_full[:, -self.seq_len :]  # (B, seq_len)
+            noise_level_for_update = noise_level_full  # (B, end_index), matches pred shape
 
             # Predict noise through WanModel
             noisy_input = []
@@ -1323,7 +1323,7 @@ class DiffForcingWanModel(nn.Module):
                     )
                 elif self.prediction_type == "x0":
                     nl = (
-                        noise_level[i, start_index:end_index]
+                        noise_level_for_update[i, start_index:end_index]
                         .unsqueeze(0)
                         .unsqueeze(-1)
                         .unsqueeze(-1)
@@ -1340,7 +1340,7 @@ class DiffForcingWanModel(nn.Module):
                     denom = (
                         1
                         + self.dt
-                        - noise_level[i, start_index:end_index]
+                        - noise_level_for_update[i, start_index:end_index]
                         .unsqueeze(0)
                         .unsqueeze(-1)
                         .unsqueeze(-1)
