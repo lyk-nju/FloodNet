@@ -28,6 +28,12 @@ def _expand_precomputed_caption_keys(emb: dict) -> dict:
 
 
 class DiffForcingWanModel(nn.Module):
+    """Diffusion Forcing with streaming trajectory ControlNet conditioning.
+
+    Triangular noise schedule (left-clean, right-noisy) with per-sample time
+    steps. Supports velocity / x0 / noise prediction with CFG over text and
+    trajectory conditions.
+    """
     def __init__(
         self,
         checkpoint_path="deps/t5_umt5-xxl-enc-bf16/models_t5_umt5-xxl-enc-bf16.pth",

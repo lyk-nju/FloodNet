@@ -176,7 +176,9 @@ class BabelDataset(Dataset):
         output["name"] = data["name"]
         if "segment_names" in data:
             output["segment_names"] = list(data["segment_names"])
-        # --- feature ---
+        ##############################
+        # feature
+        ##############################
         crop_start = 0
         feature_length = None
         if "feature" in data:
@@ -187,12 +189,16 @@ class BabelDataset(Dataset):
                 feature_length = feature.shape[0]
             output["feature"] = feature
             output["feature_length"] = feature_length
-            # --- traj (derived from feature) ---
+            ##############################
+            # traj (root xyz derived from feature)
+            ##############################
             traj = extract_root_trajectory_263(feature)
             output["traj"] = traj
             output["traj_length"] = len(traj)
 
-        # --- token ---
+        ##############################
+        # token
+        ##############################
         if "token" in data:
             if apply_crop:
                 token, token_length, token_start = self.process_token(
@@ -206,12 +212,14 @@ class BabelDataset(Dataset):
                 token_start = 0
             output["token"] = token
             output["token_length"] = token_length
-            # --- mask (token-level sparsity, expanded to frame-level) ---
+            ##############################
+            # mask (token-level sparsity expanded to frame-level VAE)
+            ##############################
             token_mask = self.sample_token_mask(token_length)
             output["token_mask"] = token_mask
 
             if "traj" in output:
-                # Causal VAE convention: token 0 → frame 0; token k (k≥1) → frames [4k-3, 4k]
+                # Causal VAE: token 0 → frame 0; token k≥1 → frames [4k-3, 4k]
                 traj_length = output["traj_length"]
                 traj_mask = np.zeros(traj_length, dtype=np.float32)
                 if len(token_mask) > 0:
@@ -225,9 +233,11 @@ class BabelDataset(Dataset):
         else:
             token_start = 0
 
-        # --- traj_features: [x, z, cos(psi), sin(psi)], psi = xz path heading ---
-        # output["traj"] (raw) is kept unchanged for L_control_xz GT supervision.
-        # traj_features feeds the ControlNet conditioning signal only.
+        ##############################
+        # traj_features
+        ##############################
+        # [x, z, cos(ψ), sin(ψ)] for ControlNet conditioning.
+        # output["traj"] (raw xyz) feeds L_control_xz GT supervision.
         if "feature" in output and "token" in output:
             traj_xyz = output["traj"]
             if self.smooth_traj_sigma > 0.0:
@@ -241,7 +251,9 @@ class BabelDataset(Dataset):
                 traj_xyz_for_cond = traj_xyz
             output["traj_features"] = root_to_traj_feats(traj_xyz_for_cond)
 
-        # --- text ---
+        ##############################
+        # text
+        ##############################
         if "text_data" in data:
             (
                 texts,

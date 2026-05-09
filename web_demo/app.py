@@ -510,20 +510,23 @@ def get_frame():
             }), 400
         
         # Get next frame from buffer
-        joints = model_manager.get_next_frame()
-        
+        joints, traj = model_manager.get_next_frame()
+
         if joints is not None:
             # Update last consumption time
             with consumption_monitor_lock:
                 last_frame_consumed_time = time.time()
-            
+
             # Convert numpy array to list for JSON
             joints_list = joints.tolist()
-            return jsonify({
+            resp = {
                 'status': 'success',
                 'joints': joints_list,
-                'buffer_size': model_manager.frame_buffer.size()
-            })
+                'buffer_size': model_manager.frame_buffer.size(),
+            }
+            if traj is not None:
+                resp['trajectory'] = traj.tolist()
+            return jsonify(resp)
         else:
             return jsonify({
                 'status': 'waiting',
@@ -583,7 +586,7 @@ if __name__ == '__main__':
                         help='Port to run the server on (default: 5000)')
     args = parser.parse_args()
     
-    # Set config path (this is module-level code, no need for global declaration)
+    global model_config_path, demo_config_path, traj_mask_cfg
     model_config_path = args.config
     demo_config_path = args.demo_config
     traj_mask_cfg = load_traj_mask_cfg(demo_config_path)

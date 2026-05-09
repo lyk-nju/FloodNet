@@ -195,11 +195,35 @@ class MotionApp {
         // Create skeleton
         this.skeleton = new Skeleton3D(this.scene);
 
+        // Trajectory target line (light, semi-transparent, normalized to character root)
+        this.trajTargetLine = null;
+        this.initTrajectoryTargetLine();
+
         // Handle window resize
         window.addEventListener('resize', () => this.onWindowResize());
 
         // Start render loop
         this.animate();
+    }
+
+    initTrajectoryTargetLine() {
+        // Light semi-transparent line showing the model's target trajectory,
+        // rendered relative to the character's current root position.
+        const maxPoints = 20;
+        const positions = new Float32Array(maxPoints * 3);
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geometry.setDrawRange(0, 0);
+
+        const material = new THREE.LineBasicMaterial({
+            color: 0x66aadd,
+            transparent: true,
+            opacity: 0.45,
+            linewidth: 1,
+        });
+        this.trajTargetLine = new THREE.Line(geometry, material);
+        this.trajTargetLine.frustumCulled = false;
+        this.scene.add(this.trajTargetLine);
     }
 
     initUI() {
@@ -596,6 +620,12 @@ class MotionApp {
                 // Clear drawn trajectory points (mouse-drawn)
                 this.clearDrawnTrajectoryUI();
 
+                // Clear target trajectory line
+                if (this.trajTargetLine) {
+                    this.trajTargetLine.geometry.setDrawRange(0, 0);
+                    this.trajTargetLine.geometry.attributes.position.needsUpdate = true;
+                }
+
                 console.log('Reset complete - all state cleared');
             }
         } catch (error) {
@@ -676,6 +706,9 @@ class MotionApp {
                             this.taskYCaptured = true;
                         }
 
+                        // Update trajectory target line (normalized to current root)
+                        this.updateTrajectoryTargetLine(data.trajectory);
+
                         // Auto-follow (if user hasn't interacted for a while)
                         this.updateAutoFollow();
 
@@ -704,6 +737,31 @@ class MotionApp {
 
         // Use requestAnimationFrame for continuous checking
         requestAnimationFrame(() => this.fetchFrame());
+    }
+
+    updateTrajectoryTargetLine(trajPoints) {
+        if (!this.trajTargetLine) return;
+
+        const geometry = this.trajTargetLine.geometry;
+        const positions = geometry.attributes.position.array;
+        const rootX = this.currentRootPos.x;
+        const rootZ = this.currentRootPos.z;
+
+        if (!trajPoints || trajPoints.length === 0) {
+            geometry.setDrawRange(0, 0);
+            geometry.attributes.position.needsUpdate = true;
+            return;
+        }
+
+        const n = Math.min(trajPoints.length, 20);
+        for (let i = 0; i < n; i++) {
+            // Normalize to character root: character is (0,0), y on ground
+            positions[i * 3]     = trajPoints[i][0] - rootX;
+            positions[i * 3 + 1] = 0.02;  // slightly above ground
+            positions[i * 3 + 2] = trajPoints[i][2] - rootZ;
+        }
+        geometry.setDrawRange(0, n);
+        geometry.attributes.position.needsUpdate = true;
     }
 
     updateAutoFollow() {

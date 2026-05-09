@@ -45,6 +45,12 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 class CustomLightningModule(BasicLightningModule):
+    """Lightning module wiring diffusion model, VAE, EMA, and eval metrics.
+
+    Routes training between standard (auto opt) and self-forcing (manual opt)
+    via ``SelfForcingTrainer``. Handles ControlNet re-init on resume, inline
+    generation eval, and T2M metric computation.
+    """
     def __init__(self, cfg):
         self._inline_eval_dedup = {}
         self._resume_step_offset = 0

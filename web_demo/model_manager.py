@@ -111,7 +111,11 @@ class ModelManager:
         self.first_chunk = True
         self.history_length = 30  # Default history window length
         self.denoise_steps = 10  # Default denoising steps
-        
+
+        # Trajectory display: world-space future token positions for frontend viz.
+        self._display_traj_lock = threading.Lock()
+        self._display_traj = None  # (T, 3) np.ndarray or None
+
         print("ModelManager initialized successfully")
 
     def _sample_waypoint_mask(self, waypoint_len: int) -> np.ndarray:
@@ -355,6 +359,9 @@ class ModelManager:
 
     @staticmethod
     def _project_point_to_polyline(point_xyz: np.ndarray, waypoints_xyz: np.ndarray):
+        """Project a 3D point onto the XZ plane of a polyline.
+
+        Returns (projected_xyz, segment_index, t_parameter)."""
         point_xz = point_xyz[[0, 2]]
         if len(waypoints_xyz) == 1:
             return waypoints_xyz[0].copy(), 0, 1.0
@@ -445,6 +452,10 @@ class ModelManager:
             token_step=token_step,
         )
         token_mask = np.ones((1, future_traj.shape[0]), dtype=np.float32)
+
+        with self._display_traj_lock:
+            self._display_traj = future_traj.copy()
+
         return {
             "traj": future_traj[None, :, :],
             "token_mask": token_mask,
@@ -618,9 +629,18 @@ class ModelManager:
         
         print("Generation loop stopped")
     
+    def get_display_traj(self):
+        """Return a copy of the latest world-space trajectory for frontend viz, or None."""
+        with self._display_traj_lock:
+            if self._display_traj is None:
+                return None
+            return self._display_traj.copy()
+
     def get_next_frame(self):
-        """Get the next frame from buffer"""
-        return self.frame_buffer.get_frame()
+        """Get the next frame from buffer and optional trajectory display data."""
+        joints = self.frame_buffer.get_frame()
+        traj = self.get_display_traj()
+        return joints, traj
     
     def get_buffer_status(self):
         """Get buffer status"""
