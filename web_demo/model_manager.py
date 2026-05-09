@@ -459,8 +459,10 @@ class ModelManager:
             self.generation_thread.join(timeout=5.0)
             if self.generation_thread.is_alive():
                 print("Warning: generation thread did not stop within timeout; model state may be unsafe")
+                return False
         self.is_generating = False
         print("Generation paused (state preserved)")
+        return True
     
     def resume_generation(self):
         """Resume generation from paused state"""
@@ -489,7 +491,8 @@ class ModelManager:
         """
         # Stop if running, then poll until thread truly exits (max 10s total)
         if self.is_generating:
-            self.pause_generation()
+            if not self.pause_generation():
+                return False
         if self.generation_thread is not None and self.generation_thread.is_alive():
             self.reset_pending = True
             print("Reset pending — waiting for generation thread to finish...")
@@ -500,7 +503,7 @@ class ModelManager:
             if self.generation_thread.is_alive():
                 print("Reset failed: generation thread still running after 15s timeout")
                 self.reset_pending = False
-                return
+                return False
         self.reset_pending = False
 
         # Clear everything
@@ -508,6 +511,11 @@ class ModelManager:
         self.vae.clear_cache()
         self.first_chunk = True
         self.root_xz_history.clear()
+        with self.traj_state_lock:
+            self.current_traj_waypoints = None
+            self.current_traj_array = None
+            self.current_traj_mode = "replace_future"
+            self.traj_plan_version += 1
         
         if history_length is not None:
             self.history_length = history_length
@@ -534,6 +542,7 @@ class ModelManager:
         # Initialize model with denoise steps
         self.model.init_generated(self.history_length, batch_size=1, num_denoise_steps=self.denoise_steps)
         print(f"Model reset - history: {self.history_length}, smoothing: {self.smoothing_alpha}, steps: {self.denoise_steps}")
+        return True
     
     def _generation_loop(self):
         """Background loop: each iteration produces one latent token (→ 4 motion frames).
@@ -629,12 +638,15 @@ class ModelManager:
 # Global model manager instance
 _model_manager = None
 _traj_mask_cfg = None
+_model_manager_lock = threading.Lock()
 
 
 def get_model_manager(config_path=None, traj_mask_cfg=None):
     """Get or create the global model manager instance"""
     global _model_manager, _traj_mask_cfg
     if _model_manager is None:
-        _traj_mask_cfg = traj_mask_cfg or {}
-        _model_manager = ModelManager(config_path, traj_mask_cfg=_traj_mask_cfg)
+        with _model_manager_lock:
+            if _model_manager is None:
+                _traj_mask_cfg = traj_mask_cfg or {}
+                _model_manager = ModelManager(config_path, traj_mask_cfg=_traj_mask_cfg)
     return _model_manager

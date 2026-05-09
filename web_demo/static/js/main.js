@@ -332,7 +332,7 @@ class MotionApp {
                 const initTraj = this.parseWaypointsFromTextarea();
                 if (initTraj && initTraj.length > 0) {
                     this.drawnWaypoints = initTraj;
-                    this.syncTrajectorySpheresFromWaypoints();
+                    this.syncTrajectorySpheresFromWaypoints(initTraj);
                     this.pushTrajectoryToBackend(initTraj, true);
                 }
             } else if (response.status === 409 && data.conflict) {

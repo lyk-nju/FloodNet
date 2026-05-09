@@ -19,6 +19,7 @@ model_manager = None
 model_config_path = None  # Will be set once at startup
 demo_config_path = None  # Will be set once at startup
 traj_mask_cfg = None
+model_init_lock = threading.Lock()
 
 # Session tracking - only one active session can generate at a time
 active_session_id = None  # The session ID currently generating
@@ -35,14 +36,16 @@ def init_model():
     """Initialize model manager"""
     global model_manager, traj_mask_cfg
     if model_manager is None:
-        if model_config_path is None:
-            raise RuntimeError("model_config_path not set. Server not properly initialized.")
-        print(f"Initializing model manager with config: {model_config_path}")
-        model_manager = get_model_manager(
-            config_path=model_config_path,
-            traj_mask_cfg=traj_mask_cfg,
-        )
-        print("Model manager ready!")
+        with model_init_lock:
+            if model_manager is None:
+                if model_config_path is None:
+                    raise RuntimeError("model_config_path not set. Server not properly initialized.")
+                print(f"Initializing model manager with config: {model_config_path}")
+                model_manager = get_model_manager(
+                    config_path=model_config_path,
+                    traj_mask_cfg=traj_mask_cfg,
+                )
+                print("Model manager ready!")
     return model_manager
 
 
@@ -98,7 +101,9 @@ def consumption_monitor():
             print(f"No frame consumed for {time_since_last_consumption:.1f}s - client disconnected, auto-resetting...")
             
             if model_manager:
-                model_manager.reset()
+                if not model_manager.reset():
+                    print("Auto-reset skipped because the generation thread did not stop cleanly")
+                    continue
                 print("Generation reset due to client disconnect (no frame consumption)")
             
             # Clear state with proper locking - no nested locks!
@@ -131,8 +136,9 @@ def start_generation():
     """Start generation with given text"""
     try:
         global active_session_id, last_frame_consumed_time
-        
-        data = request.json
+        session_claimed = False
+
+        data = request.get_json(silent=True) or {}
         session_id = data.get('session_id')
         text = data.get('text', 'walk in a circle.')
         history_length = data.get('history_length', 30)
@@ -179,6 +185,7 @@ def start_generation():
             
             # Set this session as active
             active_session_id = session_id
+            session_claimed = True
         
         # Clear previous session's consumption tracking if force takeover (no nested locks)
         if need_force_takeover:
@@ -187,10 +194,28 @@ def start_generation():
 
         # Ensure the previous generation thread is stopped before reinitializing.
         if mm.is_generating:
-            mm.pause_generation()
+            if not mm.pause_generation():
+                with session_lock:
+                    if active_session_id == session_id:
+                        active_session_id = None
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Previous generation did not stop cleanly. Please retry reset/start.'
+                }), 503
 
         # Reset and start generation with history length, smoothing, and denoise steps
-        mm.reset(history_length=history_length, smoothing_alpha=smoothing_alpha, denoise_steps=denoise_steps)
+        if not mm.reset(
+            history_length=history_length,
+            smoothing_alpha=smoothing_alpha,
+            denoise_steps=denoise_steps,
+        ):
+            with session_lock:
+                if active_session_id == session_id:
+                    active_session_id = None
+            return jsonify({
+                'status': 'error',
+                'message': 'Model reset failed because the previous generation thread is still alive.'
+            }), 503
         mm.start_generation(text, history_length=history_length)
         
         # Initialize consumption tracking (no nested locks)
@@ -207,6 +232,12 @@ def start_generation():
             'session_id': session_id
         })
     except Exception as e:
+        if 'session_id' in locals() and session_claimed:
+            with session_lock:
+                if active_session_id == session_id:
+                    active_session_id = None
+            with consumption_monitor_lock:
+                last_frame_consumed_time = None
         print(f"Error in start_generation: {e}")
         import traceback
         traceback.print_exc()
@@ -220,7 +251,7 @@ def start_generation():
 def update_text():
     """Update the generation text"""
     try:
-        data = request.json
+        data = request.get_json(silent=True) or {}
         session_id = data.get('session_id')
         text = data.get('text', '')
         
@@ -267,7 +298,7 @@ def update_trajectory():
     - `null` / empty clears trajectory control.
     """
     try:
-        data = request.json or {}
+        data = request.get_json(silent=True) or {}
         session_id = data.get('session_id')
         waypoints = data.get('waypoints')
         mode = data.get('mode', 'replace_future')
@@ -309,7 +340,7 @@ def update_trajectory():
 def pause_generation():
     """Pause generation (keeps state for resume)"""
     try:
-        data = request.json if request.json else {}
+        data = request.get_json(silent=True) or {}
         session_id = data.get('session_id')
         
         if not session_id:
@@ -346,7 +377,7 @@ def resume_generation():
     try:
         global last_frame_consumed_time
         
-        data = request.json if request.json else {}
+        data = request.get_json(silent=True) or {}
         session_id = data.get('session_id')
         
         if not session_id:
@@ -392,7 +423,7 @@ def reset():
     try:
         global active_session_id, last_frame_consumed_time
         
-        data = request.json if request.json else {}
+        data = request.get_json(silent=True) or {}
         session_id = data.get('session_id')
         history_length = data.get('history_length', 30)
         smoothing_alpha = data.get('smoothing_alpha', None)
@@ -408,7 +439,15 @@ def reset():
                     }), 403
         
         if model_manager:
-            model_manager.reset(history_length=history_length, smoothing_alpha=smoothing_alpha, denoise_steps=denoise_steps)
+            if not model_manager.reset(
+                history_length=history_length,
+                smoothing_alpha=smoothing_alpha,
+                denoise_steps=denoise_steps,
+            ):
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Model reset failed because the previous generation thread is still alive.'
+                }), 503
         
         # Clear the active session
         with session_lock:
@@ -421,7 +460,11 @@ def reset():
 
         # If a generation thread is still around, stop it cleanly.
         if model_manager and model_manager.is_generating:
-            model_manager.pause_generation()
+            if not model_manager.pause_generation():
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Generation thread did not stop cleanly after reset.'
+                }), 503
         
         params_msg = f", smoothing: {smoothing_alpha}" if smoothing_alpha is not None else ""
         params_msg += f", steps: {denoise_steps}" if denoise_steps is not None else ""
