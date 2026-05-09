@@ -1,3 +1,10 @@
+"""FloodNet training entrypoint.
+
+Wires dataset, model, VAE, EMA, and Lightning Trainer. Supports standard
+(auto opt) and self-forcing (manual opt) training with inline generation eval
+and async eval watcher.
+"""
+
 import os
 from pathlib import Path
 import time
@@ -137,7 +144,9 @@ class CustomLightningModule(BasicLightningModule):
         )
 
     def initialize_metrics(self):
-        # vae
+        ##############################
+        # vae (frozen decoder for L_control)
+        ##############################
         self.vae = instantiate(
             target=self.cfg.test_vae.target,
             cfg=None,
@@ -169,23 +178,29 @@ class CustomLightningModule(BasicLightningModule):
         for p in self.vae.parameters():
             p.requires_grad_(False)
 
-        # metric models
+        ##############################
+        # t2m metrics
+        ##############################
         self.recover_dim = self.cfg.metrics.dim
         self.t2m_enabled = bool(self.cfg.get("t2m_metric", False))
         self.t2m_metrics = T2MMetrics(self.cfg.metrics.t2m) if self.t2m_enabled else None
 
     def on_load_checkpoint(self, checkpoint):
-        # super() not called: we handle state_dict / EMA / optimizer restore manually
-        # so that ControlNet re-init and new-param EMA reset work correctly.
+        # NOTE: super() not called — state_dict / EMA / optimizer are restored
+        # manually so ControlNet re-init and new-param EMA reset work correctly.
+        ##############################
+        # global_step sync (SF auto→manual)
+        ##############################
         self._resume_step_offset = int(checkpoint.get("global_step", 0))
-        # Self-forcing checkpoint housekeeping: mirrors auto→manual optimizer
-        # progress so global_step stays consistent across the switch.
         if self._sf_trainer is not None:
             self._resume_step_offset = self._sf_trainer.on_load_checkpoint(checkpoint)
         else:
             rank_zero_info(
                 f"[resume] loaded checkpoint global_step={self._resume_step_offset}"
             )
+        ##############################
+        # state_dict (strict vs loose for ControlNet)
+        ##############################
         ckpt_keys = set(checkpoint["state_dict"].keys())
         controlnet_missing = not any(k.startswith("controlnet.") for k in ckpt_keys)
         strict = not controlnet_missing
@@ -196,9 +211,9 @@ class CustomLightningModule(BasicLightningModule):
                 "Loaded pretrained LDF with strict=False (base checkpoint without ControlNet). "
                 f"Missing keys (new modules init from scratch): {result.missing_keys}"
             )
-        # Re-init ControlNet from the *loaded* backbone when starting from a base ckpt.
-        # init_from_backbone in __init__ runs before weights are loaded, so it copies random
-        # weights — moving the call here ensures it copies the actual pretrained backbone.
+        # Re-init ControlNet from the *loaded* backbone (not random init weights).
+        # __init__ runs before state_dict load, so init_from_backbone there copies
+        # random weights. Doing it here guarantees the pretrained backbone is used.
         if (controlnet_missing
                 and any("controlnet." in k for k in result.missing_keys)):
             self.model.controlnet.init_from_backbone(self.model.model)
@@ -207,7 +222,10 @@ class CustomLightningModule(BasicLightningModule):
                 rank_zero_info(
                     f"Unexpected keys in checkpoint (ignored): {result.unexpected_keys}"
                 )
-        # When loading pretrained with new traj params, ema_state has wrong param count -> reinit EMA
+        ##############################
+        # EMA
+        ##############################
+        # With new traj params, ema_state has wrong param count → reinit from scratch.
         if "ema_state" in checkpoint and not has_new_cond_params:
             self.ema.load_state_dict(checkpoint["ema_state"])
             rank_zero_info("init ema from ckpt")
@@ -217,9 +235,11 @@ class CustomLightningModule(BasicLightningModule):
                 decay=self.cfg.model.ema_decay,
             )
             rank_zero_info("init ema from current model weights")
-        # When has_new_cond_params, optimizer/scheduler param groups mismatch -> skip restore.
-        # When resume_reset_optimizer=True, skip restore so LR/schedule follow current yaml (not ckpt).
-        # Set to empty lists (don't pop) so Lightning passes "key exists" check but restores nothing.
+        ##############################
+        # optimizer / scheduler
+        ##############################
+        # NOTE: Set to empty lists (not pop) so Lightning passes "key exists"
+        # check but restores nothing, letting opt/sched follow current config.
         reset_optim_on_resume = bool(self.cfg.get("resume_reset_optimizer", False))
         if has_new_cond_params or reset_optim_on_resume:
             checkpoint["optimizer_states"] = []
@@ -255,11 +275,14 @@ class CustomLightningModule(BasicLightningModule):
             model_batch = prepare_model_input(batch)
         out = self.model(model_batch)
 
-        # MotionLCM-style control loss: explicit trajectory alignment in motion space
+        ##############################
+        # control loss (XZ trajectory alignment via VAE decode)
+        ##############################
         if "control_aux" in out and "traj" in batch:
             control_weight = self.cfg.model.params.get("control_loss_weight", 1.0)
             if control_weight > 0:
                 control_aux = out["control_aux"]
+                # multi-step SF: weighted average over rollout steps
                 if "pred_x0_latent_list_steps" in control_aux:
                     step_weights = [
                         float(w)
@@ -290,6 +313,7 @@ class CustomLightningModule(BasicLightningModule):
                         if weighted_control is not None and total_step_weight > 0
                         else None
                     )
+                # single-window forward: direct control loss
                 else:
                     pred_list = control_aux["pred_x0_latent_list"]
                     loss_control = self._compute_control_loss(
@@ -307,6 +331,7 @@ class CustomLightningModule(BasicLightningModule):
         return super().training_step(batch, batch_idx)
 
     def training_step(self, batch, batch_idx):
+        # Route to self-forcing (manual opt) or standard (auto opt) training
         if self._sf_trainer is not None:
             return self._sf_trainer.training_step(batch)
         return self._standard_training_step(batch, batch_idx)
@@ -324,19 +349,25 @@ class CustomLightningModule(BasicLightningModule):
         gt_feature_length = batch["feature_length"]
 
         for i in range(len(generated)):
-            # Decode motion
+            ##############################
+            # decode generated motion
+            ##############################
             single_generated = generated[i]
             decoded_single_generated = self.vae.decode(
                 single_generated[None, :].to(self.device)
             )[0]
             decoded_single_generated = decoded_single_generated.float().to(self.device)
-            # Decode ground truth
+            ##############################
+            # decode ground truth
+            ##############################
             single_gt_r = ground_truth_token[i][: gt_token_length[i]]
             decoded_single_gt_r = self.vae.decode(single_gt_r[None, :].to(self.device))[
                 0
             ]
             decoded_single_gt_r = decoded_single_gt_r.float().to(self.device)
-            # Original ground truth
+            ##############################
+            # original ground truth (VAE vs raw feature for fid_target)
+            ##############################
             single_gt_o = ground_truth_feature[i]
             decoded_single_gt_o = single_gt_o[: gt_feature_length[i], :].to(self.device)
             decoded_single_gt_o = decoded_single_gt_o.float().to(self.device)
@@ -392,7 +423,10 @@ class CustomLightningModule(BasicLightningModule):
 
 
 def main():
+    """Build config, datasets, model, and launch training or validation."""
+    ##############################
     # init
+    ##############################
     torch.set_float32_matmul_precision("high")
     cfg = load_config()
     seed_everything(cfg.seed)
@@ -411,6 +445,9 @@ def main():
     if cfg.train and cfg.resume_ckpt and async_test_mode:
         emit_resume_eval(cfg, save_dir, cfg.resume_ckpt)
 
+    ##############################
+    # logger
+    ##############################
     logger = None
     if not cfg.debug:
         wandb_key = cfg.logger.wandb.wandb_key
@@ -427,7 +464,9 @@ def main():
         else:
             rank_zero_info("WandB API key not provided, skipping WandB logging")
 
+    ##############################
     # dataloader
+    ##############################
     collate_fn = (
         get_function(cfg.data.collate_fn) if cfg.data.get("collate_fn", None) else None
     )
@@ -485,7 +524,10 @@ def main():
         f"Val dataset: {len(val_dataset) if val_dataset is not None else 0}, "
         f"Test probe samples: {total_probe_samples}"
     )
-    
+
+    ##############################
+    # self-forcing runtime (SF rewrites trainer.max_steps on resume)
+    ##############################
     trainer_absolute_max_steps = int(cfg.trainer.max_steps)
     model_self_forcing_enabled = bool(
         cfg.config.model.params.get("self_forcing_enabled", False)
@@ -518,11 +560,16 @@ def main():
             f"(was {scheduler_training_steps})"
         )
 
-    # lightning module, model is inside the lightning module
+    ##############################
+    # lightning module
+    ##############################
     model = CustomLightningModule(cfg=cfg.config)
     model.test_loader_tags = test_loader_tags
     model._resume_step_offset = int(resume_step_offset)
 
+    ##############################
+    # trainer
+    ##############################
     callbacks = []
     checkpoint_callback = ModelCheckpoint(
         dirpath=cfg.save_dir,
@@ -565,15 +612,10 @@ def main():
         cfg, val_dataloader, test_probe_loaders
     )
 
+    ##############################
+    # train or validate
+    ##############################
     if cfg.train:
-        if not cfg.debug:
-            pass
-            # trainer.validate(
-            #     model,
-            #     dataloaders=val_dataloaders,
-            #     ckpt_path=cfg.resume_ckpt if cfg.resume_ckpt else None,
-            #     weights_only=False,
-            # )
         trainer.fit(
             model,
             train_dataloader,
@@ -597,8 +639,9 @@ def main():
     if not cfg.debug and logger is not None:
         wandb.finish()
 
-    # Signal the async eval watcher that training is done so it can exit
-    # gracefully after processing remaining requests.
+    ##############################
+    # async eval teardown
+    ##############################
     if async_test_mode:
         done_marker = Path(save_dir) / "async_eval" / "training_done"
         done_marker.parent.mkdir(parents=True, exist_ok=True)
