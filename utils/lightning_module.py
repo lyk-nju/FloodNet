@@ -185,7 +185,7 @@ class BasicLightningModule(LightningModule):
                 and self.global_step > 0
                 and self.global_step % self.cfg.validation.test_steps == 0
             ):
-                self.test_step(batch, batch_idx, test_loader_idx=dataloader_idx - 1)
+                self.test_step(batch, batch_idx, dataloader_idx=dataloader_idx - 1)
         else:
             trainable = [p for p in self.model.parameters() if p.requires_grad]
             with self.ema.average_parameters(trainable):
@@ -216,7 +216,12 @@ class BasicLightningModule(LightningModule):
         self.compute_metrics()
 
     # NOTE: lightning handles with torch.no_grad() and model.eval() automatically
-    def test_step(self, batch, batch_idx, test_loader_idx=0):
+    def test_step(self, batch, batch_idx, dataloader_idx=0, test_loader_idx=None):
+        # Lightning requires the exact name `dataloader_idx` when multiple
+        # test dataloaders are passed. Keep `test_loader_idx` as a compatibility
+        # alias for internal callers and older helper code.
+        if test_loader_idx is None:
+            test_loader_idx = dataloader_idx
         self.update_test(batch, batch_idx=batch_idx, test_loader_idx=test_loader_idx)
         return
 
