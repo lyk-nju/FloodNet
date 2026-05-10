@@ -70,6 +70,13 @@ def main():
     model.test_loader_tags = test_loader_tags
     model._resume_step_offset = int(load_resume_step_offset(args.ckpt))
 
+    # Load explicitly instead of passing ckpt_path to Trainer.test. Lightning
+    # calls on_load_checkpoint() and then load_state_dict(); our modules do
+    # custom checkpoint surgery in on_load_checkpoint(), so the second generic
+    # load is both redundant and fragile for async eval workers.
+    checkpoint = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    model.on_load_checkpoint(checkpoint)
+
     accelerator = args.accelerator or (
         "gpu" if torch.cuda.is_available() and args.devices > 0 else "cpu"
     )
@@ -89,7 +96,7 @@ def main():
     trainer.test(
         model,
         dataloaders=test_probe_loaders,
-        ckpt_path=args.ckpt,
+        ckpt_path=None,
         weights_only=False,
     )
 

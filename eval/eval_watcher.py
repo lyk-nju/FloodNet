@@ -32,15 +32,17 @@ def _discover_config(run_dir: Path) -> Path:
 
 def _load_state(state_path: Path) -> dict[str, Any]:
     if not state_path.exists():
-        return {"completed": []}
+        return {"completed": [], "failed": {}}
     try:
         with open(state_path, "r") as f:
             data = json.load(f)
         if isinstance(data, dict) and isinstance(data.get("completed"), list):
+            if not isinstance(data.get("failed"), dict):
+                data["failed"] = {}
             return data
     except Exception:
         pass
-    return {"completed": []}
+    return {"completed": [], "failed": {}}
 
 
 def _save_state(state_path: Path, state: dict[str, Any]):
@@ -55,14 +57,20 @@ def _save_state(state_path: Path, state: dict[str, Any]):
 
 
 def _iter_inline_requests(
-    request_dir: Path, state: dict[str, Any], min_request_age_sec: float
+    request_dir: Path,
+    state: dict[str, Any],
+    min_request_age_sec: float,
+    max_failures: int,
 ):
     completed = set(state.get("completed", []))
+    failed = state.get("failed", {})
     now = time.time()
     requests = []
     for request_path in sorted(request_dir.glob("step_*.json")):
         request_key = str(request_path.resolve())
         if request_key in completed:
+            continue
+        if max_failures > 0 and int(failed.get(request_key, 0)) >= max_failures:
             continue
         if now - request_path.stat().st_mtime < min_request_age_sec:
             continue
@@ -122,7 +130,9 @@ def _run_inline_mode(args, run_dir: Path, config_path: Path, project_root: Path)
     last_activity = time.time()
 
     while True:
-        pending = _iter_inline_requests(request_dir, state, args.min_request_age_sec)
+        pending = _iter_inline_requests(
+            request_dir, state, args.min_request_age_sec, args.max_failures
+        )
         if not pending:
             idle_sec = time.time() - last_activity
             if args.once or training_done_marker.exists():
@@ -169,9 +179,13 @@ def _run_inline_mode(args, run_dir: Path, config_path: Path, project_root: Path)
                 env["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
             result = subprocess.run(cmd, cwd=project_root, env=env)
             if result.returncode != 0:
+                failed = state.setdefault("failed", {})
+                failed[request_key] = int(failed.get(request_key, 0)) + 1
+                _save_state(state_path, state)
                 print(
                     f"[eval-watcher|inline] evaluation failed for step={step} "
-                    f"with code={result.returncode}"
+                    f"with code={result.returncode} "
+                    f"(failures={failed[request_key]}/{args.max_failures})"
                 )
                 if args.once:
                     raise SystemExit(result.returncode)
@@ -179,6 +193,7 @@ def _run_inline_mode(args, run_dir: Path, config_path: Path, project_root: Path)
 
             if _expected_inline_summaries_exist(artifact_root, step_tag, probe_tags):
                 state.setdefault("completed", []).append(request_key)
+                state.setdefault("failed", {}).pop(request_key, None)
                 _save_state(state_path, state)
                 print(f"[eval-watcher|inline] finished step={step}")
             else:
@@ -443,6 +458,12 @@ def parse_args():
         help="Exit if idle for this many minutes. 0 = never timeout (rely on training_done marker).",
     )
     parser.add_argument("--cuda_visible_devices", type=str, default=None)
+    parser.add_argument(
+        "--max_failures",
+        type=int,
+        default=3,
+        help="Skip an inline request after this many failed eval attempts. 0 = retry forever.",
+    )
     # Generation-mode options
     parser.add_argument("--num_runs", type=int, default=None)
     parser.add_argument("--seg_size", type=int, default=None)
