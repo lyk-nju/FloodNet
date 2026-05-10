@@ -506,12 +506,17 @@ class DiffForcingWanModel(nn.Module):
             end_indices,
         ) = self._slice_diffusion_window(clean_feature, feature_length, time_steps)
 
-        if (
-            enable_scheduled_sampling
-            and self.training
-            and self.scheduled_sampling_prob > 0.0
-            and np.random.rand() < self.scheduled_sampling_prob
-        ):
+        ss_override = x.get("_scheduled_sampling_override", None)
+        if ss_override is not None:
+            do_ss = bool(ss_override)
+        else:
+            do_ss = (
+                enable_scheduled_sampling
+                and self.training
+                and self.scheduled_sampling_prob > 0.0
+                and np.random.rand() < self.scheduled_sampling_prob
+            )
+        if do_ss:
             with torch.no_grad():
                 cn_res_ss = self._controlnet_forward(
                     noisy_feature_input,

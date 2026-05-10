@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 from lightning.pytorch.utilities import rank_zero_info
 
@@ -64,13 +65,62 @@ class SelfForcingTrainer:
         return clip_val
 
     def training_step(self, batch: dict) -> torch.Tensor:
-        """Execute one complete self-forcing training step."""
+        """Batch-level mixture: scheduled-sampling single-step OR self-forcing
+        K-step rollout, determined by Bernoulli gate on ``scheduled_sampling_prob``.
+
+        When both are enabled they are *mutually exclusive* per batch — avoids
+        compounding rollout noise from both strategies in the same forward pass.
+        """
         self._check_preconditions()
 
+        model_batch = prepare_model_input(batch)
+        ss_prob = getattr(self._module.model, "scheduled_sampling_prob", 0.0)
+        if ss_prob > 0 and np.random.rand() < ss_prob:
+            return self._scheduled_sampling_step(batch, model_batch)
+        return self._self_forcing_step(batch, model_batch)
+
+    # ------------------------------------------------------------------
+    # Scheduled-sampling single step (manual opt, no rollout)
+    # ------------------------------------------------------------------
+
+    def _scheduled_sampling_step(
+        self, batch: dict, model_batch: dict
+    ) -> torch.Tensor:
+        module = self._module
+        net_start_time = time.time()
+        optimizer = module.optimizers()
+        lr_scheduler = module.lr_schedulers()
+
+        model_batch["_scheduled_sampling_override"] = True
+        optimizer.zero_grad(set_to_none=True)
+
+        loss_dict = module._step(batch, is_training=True, model_batch=model_batch)
+        total_loss = loss_dict["total"]
+
+        module.manual_backward(total_loss)
+        trainable = [p for p in module.model.parameters() if p.requires_grad]
+        torch.nn.utils.clip_grad_norm_(trainable, self._resolve_grad_clip())
+        optimizer.step()
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+
+        module._log_step_metrics(
+            {"total": total_loss.detach(), "mse": loss_dict["mse"].detach()},
+            optimizer,
+            net_start_time,
+        )
+        return total_loss
+
+    # ------------------------------------------------------------------
+    # Self-forcing K-step rollout
+    # ------------------------------------------------------------------
+
+    def _self_forcing_step(
+        self, batch: dict, model_batch: dict
+    ) -> torch.Tensor:
         module = self._module
         net_start_time = time.time()
         semantics, runtime_metrics = self._build_runtime_metrics()
-        model_batch = prepare_model_input(batch)
         optimizer = module.optimizers()
         lr_scheduler = module.lr_schedulers()
         self._log_metrics(runtime_metrics)
