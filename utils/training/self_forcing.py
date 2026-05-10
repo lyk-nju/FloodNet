@@ -104,10 +104,17 @@ class SelfForcingTrainer:
         if lr_scheduler is not None:
             lr_scheduler.step()
 
+        log_loss = {"total": total_loss.detach(), "mse": loss_dict["mse"].detach()}
+        if "control" in loss_dict:
+            log_loss["control"] = loss_dict["control"].detach()
         module._log_step_metrics(
-            {"total": total_loss.detach(), "mse": loss_dict["mse"].detach()},
+            log_loss,
             optimizer,
             net_start_time,
+            extra_metrics={
+                "scheduled_sampling/active": 1.0,
+                "self_forcing/active": 0.0,
+            },
         )
         return total_loss
 
