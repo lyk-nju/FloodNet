@@ -3,6 +3,18 @@ import os
 import sys
 from pathlib import Path
 
+# Async eval runs beside an 8-rank training job. Keep BLAS/OpenMP libraries from
+# spawning large CPU thread pools and exhausting per-user process limits.
+for _thread_env_key in (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "BLIS_NUM_THREADS",
+):
+    os.environ.setdefault(_thread_env_key, "1")
+
 import torch
 from lightning import Trainer, seed_everything
 from lightning.pytorch.utilities import rank_zero_info
@@ -34,6 +46,8 @@ def parse_args():
 def main():
     args = parse_args()
     torch.set_float32_matmul_precision("high")
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
 
     artifact_root = args.artifact_root or args.output_dir
     if artifact_root is None:

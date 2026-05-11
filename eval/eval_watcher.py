@@ -18,9 +18,27 @@ from pathlib import Path
 from typing import Any
 
 
+THREAD_LIMIT_ENV = {
+    "OPENBLAS_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1",
+    "BLIS_NUM_THREADS": "1",
+}
+
+
 # ------------------------------------------------------------------
 # Shared helpers
 # ------------------------------------------------------------------
+
+def _subprocess_env(cuda_visible_devices: str | None = None) -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(THREAD_LIMIT_ENV)
+    if cuda_visible_devices is not None:
+        env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
+    return env
+
 
 def _discover_config(run_dir: Path) -> Path:
     sanity_dir = run_dir / "sanity_check"
@@ -174,9 +192,7 @@ def _run_inline_mode(args, run_dir: Path, config_path: Path, project_root: Path)
                 f"ckpt={Path(payload['ckpt_path']).name}"
             )
             print(f"[eval-watcher|inline] cmd={' '.join(cmd)}")
-            env = os.environ.copy()
-            if args.cuda_visible_devices is not None:
-                env["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
+            env = _subprocess_env(args.cuda_visible_devices)
             result = subprocess.run(cmd, cwd=project_root, env=env)
             if result.returncode != 0:
                 failed = state.setdefault("failed", {})
@@ -387,7 +403,7 @@ def _run_generation_mode(args, run_dir: Path, config_path: Path, project_root: P
                     f"probe={probe_tag} ckpt={ckpt_path.name}"
                 )
                 print(f"[eval-watcher|generation] cmd={' '.join(cmd)}")
-                result = subprocess.run(cmd, cwd=project_root)
+                result = subprocess.run(cmd, cwd=project_root, env=_subprocess_env())
                 if result.returncode != 0:
                     print(
                         f"[eval-watcher|generation] evaluation failed for "

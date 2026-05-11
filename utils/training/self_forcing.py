@@ -90,6 +90,7 @@ class SelfForcingTrainer:
         net_start_time = time.time()
         optimizer = module.optimizers()
         lr_scheduler = module.lr_schedulers()
+        lr_for_step = float(optimizer.param_groups[0]["lr"])
 
         model_batch["_scheduled_sampling_override"] = True
         optimizer.zero_grad(set_to_none=True)
@@ -107,14 +108,18 @@ class SelfForcingTrainer:
         log_loss = {"total": total_loss.detach(), "mse": loss_dict["mse"].detach()}
         if "control" in loss_dict:
             log_loss["control"] = loss_dict["control"].detach()
+        extra_metrics = {
+            "scheduled_sampling/active": 1.0,
+            "self_forcing/active": 0.0,
+        }
+        if lr_scheduler is not None:
+            extra_metrics["lr_next"] = float(optimizer.param_groups[0]["lr"])
         module._log_step_metrics(
             log_loss,
             optimizer,
             net_start_time,
-            extra_metrics={
-                "scheduled_sampling/active": 1.0,
-                "self_forcing/active": 0.0,
-            },
+            extra_metrics=extra_metrics,
+            lr_value=lr_for_step,
         )
         return total_loss
 
@@ -130,6 +135,7 @@ class SelfForcingTrainer:
         semantics, runtime_metrics = self._build_runtime_metrics()
         optimizer = module.optimizers()
         lr_scheduler = module.lr_schedulers()
+        lr_for_step = float(optimizer.param_groups[0]["lr"])
         self._log_metrics(runtime_metrics)
 
         optimizer.zero_grad(set_to_none=True)
@@ -157,8 +163,14 @@ class SelfForcingTrainer:
         loss_dict = {"total": total_loss.detach(), "mse": step_diff_loss.detach()}
         if step_control_loss is not None:
             loss_dict["control"] = step_control_loss.detach()
+        if lr_scheduler is not None:
+            runtime_metrics["lr_next"] = float(optimizer.param_groups[0]["lr"])
         self._module._log_step_metrics(
-            loss_dict, optimizer, net_start_time, extra_metrics=runtime_metrics
+            loss_dict,
+            optimizer,
+            net_start_time,
+            extra_metrics=runtime_metrics,
+            lr_value=lr_for_step,
         )
         return total_loss
 

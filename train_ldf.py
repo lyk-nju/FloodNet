@@ -9,6 +9,19 @@ import os
 from pathlib import Path
 import time
 
+# Keep CPU BLAS/OpenMP thread pools small. This process already uses DDP ranks,
+# dataloader workers, and optional eval workers; large default BLAS pools can
+# hit per-user thread limits during eval.
+for _thread_env_key in (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "BLIS_NUM_THREADS",
+):
+    os.environ.setdefault(_thread_env_key, "1")
+
 import torch
 import wandb
 from lightning import Trainer, seed_everything
@@ -74,7 +87,7 @@ class CustomLightningModule(BasicLightningModule):
         )
 
     def _log_step_metrics(
-        self, loss_dict, optimizer, net_start_time, extra_metrics=None
+        self, loss_dict, optimizer, net_start_time, extra_metrics=None, lr_value=None
     ):
         net_end_time = time.time()
         data_time = (
@@ -86,7 +99,7 @@ class CustomLightningModule(BasicLightningModule):
         batch_size = self.cfg.data.train_bs
         self.log(
             "lr",
-            optimizer.param_groups[0]["lr"],
+            optimizer.param_groups[0]["lr"] if lr_value is None else float(lr_value),
             on_step=True,
             prog_bar=True,
             batch_size=batch_size,

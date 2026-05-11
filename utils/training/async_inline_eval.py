@@ -119,6 +119,16 @@ def launch_eval_watcher(cfg, save_dir: str):
     log_path.parent.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = eval_device
+    env.update(
+        {
+            "OPENBLAS_NUM_THREADS": "1",
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
+            "VECLIB_MAXIMUM_THREADS": "1",
+            "BLIS_NUM_THREADS": "1",
+        }
+    )
     cmd = [
         sys.executable,
         str(watcher_script),

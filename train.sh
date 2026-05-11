@@ -6,4 +6,4 @@ source /opt/anaconda3/bin/activate
 
 conda activate flooddiffusion
 
-python train_ldf.py --config configs/ldf.yaml
+python train_ldf.py --config configs/ldf_babel.yaml
