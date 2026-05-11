@@ -115,6 +115,18 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                     [p for p in module.model.parameters() if p.requires_grad]
                 ):
                     model_batch = prepare_model_input(sample_batch)
+                    # --- DEBUG: snapshot model state before generate ---
+                    _dbg_param = None
+                    for _name, _p in module.model.named_parameters():
+                        if "blocks.0" in _name and _p.requires_grad:
+                            _dbg_param = (_name, _p.detach().abs().mean().item())
+                            break
+                    if run_idx == 0 and sample_idx == 0 and _dbg_param:
+                        rank_zero_info(
+                            f"[DEBUG eval] before generate: {_dbg_param[0]} "
+                            f"abs_mean={_dbg_param[1]:.8f} seed={sample_seed}"
+                        )
+                    # --- END DEBUG ---
                     output = module.model.generate(model_batch)
 
                 single_generated = output["generated"][0]

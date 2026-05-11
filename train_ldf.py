@@ -674,6 +674,16 @@ def main():
     # train or validate
     ##############################
     if cfg.train:
+        if cfg.resume_ckpt:
+            rank_zero_info(
+                f"[eval-on-resume] running inline eval on resume ckpt: {cfg.resume_ckpt}"
+            )
+            trainer.validate(
+                model,
+                dataloaders=val_dataloaders,
+                ckpt_path=cfg.resume_ckpt,
+                weights_only=False,
+            )
         trainer.fit(
             model,
             train_dataloader,
