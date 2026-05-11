@@ -272,6 +272,44 @@ class CustomLightningModule(BasicLightningModule):
         )
         self._skip_next_lightning_load_state_dict = True
 
+        # --- DEBUG: verify EMA state after load ---
+        ema_n = len(self.ema.shadow_params)
+        trainable_n = len([p for p in self.model.parameters() if p.requires_grad])
+        total_n = len(list(self.model.parameters()))
+        rank_zero_info(
+            f"[DEBUG load] ema shadow_params={ema_n} trainable={trainable_n} total={total_n}"
+        )
+        # Check if backbone params would change under EMA.
+        # They are frozen (requires_grad=False) so average_parameters skips them.
+        # We test by manually comparing state_dict weight vs the same weight after
+        # temporarily expanding EMA to all params.
+        all_params = list(self.model.parameters())
+        ema_shadow_map = {
+            id(p): s for p, s in zip(
+                [p for p in self.model.parameters() if p.requires_grad],
+                self.ema.shadow_params,
+            )
+        }
+        # Find a backbone param and check if it has an EMA shadow
+        backbone_with_ema = 0
+        backbone_total = 0
+        for name, p in self.model.named_parameters():
+            if not p.requires_grad and "controlnet" not in name and "traj_encoder" not in name and "local_traj_encoder" not in name:
+                backbone_total += 1
+                if id(p) in ema_shadow_map:
+                    backbone_with_ema += 1
+                    s = ema_shadow_map[id(p)]
+                    diff = (s - p).abs().mean().item()
+                    if backbone_with_ema == 1:
+                        rank_zero_info(
+                            f"[DEBUG load] backbone param '{name}': raw={p.abs().mean():.6f} "
+                            f"ema_shadow={s.abs().mean():.6f} diff={diff:.8f}"
+                        )
+        rank_zero_info(
+            f"[DEBUG load] backbone params with EMA shadow: {backbone_with_ema}/{backbone_total}"
+        )
+        # --- END DEBUG ---
+
     def on_train_batch_end(self, outputs, batch, batch_idx):
         super().on_train_batch_end(outputs, batch, batch_idx)
         emit_eval_request(self)
