@@ -677,16 +677,14 @@ def main():
     if cfg.train:
         if cfg.resume_ckpt:
             rank_zero_info(
-                f"[eval-on-resume] running inline eval on resume ckpt: {cfg.resume_ckpt}"
+                f"[eval-on-resume] running test on resume ckpt: {cfg.resume_ckpt}"
             )
-            model._eval_on_resume = True
-            trainer.validate(
+            trainer.test(
                 model,
-                dataloaders=val_dataloaders,
+                dataloaders=test_probe_loaders,
                 ckpt_path=cfg.resume_ckpt,
                 weights_only=False,
             )
-            model._eval_on_resume = False
         trainer.fit(
             model,
             train_dataloader,
