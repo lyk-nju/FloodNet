@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 import random
@@ -138,6 +139,17 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                     sample_text = output["text"][0]
                     token_run0 = single_generated.float().cpu().numpy()
                     feature_run0 = decoded_single_generated.cpu().numpy()
+                    # --- DEBUG: save raw token for comparison ---
+                    _debug_token_path = os.path.join(
+                        os.environ.get("FLOODNET_DEBUG_DIR", "/tmp"),
+                        f"debug_token_{sample_name}.npy",
+                    )
+                    np.save(_debug_token_path, token_run0)
+                    rank_zero_info(
+                        f"[DEBUG token] saved {sample_name} token shape={token_run0.shape} "
+                        f"abs_mean={np.abs(token_run0).mean():.6f} to {_debug_token_path}"
+                    )
+                    # --- END DEBUG ---
 
                     feat_len = int(decoded_single_generated.shape[0])
                     if "traj_features" in sample_batch:
