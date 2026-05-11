@@ -180,10 +180,11 @@ class BasicLightningModule(LightningModule):
     # NOTE: lightning handles with torch.no_grad() and model.eval() automatically
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         if dataloader_idx >= 1:
+            _force = getattr(self, "_eval_on_resume", False)
             if (
                 not self.trainer.sanity_checking
                 and self.global_step > 0
-                and self.global_step % self.cfg.validation.test_steps == 0
+                and (_force or self.global_step % self.cfg.validation.test_steps == 0)
             ):
                 self.test_step(batch, batch_idx, dataloader_idx=dataloader_idx - 1)
         else:

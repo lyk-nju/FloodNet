@@ -447,10 +447,11 @@ class CustomLightningModule(BasicLightningModule):
 
     def on_validation_epoch_end(self):
         if not is_async_eval(self.cfg):
+            _force = getattr(self, "_eval_on_resume", False)
             if (
                 not self.trainer.sanity_checking
                 and self.global_step > 0
-                and self.global_step % self.cfg.validation.test_steps == 0
+                and (_force or self.global_step % self.cfg.validation.test_steps == 0)
             ):
                 self.on_test_epoch_end()
                 self._inline_eval_dedup.clear()
@@ -678,12 +679,14 @@ def main():
             rank_zero_info(
                 f"[eval-on-resume] running inline eval on resume ckpt: {cfg.resume_ckpt}"
             )
+            model._eval_on_resume = True
             trainer.validate(
                 model,
                 dataloaders=val_dataloaders,
                 ckpt_path=cfg.resume_ckpt,
                 weights_only=False,
             )
+            model._eval_on_resume = False
         trainer.fit(
             model,
             train_dataloader,
