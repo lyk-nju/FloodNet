@@ -123,10 +123,17 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                             _dbg_param = (_name, _p.detach().abs().mean().item())
                             break
                     if run_idx == 0 and sample_idx == 0 and _dbg_param:
-                        rank_zero_info(
-                            f"[DEBUG eval] before generate: {_dbg_param[0]} "
+                        _msg = (
+                            f"[DEBUG eval][{step_tag}] before generate: {_dbg_param[0]} "
                             f"abs_mean={_dbg_param[1]:.8f} seed={sample_seed}"
                         )
+                        rank_zero_info(_msg)
+                        _dbg_file = os.path.join(
+                            os.environ.get("FLOODNET_DEBUG_DIR", "/tmp"),
+                            "eval_state.log",
+                        )
+                        with open(_dbg_file, "a") as _f:
+                            _f.write(_msg + "\n")
                     # --- END DEBUG ---
                     output = module.model.generate(model_batch)
 
