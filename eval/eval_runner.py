@@ -116,16 +116,21 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                     [p for p in module.model.parameters() if p.requires_grad]
                 ):
                     model_batch = prepare_model_input(sample_batch)
-                    # --- DEBUG: snapshot model state before generate ---
+                    # --- DEBUG: snapshot model state & model_batch before generate ---
                     _dbg_param = None
                     for _name, _p in module.model.named_parameters():
                         if "blocks.0" in _name and _p.requires_grad:
                             _dbg_param = (_name, _p.detach().abs().mean().item())
                             break
                     if run_idx == 0 and sample_idx == 0 and _dbg_param:
+                        _text = model_batch.get("text", [None])[0]
+                        _feat = model_batch.get("feature", None)
+                        _feat_mean = _feat[0].abs().mean().item() if _feat is not None else -1
                         _msg = (
                             f"[DEBUG eval][{step_tag}] before generate: {_dbg_param[0]} "
-                            f"abs_mean={_dbg_param[1]:.8f} seed={sample_seed}"
+                            f"abs_mean={_dbg_param[1]:.8f} seed={sample_seed} "
+                            f"feature_abs_mean={_feat_mean:.6f} "
+                            f"text_preview={str(_text)[:80]}"
                         )
                         rank_zero_info(_msg)
                         _dbg_file = os.path.join(
