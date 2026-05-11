@@ -6,6 +6,7 @@
 # Added context length corrrection.
 
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -27,6 +28,79 @@ def sinusoidal_embedding_1d(dim, position):
     )
     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
     return x
+
+
+def _embed_text_context(text_embedding, context, text_len, dim, device):
+    """Pad/embed text contexts while deduplicating repeated tensor references."""
+    dedup_enabled = os.environ.get("FLOODNET_TEXT_CONTEXT_DEDUP", "1").lower()
+    if dedup_enabled in {"0", "false", "no", "off"}:
+        context_lens = torch.tensor(
+            [u.size(0) for u in context], dtype=torch.long, device=device
+        )
+        if len(context) == 0:
+            return (
+                torch.empty(0, text_len, dim, device=device, dtype=torch.float32),
+                context_lens,
+            )
+        return (
+            text_embedding(
+                torch.stack(
+                    [
+                        torch.cat(
+                            [u, u.new_zeros(text_len - u.size(0), u.size(1))]
+                        )
+                        for u in context
+                    ]
+                )
+            ),
+            context_lens,
+        )
+
+    context_lens = torch.tensor(
+        [min(u.size(0), text_len) for u in context], dtype=torch.long, device=device
+    )
+    if len(context) == 0:
+        return (
+            torch.empty(0, text_len, dim, device=device, dtype=torch.float32),
+            context_lens,
+        )
+
+    unique_map = {}
+    unique_list = []
+    ctx_indices = []
+    for u in context:
+        key = (
+            u.data_ptr(),
+            tuple(u.size()),
+            tuple(u.stride()),
+            u.storage_offset(),
+            u.dtype,
+            u.device,
+        )
+        idx = unique_map.get(key)
+        if idx is None:
+            idx = len(unique_list)
+            unique_map[key] = idx
+            unique_list.append(u)
+        ctx_indices.append(idx)
+
+    unique_stacked = torch.stack(
+        [
+            torch.cat(
+                [
+                    u[:text_len],
+                    u.new_zeros(text_len - min(u.size(0), text_len), u.size(1)),
+                ]
+            )
+            for u in unique_list
+        ]
+    )
+    unique_embedded = text_embedding(unique_stacked)
+    if len(unique_list) == len(context):
+        return unique_embedded, context_lens
+
+    idx_t = torch.tensor(ctx_indices, device=unique_embedded.device, dtype=torch.long)
+    return unique_embedded[idx_t], context_lens
 
 
 @torch.amp.autocast("cuda", enabled=False)
@@ -676,38 +750,10 @@ class WanModel(ModelMixin, ConfigMixin):
                 e0 = torch.cat([e0, e0_traj], dim=1)
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
-        # context — deduplicate frame-aligned entries (BABEL stream mode)
-        # so torch.stack only materialises unique tensors, not B*seq_len copies.
-        context_lens = torch.tensor([u.size(0) for u in context], dtype=torch.long)
-        if len(context) > 0:
-            unique_map = {}
-            unique_list = []
-            ctx_indices = []
-            for u in context:
-                key = u.data_ptr()
-                idx = unique_map.get(key)
-                if idx is None:
-                    idx = len(unique_list)
-                    unique_map[key] = idx
-                    unique_list.append(u)
-                ctx_indices.append(idx)
-            unique_stacked = torch.stack(
-                [
-                    torch.cat(
-                        [u[: self.text_len],
-                         u.new_zeros(self.text_len - min(u.size(0), self.text_len), u.size(1))]
-                    )
-                    for u in unique_list
-                ]
-            )
-            unique_embedded = self.text_embedding(unique_stacked)
-            if len(unique_list) < len(context):
-                idx_t = torch.tensor(ctx_indices, device=unique_embedded.device)
-                context = unique_embedded[idx_t]
-            else:
-                context = unique_embedded
-        else:
-            context = torch.empty(0, self.text_len, self.dim, device=device)
+        # context
+        context, context_lens = _embed_text_context(
+            self.text_embedding, context, self.text_len, self.dim, device
+        )
 
         # arguments
         kwargs = dict(

@@ -224,6 +224,26 @@ def _run_inline_mode(args, run_dir: Path, config_path: Path, project_root: Path)
         time.sleep(args.poll_interval_sec)
 
 
+def _expected_inline_summaries_exist(
+    artifact_root: Path, step_tag: str, probe_tags: list[str]
+) -> bool:
+    """Return True once inline eval has written all expected summary files."""
+    expected_probe_tags = probe_tags or [
+        path.parent.name
+        for path in artifact_root.glob(f"*/metrics/*/{step_tag}/summary.json")
+    ]
+    if not expected_probe_tags:
+        return False
+
+    for probe_tag in expected_probe_tags:
+        matches = list(
+            artifact_root.glob(f"*/metrics/{probe_tag}/{step_tag}/summary.json")
+        )
+        if not matches:
+            return False
+    return True
+
+
 # ------------------------------------------------------------------
 # Generation mode
 # ------------------------------------------------------------------
