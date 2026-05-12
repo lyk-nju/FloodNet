@@ -185,6 +185,19 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                     # ── DEBUG: comprehensive state dump on first sample/run ──
                     if run_idx == 0 and sample_idx == 0:
                         _dump_eval_debug(module, model_batch, sample_seed, step_tag)
+                        # Save EMA-applied weights so standalone eval can reproduce
+                        # the exact same model state inline eval used.
+                        _snap = {}
+                        for _name, _p in module.model.named_parameters():
+                            if _p.requires_grad:
+                                _snap[_name] = _p.detach().float().cpu().clone()
+                        _snap_path = os.path.join(
+                            module.cfg.save_dir, "async_eval", "ema_applied",
+                            f"{step_tag}.pt",
+                        )
+                        os.makedirs(os.path.dirname(_snap_path), exist_ok=True)
+                        torch.save(_snap, _snap_path)
+                        rank_zero_info(f"[eval] saved EMA snapshot to {_snap_path}")
                     # ── END DEBUG ──
                     output = module.model.generate(model_batch)
 

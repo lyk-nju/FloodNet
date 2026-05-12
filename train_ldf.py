@@ -200,10 +200,9 @@ class CustomLightningModule(BasicLightningModule):
 
     def _load_eval_only_checkpoint(self, checkpoint):
         """Eval-only restore: load model weights, then overwrite trainable params
-        with the float32 EMA shadow snapshot saved at checkpoint time.
-
-        This bypasses torch_ema.load_state_dict()'s dtype/device conversion which
-        can subtly differ between trainer.fit and trainer.test lifecycles.
+        with the EMA shadow snapshot saved *during inline eval* (not during
+        on_save_checkpoint).  Falls back to the checkpoint-level snapshot for
+        backwards compatibility with old checkpoints.
         """
         ckpt_keys = set(checkpoint["state_dict"].keys())
         controlnet_missing = not any(k.startswith("controlnet.") for k in ckpt_keys)
@@ -214,14 +213,25 @@ class CustomLightningModule(BasicLightningModule):
             rank_zero_info(
                 "Eval-only: Re-initialized ControlNet from loaded backbone weights"
             )
-        # Overwrite trainable params with EMA shadow snapshot.
-        ema_applied = checkpoint["ema_applied_trainable"]
-        with torch.no_grad():
-            for name, param in self.model.named_parameters():
-                if name in ema_applied:
-                    param.data.copy_(
-                        ema_applied[name].to(device=param.device, dtype=param.dtype)
-                    )
+
+        # Prefer the eval-time snapshot (saved by inline eval) over the
+        # checkpoint-level one (saved by on_save_checkpoint, which runs earlier).
+        snap_path = getattr(self, "_eval_snapshot_path", None)
+        ema_applied = None
+        if snap_path and os.path.exists(snap_path):
+            ema_applied = torch.load(snap_path, map_location="cpu", weights_only=True)
+            rank_zero_info(f"[eval-only] loaded eval-time EMA snapshot from {snap_path}")
+        elif "ema_applied_trainable" in checkpoint:
+            ema_applied = checkpoint["ema_applied_trainable"]
+            rank_zero_info("[eval-only] falling back to checkpoint ema_applied_trainable")
+
+        if ema_applied is not None:
+            with torch.no_grad():
+                for name, param in self.model.named_parameters():
+                    if name in ema_applied:
+                        param.data.copy_(
+                            ema_applied[name].to(device=param.device, dtype=param.dtype)
+                        )
         self.ema = ExponentialMovingAverage(
             [p for p in self.model.parameters() if p.requires_grad],
             decay=self.cfg.model.ema_decay,
@@ -233,8 +243,7 @@ class CustomLightningModule(BasicLightningModule):
         )
         self._skip_next_lightning_load_state_dict = True
         rank_zero_info(
-            f"[eval-only] loaded EMA-applied weights from snapshot "
-            f"(step={self._resume_step_offset})"
+            f"[eval-only] EMA-applied weights restored (step={self._resume_step_offset})"
         )
 
     def on_load_checkpoint(self, checkpoint):
