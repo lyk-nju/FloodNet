@@ -48,6 +48,8 @@ def main():
     torch.set_float32_matmul_precision("high")
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
+    # Force deterministic cuDNN / matmul for reproducible eval.
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
     artifact_root = args.artifact_root or args.output_dir
     if artifact_root is None:
