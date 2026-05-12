@@ -178,12 +178,10 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                     module.cfg.seed, probe_tag, sample_name, run_idx
                 )
                 _seed_eval_locally(sample_seed)
-                # ── DEBUG: state BEFORE EMA ──
-                if run_idx == 0 and sample_idx == 0:
+                _debug = os.environ.get("FLOODNET_DEBUG", "") == "1"
+                if _debug and run_idx == 0 and sample_idx == 0:
                     _dbg_file = os.path.join(
-                        os.environ.get("FLOODNET_DEBUG_DIR", "/tmp"),
-                        "eval_state.log",
-                    )
+                        os.environ.get("FLOODNET_DEBUG_DIR", "/tmp"), "eval_state.log")
                     _pre_sd = _hash_sd(module.model.state_dict())
                     _pre_ema = _hash_ema(module.ema)
                     with open(_dbg_file, "a") as _f:
@@ -191,18 +189,14 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                             f"[PRE-EMA {step_tag}] sd_hash={_pre_sd} "
                             f"ema_hash={_pre_ema}\n"
                         )
-                # ── END DEBUG ──
                 with module.ema.average_parameters(
                     [p for p in module.model.parameters() if p.requires_grad]
                 ):
                     model_batch = prepare_model_input(sample_batch)
-                    # ── DEBUG: state INSIDE EMA context ──
-                    if run_idx == 0 and sample_idx == 0:
+                    if _debug and run_idx == 0 and sample_idx == 0:
                         _dump_eval_debug(module, model_batch, sample_seed, step_tag)
-                    # ── END DEBUG ──
                     output = module.model.generate(model_batch)
-                # ── DEBUG: state AFTER EMA (should == PRE-EMA) ──
-                if run_idx == 0 and sample_idx == 0:
+                if _debug and run_idx == 0 and sample_idx == 0:
                     _post_sd = _hash_sd(module.model.state_dict())
                     _post_ema = _hash_ema(module.ema)
                     with open(_dbg_file, "a") as _f:
@@ -211,7 +205,6 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                             f"ema_hash={_post_ema} "
                             f"sd_restored={_pre_sd == _post_sd}\n"
                         )
-                # ── END DEBUG ──
 
                 single_generated = output["generated"][0]
                 decoded_single_generated = module.vae.decode(
@@ -222,17 +215,16 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                     sample_text = output["text"][0]
                     token_run0 = single_generated.float().cpu().numpy()
                     feature_run0 = decoded_single_generated.cpu().numpy()
-                    # --- DEBUG: save raw token for comparison ---
-                    _debug_token_path = os.path.join(
-                        os.environ.get("FLOODNET_DEBUG_DIR", "/tmp"),
-                        f"debug_token_{sample_name}.npy",
-                    )
-                    np.save(_debug_token_path, token_run0)
-                    rank_zero_info(
-                        f"[DEBUG token] saved {sample_name} token shape={token_run0.shape} "
-                        f"abs_mean={np.abs(token_run0).mean():.6f} to {_debug_token_path}"
-                    )
-                    # --- END DEBUG ---
+                    if _debug:
+                        _debug_token_path = os.path.join(
+                            os.environ.get("FLOODNET_DEBUG_DIR", "/tmp"),
+                            f"debug_token_{sample_name}.npy",
+                        )
+                        np.save(_debug_token_path, token_run0)
+                        rank_zero_info(
+                            f"[DEBUG token] saved {sample_name} token shape={token_run0.shape} "
+                            f"abs_mean={np.abs(token_run0).mean():.6f}"
+                        )
 
                     feat_len = int(decoded_single_generated.shape[0])
                     if "traj_features" in sample_batch:
