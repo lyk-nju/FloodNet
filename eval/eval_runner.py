@@ -123,6 +123,11 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                             _dbg_param = (_name, _p.detach().abs().mean().item())
                             break
                     if run_idx == 0 and sample_idx == 0 and _dbg_param:
+                        import hashlib, struct
+                        _hasher = hashlib.sha256()
+                        for _name, _p in sorted(module.model.named_parameters()):
+                            _data = _p.detach().cpu().numpy().tobytes()
+                            _hasher.update(_data)
                         _text = model_batch.get("text", [None])[0]
                         _feat = model_batch.get("feature", None)
                         _feat_mean = _feat[0].abs().mean().item() if _feat is not None else -1
@@ -130,6 +135,7 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                             f"[DEBUG eval][{step_tag}] before generate: {_dbg_param[0]} "
                             f"abs_mean={_dbg_param[1]:.8f} seed={sample_seed} "
                             f"feature_abs_mean={_feat_mean:.6f} "
+                            f"param_hash={_hasher.hexdigest()[:16]} "
                             f"text_preview={str(_text)[:80]}"
                         )
                         rank_zero_info(_msg)
