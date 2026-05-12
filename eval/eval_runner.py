@@ -44,6 +44,72 @@ except ImportError:  # pragma: no cover - script entrypoints use top-level impor
     )
 
 
+def _dump_eval_debug(module, model_batch, sample_seed, step_tag):
+    """Write comprehensive debug state to FLOODNET_DEBUG_DIR/eval_state.log."""
+    import hashlib, time
+
+    _dbg_dir = os.environ.get("FLOODNET_DEBUG_DIR", "/tmp")
+    _dbg_file = os.path.join(_dbg_dir, "eval_state.log")
+    _lines = []
+    _w = _lines.append
+
+    _w(f"=== {step_tag} seed={sample_seed} time={time.time():.3f} ===")
+
+    # 1. Model param hash (all named_parameters)
+    _h = hashlib.sha256()
+    for _name, _p in sorted(module.model.named_parameters()):
+        _h.update(_p.detach().cpu().numpy().tobytes())
+    _w(f"model_param_hash={_h.hexdigest()[:24]}")
+
+    # 2. EMA shadow param hash (all shadow_params)
+    _h = hashlib.sha256()
+    for _sp in module.ema.shadow_params:
+        _h.update(_sp.detach().cpu().numpy().tobytes())
+    _w(f"ema_shadow_hash={_h.hexdigest()[:24]}")
+
+    # 3. A few model param spot-checks (pre-EMA-restore baseline is already applied)
+    for _name in (
+        "model.blocks.0.self_attn.q.weight",
+        "model.blocks.0.cross_attn.q.weight",
+        "controlnet.blocks.0.self_attn.q.weight",
+        "controlnet.zero_out.0.weight",
+    ):
+        _p = dict(module.model.named_parameters()).get(_name)
+        if _p is not None:
+            _w(f"param.{_name} abs_mean={_p.detach().abs().mean().item():.10f}")
+
+    # 4. model_batch key shapes & hashes
+    _feat = model_batch.get("feature")
+    if _feat is not None:
+        _h = hashlib.sha256()
+        _h.update(_feat.detach().cpu().numpy().tobytes())
+        _w(f"feature shape={tuple(_feat.shape)} abs_mean={_feat.abs().mean().item():.6f} hash={_h.hexdigest()[:16]}")
+    _w(f"feature_length={model_batch.get('feature_length', 'N/A')}")
+    _text = model_batch.get("text", [None])
+    _w(f"text={_text[0] if _text else 'N/A'}")
+
+    _traj = model_batch.get("traj_features", model_batch.get("traj"))
+    if _traj is not None:
+        _h = hashlib.sha256()
+        _h.update(_traj.detach().cpu().numpy().tobytes())
+        _w(f"traj shape={tuple(_traj.shape)} abs_mean={_traj.abs().mean().item():.6f} hash={_h.hexdigest()[:16]}")
+        _w(f"traj_mask sample={model_batch.get('traj_mask', 'N/A')}")
+
+    # 5. Config / model knobs
+    _w(f"cfg_scale_text={module.cfg.model.params.get('cfg_scale_text')}")
+    _w(f"cfg_scale_traj={module.cfg.model.params.get('cfg_scale_traj')}")
+    _w(f"chunk_size={module.model.chunk_size}")
+    _w(f"noise_steps={module.model.noise_steps}")
+    _w(f"prediction_type={module.model.prediction_type}")
+    _w(f"use_precomputed_text_emb={module.model.use_precomputed_text_emb}")
+    _w(f"device={module.device}")
+    _w(f"autocast={'bf16-mixed' if module.cfg.trainer.get('precision','').startswith('bf16') else 'unknown'}")
+    _w(f"inference_mode={torch.is_inference_mode_enabled()}")
+
+    with open(_dbg_file, "a") as _f:
+        _f.write("\n".join(_lines) + "\n\n")
+
+
 def _gather_payloads(local_payloads):
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         gathered_payloads = [None] * torch.distributed.get_world_size()
@@ -116,36 +182,10 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                     [p for p in module.model.parameters() if p.requires_grad]
                 ):
                     model_batch = prepare_model_input(sample_batch)
-                    # --- DEBUG: snapshot model state & model_batch before generate ---
-                    _dbg_param = None
-                    for _name, _p in module.model.named_parameters():
-                        if "blocks.0" in _name and _p.requires_grad:
-                            _dbg_param = (_name, _p.detach().abs().mean().item())
-                            break
-                    if run_idx == 0 and sample_idx == 0 and _dbg_param:
-                        import hashlib, struct
-                        _hasher = hashlib.sha256()
-                        for _name, _p in sorted(module.model.named_parameters()):
-                            _data = _p.detach().cpu().numpy().tobytes()
-                            _hasher.update(_data)
-                        _text = model_batch.get("text", [None])[0]
-                        _feat = model_batch.get("feature", None)
-                        _feat_mean = _feat[0].abs().mean().item() if _feat is not None else -1
-                        _msg = (
-                            f"[DEBUG eval][{step_tag}] before generate: {_dbg_param[0]} "
-                            f"abs_mean={_dbg_param[1]:.8f} seed={sample_seed} "
-                            f"feature_abs_mean={_feat_mean:.6f} "
-                            f"param_hash={_hasher.hexdigest()[:16]} "
-                            f"text_preview={str(_text)[:80]}"
-                        )
-                        rank_zero_info(_msg)
-                        _dbg_file = os.path.join(
-                            os.environ.get("FLOODNET_DEBUG_DIR", "/tmp"),
-                            "eval_state.log",
-                        )
-                        with open(_dbg_file, "a") as _f:
-                            _f.write(_msg + "\n")
-                    # --- END DEBUG ---
+                    # ── DEBUG: comprehensive state dump on first sample/run ──
+                    if run_idx == 0 and sample_idx == 0:
+                        _dump_eval_debug(module, model_batch, sample_seed, step_tag)
+                    # ── END DEBUG ──
                     output = module.model.generate(model_batch)
 
                 single_generated = output["generated"][0]
