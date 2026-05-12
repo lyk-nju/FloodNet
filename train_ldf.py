@@ -198,6 +198,45 @@ class CustomLightningModule(BasicLightningModule):
         self.t2m_enabled = bool(self.cfg.get("t2m_metric", False))
         self.t2m_metrics = T2MMetrics(self.cfg.metrics.t2m) if self.t2m_enabled else None
 
+    def _load_eval_only_checkpoint(self, checkpoint):
+        """Eval-only restore: load model weights, then overwrite trainable params
+        with the float32 EMA shadow snapshot saved at checkpoint time.
+
+        This bypasses torch_ema.load_state_dict()'s dtype/device conversion which
+        can subtly differ between trainer.fit and trainer.test lifecycles.
+        """
+        ckpt_keys = set(checkpoint["state_dict"].keys())
+        controlnet_missing = not any(k.startswith("controlnet.") for k in ckpt_keys)
+        strict = not controlnet_missing
+        result = self.model.load_state_dict(checkpoint["state_dict"], strict=strict)
+        if controlnet_missing and any("controlnet." in k for k in result.missing_keys):
+            self.model.controlnet.init_from_backbone(self.model.model)
+            rank_zero_info(
+                "Eval-only: Re-initialized ControlNet from loaded backbone weights"
+            )
+        # Overwrite trainable params with EMA shadow snapshot.
+        ema_applied = checkpoint["ema_applied_trainable"]
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                if name in ema_applied:
+                    param.data.copy_(
+                        ema_applied[name].to(device=param.device, dtype=param.dtype)
+                    )
+        self.ema = ExponentialMovingAverage(
+            [p for p in self.model.parameters() if p.requires_grad],
+            decay=self.cfg.model.ema_decay,
+        )
+        check_state_dict(
+            state_dict=self.model.state_dict(),
+            named_parameters=self.model.named_parameters(),
+            named_buffers=self.model.named_buffers(),
+        )
+        self._skip_next_lightning_load_state_dict = True
+        rank_zero_info(
+            f"[eval-only] loaded EMA-applied weights from snapshot "
+            f"(step={self._resume_step_offset})"
+        )
+
     def on_load_checkpoint(self, checkpoint):
         # NOTE: super() not called — state_dict / EMA / optimizer are restored
         # manually so ControlNet re-init and new-param EMA reset work correctly.
@@ -211,6 +250,12 @@ class CustomLightningModule(BasicLightningModule):
             rank_zero_info(
                 f"[resume] loaded checkpoint global_step={self._resume_step_offset}"
             )
+        ##############################
+        # eval-only fast path: use saved EMA snapshot directly
+        ##############################
+        if getattr(self, "_eval_only", False) and "ema_applied_trainable" in checkpoint:
+            self._load_eval_only_checkpoint(checkpoint)
+            return
         ##############################
         # state_dict (strict vs loose for ControlNet)
         ##############################
