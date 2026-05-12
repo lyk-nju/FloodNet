@@ -236,6 +236,25 @@ class CustomLightningModule(BasicLightningModule):
             [p for p in self.model.parameters() if p.requires_grad],
             decay=self.cfg.model.ema_decay,
         )
+        # --- DEBUG: hash after loading eval snapshot ---
+        import hashlib
+        _h_sd = hashlib.sha256()
+        _h_ema = hashlib.sha256()
+        for _k, _v in sorted(self.model.state_dict().items()):
+            _h_sd.update(_v.cpu().numpy().tobytes())
+        for _s in self.ema.shadow_params:
+            _h_ema.update(_s.cpu().numpy().tobytes())
+        _dbg_file = os.path.join(
+            os.environ.get("FLOODNET_DEBUG_DIR", "/tmp"),
+            "eval_state.log",
+        )
+        with open(_dbg_file, "a") as _f:
+            _f.write(
+                f"[EVAL-LOAD step={self._resume_step_offset}] "
+                f"sd_hash={_h_sd.hexdigest()[:16]} "
+                f"ema_hash={_h_ema.hexdigest()[:16]}\n"
+            )
+        # --- END DEBUG ---
         check_state_dict(
             state_dict=self.model.state_dict(),
             named_parameters=self.model.named_parameters(),

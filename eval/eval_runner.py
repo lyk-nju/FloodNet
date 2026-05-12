@@ -44,6 +44,20 @@ except ImportError:  # pragma: no cover - script entrypoints use top-level impor
     )
 
 
+def _hash_sd(sd):
+    import hashlib
+    _h = hashlib.sha256()
+    for _k in sorted(sd.keys()):
+        _h.update(sd[_k].detach().cpu().numpy().tobytes())
+    return _h.hexdigest()[:16]
+
+def _hash_ema(ema):
+    import hashlib
+    _h = hashlib.sha256()
+    for _s in ema.shadow_params:
+        _h.update(_s.detach().cpu().numpy().tobytes())
+    return _h.hexdigest()[:16]
+
 def _dump_eval_debug(module, model_batch, sample_seed, step_tag):
     """Write comprehensive debug state to FLOODNET_DEBUG_DIR/eval_state.log."""
     import hashlib, time
@@ -55,19 +69,13 @@ def _dump_eval_debug(module, model_batch, sample_seed, step_tag):
 
     _w(f"=== {step_tag} seed={sample_seed} time={time.time():.3f} ===")
 
-    # 1. Model param hash (all named_parameters)
-    _h = hashlib.sha256()
-    for _name, _p in sorted(module.model.named_parameters()):
-        _h.update(_p.detach().cpu().numpy().tobytes())
-    _w(f"model_param_hash={_h.hexdigest()[:24]}")
+    # 1. Model state_dict hash
+    _w(f"sd_hash={_hash_sd(module.model.state_dict())}")
 
-    # 2. EMA shadow param hash (all shadow_params)
-    _h = hashlib.sha256()
-    for _sp in module.ema.shadow_params:
-        _h.update(_sp.detach().cpu().numpy().tobytes())
-    _w(f"ema_shadow_hash={_h.hexdigest()[:24]}")
+    # 2. EMA shadow hash
+    _w(f"ema_hash={_hash_ema(module.ema)}")
 
-    # 3. A few model param spot-checks (pre-EMA-restore baseline is already applied)
+    # 3. Key param spot-checks
     for _name in (
         "model.blocks.0.self_attn.q.weight",
         "model.blocks.0.cross_attn.q.weight",
@@ -78,13 +86,12 @@ def _dump_eval_debug(module, model_batch, sample_seed, step_tag):
         if _p is not None:
             _w(f"param.{_name} abs_mean={_p.detach().abs().mean().item():.10f}")
 
-    # 4. model_batch key shapes & hashes
+    # 4. model_batch
     _feat = model_batch.get("feature")
     if _feat is not None:
         _h = hashlib.sha256()
         _h.update(_feat.detach().cpu().numpy().tobytes())
-        _w(f"feature shape={tuple(_feat.shape)} abs_mean={_feat.abs().mean().item():.6f} hash={_h.hexdigest()[:16]}")
-    _w(f"feature_length={model_batch.get('feature_length', 'N/A')}")
+        _w(f"feature shape={tuple(_feat.shape)} abs_mean={_feat.abs().mean():.6f} hash={_h.hexdigest()[:16]}")
     _text = model_batch.get("text", [None])
     _w(f"text={_text[0] if _text else 'N/A'}")
 
@@ -92,19 +99,12 @@ def _dump_eval_debug(module, model_batch, sample_seed, step_tag):
     if _traj is not None:
         _h = hashlib.sha256()
         _h.update(_traj.detach().cpu().numpy().tobytes())
-        _w(f"traj shape={tuple(_traj.shape)} abs_mean={_traj.abs().mean().item():.6f} hash={_h.hexdigest()[:16]}")
-        _w(f"traj_mask sample={model_batch.get('traj_mask', 'N/A')}")
+        _w(f"traj shape={tuple(_traj.shape)} abs_mean={_traj.abs().mean():.6f} hash={_h.hexdigest()[:16]}")
 
-    # 5. Config / model knobs
-    _w(f"cfg_scale_text={module.cfg.model.params.get('cfg_scale_text')}")
-    _w(f"cfg_scale_traj={module.cfg.model.params.get('cfg_scale_traj')}")
-    _w(f"chunk_size={module.model.chunk_size}")
-    _w(f"noise_steps={module.model.noise_steps}")
-    _w(f"prediction_type={module.model.prediction_type}")
-    _w(f"use_precomputed_text_emb={module.model.use_precomputed_text_emb}")
-    _w(f"device={module.device}")
-    _w(f"autocast={'bf16-mixed' if module.cfg.trainer.get('precision','').startswith('bf16') else 'unknown'}")
-    _w(f"inference_mode={torch.is_inference_mode_enabled()}")
+    # 5. Config knobs
+    _w(f"cfg_text={module.cfg.model.params.get('cfg_scale_text')} cfg_traj={module.cfg.model.params.get('cfg_scale_traj')}")
+    _w(f"chunk={module.model.chunk_size} noise_steps={module.model.noise_steps} pred={module.model.prediction_type}")
+    _w(f"device={module.device} inf_mode={torch.is_inference_mode_enabled()}")
 
     with open(_dbg_file, "a") as _f:
         _f.write("\n".join(_lines) + "\n\n")
@@ -178,15 +178,28 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                     module.cfg.seed, probe_tag, sample_name, run_idx
                 )
                 _seed_eval_locally(sample_seed)
+                # ── DEBUG: state BEFORE EMA ──
+                if run_idx == 0 and sample_idx == 0:
+                    _dbg_file = os.path.join(
+                        os.environ.get("FLOODNET_DEBUG_DIR", "/tmp"),
+                        "eval_state.log",
+                    )
+                    _pre_sd = _hash_sd(module.model.state_dict())
+                    _pre_ema = _hash_ema(module.ema)
+                    with open(_dbg_file, "a") as _f:
+                        _f.write(
+                            f"[PRE-EMA {step_tag}] sd_hash={_pre_sd} "
+                            f"ema_hash={_pre_ema}\n"
+                        )
+                # ── END DEBUG ──
                 with module.ema.average_parameters(
                     [p for p in module.model.parameters() if p.requires_grad]
                 ):
                     model_batch = prepare_model_input(sample_batch)
-                    # ── DEBUG: comprehensive state dump on first sample/run ──
+                    # ── DEBUG: state INSIDE EMA context ──
                     if run_idx == 0 and sample_idx == 0:
                         _dump_eval_debug(module, model_batch, sample_seed, step_tag)
-                        # Save EMA-applied weights so standalone eval can reproduce
-                        # the exact same model state inline eval used.
+                        # Save EMA-applied snapshot for standalone eval
                         _snap = {}
                         for _name, _p in module.model.named_parameters():
                             if _p.requires_grad:
@@ -200,6 +213,17 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                         rank_zero_info(f"[eval] saved EMA snapshot to {_snap_path}")
                     # ── END DEBUG ──
                     output = module.model.generate(model_batch)
+                # ── DEBUG: state AFTER EMA (should == PRE-EMA) ──
+                if run_idx == 0 and sample_idx == 0:
+                    _post_sd = _hash_sd(module.model.state_dict())
+                    _post_ema = _hash_ema(module.ema)
+                    with open(_dbg_file, "a") as _f:
+                        _f.write(
+                            f"[POST-EMA {step_tag}] sd_hash={_post_sd} "
+                            f"ema_hash={_post_ema} "
+                            f"sd_restored={_pre_sd == _post_sd}\n"
+                        )
+                # ── END DEBUG ──
 
                 single_generated = output["generated"][0]
                 decoded_single_generated = module.vae.decode(
