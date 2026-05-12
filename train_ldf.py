@@ -200,9 +200,11 @@ class CustomLightningModule(BasicLightningModule):
 
     def _load_eval_only_checkpoint(self, checkpoint):
         """Eval-only restore: load model weights, then overwrite trainable params
-        with the EMA shadow snapshot saved *during inline eval* (not during
-        on_save_checkpoint).  Falls back to the checkpoint-level snapshot for
-        backwards compatibility with old checkpoints.
+        with ema_applied_trainable from the checkpoint.
+
+        _resave_checkpoint_with_eval_ema overwrites the checkpoint file at
+        on_validation_epoch_end time, so ema_applied_trainable always holds
+        the post-val-loss EMA that inline eval used.
         """
         ckpt_keys = set(checkpoint["state_dict"].keys())
         controlnet_missing = not any(k.startswith("controlnet.") for k in ckpt_keys)
@@ -214,45 +216,38 @@ class CustomLightningModule(BasicLightningModule):
                 "Eval-only: Re-initialized ControlNet from loaded backbone weights"
             )
 
-        # Prefer the eval-time snapshot (saved by inline eval) over the
-        # checkpoint-level one (saved by on_save_checkpoint, which runs earlier).
-        snap_path = getattr(self, "_eval_snapshot_path", None)
-        ema_applied = None
-        if snap_path and os.path.exists(snap_path):
-            ema_applied = torch.load(snap_path, map_location="cpu", weights_only=True)
-            rank_zero_info(f"[eval-only] loaded eval-time EMA snapshot from {snap_path}")
-        elif "ema_applied_trainable" in checkpoint:
-            ema_applied = checkpoint["ema_applied_trainable"]
-            rank_zero_info("[eval-only] falling back to checkpoint ema_applied_trainable")
-
-        if ema_applied is not None:
+        if "ema_applied_trainable" in checkpoint:
             with torch.no_grad():
                 for name, param in self.model.named_parameters():
-                    if name in ema_applied:
+                    if name in checkpoint["ema_applied_trainable"]:
                         param.data.copy_(
-                            ema_applied[name].to(device=param.device, dtype=param.dtype)
+                            checkpoint["ema_applied_trainable"][name].to(
+                                device=param.device, dtype=param.dtype
+                            )
                         )
+            rank_zero_info("[eval-only] loaded ema_applied_trainable from checkpoint")
+        else:
+            rank_zero_info(
+                "[eval-only] warning: ema_applied_trainable not found, "
+                "using raw state_dict weights"
+            )
+
         self.ema = ExponentialMovingAverage(
             [p for p in self.model.parameters() if p.requires_grad],
             decay=self.cfg.model.ema_decay,
         )
-        # --- DEBUG: hash after loading eval snapshot ---
+        # --- DEBUG ---
         import hashlib
-        _h_sd = hashlib.sha256()
-        _h_ema = hashlib.sha256()
+        _h = hashlib.sha256()
         for _k, _v in sorted(self.model.state_dict().items()):
-            _h_sd.update(_v.cpu().numpy().tobytes())
-        for _s in self.ema.shadow_params:
-            _h_ema.update(_s.cpu().numpy().tobytes())
+            _h.update(_v.cpu().numpy().tobytes())
         _dbg_file = os.path.join(
-            os.environ.get("FLOODNET_DEBUG_DIR", "/tmp"),
-            "eval_state.log",
+            os.environ.get("FLOODNET_DEBUG_DIR", "/tmp"), "eval_state.log"
         )
         with open(_dbg_file, "a") as _f:
             _f.write(
                 f"[EVAL-LOAD step={self._resume_step_offset}] "
-                f"sd_hash={_h_sd.hexdigest()[:16]} "
-                f"ema_hash={_h_ema.hexdigest()[:16]}\n"
+                f"sd_hash={_h.hexdigest()[:16]}\n"
             )
         # --- END DEBUG ---
         check_state_dict(
@@ -518,6 +513,24 @@ class CustomLightningModule(BasicLightningModule):
         for key, value in t2m_output.items():
             self.log(f"metrics/t2m_metrics/{key}", value, sync_dist=True)
 
+    def _resave_checkpoint_with_eval_ema(self):
+        """Re-save the checkpoint AFTER validation so ema_applied_trainable
+        captures the correct EMA state that inline eval actually used.
+
+        ModelCheckpoint fires at on_train_batch_end (before validation),
+        so its ema_state is stale. Calling trainer.save_checkpoint here
+        (on_validation_epoch_end) overwrites the file with the post-val
+        EMA that matches inline generation eval.
+        """
+        step_val = int(ckpt_step_info(self).metric_value)
+        ckpt_path = os.path.join(
+            self.cfg.save_dir, f"step_{step_val:06.0f}.ckpt"
+        )
+        self.trainer.save_checkpoint(ckpt_path, weights_only=False)
+        rank_zero_info(
+            f"[eval] re-saved checkpoint with eval EMA: step_{step_val:06d}.ckpt"
+        )
+
     def on_validation_epoch_end(self):
         if not is_async_eval(self.cfg):
             _force = getattr(self, "_eval_on_resume", False)
@@ -528,6 +541,8 @@ class CustomLightningModule(BasicLightningModule):
             ):
                 self.on_test_epoch_end()
                 self._inline_eval_dedup.clear()
+                # Re-save checkpoint now that EMA reflects inline eval state.
+                self._resave_checkpoint_with_eval_ema()
         else:
             self._inline_eval_dedup.clear()
         self.compute_metrics()
