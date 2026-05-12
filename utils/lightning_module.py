@@ -156,7 +156,7 @@ class BasicLightningModule(LightningModule):
             for name, s in zip(trainable_names, self.ema.shadow_params)
         }
         # --- DEBUG: hash state_dict + ema + snapshot right at save time ---
-        import hashlib
+        import hashlib, traceback
         _h_sd = hashlib.sha256()
         _h_ema = hashlib.sha256()
         _h_snap = hashlib.sha256()
@@ -176,6 +176,7 @@ class BasicLightningModule(LightningModule):
                 f"sd_hash={_h_sd.hexdigest()[:16]} "
                 f"ema_hash={_h_ema.hexdigest()[:16]} "
                 f"snap_hash={_h_snap.hexdigest()[:16]}\n"
+                f"{''.join(traceback.format_stack()[-7:-1])}\n"
             )
         # --- END DEBUG ---
 
