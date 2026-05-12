@@ -101,10 +101,49 @@ class BasicLightningModule(LightningModule):
             named_buffers=self.model.named_buffers(),
         )
         self._skip_next_lightning_load_state_dict = True
+        # --- DEBUG: hash right after loading ---
+        import hashlib
+        _h_sd = hashlib.sha256()
+        _h_ema = hashlib.sha256()
+        _sd = self.model.state_dict()
+        for _k, _v in sorted(_sd.items()):
+            _h_sd.update(_v.cpu().numpy().tobytes())
+        for _s in self.ema.shadow_params:
+            _h_ema.update(_s.cpu().numpy().tobytes())
+        _dbg_file = os.path.join(
+            os.environ.get("FLOODNET_DEBUG_DIR", "/tmp"),
+            "eval_state.log",
+        )
+        with open(_dbg_file, "a") as _f:
+            _f.write(
+                f"[LOAD step={self.global_step}] "
+                f"state_dict_hash={_h_sd.hexdigest()[:24]} "
+                f"ema_hash={_h_ema.hexdigest()[:24]}\n"
+            )
+        # --- END DEBUG ---
 
     def on_save_checkpoint(self, checkpoint):
         checkpoint["ema_state"] = self.ema.state_dict()
         checkpoint["state_dict"] = self.model.state_dict()
+        # --- DEBUG: hash state_dict right at save time ---
+        import hashlib
+        _h_sd = hashlib.sha256()
+        _h_ema = hashlib.sha256()
+        for _k, _v in sorted(checkpoint["state_dict"].items()):
+            _h_sd.update(_v.cpu().numpy().tobytes())
+        for _s in checkpoint["ema_state"]["shadow_params"]:
+            _h_ema.update(_s.cpu().numpy().tobytes())
+        _dbg_file = os.path.join(
+            os.environ.get("FLOODNET_DEBUG_DIR", "/tmp"),
+            "eval_state.log",
+        )
+        with open(_dbg_file, "a") as _f:
+            _f.write(
+                f"[SAVE step={self.global_step}] "
+                f"state_dict_hash={_h_sd.hexdigest()[:24]} "
+                f"ema_hash={_h_ema.hexdigest()[:24]}\n"
+            )
+        # --- END DEBUG ---
 
     def _step(self, batch, is_training=True):
         out = self.model(batch)
