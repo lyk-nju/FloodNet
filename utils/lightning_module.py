@@ -32,6 +32,26 @@ class BasicLightningModule(LightningModule):
             [p for p in self.model.parameters() if p.requires_grad],
             decay=cfg.model.ema_decay,
         )
+        # --- DEBUG: trace every EMA.update() call ---
+        _orig_update = self.ema.update
+        def _traced_update():
+            import traceback, hashlib
+            _orig_update()
+            self._ema_call_cnt = getattr(self, "_ema_call_cnt", 0) + 1
+            _h = hashlib.sha256()
+            for _s in self.ema.shadow_params:
+                _h.update(_s.detach().cpu().numpy().tobytes())
+            _dbg = os.path.join(
+                os.environ.get("FLOODNET_DEBUG_DIR", "/tmp"), "eval_state.log"
+            )
+            with open(_dbg, "a") as _f:
+                _f.write(
+                    f"[EMA-TRACE #{self._ema_call_cnt} step={self.global_step}] "
+                    f"ema_hash={_h.hexdigest()[:16]}\n"
+                    f"{''.join(traceback.format_stack()[-6:-1])}\n"
+                )
+        self.ema.update = _traced_update
+        # --- END DEBUG ---
         print_model_size(self.model)
 
         # logging
@@ -215,25 +235,6 @@ class BasicLightningModule(LightningModule):
         self.last_batch_end_time = time.time()
         self.ema.to(self.device)
         self.ema.update()
-        # --- DEBUG: count EMA updates per step ---
-        import traceback, hashlib
-        _cnt = getattr(self, "_ema_update_cnt", {})
-        _cnt[self.global_step] = _cnt.get(self.global_step, 0) + 1
-        self._ema_update_cnt = _cnt
-        if _cnt[self.global_step] > 1:
-            _h = hashlib.sha256()
-            for _s in self.ema.shadow_params:
-                _h.update(_s.detach().cpu().numpy().tobytes())
-            _dbg = os.path.join(
-                os.environ.get("FLOODNET_DEBUG_DIR", "/tmp"), "eval_state.log"
-            )
-            with open(_dbg, "a") as _f:
-                _f.write(
-                    f"[EMA-UPDATE #{_cnt[self.global_step]} step={self.global_step}] "
-                    f"ema_hash={_h.hexdigest()[:16]}\n"
-                    f"{''.join(traceback.format_stack()[-5:-1])}\n"
-                )
-        # --- END DEBUG ---
         # Calculate average difference using vectorized operations
         if self.global_step % 100 == 0:
             self.log("ema_decay", self.ema.decay, sync_dist=False)
