@@ -323,31 +323,39 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                     "text": sample_text,
                     "text_all": _all_captions,
                 }
-                # Per-caption metrics (average within each caption first)
-                if _all_cap_traj:
-                    _cap_t_ade = np.array([m.get("ade", float("nan")) for m in _all_cap_traj])
-                    _cap_t_fde = np.array([m.get("fde", float("nan")) for m in _all_cap_traj])
-                    _cap_t_mse = np.array([m.get("mse", float("nan")) for m in _all_cap_traj])
-                    record["ade"] = float(np.nanmean(_cap_t_ade))
-                    record["ade_std"] = float(np.nanstd(_cap_t_ade))
-                    record["fde"] = float(np.nanmean(_cap_t_fde))
-                    record["fde_std"] = float(np.nanstd(_cap_t_fde))
-                    record["mse"] = float(np.nanmean(_cap_t_mse))
-                    record["mse_std"] = float(np.nanstd(_cap_t_mse))
-                    record["caption_ade_mean"] = record["ade"]
-                    record["caption_ade_std"] = float(np.nanstd(_cap_t_ade))
-                if _all_cap_ctrl:
-                    _cap_c_l2 = np.array([m.get("control_l2_dist", float("nan")) for m in _all_cap_ctrl])
-                    record["control_l2_dist"] = float(np.nanmean(_cap_c_l2))
-                    record["control_l2_dist_std"] = float(np.nanstd(_cap_c_l2))
+                # Aggregate per-caption metrics: for each scalar field,
+                # store caption-mean and cross-caption mean/std.
+                _scalar_fields = (
+                    "ade", "fde", "mse", "traj_jitter",
+                    "path_arc_ade", "path_chamfer",
+                    "control_l2_dist", "skating_ratio",
+                    "traj_fail_20cm", "traj_fail_50cm",
+                    "kps_fail_20cm", "kps_fail_50cm", "kps_mean_err_m",
+                    "T", "masked_ratio",
+                )
+                for _field in _scalar_fields:
+                    _vals = [m.get(_field, float("nan")) for m in _all_cap_traj]
+                    _vals = [v for v in _vals if v == v]  # filter nan
+                    if _vals:
+                        record[_field] = float(np.mean(_vals))
+                        record[f"{_field}_std"] = float(np.std(_vals))
+                for _field in _scalar_fields:
+                    _vals = [m.get(_field, float("nan")) for m in _all_cap_ctrl]
+                    _vals = [v for v in _vals if v == v]
+                    if _vals:
+                        record[f"caption_ctrl_{_field}"] = float(np.mean(_vals))
+                        record[f"caption_ctrl_{_field}_std"] = float(np.std(_vals))
+                record["caption_ade_mean"] = record.get("ade", float("nan"))
+                record["caption_ade_std"] = record.get("ade_std", float("nan"))
+                # Per-caption raw dicts (summary can aggregate across samples)
+                record["_caption_traj"] = _all_cap_traj
+                record["_caption_ctrl"] = _all_cap_ctrl
                 if fwd_stat is not None:
                     record["fwd_ctrl_loss"] = fwd_stat.get("loss", float("nan"))
                     record["fwd_ctrl_loss_std"] = fwd_stat.get("loss_std", float("nan"))
                     record["fwd_n_valid"] = fwd_stat.get("n_valid", float("nan"))
                     record["fwd_win_len"] = fwd_stat.get("window_len", float("nan"))
                     record["fwd_num_windows"] = fwd_stat.get("num_windows", 0)
-                record["_traj_runs"] = _all_flat_traj
-                record["_control_runs"] = _all_flat_ctrl
 
             local_payloads.append(
                 {

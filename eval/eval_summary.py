@@ -137,15 +137,23 @@ def build_inline_eval_summary(sample_records):
         "kps_fail_50cm": "kps_fail_50cm",
         "kps_mean_err_m": "kps_mean_err_m",
     }
-    max_runs = max(len(r.get("_control_runs", [])) for r in sample_records)
+    # Use per-caption-aggregated records when available, raw runs otherwise.
+    _ctrl_source = sample_records[0].get("_caption_ctrl") if sample_records else None
+    if _ctrl_source is not None:
+        max_runs = max(len(r.get("_caption_ctrl", [])) for r in sample_records)
+    else:
+        max_runs = max(len(r.get("_control_runs", [])) for r in sample_records)
     for key in control_metric_keys:
         per_run_vals = []
         for run_idx in range(max_runs):
             vals = []
             for record in sample_records:
-                control_runs = record.get("_control_runs", [])
-                if run_idx < len(control_runs):
-                    val = control_runs[run_idx].get(key, float("nan"))
+                if _ctrl_source is not None:
+                    runs = record.get("_caption_ctrl", [])
+                else:
+                    runs = record.get("_control_runs", [])
+                if run_idx < len(runs):
+                    val = runs[run_idx].get(key, float("nan"))
                     if val == val:
                         vals.append(val)
             if vals:
