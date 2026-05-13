@@ -466,6 +466,9 @@ class CustomLightningModule(BasicLightningModule):
                 _ckpt_path = os.path.join(
                     self.cfg.save_dir, f"step_{_step_val:06.0f}.ckpt"
                 )
+                rank_zero_info(
+                    f"[re-save] overwriting {_ckpt_path} with step={_step_val}"
+                )
                 self.trainer.save_checkpoint(_ckpt_path, weights_only=False)
         else:
             self._inline_eval_dedup.clear()
