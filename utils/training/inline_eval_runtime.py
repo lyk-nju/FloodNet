@@ -11,6 +11,7 @@ def build_generation_eval_cfg(cfg):
         "forward_ctrl_window_mode": str(
             val_cfg.get("eval_forward_control_loss_window_mode", "mean_chunk_windows")
         ),
+        "eval_all_captions": bool(val_cfg.get("eval_all_captions", False)),
     }
 
 

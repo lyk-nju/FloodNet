@@ -212,8 +212,9 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
 
             _debug = os.environ.get("FLOODNET_DEBUG", "") == "1"
             _all = sample_batch.get("text_all", None)
+            _eval_all = eval_cfg.get("eval_all_captions", False)
             # text_all is a list-of-lists from collate; extract inner list.
-            _all_captions = _all[0] if _all else [sample_batch["text"][0]]
+            _all_captions = _all[0] if (_all and _eval_all) else [sample_batch["text"][0]]
             for _cap_idx, _cap_text in enumerate(_all_captions):
                 _cap_batch = {k: v for k, v in sample_batch.items()}
                 _cap_batch["text"] = [_cap_text]
@@ -347,6 +348,16 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                         record[f"caption_ctrl_{_field}_std"] = float(np.std(_vals))
                 record["caption_ade_mean"] = record.get("ade", float("nan"))
                 record["caption_ade_std"] = record.get("ade_std", float("nan"))
+                # List fields: element-wise mean/std across captions
+                for _field in ("seg_mse", "prefix_mse"):
+                    _lists = [m.get(_field, []) for m in _all_cap_traj]
+                    if _lists and _lists[0]:
+                        _n = max(len(l) for l in _lists)
+                        _means = []
+                        for _i in range(_n):
+                            _vals = [l[_i] for l in _lists if _i < len(l) and l[_i] is not None]
+                            _means.append(float(np.mean(_vals)) if _vals else None)
+                        record[_field] = _means
                 # Per-caption raw dicts (summary can aggregate across samples)
                 record["_caption_traj"] = _all_cap_traj
                 record["_caption_ctrl"] = _all_cap_ctrl

@@ -138,22 +138,23 @@ def build_inline_eval_summary(sample_records):
         "kps_mean_err_m": "kps_mean_err_m",
     }
     # Use per-caption-aggregated records when available, raw runs otherwise.
-    _ctrl_source = sample_records[0].get("_caption_ctrl") if sample_records else None
-    if _ctrl_source is not None:
-        max_runs = max(len(r.get("_caption_ctrl", [])) for r in sample_records)
+    _use_caption = any("_caption_ctrl" in r for r in sample_records)
+    if _use_caption:
+        max_slots = max(len(r.get("_caption_ctrl", [])) for r in sample_records)
+        _source_key = "_caption_ctrl"
+        _run_label = "num_captions"
     else:
-        max_runs = max(len(r.get("_control_runs", [])) for r in sample_records)
+        max_slots = max(len(r.get("_control_runs", [])) for r in sample_records)
+        _source_key = "_control_runs"
+        _run_label = "num_runs"
     for key in control_metric_keys:
         per_run_vals = []
-        for run_idx in range(max_runs):
+        for idx in range(max_slots):
             vals = []
             for record in sample_records:
-                if _ctrl_source is not None:
-                    runs = record.get("_caption_ctrl", [])
-                else:
-                    runs = record.get("_control_runs", [])
-                if run_idx < len(runs):
-                    val = runs[run_idx].get(key, float("nan"))
+                runs = record.get(_source_key, [])
+                if idx < len(runs):
+                    val = runs[idx].get(key, float("nan"))
                     if val == val:
                         vals.append(val)
             if vals:
@@ -166,7 +167,7 @@ def build_inline_eval_summary(sample_records):
             summary[f"control/{out_key}_mean"] = float(mean)
             summary[f"control/{out_key}_std"] = float(std)
             summary[f"control/{out_key}_conf_interval"] = float(conf)
-            summary[f"control/{out_key}_num_runs"] = int(len(per_run_vals))
+            summary[f"control/{out_key}_{_run_label}"] = int(len(per_run_vals))
     return summary
 
 
