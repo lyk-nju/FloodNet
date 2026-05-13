@@ -138,14 +138,6 @@ class BasicLightningModule(LightningModule):
                 )
 
     def on_save_checkpoint(self, checkpoint):
-        # on_save_checkpoint can fire twice per step (on_train_batch_end
-        # callback for save_last, then on_validation_end for save_monitor).
-        # Only update EMA once so inline eval between the two saves sees
-        # the same EMA that ends up on disk.
-        _step = int(self.global_step)
-        if getattr(self, "_ema_updated_at_save_step", -1) != _step:
-            self.ema.update()
-            self._ema_updated_at_save_step = _step
         checkpoint["ema_state"] = self.ema.state_dict()
         checkpoint["state_dict"] = self.model.state_dict()
         # Write EMA-applied hash so inline eval can verify the saved ckpt

@@ -215,7 +215,17 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                 _seed_eval_locally(sample_seed)
                 _debug = os.environ.get("FLOODNET_DEBUG", "") == "1"
                 if run_idx == 0 and sample_idx == 0:
-                    # Always-on consistency check: hash BEFORE EMA matches ckpt_hash.txt
+                    # Re-save checkpoint NOW so the saved EMA matches what
+                    # inline eval is about to use. ModelCheckpoint saved
+                    # earlier (on_validation_end) with a stale EMA.
+                    _step_val = int(ckpt_step_info(module).metric_value)
+                    _ckpt_path = os.path.join(
+                        module.cfg.save_dir, f"step_{_step_val:06.0f}.ckpt"
+                    )
+                    _trainer = getattr(module, "trainer", None)
+                    if _trainer is not None:
+                        _trainer.save_checkpoint(_ckpt_path, weights_only=False)
+                    # Always-on consistency check
                     _check_ckpt_consistency(module, step_tag)
                 if _debug and run_idx == 0 and sample_idx == 0:
                     _dbg_file = os.path.join(
