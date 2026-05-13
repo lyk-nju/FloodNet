@@ -179,6 +179,10 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
             sample_batch = _slice_single_sample_batch(batch, sample_idx)
             sample_name = sample_batch["name"][0]
             sample_dataset_id = sample_batch["dataset"][0]
+            # Use saved text from training inline eval if available.
+            _overrides = getattr(module, "_text_overrides", None)
+            if _overrides and sample_name in _overrides:
+                sample_batch["text"] = [_overrides[sample_name]]
             sample_text = ""
             token_run0 = None
             feature_run0 = None

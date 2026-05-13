@@ -82,9 +82,28 @@ def main():
     )
     rank_zero_info(f"[async-inline-eval] total probe samples: {total_probe_samples}")
 
+    # Load text annotations saved during training inline eval so standalone
+    # uses the exact same captions (HumanML3D has multiple captions per sample).
+    _text_overrides = {}
+    _train_dir = os.path.dirname(os.path.abspath(args.ckpt))
+    _step = load_resume_step_offset(args.ckpt)
+    _text_glob = os.path.join(
+        _train_dir, "HumanML3D", "text", "*", f"step_{_step:06d}", "*.txt"
+    )
+    import glob as _glob
+    for _txt_file in _glob.glob(_text_glob):
+        _sample_name = os.path.splitext(os.path.basename(_txt_file))[0]
+        with open(_txt_file, "r") as _tf:
+            _text_overrides[_sample_name] = _tf.read().strip()
+    if _text_overrides:
+        rank_zero_info(
+            f"[standalone] loaded {len(_text_overrides)} text overrides from training artifacts"
+        )
+
     model = CustomLightningModule(cfg=cfg.config)
     model.test_loader_tags = test_loader_tags
     model._resume_step_offset = int(load_resume_step_offset(args.ckpt))
+    model._text_overrides = _text_overrides
 
     # --- DEBUG: verify loaded ckpt matches training inline eval ---
     _ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
