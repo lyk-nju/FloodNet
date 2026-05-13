@@ -148,6 +148,25 @@ class BasicLightningModule(LightningModule):
             self._ema_updated_at_save_step = _step
         checkpoint["ema_state"] = self.ema.state_dict()
         checkpoint["state_dict"] = self.model.state_dict()
+        # Write a consistency hash so inline eval can verify the saved ckpt
+        # matches what it's about to evaluate.
+        _trainer = getattr(self, "trainer", None)
+        if _trainer is not None and _trainer.is_global_zero:
+            try:
+                import hashlib, json
+                _h = hashlib.sha256()
+                for _k, _v in sorted(checkpoint["state_dict"].items()):
+                    _h.update(_v.cpu().numpy().tobytes())
+                for _s in checkpoint["ema_state"]["shadow_params"]:
+                    _h.update(_s.cpu().numpy().tobytes())
+                _hash_path = os.path.join(self.cfg.save_dir, "ckpt_hash.txt")
+                with open(_hash_path, "w") as _f:
+                    json.dump(
+                        {"step": int(self.global_step), "hash": _h.hexdigest()},
+                        _f,
+                    )
+            except Exception:
+                pass
         if os.environ.get("FLOODNET_DEBUG", "") == "1":
             import hashlib, traceback
             _h_sd = hashlib.sha256()

@@ -75,6 +75,30 @@ def _dump_eval_debug(module, model_batch, sample_seed, step_tag):
     # 2. EMA shadow hash
     _w(f"ema_hash={_hash_ema(module.ema)}")
 
+    # 3. Consistency: compare with on_save_checkpoint's hash
+    import hashlib as _hashlib, json as _json
+    try:
+        _hash_path = os.path.join(module.cfg.save_dir, "ckpt_hash.txt")
+        if os.path.exists(_hash_path):
+            with open(_hash_path) as _fh:
+                _saved = _json.load(_fh)
+            _eval_h = _hashlib.sha256()
+            _sd = module.model.state_dict()
+            for _k, _v in sorted(_sd.items()):
+                _eval_h.update(_v.cpu().numpy().tobytes())
+            for _s in module.ema.shadow_params:
+                _eval_h.update(_s.cpu().numpy().tobytes())
+            _eval_hash = _eval_h.hexdigest()
+            _match = "MATCH" if _eval_hash == _saved["hash"] else "MISMATCH"
+            _w(
+                f"ckpt_consistency={_match} "
+                f"saved_step={_saved['step']} "
+                f"saved_hash={_saved['hash'][:16]} "
+                f"eval_hash={_eval_hash[:16]}"
+            )
+    except Exception:
+        pass
+
     # 3. Key param spot-checks
     for _name in (
         "model.blocks.0.self_attn.q.weight",
