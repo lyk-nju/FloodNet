@@ -148,21 +148,17 @@ class BasicLightningModule(LightningModule):
             import hashlib, traceback
             _h_sd = hashlib.sha256()
             _h_ema = hashlib.sha256()
-            _h_snap = hashlib.sha256()
             for _k, _v in sorted(checkpoint["state_dict"].items()):
                 _h_sd.update(_v.cpu().numpy().tobytes())
             for _s in checkpoint["ema_state"]["shadow_params"]:
                 _h_ema.update(_s.cpu().numpy().tobytes())
-            for _v in checkpoint["ema_applied_trainable"].values():
-                _h_snap.update(_v.numpy().tobytes())
             _dbg_file = os.path.join(
                 os.environ.get("FLOODNET_DEBUG_DIR", "/tmp"), "eval_state.log")
             with open(_dbg_file, "a") as _f:
                 _f.write(
                     f"[SAVE step={self.global_step}] "
                     f"sd_hash={_h_sd.hexdigest()[:16]} "
-                    f"ema_hash={_h_ema.hexdigest()[:16]} "
-                    f"snap_hash={_h_snap.hexdigest()[:16]}\n"
+                    f"ema_hash={_h_ema.hexdigest()[:16]}\n"
                     f"{''.join(traceback.format_stack()[-7:-1])}\n"
                 )
 
