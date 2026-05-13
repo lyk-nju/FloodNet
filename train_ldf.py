@@ -447,9 +447,19 @@ class CustomLightningModule(BasicLightningModule):
     def update_metrics(self, batch):
         if not self.t2m_enabled or self.t2m_metrics is None:
             return
-        with self.ema.average_parameters([p for p in self.model.parameters() if p.requires_grad]):
-            model_batch = prepare_model_input(batch)
-            output = self.model.generate(model_batch)
+        # Save/restore CUDA RNG — model.generate() consumes random state via
+        # torch.randn() for latent init, which would otherwise shift the noise
+        # used in subsequent training steps.
+        cpu_state = torch.random.get_rng_state()
+        cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        try:
+            with self.ema.average_parameters([p for p in self.model.parameters() if p.requires_grad]):
+                model_batch = prepare_model_input(batch)
+                output = self.model.generate(model_batch)
+        finally:
+            torch.random.set_rng_state(cpu_state)
+            if cuda_state is not None:
+                torch.cuda.set_rng_state_all(cuda_state)
         generated = output["generated"]
         ground_truth_token = batch["token"]
         gt_token_length = batch["token_length"]
