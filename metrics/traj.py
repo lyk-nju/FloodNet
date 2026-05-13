@@ -35,7 +35,7 @@ def _seed_eval_locally(seed: int):
     gen.manual_seed(int(seed))
     torch.random.set_rng_state(gen.get_state())
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(int(seed))
+        torch.cuda.manual_seed_all(int(seed))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
