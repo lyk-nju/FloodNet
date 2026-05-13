@@ -459,6 +459,14 @@ class CustomLightningModule(BasicLightningModule):
             ):
                 self.on_test_epoch_end()
                 self._inline_eval_dedup.clear()
+                # Re-save checkpoint: ModelCheckpoint saved earlier (on_validation_end)
+                # with stale EMA. Now that inline eval has run, overwrite with the
+                # EMA that was actually used.
+                _step_val = int(ckpt_step_info(self).metric_value)
+                _ckpt_path = os.path.join(
+                    self.cfg.save_dir, f"step_{_step_val:06.0f}.ckpt"
+                )
+                self.trainer.save_checkpoint(_ckpt_path, weights_only=False)
         else:
             self._inline_eval_dedup.clear()
         self.compute_metrics()
