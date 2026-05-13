@@ -185,8 +185,10 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
             traj_xz = None
             traj_mask = None
             frames = None
-            traj_runs = []
-            control_runs = []
+            _all_cap_traj = []
+            _all_cap_ctrl = []
+            _all_flat_traj = []
+            _all_flat_ctrl = []
             fwd_stat = None
 
             if "feature_text_end" in sample_batch:
@@ -215,6 +217,8 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
             for _cap_idx, _cap_text in enumerate(_all_captions):
                 _cap_batch = {k: v for k, v in sample_batch.items()}
                 _cap_batch["text"] = [_cap_text]
+                _cap_traj = []
+                _cap_ctrl = []
 
                 for run_idx in range(generation_num_runs):
                     sample_seed = _stable_eval_seed(
@@ -294,14 +298,20 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                             traj_mask = np.asarray(traj_mask_i).reshape(-1)[:feat_len]
 
                     if do_eval_metrics:
-                        traj_runs.append(
+                        _cap_traj.append(
                             _compute_traj_metrics(
                                 decoded_single_generated, sample_batch, 0, seg_size=eval_seg_size
                             )
                         )
-                        control_runs.append(
+                        _cap_ctrl.append(
                             _compute_omni_control_metrics(decoded_single_generated, sample_batch, 0)
                         )
+
+                if do_eval_metrics:
+                    _all_cap_traj.append(_average_traj_metrics(_cap_traj))
+                    _all_cap_ctrl.append(_average_control_metrics(_cap_ctrl))
+                    _all_flat_traj.extend(_cap_traj)
+                    _all_flat_ctrl.extend(_cap_ctrl)
 
             record = None
             if do_eval_metrics:
@@ -313,18 +323,31 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                     "text": sample_text,
                     "text_all": _all_captions,
                 }
-                if traj_runs:
-                    record.update(_average_traj_metrics(traj_runs))
-                if control_runs:
-                    record.update(_average_control_metrics(control_runs))
+                # Per-caption metrics (average within each caption first)
+                if _all_cap_traj:
+                    _cap_t_ade = np.array([m.get("ade", float("nan")) for m in _all_cap_traj])
+                    _cap_t_fde = np.array([m.get("fde", float("nan")) for m in _all_cap_traj])
+                    _cap_t_mse = np.array([m.get("mse", float("nan")) for m in _all_cap_traj])
+                    record["ade"] = float(np.nanmean(_cap_t_ade))
+                    record["ade_std"] = float(np.nanstd(_cap_t_ade))
+                    record["fde"] = float(np.nanmean(_cap_t_fde))
+                    record["fde_std"] = float(np.nanstd(_cap_t_fde))
+                    record["mse"] = float(np.nanmean(_cap_t_mse))
+                    record["mse_std"] = float(np.nanstd(_cap_t_mse))
+                    record["caption_ade_mean"] = record["ade"]
+                    record["caption_ade_std"] = float(np.nanstd(_cap_t_ade))
+                if _all_cap_ctrl:
+                    _cap_c_l2 = np.array([m.get("control_l2_dist", float("nan")) for m in _all_cap_ctrl])
+                    record["control_l2_dist"] = float(np.nanmean(_cap_c_l2))
+                    record["control_l2_dist_std"] = float(np.nanstd(_cap_c_l2))
                 if fwd_stat is not None:
                     record["fwd_ctrl_loss"] = fwd_stat.get("loss", float("nan"))
                     record["fwd_ctrl_loss_std"] = fwd_stat.get("loss_std", float("nan"))
                     record["fwd_n_valid"] = fwd_stat.get("n_valid", float("nan"))
                     record["fwd_win_len"] = fwd_stat.get("window_len", float("nan"))
                     record["fwd_num_windows"] = fwd_stat.get("num_windows", 0)
-                record["_traj_runs"] = traj_runs
-                record["_control_runs"] = control_runs
+                record["_traj_runs"] = _all_flat_traj
+                record["_control_runs"] = _all_flat_ctrl
 
             local_payloads.append(
                 {
