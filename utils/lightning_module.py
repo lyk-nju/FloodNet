@@ -138,18 +138,12 @@ class BasicLightningModule(LightningModule):
                 )
 
     def on_save_checkpoint(self, checkpoint):
+        # Update EMA so the saved checkpoint reflects the latest model weights.
+        # ModelCheckpoint may fire before on_train_batch_end's ema.update(),
+        # leaving the saved EMA one step stale relative to inline eval.
+        self.ema.update()
         checkpoint["ema_state"] = self.ema.state_dict()
         checkpoint["state_dict"] = self.model.state_dict()
-        # Snapshot EMA shadow params as float32 CPU tensors keyed by param name.
-        # This lets standalone eval (run_eval.py) reproduce EMA-applied weights
-        # exactly, regardless of Lightning's precision-plugin lifecycle ordering.
-        trainable_names = [
-            name for name, p in self.model.named_parameters() if p.requires_grad
-        ]
-        checkpoint["ema_applied_trainable"] = {
-            name: s.detach().float().cpu().clone()
-            for name, s in zip(trainable_names, self.ema.shadow_params)
-        }
         if os.environ.get("FLOODNET_DEBUG", "") == "1":
             import hashlib, traceback
             _h_sd = hashlib.sha256()

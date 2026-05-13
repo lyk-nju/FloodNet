@@ -85,10 +85,6 @@ def main():
     model = CustomLightningModule(cfg=cfg.config)
     model.test_loader_tags = test_loader_tags
     model._resume_step_offset = int(load_resume_step_offset(args.ckpt))
-    # ema_applied_trainable in the checkpoint was updated by
-    # _resave_checkpoint_with_eval_ema at on_validation_epoch_end time,
-    # so it already carries the correct post-val EMA.
-    model._eval_only = True
 
     accelerator = args.accelerator or (
         "gpu" if torch.cuda.is_available() and args.devices > 0 else "cpu"
