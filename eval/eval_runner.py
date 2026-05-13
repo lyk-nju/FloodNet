@@ -208,99 +208,114 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                         f"[inline fwd_ctrl_loss] sample={sample_name} deterministic eval failed: {e}"
                     )
 
-            for run_idx in range(generation_num_runs):
-                sample_seed = _stable_eval_seed(
-                    module.cfg.seed, probe_tag, sample_name, run_idx
-                )
-                _seed_eval_locally(sample_seed)
-                _debug = os.environ.get("FLOODNET_DEBUG", "") == "1"
-                if run_idx == 0 and sample_idx == 0:
-                    _check_ckpt_consistency(module, step_tag)
-                if _debug and run_idx == 0 and sample_idx == 0:
-                    _dbg_file = os.path.join(
-                        os.environ.get("FLOODNET_DEBUG_DIR", "/tmp"), "eval_state.log")
-                    _pre_sd = _hash_sd(module.model.state_dict())
-                    _pre_ema = _hash_ema(module.ema)
-                    with open(_dbg_file, "a") as _f:
-                        _f.write(
-                            f"[PRE-EMA {step_tag}] sd_hash={_pre_sd} "
-                            f"ema_hash={_pre_ema}\n"
-                        )
-                with module.ema.average_parameters(
-                    [p for p in module.model.parameters() if p.requires_grad]
-                ):
-                    model_batch = prepare_model_input(sample_batch)
-                    if _debug and run_idx == 0 and sample_idx == 0:
-                        _dump_eval_debug(module, model_batch, sample_seed, step_tag)
-                    output = module.model.generate(model_batch)
-                if _debug and run_idx == 0 and sample_idx == 0:
-                    _post_sd = _hash_sd(module.model.state_dict())
-                    _post_ema = _hash_ema(module.ema)
-                    with open(_dbg_file, "a") as _f:
-                        _f.write(
-                            f"[POST-EMA {step_tag}] sd_hash={_post_sd} "
-                            f"ema_hash={_post_ema} "
-                            f"sd_restored={_pre_sd == _post_sd}\n"
-                        )
+            _debug = os.environ.get("FLOODNET_DEBUG", "") == "1"
+            _all = sample_batch.get("text_all", None)
+            # text_all is a list-of-lists from collate; extract inner list.
+            _all_captions = _all[0] if _all else [sample_batch["text"][0]]
+            _tokens_captions = sample_batch.get("text_tokens", None)
+            for _cap_idx, _cap_text in enumerate(_all_captions):
+                # Build a sample batch with this specific caption.
+                _cap_batch = {k: v for k, v in sample_batch.items()}
+                _cap_batch["text"] = [_cap_text]
+                if _tokens_captions is not None:
+                    _cap_batch["text_tokens"] = _tokens_captions
 
-                single_generated = output["generated"][0]
-                decoded_single_generated = module.vae.decode(
-                    single_generated[None, :].to(module.device)
-                )[0].float().detach()
-
-                if run_idx == 0:
-                    sample_text = output["text"][0]
-                    token_run0 = single_generated.float().cpu().numpy()
-                    feature_run0 = decoded_single_generated.cpu().numpy()
-                    if _debug:
-                        _debug_token_path = os.path.join(
-                            os.environ.get("FLOODNET_DEBUG_DIR", "/tmp"),
-                            f"debug_token_{sample_name}.npy",
-                        )
-                        np.save(_debug_token_path, token_run0)
-                        rank_zero_info(
-                            f"[DEBUG token] saved {sample_name} token shape={token_run0.shape} "
-                            f"abs_mean={np.abs(token_run0).mean():.6f}"
-                        )
-
-                    feat_len = int(decoded_single_generated.shape[0])
-                    if "traj_features" in sample_batch:
-                        cond = sample_batch["traj_features"][0]
-                        if torch.is_tensor(cond):
-                            cond = cond.detach().cpu().numpy()
-                        cond = np.asarray(cond)
-                        if cond.ndim == 2 and cond.shape[1] >= 2:
-                            traj_xz = cond[:feat_len, :2].astype(np.float32)
-                    if traj_xz is None and "traj" in sample_batch:
-                        traj = sample_batch["traj"][0]
-                        if torch.is_tensor(traj):
-                            traj = traj.detach().cpu().numpy()
-                        traj = np.asarray(traj)[:feat_len]
-                        if traj.ndim == 2 and traj.shape[1] >= 3:
-                            traj_xz = root_to_traj_feats(traj)[:, :2].astype(np.float32)
-                    if "traj_mask" in sample_batch:
-                        traj_mask_i = sample_batch["traj_mask"][0]
-                        if torch.is_tensor(traj_mask_i):
-                            traj_mask_i = traj_mask_i.detach().cpu().numpy()
-                        traj_mask = np.asarray(traj_mask_i).reshape(-1)[:feat_len]
-
-                if do_eval_metrics:
-                    traj_runs.append(
-                        _compute_traj_metrics(
-                            decoded_single_generated, sample_batch, 0, seg_size=eval_seg_size
-                        )
+                for run_idx in range(generation_num_runs):
+                    sample_seed = _stable_eval_seed(
+                        module.cfg.seed, probe_tag, sample_name,
+                        _cap_idx * generation_num_runs + run_idx
                     )
-                    control_runs.append(
-                        _compute_omni_control_metrics(decoded_single_generated, sample_batch, 0)
-                    )
+                    _seed_eval_locally(sample_seed)
+                    if run_idx == 0 and _cap_idx == 0 and sample_idx == 0:
+                        _check_ckpt_consistency(module, step_tag)
+                    if _debug and run_idx == 0 and _cap_idx == 0 and sample_idx == 0:
+                        _dbg_file = os.path.join(
+                            os.environ.get("FLOODNET_DEBUG_DIR", "/tmp"), "eval_state.log")
+                        _pre_sd = _hash_sd(module.model.state_dict())
+                        _pre_ema = _hash_ema(module.ema)
+                        with open(_dbg_file, "a") as _f:
+                            _f.write(
+                                f"[PRE-EMA {step_tag}] sd_hash={_pre_sd} "
+                                f"ema_hash={_pre_ema}\n"
+                            )
+                    with module.ema.average_parameters(
+                        [p for p in module.model.parameters() if p.requires_grad]
+                    ):
+                        model_batch = prepare_model_input(_cap_batch)
+                        if _debug and run_idx == 0 and _cap_idx == 0 and sample_idx == 0:
+                            _dump_eval_debug(module, model_batch, sample_seed, step_tag)
+                        output = module.model.generate(model_batch)
+                    if _debug and run_idx == 0 and _cap_idx == 0 and sample_idx == 0:
+                        _post_sd = _hash_sd(module.model.state_dict())
+                        _post_ema = _hash_ema(module.ema)
+                        with open(_dbg_file, "a") as _f:
+                            _f.write(
+                                f"[POST-EMA {step_tag}] sd_hash={_post_sd} "
+                                f"ema_hash={_post_ema} "
+                                f"sd_restored={_pre_sd == _post_sd}\n"
+                            )
+
+                    single_generated = output["generated"][0]
+                    decoded_single_generated = module.vae.decode(
+                        single_generated[None, :].to(module.device)
+                    )[0].float().detach()
+
+                    if run_idx == 0 and _cap_idx == 0:
+                        sample_text = output["text"][0]
+                        token_run0 = single_generated.float().cpu().numpy()
+                        feature_run0 = decoded_single_generated.cpu().numpy()
+                        if _debug:
+                            _debug_token_path = os.path.join(
+                                os.environ.get("FLOODNET_DEBUG_DIR", "/tmp"),
+                                f"debug_token_{sample_name}.npy",
+                            )
+                            np.save(_debug_token_path, token_run0)
+                            rank_zero_info(
+                                f"[DEBUG token] saved {sample_name} "
+                                f"token shape={token_run0.shape} "
+                                f"abs_mean={np.abs(token_run0).mean():.6f}"
+                            )
+
+                        feat_len = int(decoded_single_generated.shape[0])
+                        if "traj_features" in sample_batch:
+                            cond = sample_batch["traj_features"][0]
+                            if torch.is_tensor(cond):
+                                cond = cond.detach().cpu().numpy()
+                            cond = np.asarray(cond)
+                            if cond.ndim == 2 and cond.shape[1] >= 2:
+                                traj_xz = cond[:feat_len, :2].astype(np.float32)
+                        if traj_xz is None and "traj" in sample_batch:
+                            traj = sample_batch["traj"][0]
+                            if torch.is_tensor(traj):
+                                traj = traj.detach().cpu().numpy()
+                            traj = np.asarray(traj)[:feat_len]
+                            if traj.ndim == 2 and traj.shape[1] >= 3:
+                                traj_xz = root_to_traj_feats(traj)[:, :2].astype(np.float32)
+                        if "traj_mask" in sample_batch:
+                            traj_mask_i = sample_batch["traj_mask"][0]
+                            if torch.is_tensor(traj_mask_i):
+                                traj_mask_i = traj_mask_i.detach().cpu().numpy()
+                            traj_mask = np.asarray(traj_mask_i).reshape(-1)[:feat_len]
+
+                    if do_eval_metrics:
+                        traj_runs.append(
+                            _compute_traj_metrics(
+                                decoded_single_generated, sample_batch, 0, seg_size=eval_seg_size
+                            )
+                        )
+                        control_runs.append(
+                            _compute_omni_control_metrics(decoded_single_generated, sample_batch, 0)
+                        )
 
             record = None
             if do_eval_metrics:
                 record = {
                     "name": sample_name,
                     "num_runs": eval_num_runs,
+                    "num_captions": len(_all_captions),
                     "probe_tag": probe_tag,
                     "text": sample_text,
+                    "text_all": _all_captions,
                 }
                 if traj_runs:
                     record.update(_average_traj_metrics(traj_runs))

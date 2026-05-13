@@ -232,12 +232,14 @@ class HumanML3DDataset(Dataset):
         # text
         ##############################
         if "text_data" in data:
-            # Deterministic selection for val/test so inline eval uses the
-            # same caption across training steps and standalone runs.
             if self.split in ("val", "test"):
                 import hashlib
                 _idx = int(hashlib.md5(data["name"].encode()).hexdigest(), 16)
                 text_dict = data["text_data"][_idx % len(data["text_data"])]
+                # Also expose all captions so eval can iterate over all of them.
+                output["text_all"] = [
+                    self.process_text_dict(td)[0] for td in data["text_data"]
+                ]
             else:
                 text_dict = random.choice(data["text_data"])
             text, text_tokens, f_tag, to_tag = self.process_text_dict(text_dict)
