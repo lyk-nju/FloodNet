@@ -75,30 +75,6 @@ def _dump_eval_debug(module, model_batch, sample_seed, step_tag):
     # 2. EMA shadow hash
     _w(f"ema_hash={_hash_ema(module.ema)}")
 
-    # 3. Consistency: compare with on_save_checkpoint's hash
-    import hashlib as _hashlib, json as _json
-    try:
-        _hash_path = os.path.join(module.cfg.save_dir, "ckpt_hash.txt")
-        if os.path.exists(_hash_path):
-            with open(_hash_path) as _fh:
-                _saved = _json.load(_fh)
-            _eval_h = _hashlib.sha256()
-            _sd = module.model.state_dict()
-            for _k, _v in sorted(_sd.items()):
-                _eval_h.update(_v.cpu().numpy().tobytes())
-            for _s in module.ema.shadow_params:
-                _eval_h.update(_s.cpu().numpy().tobytes())
-            _eval_hash = _eval_h.hexdigest()
-            _match = "MATCH" if _eval_hash == _saved["hash"] else "MISMATCH"
-            _w(
-                f"ckpt_consistency={_match} "
-                f"saved_step={_saved['step']} "
-                f"saved_hash={_saved['hash'][:16]} "
-                f"eval_hash={_eval_hash[:16]}"
-            )
-    except Exception:
-        pass
-
     # 3. Key param spot-checks
     for _name in (
         "model.blocks.0.self_attn.q.weight",
@@ -132,6 +108,34 @@ def _dump_eval_debug(module, model_batch, sample_seed, step_tag):
 
     with open(_dbg_file, "a") as _f:
         _f.write("\n".join(_lines) + "\n\n")
+
+
+def _check_ckpt_consistency(module, step_tag):
+    """Compare inline eval's EMA-applied model state against the saved ckpt hash.
+    Always writes to {save_dir}/ckpt_consistency.txt, no env var needed."""
+    import hashlib, json
+    try:
+        _hash_path = os.path.join(module.cfg.save_dir, "ckpt_hash.txt")
+        if not os.path.exists(_hash_path):
+            return
+        with open(_hash_path) as _fh:
+            _saved = json.load(_fh)
+        _h = hashlib.sha256()
+        for _k, _v in sorted(module.model.state_dict().items()):
+            _h.update(_v.cpu().numpy().tobytes())
+        for _s in module.ema.shadow_params:
+            _h.update(_s.cpu().numpy().tobytes())
+        _eval_hash = _h.hexdigest()
+        _match = "MATCH" if _eval_hash == _saved["hash"] else "MISMATCH"
+        _out_path = os.path.join(module.cfg.save_dir, "ckpt_consistency.txt")
+        with open(_out_path, "a") as _f:
+            _f.write(
+                f"{step_tag} {_match} "
+                f"saved_hash={_saved['hash'][:16]} "
+                f"eval_hash={_eval_hash[:16]}\n"
+            )
+    except Exception:
+        pass
 
 
 def _gather_payloads(local_payloads):
@@ -203,6 +207,9 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                 )
                 _seed_eval_locally(sample_seed)
                 _debug = os.environ.get("FLOODNET_DEBUG", "") == "1"
+                if run_idx == 0 and sample_idx == 0:
+                    # Always-on consistency check: hash BEFORE EMA matches ckpt_hash.txt
+                    _check_ckpt_consistency(module, step_tag)
                 if _debug and run_idx == 0 and sample_idx == 0:
                     _dbg_file = os.path.join(
                         os.environ.get("FLOODNET_DEBUG_DIR", "/tmp"), "eval_state.log")
