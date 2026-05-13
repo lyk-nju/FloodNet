@@ -148,17 +148,23 @@ class BasicLightningModule(LightningModule):
             self._ema_updated_at_save_step = _step
         checkpoint["ema_state"] = self.ema.state_dict()
         checkpoint["state_dict"] = self.model.state_dict()
-        # Write a consistency hash so inline eval can verify the saved ckpt
-        # matches what it's about to evaluate.
+        # Write EMA-applied hash so inline eval can verify the saved ckpt
+        # matches what generation will actually use.
         _trainer = getattr(self, "trainer", None)
         if _trainer is not None and _trainer.is_global_zero:
             try:
                 import hashlib, json
+                _sd = {k: v.clone() for k, v in checkpoint["state_dict"].items()}
+                _shadows = checkpoint["ema_state"]["shadow_params"]
+                _trainable_names = [
+                    n for n, p in self.model.named_parameters() if p.requires_grad
+                ]
+                for _name, _s in zip(_trainable_names, _shadows):
+                    if _name in _sd:
+                        _sd[_name] = _s.clone()
                 _h = hashlib.sha256()
-                for _k, _v in sorted(checkpoint["state_dict"].items()):
+                for _k, _v in sorted(_sd.items()):
                     _h.update(_v.cpu().numpy().tobytes())
-                for _s in checkpoint["ema_state"]["shadow_params"]:
-                    _h.update(_s.cpu().numpy().tobytes())
                 _hash_path = os.path.join(self.cfg.save_dir, "ckpt_hash.txt")
                 with open(_hash_path, "w") as _f:
                     json.dump(

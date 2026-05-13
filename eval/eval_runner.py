@@ -111,8 +111,9 @@ def _dump_eval_debug(module, model_batch, sample_seed, step_tag):
 
 
 def _check_ckpt_consistency(module, step_tag):
-    """Compare inline eval's EMA-applied model state against the saved ckpt hash.
-    Always writes to {save_dir}/ckpt_consistency.txt, no env var needed."""
+    """Compare email-applied model state against the saved ckpt hash.
+    Uses EMA-applied weights (what generation actually uses), not raw state_dict.
+    Always writes to {save_dir}/ckpt_consistency.txt."""
     import hashlib, json
     try:
         _hash_path = os.path.join(module.cfg.save_dir, "ckpt_hash.txt")
@@ -120,11 +121,17 @@ def _check_ckpt_consistency(module, step_tag):
             return
         with open(_hash_path) as _fh:
             _saved = json.load(_fh)
+        # Build EMA-applied state_dict: replace trainable params with EMA shadows
+        _sd = {k: v.clone() for k, v in module.model.state_dict().items()}
+        _trainable_names = [
+            n for n, p in module.model.named_parameters() if p.requires_grad
+        ]
+        for _name, _s in zip(_trainable_names, module.ema.shadow_params):
+            if _name in _sd:
+                _sd[_name] = _s.clone()
         _h = hashlib.sha256()
-        for _k, _v in sorted(module.model.state_dict().items()):
+        for _k, _v in sorted(_sd.items()):
             _h.update(_v.cpu().numpy().tobytes())
-        for _s in module.ema.shadow_params:
-            _h.update(_s.cpu().numpy().tobytes())
         _eval_hash = _h.hexdigest()
         _match = "MATCH" if _eval_hash == _saved["hash"] else "MISMATCH"
         _out_path = os.path.join(module.cfg.save_dir, "ckpt_consistency.txt")
