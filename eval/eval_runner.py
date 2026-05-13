@@ -212,13 +212,9 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
             _all = sample_batch.get("text_all", None)
             # text_all is a list-of-lists from collate; extract inner list.
             _all_captions = _all[0] if _all else [sample_batch["text"][0]]
-            _tokens_captions = sample_batch.get("text_tokens", None)
             for _cap_idx, _cap_text in enumerate(_all_captions):
-                # Build a sample batch with this specific caption.
                 _cap_batch = {k: v for k, v in sample_batch.items()}
                 _cap_batch["text"] = [_cap_text]
-                if _tokens_captions is not None:
-                    _cap_batch["text_tokens"] = _tokens_captions
 
                 for run_idx in range(generation_num_runs):
                     sample_seed = _stable_eval_seed(
