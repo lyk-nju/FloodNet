@@ -122,7 +122,7 @@ class BabelDataset(Dataset):
             )
         else:
             for i in range(3):
-                tmp = random.choice(dataset)
+                tmp = dataset[i % len(dataset)]  # avoid burning global RNG
                 shape_str = tmp["feature"].shape if "feature" in tmp else "(no feature)"
                 rank_zero_info(f"Random data {tmp['name']}: {shape_str}")
         return dataset
