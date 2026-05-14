@@ -19,20 +19,20 @@ def is_async_eval(cfg) -> bool:
     return str(cfg.get("validation", {}).get("test_mode", "inline")) == "async"
 
 
-def get_async_eval_root(save_dir: str | Path) -> Path:
+def _eval_root(save_dir: str | Path) -> Path:
     return Path(save_dir) / "async_eval"
 
 
-def get_run_config_path(save_dir: str | Path, exp_name: str) -> Path:
+def _config_path(save_dir: str | Path, exp_name: str) -> Path:
     return Path(save_dir) / "sanity_check" / f"{exp_name}.yaml"
 
 
-def get_async_eval_ckpt_path(save_dir: str | Path, step: int) -> Path:
-    return get_async_eval_root(save_dir) / "ckpts" / f"step_{step:06d}.ckpt"
+def _eval_ckpt_path(save_dir: str | Path, step: int) -> Path:
+    return _eval_root(save_dir) / "ckpts" / f"step_{step:06d}.ckpt"
 
 
-def get_async_eval_request_path(save_dir: str | Path, step: int) -> Path:
-    return get_async_eval_root(save_dir) / "requests" / f"step_{step:06d}.json"
+def _eval_request_path(save_dir: str | Path, step: int) -> Path:
+    return _eval_root(save_dir) / "requests" / f"step_{step:06d}.json"
 
 
 def emit_eval_request(module):
@@ -50,8 +50,8 @@ def emit_eval_request(module):
     step_semantics = compute_step_semantics(module)
     step_info = ckpt_step_info(module)
     step = int(step_semantics.absolute_step)
-    ckpt_path = get_async_eval_ckpt_path(module.cfg.save_dir, step)
-    request_path = get_async_eval_request_path(module.cfg.save_dir, step)
+    ckpt_path = _eval_ckpt_path(module.cfg.save_dir, step)
+    request_path = _eval_request_path(module.cfg.save_dir, step)
 
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
     request_path.parent.mkdir(parents=True, exist_ok=True)
@@ -62,7 +62,7 @@ def emit_eval_request(module):
 
     if trainer.is_global_zero:
         run_dir = Path(module.cfg.save_dir).resolve()
-        config_path = get_run_config_path(module.cfg.save_dir, module.cfg.exp_name).resolve()
+        config_path = _config_path(module.cfg.save_dir, module.cfg.exp_name).resolve()
         payload = {
             "step": step,
             "step_tag": step_info.step_tag,
@@ -173,7 +173,7 @@ def emit_resume_eval(cfg, save_dir: str, resume_ckpt: str):
         )
         return
 
-    request_dir = get_async_eval_root(save_dir) / "requests"
+    request_dir = _eval_root(save_dir) / "requests"
     request_dir.mkdir(parents=True, exist_ok=True)
     request_path = request_dir / f"step_{global_step:06d}.json"
 
@@ -181,7 +181,7 @@ def emit_resume_eval(cfg, save_dir: str, resume_ckpt: str):
         return
 
     run_dir = Path(save_dir).resolve()
-    config_path = get_run_config_path(save_dir, cfg.exp_name).resolve()
+    config_path = _config_path(save_dir, cfg.exp_name).resolve()
     probe_tags = build_test_probe_tags(cfg)
 
     payload = {

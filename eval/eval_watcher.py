@@ -106,7 +106,7 @@ def _iter_inline_requests(
     return requests
 
 
-def _build_inline_eval_command(
+def _build_cmd(
     runner_script: Path,
     config_path: Path,
     request_payload: dict[str, Any],
@@ -200,7 +200,7 @@ def _run_inline_mode(args, run_dir: Path, config_path: Path, project_root: Path)
             step_tag = str(payload.get("step_tag") or f"step_{step:06d}")
             probe_tags = [str(tag) for tag in payload.get("probe_tags", [])]
 
-            cmd = _build_inline_eval_command(
+            cmd = _build_cmd(
                 runner_script=runner_script,
                 config_path=config_path_for_request,
                 request_payload=payload,
@@ -228,7 +228,7 @@ def _run_inline_mode(args, run_dir: Path, config_path: Path, project_root: Path)
                     raise SystemExit(result.returncode)
                 break
 
-            if _expected_inline_summaries_exist(artifact_root, step_tag, probe_tags):
+            if _summaries_exist(artifact_root, step_tag, probe_tags):
                 state.setdefault("completed", []).append(request_key)
                 state.setdefault("failed", {}).pop(request_key, None)
                 _save_state(state_path, state)
@@ -245,7 +245,7 @@ def _run_inline_mode(args, run_dir: Path, config_path: Path, project_root: Path)
         time.sleep(args.poll_interval_sec)
 
 
-def _expected_inline_summaries_exist(
+def _summaries_exist(
     artifact_root: Path, step_tag: str, probe_tags: list[str]
 ) -> bool:
     """Return True once inline eval has written all expected summary files."""
@@ -287,7 +287,7 @@ def _metrics_exist(step_dir: Path) -> bool:
     return any(step_dir.glob("**/metrics.json"))
 
 
-def _resolve_eval_defaults(config_path: Path) -> dict[str, Any]:
+def _defaults(config_path: Path) -> dict[str, Any]:
     from omegaconf import OmegaConf
 
     cfg = OmegaConf.load(config_path)
@@ -302,7 +302,7 @@ def _resolve_eval_defaults(config_path: Path) -> dict[str, Any]:
     }
 
 
-def _resolve_probe_specs(config_path: Path) -> list[tuple[str, list[str]]]:
+def _probe_specs(config_path: Path) -> list[tuple[str, list[str]]]:
     from omegaconf import OmegaConf
 
     cfg = OmegaConf.load(config_path)
@@ -315,7 +315,7 @@ def _resolve_probe_specs(config_path: Path) -> list[tuple[str, list[str]]]:
     return [("test", list(cfg.get("data", {}).get("test_meta_paths", [])))]
 
 
-def _build_generation_eval_command(
+def _build_gen_cmd(
     eval_script: Path,
     config_path: Path,
     ckpt_path: Path,
@@ -382,8 +382,8 @@ def _iter_generation_checkpoints(
 
 
 def _run_generation_mode(args, run_dir: Path, config_path: Path, project_root: Path):
-    defaults = _resolve_eval_defaults(config_path)
-    probe_specs = _resolve_probe_specs(config_path)
+    defaults = _defaults(config_path)
+    probe_specs = _probe_specs(config_path)
     eval_script = (project_root / "eval" / "eval_generation_metrics.py").resolve()
     async_root = run_dir / "async_eval"
     state_path = async_root / "watcher_state.json"
@@ -433,7 +433,7 @@ def _run_generation_mode(args, run_dir: Path, config_path: Path, project_root: P
 
                 all_probe_done = False
                 step_dir.mkdir(parents=True, exist_ok=True)
-                cmd = _build_generation_eval_command(
+                cmd = _build_gen_cmd(
                     eval_script=eval_script,
                     config_path=config_path,
                     ckpt_path=ckpt_path,

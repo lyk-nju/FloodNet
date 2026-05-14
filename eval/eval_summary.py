@@ -38,7 +38,7 @@ def flatten_inline_eval_summary(summary: dict, prefix: str) -> dict:
     return flat_metrics
 
 
-def build_inline_eval_summary(sample_records):
+def build_summary(sample_records):
     summary = {}
     valid_traj = [r for r in sample_records if "ade" in r and r["ade"] == r["ade"]]
     if valid_traj:
@@ -170,7 +170,7 @@ def build_inline_eval_summary(sample_records):
             summary[f"control/{out_key}_{_run_label}"] = int(len(per_run_vals))
     return summary
 
-build_eval_summary = build_inline_eval_summary  # alias for stream metrics
+build_eval_summary = build_summary  # alias for stream metrics
 
 
 def _render_probe_outputs(module, dataset_id, probe_tag, artifact_dirs):
@@ -250,7 +250,7 @@ def process_inline_generation_results(module):
         if not os.path.exists(feature_root):
             continue
         for probe_tag in get_test_probe_tags(module):
-            artifact_dirs = build_inline_eval_artifact_dirs(
+            artifact_dirs = eval_artifact_dirs(
                 module.cfg.save_dir,
                 dataset_id,
                 probe_tag,
@@ -263,11 +263,11 @@ def process_inline_generation_results(module):
 
             if not artifact_dirs["metrics"].exists():
                 continue
-            sample_records = load_inline_eval_sample_records(artifact_dirs["metrics"])
+            sample_records = load_eval_records(artifact_dirs["metrics"])
             if not sample_records:
                 continue
 
-            summary = build_inline_eval_summary(sample_records)
+            summary = build_summary(sample_records)
             _save_summary(artifact_dirs["metrics"], summary, sample_records)
             _log_probe_summary(module, dataset_id, probe_tag, step_tag, summary)
 
@@ -277,7 +277,7 @@ def process_inline_generation_results(module):
 # ------------------------------------------------------------------
 
 
-def build_inline_eval_artifact_dirs(save_dir, dataset_id, probe_tag, step_tag):
+def eval_artifact_dirs(save_dir, dataset_id, probe_tag, step_tag):
     base_dir = Path(save_dir) / dataset_id
     return {
         "text": base_dir / "text" / probe_tag / step_tag,
@@ -292,7 +292,7 @@ def build_inline_eval_artifact_dirs(save_dir, dataset_id, probe_tag, step_tag):
     }
 
 
-def save_inline_eval_payloads(module, payloads, probe_tag, step_tag):
+def save_eval_payloads(module, payloads, probe_tag, step_tag):
     if module.trainer.global_rank != 0:
         return
 
@@ -305,7 +305,7 @@ def save_inline_eval_payloads(module, payloads, probe_tag, step_tag):
             continue
         seen.add(dedupe_key)
 
-        dirs = build_inline_eval_artifact_dirs(
+        dirs = eval_artifact_dirs(
             module.cfg.save_dir,
             dataset_id,
             probe_tag,
@@ -342,7 +342,7 @@ def save_inline_eval_payloads(module, payloads, probe_tag, step_tag):
             )
 
 
-def load_inline_eval_sample_records(metrics_dir):
+def load_eval_records(metrics_dir):
     sample_records = []
     for metric_file in sorted(os.listdir(metrics_dir)):
         if not metric_file.endswith(".json"):
