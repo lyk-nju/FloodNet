@@ -690,7 +690,7 @@ def main():
     # train or validate
     ##############################
     if cfg.train:
-        if cfg.resume_ckpt:
+        if cfg.resume_ckpt and not async_test_mode:
             rank_zero_info(
                 f"[eval-on-resume] running test on resume ckpt: {cfg.resume_ckpt}"
             )

@@ -170,6 +170,8 @@ def build_inline_eval_summary(sample_records):
             summary[f"control/{out_key}_{_run_label}"] = int(len(per_run_vals))
     return summary
 
+build_eval_summary = build_inline_eval_summary  # alias for stream metrics
+
 
 def _render_probe_outputs(module, dataset_id, probe_tag, artifact_dirs):
     if not module.cfg.test_setting.render:

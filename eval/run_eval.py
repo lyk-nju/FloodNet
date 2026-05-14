@@ -86,31 +86,31 @@ def main():
     model.test_loader_tags = test_loader_tags
     model._resume_step_offset = int(load_resume_step_offset(args.ckpt))
 
-    # --- DEBUG: verify loaded ckpt matches training inline eval ---
-    _ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    _sd = {k: v.clone() for k, v in _ckpt["state_dict"].items()}
-    _trainable_names = [
-        n for n, p in model.model.named_parameters() if p.requires_grad
-    ]
-    for _name, _s in zip(_trainable_names, _ckpt["ema_state"]["shadow_params"]):
-        if _name in _sd:
-            _sd[_name] = _s.clone()
-    import hashlib as _hl
-    _h = _hl.sha256()
-    for _k, _v in sorted(_sd.items()):
-        _h.update(_v.cpu().numpy().tobytes())
-    _load_hash = _h.hexdigest()
-    _hash_path = os.path.join(os.path.dirname(os.path.abspath(args.ckpt)), "ckpt_hash.txt")
-    if os.path.exists(_hash_path):
-        import json as _json
-        with open(_hash_path) as _fh:
-            _saved = _json.load(_fh)
-        _match = "MATCH" if _load_hash == _saved["hash"] else "MISMATCH"
-        rank_zero_info(
-            f"[standalone verify] load_hash={_load_hash[:16]} "
-            f"saved_hash={_saved['hash'][:16]} {_match}"
-        )
-    # --- END DEBUG ---
+    if os.environ.get("FLOODNET_DEBUG", "") == "1":
+        _ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+        if "ema_state" in _ckpt:
+            import hashlib as _hl
+            _sd = {k: v.clone() for k, v in _ckpt["state_dict"].items()}
+            _trainable_names = [
+                n for n, p in model.model.named_parameters() if p.requires_grad
+            ]
+            for _name, _s in zip(_trainable_names, _ckpt["ema_state"]["shadow_params"]):
+                if _name in _sd:
+                    _sd[_name] = _s.clone()
+            _h = _hl.sha256()
+            for _k, _v in sorted(_sd.items()):
+                _h.update(_v.cpu().numpy().tobytes())
+            _load_hash = _h.hexdigest()
+            _hash_path = os.path.join(os.path.dirname(os.path.abspath(args.ckpt)), "ckpt_hash.txt")
+            if os.path.exists(_hash_path):
+                import json as _json
+                with open(_hash_path) as _fh:
+                    _saved = _json.load(_fh)
+                _match = "MATCH" if _load_hash == _saved["hash"] else "MISMATCH"
+                rank_zero_info(
+                    f"[standalone verify] load_hash={_load_hash[:16]} "
+                    f"saved_hash={_saved['hash'][:16]} {_match}"
+                )
 
     accelerator = args.accelerator or (
         "gpu" if torch.cuda.is_available() and args.devices > 0 else "cpu"

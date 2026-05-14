@@ -94,17 +94,18 @@ def build_stream_suffix_conditioning(sample_batch: Dict, commit_index: int) -> D
     if token_mask is not None:
         payload["token_mask"] = _slice_batch_suffix(token_mask, commit_index)
 
-    traj = sample_batch.get("traj", None)
-    if traj is not None:
-        payload["traj"] = _slice_batch_suffix(
-            _to_token_level_traj(sample_batch), commit_index
-        )
-        return payload
-
+    # Prefer traj_features (consistent with encode_traj_batch) over traj.
     traj_features = sample_batch.get("traj_features", None)
     if traj_features is not None:
         payload["traj_features"] = _slice_batch_suffix(
             _to_token_level_traj_features(sample_batch), commit_index
+        )
+        return payload
+
+    traj = sample_batch.get("traj", None)
+    if traj is not None:
+        payload["traj"] = _slice_batch_suffix(
+            _to_token_level_traj(sample_batch), commit_index
         )
     return payload
 

@@ -153,6 +153,11 @@ def _run_inline_mode(args, run_dir: Path, config_path: Path, project_root: Path)
         )
         if not pending:
             idle_sec = time.time() - last_activity
+            # Drain mode: training_done exists but requests too young;
+            # wait and retry instead of exiting.
+            if training_done_marker.exists() and list(request_dir.glob("step_*.json")):
+                time.sleep(args.poll_interval_sec)
+                continue
             if args.once or training_done_marker.exists():
                 print("[eval-watcher|inline] no pending requests; exit.")
                 return
@@ -381,6 +386,10 @@ def _run_generation_mode(args, run_dir: Path, config_path: Path, project_root: P
         )
         if not pending:
             idle_sec = time.time() - last_activity
+            # Drain: training_done but young checkpoints remain; wait.
+            if training_done_marker.exists() and list(run_dir.glob("step_*.ckpt")):
+                time.sleep(args.poll_interval_sec)
+                continue
             if args.once or training_done_marker.exists():
                 print("[eval-watcher|generation] no pending checkpoints; exit.")
                 return
