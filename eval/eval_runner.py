@@ -4,7 +4,7 @@ import torch
 import random
 from lightning.pytorch.utilities import rank_zero_info
 
-from .eval_summary import save_inline_eval_payloads
+from .eval_summary import save_eval_payloads
 
 try:
     from FloodNet.metrics.traj import (
@@ -383,7 +383,7 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
             )
 
         all_payloads = _gather_payloads(local_payloads)
-        save_inline_eval_payloads(module, all_payloads, probe_tag, step_tag)
+        save_eval_payloads(module, all_payloads, probe_tag, step_tag)
         return {"output": None}
     finally:
         random.setstate(py_state)
