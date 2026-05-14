@@ -389,6 +389,16 @@ def _run_generation_mode(args, run_dir: Path, config_path: Path, project_root: P
     state_path = async_root / "watcher_state.json"
     state = _load_state(state_path)
 
+    def _has_unfinished():
+        completed = set(state.get("completed", []))
+        for ckpt_path in run_dir.glob("step_*.ckpt"):
+            if str(ckpt_path.resolve()) in completed:
+                continue
+            if _parse_step_from_ckpt(ckpt_path) is None:
+                continue
+            return True
+        return False
+
     training_done_marker = async_root / "training_done"
     last_activity = time.time()
 
@@ -402,11 +412,13 @@ def _run_generation_mode(args, run_dir: Path, config_path: Path, project_root: P
         )
         if not pending:
             idle_sec = time.time() - last_activity
-            # Drain: training_done but young checkpoints remain; wait.
-            if training_done_marker.exists() and list(run_dir.glob("step_*.ckpt")):
+            if training_done_marker.exists():
+                if not _has_unfinished():
+                    print("[eval-watcher|generation] all done; exit.")
+                    return
                 time.sleep(args.poll_interval_sec)
                 continue
-            if args.once or training_done_marker.exists():
+            if args.once:
                 print("[eval-watcher|generation] no pending checkpoints; exit.")
                 return
             if args.idle_timeout_min > 0 and idle_sec > args.idle_timeout_min * 60:
