@@ -593,6 +593,7 @@ def main():
             }
 
             if compute_offline_baseline:
+                _seed_eval_locally(sample_seed)
                 with torch.no_grad():
                     offline_out = run_offline_generate_sample(
                         model=model,
@@ -685,3 +686,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
