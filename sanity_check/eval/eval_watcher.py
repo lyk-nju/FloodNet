@@ -153,28 +153,7 @@ def _run_inline_mode(args, run_dir: Path, config_path: Path, project_root: Path)
         )
         if not pending:
             idle_sec = time.time() - last_activity
-            # Drain mode: training_done exists but requests too young;
-            # wait and retry only if there are unfinished requests.
-            if training_done_marker.exists():
-                completed = set(state.get("completed", []))
-                failed = state.get("failed", {})
-                unfinished = []
-                for request_path in request_dir.glob("step_*.json"):
-                    request_key = str(request_path.resolve())
-                    if request_key in completed:
-                        continue
-                    if (
-                        args.max_failures > 0
-                        and int(failed.get(request_key, 0)) >= args.max_failures
-                    ):
-                        continue
-                    unfinished.append(request_path)
-                if not unfinished:
-                    print("[eval-watcher|inline] no pending requests; exit.")
-                    return
-                time.sleep(args.poll_interval_sec)
-                continue
-            if args.once:
+            if args.once or training_done_marker.exists():
                 print("[eval-watcher|inline] no pending requests; exit.")
                 return
             if args.idle_timeout_min > 0 and idle_sec > args.idle_timeout_min * 60:
@@ -402,10 +381,6 @@ def _run_generation_mode(args, run_dir: Path, config_path: Path, project_root: P
         )
         if not pending:
             idle_sec = time.time() - last_activity
-            # Drain: training_done but young checkpoints remain; wait.
-            if training_done_marker.exists() and list(run_dir.glob("step_*.ckpt")):
-                time.sleep(args.poll_interval_sec)
-                continue
             if args.once or training_done_marker.exists():
                 print("[eval-watcher|generation] no pending checkpoints; exit.")
                 return
