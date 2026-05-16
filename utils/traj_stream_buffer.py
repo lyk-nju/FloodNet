@@ -67,6 +67,12 @@ class TrajStreamBuffer:
     def update(self, x: dict, commit_index: int, device):
         """Write traj data from batch dict x into the buffer at commit_index.
 
+        Write semantics: INCREMENTAL APPEND — only the range
+        [commit_index, commit_index + len(tf)) is written; positions beyond
+        that are NOT cleared.  Callers that want to replace future trajectory
+        data should call reset() first, or re-pass the full remaining
+        trajectory at every step.
+
         If x contains no traj fields, the buffer is cleared (stops conditioning).
         Increments the internal version to invalidate the embedding cache.
         """
@@ -160,6 +166,11 @@ class TrajStreamBuffer:
         self, end_index: int, seq_len: int, device
     ) -> torch.Tensor | None:
         """Return the last-valid-token position + 1 for each batch item.
+
+        Assumes a contiguous-prefix mask ([1,1,...,1,0,...,0]).  Sparse masks
+        (e.g. waypoints) will get lens = last_valid_pos + 1, which may cause
+        FlexTraj attention to attend to zero-filled gaps in between.
+        Currently safe because mask_ratio=1.0 always produces full-prefix masks.
 
         Returns None if no mask is tracked (all tokens assumed valid by caller).
         """

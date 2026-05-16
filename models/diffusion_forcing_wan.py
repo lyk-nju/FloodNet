@@ -799,25 +799,35 @@ class DiffForcingWanModel(nn.Module):
             residuals = self._controlnet_forward(
                 noisy_double, t_double, ctx_double, seq_len, traj_double, traj_sl_double
             )
-            pred_double = self.model(
-                noisy_double, t_double, ctx_double, seq_len,
-                y=None, traj_emb=None, traj_seq_lens=None, controlnet_residuals=residuals,
-            )
             if self.cfg_scale_traj > 0.0:
-                # Separated CFG (kimodo-style):
+                # Separated CFG — batch all 3 passes into a single 3B backbone forward.
+                # ControlNet runs on 2B; uncond slot gets zero residuals (no ControlNet effect).
                 #   out = out_uncond
-                #       + w_text * (out_full - out_uncond)
-                #       + w_traj * (out_null_text+traj - out_uncond)
-                pred_uncond = self._uncond_backbone_forward(
-                    noisy_input, t_scaled, text_null_ctx, seq_len
+                #       + w_text * (out_full - out_null_text+traj)   ← pure text effect, traj fixed
+                #       + w_traj * (out_null_text+traj - out_uncond) ← pure traj effect, text=null
+                noisy_triple = list(noisy_double) + list(noisy_input)
+                t_triple = torch.cat([t_double, t_scaled], dim=0)
+                ctx_triple = list(ctx_double) + list(text_null_ctx)
+                residuals_triple = [
+                    torch.cat([r, r.new_zeros(batch_size, r.size(1), r.size(2))], dim=0)
+                    for r in residuals
+                ]
+                pred_triple = self.model(
+                    noisy_triple, t_triple, ctx_triple, seq_len,
+                    y=None, traj_emb=None, traj_seq_lens=None,
+                    controlnet_residuals=residuals_triple,
                 )
                 return [
-                    pred_uncond[i]
-                    + self.cfg_scale_text * (pred_double[i] - pred_uncond[i])
-                    + self.cfg_scale_traj * (pred_double[i + batch_size] - pred_uncond[i])
+                    pred_triple[i + 2 * batch_size]
+                    + self.cfg_scale_text * (pred_triple[i] - pred_triple[i + batch_size])
+                    + self.cfg_scale_traj * (pred_triple[i + batch_size] - pred_triple[i + 2 * batch_size])
                     for i in range(batch_size)
                 ]
             else:
+                pred_double = self.model(
+                    noisy_double, t_double, ctx_double, seq_len,
+                    y=None, traj_emb=None, traj_seq_lens=None, controlnet_residuals=residuals,
+                )
                 return [
                     self.cfg_scale_text * pred_double[i]
                     - (self.cfg_scale_text - 1) * pred_double[i + batch_size]

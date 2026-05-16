@@ -147,6 +147,7 @@ model:
         traj_encoder_in_dim: 4
         traj_out_dim: 64
         traj_dropout: 0.1
+        text_dropout: 0.2
         use_traj_emb_cache: true
 
         # Explicit motion-space control loss
