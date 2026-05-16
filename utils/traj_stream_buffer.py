@@ -73,7 +73,8 @@ class TrajStreamBuffer:
         data should call reset() first, or re-pass the full remaining
         trajectory at every step.
 
-        If x contains no traj fields, the buffer is cleared (stops conditioning).
+        If x contains no traj fields, returns immediately (buffer is preserved).
+        To stop conditioning, call reset() explicitly before the step.
         Increments the internal version to invalidate the embedding cache.
         """
         if commit_index >= self.buf_len:
@@ -84,8 +85,6 @@ class TrajStreamBuffer:
             and ("traj_features" not in x or x["traj_features"] is None)
         )
         if no_traj:
-            if self._feat_buf is not None or self._xyz_buf is not None:
-                self.reset()
             return
 
         wrote = False

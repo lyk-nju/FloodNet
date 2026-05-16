@@ -130,8 +130,12 @@ class WanControlNet(nn.Module):
 
     def init_weights(self):
         # Same init policy as WanModel (linear xavier; embeddings normal; residual heads already zero).
+        # Exclude zero_out heads and traj_in_proj — both get explicit zero-init after this call.
+        _exclude = set(self.zero_out)
+        if self.traj_in_proj is not None:
+            _exclude.add(self.traj_in_proj)
         for m in self.modules():
-            if isinstance(m, nn.Linear) and m not in set(self.zero_out):
+            if isinstance(m, nn.Linear) and m not in _exclude:
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
