@@ -379,16 +379,30 @@ class DiffForcingWanModel(nn.Module):
             return ((tl + 2) // 4 + 1).clamp(min=0, max=seq_len)
         return None
 
-    def _prepare_text_context(self, x, seq_len, device):
+    def _decide_text_dropout(self, batch_size: int, device) -> list:
+        """Sample per-sample text-dropout flags, synced across DDP ranks."""
+        if not self.training:
+            return [False] * batch_size
+        drop = torch.empty(batch_size, device=device).uniform_()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.broadcast(drop, src=0)
+        return (drop < self.text_dropout).tolist()
+
+    def _prepare_text_context(self, x, seq_len, device, text_dropped_flags=None):
         if self.use_text_cond and "text" in x:
             text_list = x["text"]  # List[str] or List[List[str]]
             if isinstance(text_list[0], list):
                 text_end_list = x["feature_text_end"]
                 all_text_context = []
-                for single_text_list, single_text_end_list in zip(
-                    text_list, text_end_list
+                for i, (single_text_list, single_text_end_list) in enumerate(
+                    zip(text_list, text_end_list)
                 ):
-                    if (not self.training) or (np.random.rand() > self.text_dropout):
+                    sample_dropped = (
+                        text_dropped_flags[i]
+                        if text_dropped_flags is not None
+                        else False
+                    )
+                    if (not self.training) or (not sample_dropped):
                         single_text_end_list = [0] + [
                             min(t, seq_len) for t in single_text_end_list
                         ]
@@ -418,9 +432,10 @@ class DiffForcingWanModel(nn.Module):
                         ]
                     )
             else:
-                if self.training:
+                if self.training and text_dropped_flags is not None:
                     all_text_context = [
-                        (u if np.random.rand() > self.text_dropout else "") for u in text_list
+                        ("" if text_dropped_flags[i] else u)
+                        for i, u in enumerate(text_list)
                     ]
                 else:
                     all_text_context = list(text_list)
@@ -518,13 +533,17 @@ class DiffForcingWanModel(nn.Module):
             )
         if do_ss:
             with torch.no_grad():
-                cn_res_ss = self._controlnet_forward(
-                    noisy_feature_input,
-                    noise_level * self.time_embedding_scale,
-                    all_text_context,
-                    seq_len,
-                    traj_emb,
-                    traj_seq_lens,
+                cn_res_ss = (
+                    None
+                    if traj_dropped
+                    else self._controlnet_forward(
+                        noisy_feature_input,
+                        noise_level * self.time_embedding_scale,
+                        all_text_context,
+                        seq_len,
+                        traj_emb,
+                        traj_seq_lens,
+                    )
                 )
                 pred_ss = self.model(
                     noisy_feature_input,
@@ -557,13 +576,17 @@ class DiffForcingWanModel(nn.Module):
                     [x0_hat[:, :ctx_len], noisy_feature_input[b][:, ctx_len:]], dim=1
                 )
 
-        controlnet_residuals = self._controlnet_forward(
-            noisy_feature_input,
-            noise_level * self.time_embedding_scale,
-            all_text_context,
-            seq_len,
-            traj_emb,
-            traj_seq_lens,
+        controlnet_residuals = (
+            None
+            if traj_dropped
+            else self._controlnet_forward(
+                noisy_feature_input,
+                noise_level * self.time_embedding_scale,
+                all_text_context,
+                seq_len,
+                traj_emb,
+                traj_seq_lens,
+            )
         )
         predicted_result = self.model(
             noisy_feature_input,
@@ -713,7 +736,8 @@ class DiffForcingWanModel(nn.Module):
                 max_time = valid_len / self.chunk_size
                 time_steps.append(torch.FloatTensor(1).uniform_(0, max_time).item())
             time_steps = torch.tensor(time_steps, device=device)  # (B,)
-        all_text_context = self._prepare_text_context(x, seq_len, device)
+        text_dropped_flags = self._decide_text_dropout(batch_size, device)
+        all_text_context = self._prepare_text_context(x, seq_len, device, text_dropped_flags)
         traj_emb, traj_seq_lens, traj_dropped = self._prepare_traj_condition(
             x, seq_len, device
         )
@@ -1287,16 +1311,22 @@ class DiffForcingWanModel(nn.Module):
                 )  # (T, D, 4096)
 
             traj_emb = self._traj_buf.build_traj_emb(end_index, self.seq_len, device)
-            traj_seq_lens = (
-                torch.full(
-                    (self.batch_size,),
-                    min(end_index, self.seq_len),
-                    device=device,
-                    dtype=torch.long,
+            if traj_emb is not None:
+                valid_lens = self._traj_buf.get_traj_valid_lens(
+                    end_index, self.seq_len, device
                 )
-                if traj_emb is not None
-                else None
-            )
+                traj_seq_lens = (
+                    valid_lens
+                    if valid_lens is not None
+                    else torch.full(
+                        (self.batch_size,),
+                        min(end_index, self.seq_len),
+                        device=device,
+                        dtype=torch.long,
+                    )
+                )
+            else:
+                traj_seq_lens = None
             model_sl = min(end_index, self.seq_len)
             t_scaled = noise_level * self.time_embedding_scale
             predicted_result = self._denoise_with_cfg(

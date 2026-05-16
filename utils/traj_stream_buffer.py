@@ -101,7 +101,6 @@ class TrajStreamBuffer:
                 else:
                     self._feat_buf = self._feat_buf.to(device)
                 k = max(0, min(tf.size(1), self.buf_len - commit_index))
-                self._feat_buf[:, commit_index:] = 0
                 if k > 0:
                     self._feat_buf[:, commit_index:commit_index + k] = tf[:, :k]
                     wrote = True
@@ -128,7 +127,6 @@ class TrajStreamBuffer:
                 else:
                     self._xyz_buf = self._xyz_buf.to(device)
                 k = max(0, min(traj_in.size(1), self.buf_len - commit_index))
-                self._xyz_buf[:, commit_index:] = 0
                 if k > 0:
                     self._xyz_buf[:, commit_index:commit_index + k] = traj_in[:, :k]
                     wrote = True
@@ -157,6 +155,29 @@ class TrajStreamBuffer:
         if self._xyz_buf is not None:
             return self._build_from_xyz(start_t, end_index, ctx_len, device)
         return None
+
+    def get_traj_valid_lens(
+        self, end_index: int, seq_len: int, device
+    ) -> torch.Tensor | None:
+        """Return the last-valid-token position + 1 for each batch item.
+
+        Returns None if no mask is tracked (all tokens assumed valid by caller).
+        """
+        if self._mask_buf is None:
+            return None
+        ctx_len = min(end_index, seq_len)
+        start_t = max(0, end_index - seq_len)
+        mask_slice = self._mask_buf[:, start_t:end_index].to(device)
+        mask_slice = self._pad_mask_to_ctx(mask_slice, ctx_len, device)
+        valid = mask_slice > 0  # (B, ctx_len)
+        has_valid = valid.any(dim=1)  # (B,)
+        if not has_valid.any():
+            return None
+        # Distance from the end to the last valid token
+        last_from_end = valid.long().flip(1).argmax(dim=1)  # (B,)
+        lens = (ctx_len - last_from_end).clamp(min=0)
+        lens = torch.where(has_valid, lens, torch.zeros_like(lens))
+        return lens.to(dtype=torch.long)
 
     def roll(self, seq_len: int, device):
         """Shift the buffer left by seq_len when commit_index reaches 2*seq_len.
@@ -201,7 +222,6 @@ class TrajStreamBuffer:
             )
         else:
             self._mask_buf = self._mask_buf.to(device)
-        self._mask_buf[:, commit_index:] = 0
 
         if token_mask is not None and k > 0:
             tm = token_mask

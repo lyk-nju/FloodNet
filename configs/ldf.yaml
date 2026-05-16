@@ -4,20 +4,21 @@ debug: false
 train: true
 
 dirs:
-    deps: /data1/yuankai/text2Motion/FloodDiffusion/deps
+    deps: /data/home/shengqiuProf_user_yuankai/FloodDiffusion/deps
     outputs: ./outputs
-    raw_data: /data1/yuankai/text2Motion/FloodDiffusion/raw_data
+    raw_data: /data/home/shengqiuProf_user_yuankai/FloodDiffusion/raw_data
 
 save_dir: ./outputs
-# resume_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20260506_012427_ldf/step_240000.ckpt
-# test_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20260506_012427_ldf/step_240000.ckpt
+resume_ckpt: /data/home/shengqiuProf_user_yuankai/FloodNet/outputs/20260508_001434_ldf/step_396000.ckpt
+test_ckpt: /data/home/shengqiuProf_user_yuankai/FloodNet/outputs/20260508_001434_ldf/step_396000.ckpt
 
-resume_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt
-test_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt
-# resume_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20260415_114956_ldf/step_step=245000.ckpt
-# test_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20260415_114956_ldf/step_step=245000.ckpt
+# resume_ckpt: /data/home/shengqiuProf_user_yuankai/FloodNet/outputs/20260428_004404_ldf/step_step=300000.ckpt
+# test_ckpt: /data/home/shengqiuProf_user_yuankai/FloodNet/outputs/20260428_004404_ldf/step_step=300000.ckpt
 
-test_vae_ckpt: "/home/yuankai/Text2Motion/FloodNet/outputs/vae_1d_z4_step=300000.ckpt"
+# resume_ckpt: /data/home/shengqiuProf_user_yuankai/FloodDiffusion/step_step=240000.ckpt
+# test_ckpt: /data/home/shengqiuProf_user_yuankai/FloodDiffusion/step_step=240000.ckpt
+
+test_vae_ckpt: /data/home/shengqiuProf_user_yuankai/FloodDiffusion/vae_1d_z4_step=300000.ckpt
 test_vae:
     target: models.vae_wan_1d.VAEWanModel
     ema_decay: 0.99
@@ -42,26 +43,26 @@ logger:
         entity: "${wandb_info.entity}"
 
 trainer: # lightning trainer
-    max_steps: 260000
+    max_steps: 500000
     accelerator: gpu
-    devices: [4]
+    devices: [0,1,2,3,4,5,6,7]
     log_every_n_steps: 100
     precision: bf16-mixed
 # Set to true to run T2M FID/R-Precision on val_meta_paths during eval.
 # Can also be enabled via --t2m_metric CLI flag.
-t2m_metric: false
+t2m_metric: true
 
 validation:
-    validation_steps: 3000
-    test_steps: 3000
-    test_mode: inline  # inline | async
-    save_every_n_steps: 3000
+    validation_steps: 5000
+    test_steps: 5000
+    save_every_n_steps: 5000
     save_top_k: 100
     eval_generation_metrics: true
-    eval_num_runs: 10
+    eval_num_runs: 5
     eval_seg_size: 20
     eval_forward_control_loss: true
     eval_forward_control_loss_window_mode: mean_chunk_windows
+    eval_all_captions: true
 metrics:
     dim: 263
     t2m:
@@ -103,29 +104,25 @@ data:
     collate_fn: datasets.humanml3d.collate_fn
     train_bs: 8
     val_bs: 32
-    test_bs: 1
-    num_workers: 4
-    # mask_ratio: [0.2,0.3]       
+    test_bs: 4
+    num_workers: 4 
     mask_ratio: 1.0
 
     train_meta_paths:
-        - ${dirs.raw_data}/HumanML3D/train.txt
+        # - ${dirs.raw_data}/HumanML3D/train.txt
+        - ${dirs.raw_data}/HumanML3D/train_difficult.txt
         # - ${dirs.raw_data}/HumanML3D/test_min.txt
         # - ${dirs.raw_data}/HumanML3D/val.txt
     val_meta_paths:
         - ${dirs.raw_data}/HumanML3D/val.txt
         # - ${dirs.raw_data}/HumanML3D/test_min.txt
         # - ${dirs.raw_data}/HumanML3D/test.txt
-    test_meta_paths:
-        - ${dirs.raw_data}/HumanML3D/test_min.txt
-    # Optional separate inline probe sets.
-    # When set, these override the single test_meta_paths loader and produce
-    # separate metric prefixes such as eval/test/... and eval/train/...
-    # test_probe_meta_paths:
-    #     test:
-    #         - ${dirs.raw_data}/HumanML3D/test_probe.txt
-    #     train:
-    #         - ${dirs.raw_data}/HumanML3D/train_probe.txt
+    test_probe_meta_paths:
+        test:
+            - ${dirs.raw_data}/HumanML3D/test_min.txt
+        train:
+            - ${dirs.raw_data}/HumanML3D/train_min.txt
+
     feature_path: "new_joint_vecs"
     token_path: "TOKENS_20251030_085836_vae_wan_z4"
     text_path: "texts"
@@ -149,11 +146,11 @@ model:
         # Trajectory condition encoder (used by ControlNet)
         traj_encoder_in_dim: 4
         traj_out_dim: 64
-        traj_dropout: 0.0
+        traj_dropout: 0.1
         use_traj_emb_cache: true
 
         # Explicit motion-space control loss
-        control_loss_weight: 1.0
+        control_loss_weight: 5.0
         scheduled_sampling_prob: 0.0
         cfg_scale_traj: 3.0
         cfg_scale_text: 5.0
@@ -161,20 +158,15 @@ model:
         self_forcing_stride_tokens: 1
         self_forcing_detach_between_steps: true
         # Thresholds are phase progress over [resume_ckpt.global_step, trainer.max_steps].
-        # K=1 is diagnostic mode: rollout forward runs but no self-pred substitution.
-        # For real multi-step self-forcing, raise K (e.g. [0.0, 2], [0.4, 3], [0.7, 5]).
         self_forcing_k_schedule:
             - [0.0, 1]
-
-# Diagnostic: when true, run the rollout forward but skip the self-pred
-# substitution.  Used to isolate whether the bug lives in the substituted
-# value (set true → behaves like K=1) or in the dual-forward path itself.
-self_forcing_disable_replace: false
+            - [0.3, 3]
+            - [0.6, 5]
 
 # control_loss_train_mode selects gradient strategy for the XZ control loss:
 #   1 — active window, absolute coords, no detach   (gradient → ALL tokens via cumsum)
 #   2 — active window, absolute coords, detach past (gradient → active window only, wrong abs offset)
-#   3 — full sequence, absolute coords, no detach   (balanced gradient, proven in 20260402) [DEFAULT]
+#   3 — full sequence, absolute coords, no detach   (balanced gradient)
 #   4 — full sequence, absolute coords, detach past (full coverage loss, gradient → active window only)
 #   5 — active window, relative displacement, pred anchor  (loss = |e[t]-e[0]|², fixed offset → zero loss)
 #   6 — active window, relative displacement, GT anchor    (loss = |pred_rel[t]-gt_rel[t]|², true disp error)
@@ -184,7 +176,7 @@ resume_reset_optimizer: true
 optimizer:
     target: AdamW
     params:
-        lr: 1e-3
+        lr: 5e-5
         betas: [0.9, 0.999]
         weight_decay: 0.0
         eps: 1e-8

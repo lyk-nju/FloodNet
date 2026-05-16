@@ -303,7 +303,8 @@ class SelfForcingTrainer:
         _, seq_len, _ = feature.shape
         device = feature.device
 
-        all_text_context = model._prepare_text_context(model_batch, seq_len, device)
+        text_dropped_flags = model._decide_text_dropout(feature.shape[0], device)
+        all_text_context = model._prepare_text_context(model_batch, seq_len, device, text_dropped_flags)
         traj_dropped = model._decide_traj_dropout(device)
         plan = self.plan_rollout(feature_length, device, progress)
         traj_emb, traj_seq_lens, _ = model._prepare_traj_condition(
