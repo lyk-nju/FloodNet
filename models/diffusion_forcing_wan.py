@@ -807,7 +807,14 @@ class DiffForcingWanModel(nn.Module):
                 #       + w_traj * (out_null_text+traj - out_uncond) ← pure traj effect, text=null
                 noisy_triple = list(noisy_double) + list(noisy_input)
                 t_triple = torch.cat([t_double, t_scaled], dim=0)
-                ctx_triple = list(ctx_double) + list(text_null_ctx)
+                if len(ctx_double) == 2 * batch_size:
+                    # simple mode: one context per sample
+                    ctx_triple = list(ctx_double) + list(text_null_ctx)
+                else:
+                    # frame-aligned mode: seq_len contexts per sample in ctx_double
+                    # expand each null ctx over seq_len token positions so ctx_triple = 3*B*seq_len
+                    null_flat_uncond = [ni for ni in text_null_ctx for _ in range(seq_len)]
+                    ctx_triple = list(ctx_double) + null_flat_uncond
                 residuals_triple = [
                     torch.cat([r, r.new_zeros(batch_size, r.size(1), r.size(2))], dim=0)
                     for r in residuals
