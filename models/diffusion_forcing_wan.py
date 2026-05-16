@@ -576,17 +576,17 @@ class DiffForcingWanModel(nn.Module):
                     [x0_hat[:, :ctx_len], noisy_feature_input[b][:, ctx_len:]], dim=1
                 )
 
-        controlnet_residuals = (
-            None
-            if traj_dropped
-            else self._controlnet_forward(
-                noisy_feature_input,
-                noise_level * self.time_embedding_scale,
-                all_text_context,
-                seq_len,
-                traj_emb,
-                traj_seq_lens,
-            )
+        # Always call ControlNet so gradients flow when backbone is frozen.
+        # When traj_dropped=True, traj_emb is already None; ControlNet learns
+        # to produce near-zero residuals for null-traj input, which closely
+        # approximates the zero residuals used by pred_uncond at inference.
+        controlnet_residuals = self._controlnet_forward(
+            noisy_feature_input,
+            noise_level * self.time_embedding_scale,
+            all_text_context,
+            seq_len,
+            traj_emb,
+            traj_seq_lens,
         )
         predicted_result = self.model(
             noisy_feature_input,
