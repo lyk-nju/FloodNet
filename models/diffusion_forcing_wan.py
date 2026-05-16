@@ -804,16 +804,16 @@ class DiffForcingWanModel(nn.Module):
                 y=None, traj_emb=None, traj_seq_lens=None, controlnet_residuals=residuals,
             )
             if self.cfg_scale_traj > 0.0:
-                # Separated CFG:
+                # Separated CFG (kimodo-style):
                 #   out = out_uncond
-                #       + w_text * (out_full - out_null_text)
-                #       + w_traj * (out_null_text - out_uncond)
+                #       + w_text * (out_full - out_uncond)
+                #       + w_traj * (out_null_text+traj - out_uncond)
                 pred_uncond = self._uncond_backbone_forward(
                     noisy_input, t_scaled, text_null_ctx, seq_len
                 )
                 return [
                     pred_uncond[i]
-                    + self.cfg_scale_text * (pred_double[i] - pred_double[i + batch_size])
+                    + self.cfg_scale_text * (pred_double[i] - pred_uncond[i])
                     + self.cfg_scale_traj * (pred_double[i + batch_size] - pred_uncond[i])
                     for i in range(batch_size)
                 ]
