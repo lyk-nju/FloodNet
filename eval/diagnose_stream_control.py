@@ -1518,6 +1518,7 @@ def main():
 
     if args.step_bypass_buf:
         print("\n=== Bypass-buffer ablation ===")
+        torch.cuda.empty_cache()
         token_length = sample["token_length"]
         total_frames = 1 + 4 * (token_length - 1) if token_length > 1 else 1
 
