@@ -650,6 +650,13 @@ def main():
         help="Ablation: extend stream_generate_step trajectory window to "
         "include future horizon (tests whether truncated traj window is the root cause).",
     )
+    parser.add_argument(
+        "--step_fixed_model_window",
+        action="store_true",
+        default=False,
+        help="Ablation: keep stream_generate_step's WanModel seq_len fixed to "
+        "history_length while preserving the existing traj window.",
+    )
     parser.add_argument("--traj_horizon_tokens", type=int, default=20)
     parser.add_argument("--num_denoise_steps", type=int, default=10)
     parser.add_argument("--seed", type=int, default=1234)
@@ -1067,6 +1074,226 @@ def main():
             print(f"{rec['mode']:<35} {rec['ADE']:>8.4f} {rec['FDE']:>8.4f}")
         return
 
+    if args.step_fixed_model_window:
+        print("\n=== Fixed-model-window ablation ===")
+        _orig_step = model.stream_generate_step
+
+        def _patched_step(x, first_chunk=True):
+            device = next(model.parameters()).device
+            if first_chunk:
+                model.generated = model.generated.to(device)
+            model._traj_buf.update(x, model.commit_index, device)
+
+            if model.use_text_cond and "text" in x:
+                text_list = x["text"]
+                new_text_context = model.encode_text_with_cache(text_list, device)
+                new_text_context = [u.to(model.param_dtype) for u in new_text_context]
+            else:
+                new_text_context = [""] * model.batch_size
+                new_text_context = model.encode_text_with_cache(new_text_context, device)
+                new_text_context = [u.to(model.param_dtype) for u in new_text_context]
+
+            text_null_list = [""] * model.batch_size
+            text_null_context = model.encode_text_with_cache(text_null_list, device)
+            text_null_context = [u.to(model.param_dtype) for u in text_null_context]
+
+            for i in range(model.batch_size):
+                if first_chunk:
+                    model.text_condition_list[i].extend(
+                        [new_text_context[i]] * model.chunk_size
+                    )
+                else:
+                    model.text_condition_list[i].extend([new_text_context[i]])
+
+            end_step = (
+                (model.commit_index + model.chunk_size)
+                * model.num_denoise_steps
+                / model.chunk_size
+            )
+            while model.current_step < end_step:
+                current_time = model.current_step * model.dt
+                start_index = max(0, int(model.chunk_size * (current_time - 1)) + 1)
+                end_index = int(model.chunk_size * current_time) + 1
+                time_steps = torch.full((model.batch_size,), current_time, device=device)
+
+                noise_level_full = model._get_noise_levels(device, end_index, time_steps)
+                noise_level_for_update = noise_level_full
+
+                # ABLATION: keep WanModel's seq_len fixed even during early
+                # stream_generate_step calls. The formal path passes
+                # model_sl=min(end_index, seq_len), so the first steps run with
+                # very short positional/time/context windows. stream_generate()
+                # instead always calls the model with a fixed padded seq_len.
+                model_sl = model.seq_len
+                if end_index < model_sl:
+                    noise_level = model._get_noise_levels(device, model_sl, time_steps)
+                else:
+                    noise_level = noise_level_full[:, -model_sl:]
+
+                noisy_input = []
+                for i in range(model.batch_size):
+                    noisy_input.append(
+                        model.generated[i, :, :end_index, ...][:, -model_sl:]
+                    )
+
+                text_condition = []
+                for i in range(model.batch_size):
+                    tc = model.text_condition_list[i][:end_index][-model_sl:]
+                    if not tc:
+                        tc = [new_text_context[i]]
+                    if len(tc) < model_sl:
+                        tc = tc + [tc[-1]] * (model_sl - len(tc))
+                    else:
+                        tc = tc[:model_sl]
+                    text_condition.extend(tc)
+
+                traj_emb = model._traj_buf.build_traj_emb(end_index, model_sl, device)
+                if traj_emb is not None:
+                    valid_lens = model._traj_buf.get_traj_valid_lens(
+                        end_index, model_sl, device
+                    )
+                    traj_seq_lens = (
+                        valid_lens
+                        if valid_lens is not None
+                        else torch.full(
+                            (model.batch_size,),
+                            min(end_index, model_sl),
+                            device=device,
+                            dtype=torch.long,
+                        )
+                    )
+                else:
+                    traj_seq_lens = None
+
+                t_scaled = noise_level * model.time_embedding_scale
+                predicted_result = model._denoise_with_cfg(
+                    noisy_input, t_scaled,
+                    text_condition, text_null_context,
+                    traj_emb, traj_seq_lens, model_sl, model.batch_size,
+                )
+
+                for i in range(model.batch_size):
+                    predicted_result_i = predicted_result[i]
+                    if end_index > model_sl:
+                        predicted_result_i = torch.cat(
+                            [
+                                torch.zeros(
+                                    predicted_result_i.shape[0],
+                                    end_index - model_sl,
+                                    predicted_result_i.shape[2],
+                                    predicted_result_i.shape[3],
+                                    device=device,
+                                ),
+                                predicted_result_i,
+                            ],
+                            dim=1,
+                        )
+                    if model.prediction_type == "vel":
+                        predicted_vel = predicted_result_i[:, start_index:end_index, ...]
+                        model.generated[i, :, start_index:end_index, ...] += (
+                            predicted_vel * model.dt
+                        )
+                    elif model.prediction_type == "x0":
+                        nl = (
+                            noise_level_for_update[i, start_index:end_index]
+                            .unsqueeze(0)
+                            .unsqueeze(-1)
+                            .unsqueeze(-1)
+                            .clamp(min=1e-6)
+                        )
+                        predicted_vel = (
+                            predicted_result_i[:, start_index:end_index, ...]
+                            - model.generated[i, :, start_index:end_index, ...]
+                        ) / nl
+                        model.generated[i, :, start_index:end_index, ...] += (
+                            predicted_vel * model.dt
+                        )
+                    elif model.prediction_type == "noise":
+                        denom = (
+                            1
+                            + model.dt
+                            - noise_level_for_update[i, start_index:end_index]
+                            .unsqueeze(0)
+                            .unsqueeze(-1)
+                            .unsqueeze(-1)
+                        ).clamp(min=1e-6)
+                        predicted_vel = (
+                            model.generated[i, :, start_index:end_index, ...]
+                            - predicted_result_i[:, start_index:end_index, ...]
+                        ) / denom
+                        model.generated[i, :, start_index:end_index, ...] += (
+                            predicted_vel * model.dt
+                        )
+                model.current_step += 1
+
+            output = model.generated[:, :, model.commit_index : model.commit_index + 1, ...]
+            output = model.postprocess(output)
+            out = {"generated": output}
+            model.commit_index += 1
+
+            if model.commit_index == model.seq_len * 2:
+                model.generated = torch.cat(
+                    [
+                        model.generated[:, :, model.seq_len :, ...],
+                        torch.randn(
+                            model.batch_size,
+                            model.input_dim,
+                            model.seq_len,
+                            1,
+                            1,
+                            device=device,
+                        ),
+                    ],
+                    dim=2,
+                )
+                model._traj_buf.roll(model.seq_len, device)
+                model.current_step -= (
+                    model.seq_len * model.num_denoise_steps / model.chunk_size
+                )
+                model.commit_index -= model.seq_len
+                for i in range(model.batch_size):
+                    model.text_condition_list[i] = model.text_condition_list[i][
+                        model.seq_len:
+                    ]
+            return out
+
+        model.stream_generate_step = _patched_step
+        pred_motion, pred_root = run_stream_step(
+            model, vae, sample, device,
+            history_length=args.history_length,
+            num_denoise_steps=args.num_denoise_steps,
+            horizon_tokens=None, use_pred_root=False,
+            use_features_path=False, no_traj=False, collect_latents=False,
+        )
+        metrics = _build_mode_metrics(
+            pred_root, gt_root, target_traj, "step_fixed_model_window_gtroot",
+            None, "gt", traj_encoder_path="xyz (fixed model seq_len)",
+        )
+        print(f"  ADE={metrics['ADE']:.4f}  FDE={metrics['FDE']:.4f}")
+        model.stream_generate_step = _orig_step
+
+        mode_dir = os.path.join(out_root, "step_fixed_model_window_gtroot")
+        _save_artifacts(
+            mode_dir, pred_motion, pred_root,
+            gt_root[:len(pred_root)], target_traj[:len(pred_root)], metrics,
+        )
+
+        all_records = [metrics]
+        summary = {
+            "sample_id": args.sample_id, "dataset": args.dataset,
+            "ckpt": args.ckpt, "vae_ckpt": args.vae_ckpt,
+            "ablation": "fixed_model_window",
+            "modes": all_records,
+        }
+        summary_path = os.path.join(out_root, "summary_fixed_model_window.json")
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2, default=str)
+        print(f"\n{'Mode':<35} {'ADE':>8} {'FDE':>8}")
+        print("-" * 53)
+        for rec in all_records:
+            print(f"{rec['mode']:<35} {rec['ADE']:>8.4f} {rec['FDE']:>8.4f}")
+        return
+
     if args.step_future_traj_window:
         print("\n=== Future-traj-window ablation ===")
         _orig_step = model.stream_generate_step
@@ -1110,60 +1337,64 @@ def main():
                 time_steps = torch.full((model.batch_size,), current_time, device=device)
 
                 noise_level_full = model._get_noise_levels(device, end_index, time_steps)
-                # ABLATION: extend noise_level to full seq_len so t_scaled matches
-                # traj_emb length (both seq_len). Pad with β≈1.0 on the right (future).
-                _sl = model.seq_len
-                noise_level = noise_level_full[:, -_sl:]
-                if noise_level.shape[1] < _sl:
-                    _pad = noise_level.new_ones(noise_level.shape[0], _sl - noise_level.shape[1])
-                    noise_level = torch.cat([noise_level, _pad], dim=1)
                 noise_level_for_update = noise_level_full
+
+                # ABLATION: keep the model window length unchanged, but shift
+                # the rolling window so it contains a short history plus future
+                # trajectory slots.  This avoids changing the model's positional
+                # distribution while testing whether future traj keys matter:
+                #
+                #   [window_start, end_index)           = latent history
+                #   [end_index, window_start + seq_len) = future traj only
+                #
+                # This mirrors full stream_generate(), where WanModel receives
+                # a short latent prefix padded to a fixed seq_len plus future
+                # traj_emb in the padded slots.
+                model_window_len = model.seq_len
+                horizon_len = min(max(0, int(args.traj_horizon_tokens)), model_window_len)
+                history_context_len = max(1, model_window_len - horizon_len)
+                window_start = max(0, end_index - history_context_len)
+                window_end = min(window_start + model_window_len, model._traj_buf.buf_len)
+                model_window_len = window_end - window_start
+                if model_window_len <= 0:
+                    continue
+
+                noise_level_window_full = model._get_noise_levels(
+                    device, window_end, time_steps
+                )
+                noise_level = noise_level_window_full[:, window_start:window_end]
 
                 noisy_input = []
                 for i in range(model.batch_size):
                     noisy_input.append(
-                        model.generated[i, :, :end_index, ...][:, -model.seq_len:]
+                        model.generated[i, :, window_start:end_index, ...]
                     )
 
                 text_condition = []
                 for i in range(model.batch_size):
-                    tc = model.text_condition_list[i][:end_index][-model.seq_len:]
-                    # Pad text to seq_len if needed (replicate last entry for future).
-                    if len(tc) < model.seq_len:
-                        tc = tc + [tc[-1]] * (model.seq_len - len(tc))
+                    tc = model.text_condition_list[i][window_start:end_index]
+                    if not tc:
+                        tc = [new_text_context[i]]
+                    # Pad future text with the most recent known condition.
+                    if len(tc) < model_window_len:
+                        tc = tc + [tc[-1]] * (model_window_len - len(tc))
+                    else:
+                        tc = tc[:model_window_len]
                     text_condition.extend(tc)
 
-                # ====== ABLATION: extend traj window to include future ======
-                model_sl = model.seq_len  # full window for both latent and traj
-                _extra_end = min(
-                    end_index + model.seq_len,
-                    model._traj_buf.buf_len,
-                )
                 traj_emb = model._traj_buf.build_traj_emb(
-                    _extra_end, model.seq_len, device
+                    window_end, model_window_len, device
                 )
-                # Pad noisy_input to seq_len (right-pad with noise).
-                _padded_noisy = []
-                for ni in noisy_input:
-                    _cur = ni.shape[1]
-                    if _cur < model.seq_len:
-                        _np = torch.randn(
-                            ni.shape[0], model.seq_len - _cur, *ni.shape[2:],
-                            device=ni.device, dtype=ni.dtype,
-                        )
-                        ni = torch.cat([ni, _np], dim=1)
-                    _padded_noisy.append(ni)
-                noisy_input = _padded_noisy
 
                 if traj_emb is not None:
                     valid_lens = model._traj_buf.get_traj_valid_lens(
-                        _extra_end, model.seq_len, device,
+                        window_end, model_window_len, device,
                     )
                     traj_seq_lens = (
                         valid_lens
                         if valid_lens is not None
                         else torch.full(
-                            (model.batch_size,), model.seq_len,
+                            (model.batch_size,), model_window_len,
                             device=device, dtype=torch.long,
                         )
                     )
@@ -1173,27 +1404,15 @@ def main():
                 predicted_result = model._denoise_with_cfg(
                     noisy_input, t_scaled,
                     text_condition, text_null_context,
-                    traj_emb, traj_seq_lens, model_sl, model.batch_size,
+                    traj_emb, traj_seq_lens, model_window_len, model.batch_size,
                 )
 
                 for i in range(model.batch_size):
                     predicted_result_i = predicted_result[i]
-                    if end_index > model.seq_len:
-                        predicted_result_i = torch.cat(
-                            [
-                                torch.zeros(
-                                    predicted_result_i.shape[0],
-                                    end_index - model.seq_len,
-                                    predicted_result_i.shape[2],
-                                    predicted_result_i.shape[3],
-                                    device=device,
-                                ),
-                                predicted_result_i,
-                            ],
-                            dim=1,
-                        )
+                    local_start = start_index - window_start
+                    local_end = end_index - window_start
                     if model.prediction_type == "vel":
-                        predicted_vel = predicted_result_i[:, start_index:end_index, ...]
+                        predicted_vel = predicted_result_i[:, local_start:local_end, ...]
                         model.generated[i, :, start_index:end_index, ...] += (
                             predicted_vel * model.dt
                         )
@@ -1204,7 +1423,7 @@ def main():
                             .clamp(min=1e-6)
                         )
                         predicted_vel = (
-                            predicted_result_i[:, start_index:end_index, ...]
+                            predicted_result_i[:, local_start:local_end, ...]
                             - model.generated[i, :, start_index:end_index, ...]
                         ) / nl
                         model.generated[i, :, start_index:end_index, ...] += (
@@ -1218,7 +1437,7 @@ def main():
                         ).clamp(min=1e-6)
                         predicted_vel = (
                             model.generated[i, :, start_index:end_index, ...]
-                            - predicted_result_i[:, start_index:end_index, ...]
+                            - predicted_result_i[:, local_start:local_end, ...]
                         ) / denom
                         model.generated[i, :, start_index:end_index, ...] += (
                             predicted_vel * model.dt
