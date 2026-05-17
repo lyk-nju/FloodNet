@@ -725,16 +725,19 @@ def main():
         step_modes = [
             ("step_full_features_gtroot", {
                 "history_length": args.history_length,
+                "num_denoise_steps": args.num_denoise_steps,
                 "horizon_tokens": None, "use_pred_root": False,
                 "use_features_path": True, "no_traj": False,
             }),
             ("step_full_xyz_gtroot", {
                 "history_length": args.history_length,
+                "num_denoise_steps": args.num_denoise_steps,
                 "horizon_tokens": None, "use_pred_root": False,
                 "use_features_path": False, "no_traj": False,
             }),
             ("step_no_traj", {
                 "history_length": args.history_length,
+                "num_denoise_steps": args.num_denoise_steps,
                 "horizon_tokens": None, "use_pred_root": False,
                 "use_features_path": False, "no_traj": True,
             }),
