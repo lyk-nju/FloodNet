@@ -1524,6 +1524,7 @@ def main():
         vae.clear_cache()
         model.init_generated(token_length, batch_size=1,
                             num_denoise_steps=args.num_denoise_steps)
+        model.generated = model.generated.to(device)
 
         # Pre-compute traj_emb using stream_generate's exact path.
         _full_x = {
