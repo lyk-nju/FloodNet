@@ -623,6 +623,12 @@ def main():
         help="Run step-path diagnosis: features-path, no-traj, offline-decode. "
         "Bypasses the full diagnostic matrix.",
     )
+    parser.add_argument(
+        "--debug_traj_emb",
+        action="store_true",
+        default=False,
+        help="Compare traj_emb statistics between generate and stream_generate_step paths.",
+    )
     parser.add_argument("--traj_horizon_tokens", type=int, default=20)
     parser.add_argument("--num_denoise_steps", type=int, default=10)
     parser.add_argument("--seed", type=int, default=1234)
@@ -803,6 +809,57 @@ def main():
         print("-" * 53)
         for rec in all_records:
             print(f"{rec['mode']:<35} {rec['ADE']:>8.4f} {rec['FDE']:>8.4f}")
+        return
+
+    if args.debug_traj_emb:
+        print("\n=== Traj-emb debug ===")
+        _bs = _wrap_flat_sample_for_suffix(sample)
+        gen_seq_len = sample["token_length"] + model.chunk_size
+
+        # 1. encode_traj_batch (used by generate / stream_generate)
+        emb_gen = model._build_traj_emb(_bs, gen_seq_len, device)
+        if emb_gen is not None:
+            print(f"  [generate path] _build_traj_emb: shape={tuple(emb_gen.shape)} "
+                  f"mean={emb_gen.mean().item():.6f} std={emb_gen.std().item():.6f} "
+                  f"min={emb_gen.min().item():.6f} max={emb_gen.max().item():.6f}")
+        else:
+            print("  [generate path] _build_traj_emb: None")
+
+        # 2. TrajStreamBuffer (used by stream_generate_step)
+        model.init_generated(args.history_length, batch_size=1,
+                            num_denoise_steps=args.num_denoise_steps)
+        # Feed one GT-root step to populate the buffer.
+        for ci in range(min(5, sample["token_length"])):
+            ti = build_stream_suffix_conditioning(_bs, ci, prefer_xyz=True)
+            sp = build_stream_step_model_input(
+                sample["text"] if isinstance(sample["text"], str) else sample["text"][0],
+                traj_input=ti,
+            )
+            model.stream_generate_step(sp, first_chunk=(ci == 0))
+
+        end_idx = min(5 + model.chunk_size,
+                      model.commit_index + model.chunk_size)
+        emb_step = model._traj_buf.build_traj_emb(end_idx, args.history_length, device)
+        if emb_step is not None:
+            print(f"  [step   path] build_traj_emb:  shape={tuple(emb_step.shape)} "
+                  f"mean={emb_step.mean().item():.6f} std={emb_step.std().item():.6f} "
+                  f"min={emb_step.min().item():.6f} max={emb_step.max().item():.6f}")
+            if emb_gen is not None:
+                _match = emb_gen[:, :emb_step.shape[1], :] - emb_step
+                print(f"  [compare]      L2-diff per token: "
+                      f"mean={_match.norm(dim=-1).mean().item():.6f} "
+                      f"max={_match.norm(dim=-1).max().item():.6f}")
+        else:
+            print("  [step   path] build_traj_emb:  None")
+
+        print(f"  [traj-buf state] commit_index={model.commit_index} "
+              f"feat_buf={'set' if model._traj_buf._feat_buf is not None else 'None'} "
+              f"xyz_buf={'set' if model._traj_buf._xyz_buf is not None else 'None'} "
+              f"mask_buf={'set' if model._traj_buf._mask_buf is not None else 'None'}")
+        if model._traj_buf._xyz_buf is not None:
+            _x = model._traj_buf._xyz_buf[0, :10, :]
+            print(f"  [traj-buf xyz first 10 tokens] mean={_x.mean().item():.4f} "
+                  f"nonzero={(_x.abs().sum(dim=-1) > 0).sum().item()}/10")
         return
 
     # Encoding path labels per mode family.
