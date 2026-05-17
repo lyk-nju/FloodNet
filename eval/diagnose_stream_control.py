@@ -1544,6 +1544,7 @@ def main():
 
         # Denoising loop: matches stream_generate structure, but uses
         # init_generated's buffer (same starting point as step path).
+        # Must run under autocast like the normal training/inference path.
         dt = 1.0 / args.num_denoise_steps
         max_t = 1 + (token_length - 1) / model.chunk_size
         total_steps = int(max_t / dt)
@@ -1557,12 +1558,13 @@ def main():
             t_scaled = noise_level * model.time_embedding_scale
 
             noisy_input = [model.generated[0, :, :end_index, ...]]
-            pred = model._denoise_with_cfg(
-                noisy_input, t_scaled,
-                text_ctx, text_null,
-                traj_emb_fixed, traj_sl_fixed,
-                gen_sl, 1,
-            )
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                pred = model._denoise_with_cfg(
+                    noisy_input, t_scaled,
+                    text_ctx, text_null,
+                    traj_emb_fixed, traj_sl_fixed,
+                    gen_sl, 1,
+                )
 
             for i in range(1):  # batch_size = 1
                 pv = pred[i][:, start_index:end_index, ...]
