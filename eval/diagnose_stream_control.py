@@ -408,13 +408,18 @@ def run_stream_step(
     num_denoise_steps: int,
     horizon_tokens: int | None,
     use_pred_root: bool,
+    use_features_path: bool = False,
+    no_traj: bool = False,
+    collect_latents: bool = False,
 ):
     """Run stream_generate_step() with configurable horizon and root source.
 
-    When *use_pred_root* is True, replicates web_demo closed-loop behaviour:
-    each step decodes the predicted motion, accumulates the root position via
-    ``StreamJointRecovery263``, projects it onto the GT polyline, and resamples
-    *horizon_tokens* future positions — exactly as ``ModelManager._build_stream_traj_input`` does.
+    When *use_pred_root* is True, replicates web_demo closed-loop behaviour.
+    When *use_features_path* is True, uses ``traj_features`` (bypasses
+    xyz→anchor-subtract→LocalTrajEncoder path).
+    When *no_traj* is True, skips trajectory conditioning entirely.
+    When *collect_latents* is True, returns latent tokens instead of decoded
+    motion (for offline-decode comparison).
     """
     token_length = sample["token_length"]
     total_frames = 1 + 4 * (token_length - 1) if token_length > 1 else 1
@@ -477,10 +482,13 @@ def run_stream_step(
                 "traj": torch.from_numpy(future_traj).float().unsqueeze(0),
                 "token_mask": torch.ones(1, future_traj.shape[0]),
             }
+        elif no_traj:
+            traj_input = None
         else:
             # GT-root path: use suffix from dataset.
+            _prefer_xyz = not use_features_path
             traj_input = build_stream_suffix_conditioning(
-                _batch_sample, commit_idx, prefer_xyz=True
+                _batch_sample, commit_idx, prefer_xyz=_prefer_xyz
             )
             if horizon_tokens is not None:
                 traj_input = clip_traj_input_to_horizon(traj_input, horizon_tokens)
@@ -489,29 +497,39 @@ def run_stream_step(
 
         output = model.stream_generate_step(step_payload, first_chunk=first_chunk)
         generated = output["generated"]
-        decoded = (
-            vae.stream_decode(
-                generated[0][None, :].to(device), first_chunk=first_chunk
-            )[0]
-            .float()
-            .cpu()
-            .numpy()
-        )
+        latent_token = generated[0].float().cpu().numpy()  # (C_latent,) or (,C_latent)
+
+        if collect_latents:
+            all_decoded.append(latent_token)
+        else:
+            decoded = (
+                vae.stream_decode(
+                    generated[0][None, :].to(device), first_chunk=first_chunk
+                )[0]
+                .float()
+                .cpu()
+                .numpy()
+            )
+            all_decoded.append(decoded)
+
+            # Accumulate root position for pred_root closed loop.
+            if use_pred_root:
+                for frame in decoded:
+                    stream_recovery.process_frame(frame)
+                    root_xz_history.append(
+                        stream_recovery.r_pos_accum[[0, 2]].astype(np.float32).copy()
+                    )
+
+            pred_root_chunk = extract_root_trajectory_263(decoded)
+            all_pred_root.append(pred_root_chunk)
+
         first_chunk = False
 
-        # Accumulate root position for pred_root closed loop (matching web_demo).
-        if use_pred_root:
-            for frame in decoded:
-                stream_recovery.process_frame(frame)
-                root_xz_history.append(
-                    stream_recovery.r_pos_accum[[0, 2]].astype(np.float32).copy()
-                )
-
-        all_decoded.append(decoded)
-        pred_root_chunk = extract_root_trajectory_263(decoded)
-        all_pred_root.append(pred_root_chunk)
-
     vae.clear_cache()
+
+    if collect_latents:
+        latent_full = np.concatenate(all_decoded, axis=0)[:token_length]
+        return latent_full, None  # caller decodes offline
 
     decoded_full = (
         np.concatenate(all_decoded, axis=0)[:total_frames]
@@ -597,6 +615,13 @@ def main():
         default=None,
         help="Comma-separated history_length values for context-window ablation. "
         "When set, runs step_full_xyz_gtroot at each value (bypasses the full matrix).",
+    )
+    parser.add_argument(
+        "--diagnose_step_path",
+        action="store_true",
+        default=False,
+        help="Run step-path diagnosis: features-path, no-traj, offline-decode. "
+        "Bypasses the full diagnostic matrix.",
     )
     parser.add_argument("--traj_horizon_tokens", type=int, default=20)
     parser.add_argument("--num_denoise_steps", type=int, default=10)
@@ -689,6 +714,88 @@ def main():
         with open(summary_path, "w") as f:
             json.dump(summary, f, indent=2, default=str)
         print(f"\nAblation summary saved to {summary_path}")
+        print(f"\n{'Mode':<35} {'ADE':>8} {'FDE':>8}")
+        print("-" * 53)
+        for rec in all_records:
+            print(f"{rec['mode']:<35} {rec['ADE']:>8.4f} {rec['FDE']:>8.4f}")
+        return
+
+    if args.diagnose_step_path:
+        print("\n=== Step-path diagnosis ===")
+        step_modes = [
+            ("step_full_features_gtroot", {
+                "history_length": args.history_length,
+                "horizon_tokens": None, "use_pred_root": False,
+                "use_features_path": True, "no_traj": False,
+            }),
+            ("step_full_xyz_gtroot", {
+                "history_length": args.history_length,
+                "horizon_tokens": None, "use_pred_root": False,
+                "use_features_path": False, "no_traj": False,
+            }),
+            ("step_no_traj", {
+                "history_length": args.history_length,
+                "horizon_tokens": None, "use_pred_root": False,
+                "use_features_path": False, "no_traj": True,
+            }),
+        ]
+        all_records = []
+        for mode_name, kw in step_modes:
+            print(f"\n--- {mode_name} ---")
+            pred_motion, pred_root = run_stream_step(
+                model, vae, sample, device, **kw,
+            )
+            metrics = _build_mode_metrics(
+                pred_root, gt_root, target_traj, mode_name,
+                kw.get("horizon_tokens"), "gt",
+                traj_encoder_path=(
+                    "traj_features (no anchor)" if kw.get("use_features_path")
+                    else "xyz (anchor-subtract)" if not kw.get("no_traj")
+                    else "none"
+                ),
+            )
+            print(f"  ADE={metrics['ADE']:.4f}  FDE={metrics['FDE']:.4f}")
+            mode_dir = os.path.join(out_root, mode_name)
+            _save_artifacts(
+                mode_dir, pred_motion, pred_root,
+                gt_root[:len(pred_root)], target_traj[:len(pred_root)], metrics,
+            )
+            all_records.append(metrics)
+
+        # Also run offline decode comparison.
+        print(f"\n--- step_offline_decode ---")
+        latents, _ = run_stream_step(
+            model, vae, sample, device,
+            history_length=args.history_length,
+            num_denoise_steps=args.num_denoise_steps,
+            horizon_tokens=None, use_pred_root=False,
+            use_features_path=False, no_traj=False, collect_latents=True,
+        )
+        decoded_offline = vae.decode(
+            torch.from_numpy(latents).float().unsqueeze(0).to(device)
+        )[0].float().cpu().numpy()
+        pred_root_off = extract_root_trajectory_263(decoded_offline)
+        metrics_off = _build_mode_metrics(
+            pred_root_off, gt_root, target_traj, "step_offline_decode",
+            None, "gt", traj_encoder_path="xyz (latents from step, decode offline)",
+        )
+        print(f"  ADE={metrics_off['ADE']:.4f}  FDE={metrics_off['FDE']:.4f}")
+        mode_dir = os.path.join(out_root, "step_offline_decode")
+        _save_artifacts(mode_dir, decoded_offline, pred_root_off,
+                        gt_root[:len(pred_root_off)], target_traj[:len(pred_root_off)],
+                        metrics_off)
+        all_records.append(metrics_off)
+
+        summary = {
+            "sample_id": args.sample_id, "dataset": args.dataset,
+            "ckpt": args.ckpt, "vae_ckpt": args.vae_ckpt, "config": args.config,
+            "diagnosis": "step_path",
+            "modes": all_records,
+        }
+        summary_path = os.path.join(out_root, "summary_step_path.json")
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2, default=str)
+        print(f"\nSummary saved to {summary_path}")
         print(f"\n{'Mode':<35} {'ADE':>8} {'FDE':>8}")
         print("-" * 53)
         for rec in all_records:
