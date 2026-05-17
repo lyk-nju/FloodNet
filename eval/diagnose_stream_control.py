@@ -1110,7 +1110,13 @@ def main():
                 time_steps = torch.full((model.batch_size,), current_time, device=device)
 
                 noise_level_full = model._get_noise_levels(device, end_index, time_steps)
-                noise_level = noise_level_full[:, -model.seq_len:]
+                # ABLATION: extend noise_level to full seq_len so t_scaled matches
+                # traj_emb length (both seq_len). Pad with β≈1.0 on the right (future).
+                _sl = model.seq_len
+                noise_level = noise_level_full[:, -_sl:]
+                if noise_level.shape[1] < _sl:
+                    _pad = noise_level.new_ones(noise_level.shape[0], _sl - noise_level.shape[1])
+                    noise_level = torch.cat([noise_level, _pad], dim=1)
                 noise_level_for_update = noise_level_full
 
                 noisy_input = []
@@ -1121,30 +1127,37 @@ def main():
 
                 text_condition = []
                 for i in range(model.batch_size):
-                    text_condition.extend(
-                        model.text_condition_list[i][:end_index][-model.seq_len:]
-                    )
+                    tc = model.text_condition_list[i][:end_index][-model.seq_len:]
+                    # Pad text to seq_len if needed (replicate last entry for future).
+                    if len(tc) < model.seq_len:
+                        tc = tc + [tc[-1]] * (model.seq_len - len(tc))
+                    text_condition.extend(tc)
 
-                # ====== ABLATION: use FULL seq_len for traj window ======
-                traj_emb = model._traj_buf.build_traj_emb(end_index, model.seq_len, device)
-                # Also try building with extended end to include future:
-                # build_traj_emb(N, seq_len) gives [N-seq_len, N).
-                # We want [end_index-seq_len, end_index + extra) → N = end_index + seq_len
-                # But limited by what the buffer actually has.
+                # ====== ABLATION: extend traj window to include future ======
+                model_sl = model.seq_len  # full window for both latent and traj
                 _extra_end = min(
                     end_index + model.seq_len,
                     model._traj_buf.buf_len,
                 )
-                traj_emb_full = model._traj_buf.build_traj_emb(
+                traj_emb = model._traj_buf.build_traj_emb(
                     _extra_end, model.seq_len, device
                 )
-                if traj_emb_full is not None:
-                    traj_emb = traj_emb_full
+                # Pad noisy_input to seq_len (right-pad with noise).
+                _padded_noisy = []
+                for ni in noisy_input:
+                    _cur = ni.shape[1]
+                    if _cur < model.seq_len:
+                        _np = torch.randn(
+                            ni.shape[0], model.seq_len - _cur, *ni.shape[2:],
+                            device=ni.device, dtype=ni.dtype,
+                        )
+                        ni = torch.cat([ni, _np], dim=1)
+                    _padded_noisy.append(ni)
+                noisy_input = _padded_noisy
 
                 if traj_emb is not None:
                     valid_lens = model._traj_buf.get_traj_valid_lens(
-                        min(end_index + model.seq_len, model._traj_buf.buf_len),
-                        model.seq_len, device,
+                        _extra_end, model.seq_len, device,
                     )
                     traj_seq_lens = (
                         valid_lens
@@ -1156,8 +1169,6 @@ def main():
                     )
                 else:
                     traj_seq_lens = None
-
-                model_sl = model.seq_len  # ABLATION: full window
                 t_scaled = noise_level * model.time_embedding_scale
                 predicted_result = model._denoise_with_cfg(
                     noisy_input, t_scaled,
