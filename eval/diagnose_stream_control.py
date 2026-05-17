@@ -323,7 +323,7 @@ def _wrap_flat_sample_for_suffix(sample: dict) -> dict:
             out[key] = torch.tensor([v])
     for key in ("traj", "traj_features", "token_mask", "traj_mask"):
         v = out.get(key)
-        if v is not None and torch.is_tensor(v) and v.ndim == 1:
+        if v is not None and torch.is_tensor(v) and v.ndim in (1, 2):
             out[key] = v.unsqueeze(0)
     return out
 
