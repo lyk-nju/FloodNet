@@ -888,42 +888,44 @@ def main():
         noisy_in = [noisy_pre[b] for b in range(noisy_pre.shape[0])]
 
         text_list = [sample["text"]] if isinstance(sample["text"], str) else [sample["text"][0]]
-        text_ctx = model.encode_text_with_cache(text_list, device)
-        text_null = model.encode_text_with_cache([""], device)
+        text_ctx = [u.to(model.param_dtype) for u in
+                     model.encode_text_with_cache(text_list, device)]
+        text_null = [u.to(model.param_dtype) for u in
+                      model.encode_text_with_cache([""], device)]
 
         traj_emb = model._build_traj_emb(_bs, seq_len + model.chunk_size, device)
         traj_sl = model._get_traj_seq_lens(_bs, seq_len + model.chunk_size, device)
         t_scaled = noise_level * model.time_embedding_scale
 
-        # --- ControlNet residual with traj ---
-        cn_res_traj = model._controlnet_forward(
-            noisy_in, t_scaled, text_ctx, seq_len, traj_emb, traj_sl,
-        )
-        cn_norm_traj = sum(r.norm().item() for r in cn_res_traj)
+        # All ControlNet / backbone forwards inside the same autocast
+        # that the training loop uses (bf16-mixed).
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            # --- ControlNet residual with traj ---
+            cn_res_traj = model._controlnet_forward(
+                noisy_in, t_scaled, text_ctx, seq_len, traj_emb, traj_sl,
+            )
+            cn_norm_traj = sum(r.norm().item() for r in cn_res_traj)
 
-        # --- ControlNet residual without traj (null traj = None) ---
-        cn_res_null = model._controlnet_forward(
-            noisy_in, t_scaled, text_ctx, seq_len, None, None,
-        )
-        cn_norm_null = sum(r.norm().item() for r in cn_res_null)
+            # --- ControlNet residual without traj ---
+            cn_res_null = model._controlnet_forward(
+                noisy_in, t_scaled, text_ctx, seq_len, None, None,
+            )
+            cn_norm_null = sum(r.norm().item() for r in cn_res_null)
 
-        cn_delta = sum((a - b).norm().item()
-                       for a, b in zip(cn_res_traj, cn_res_null))
+            cn_delta = sum((a - b).norm().item()
+                           for a, b in zip(cn_res_traj, cn_res_null))
 
-        print(f"  [control-residual] with-traj norm={cn_norm_traj:.4f}  "
-              f"without-traj norm={cn_norm_null:.4f}  delta={cn_delta:.4f}")
-
-        # --- Backbone pred with traj vs null-traj ControlNet ---
-        pred_traj = model.model(
-            noisy_in, t_scaled, text_ctx, seq_len,
-            y=None, traj_emb=None, traj_seq_lens=None,
-            controlnet_residuals=cn_res_traj,
-        )
-        pred_null = model.model(
-            noisy_in, t_scaled, text_ctx, seq_len,
-            y=None, traj_emb=None, traj_seq_lens=None,
-            controlnet_residuals=cn_res_null,
-        )
+            # --- Backbone pred with traj vs null-traj ControlNet ---
+            pred_traj = model.model(
+                noisy_in, t_scaled, text_ctx, seq_len,
+                y=None, traj_emb=None, traj_seq_lens=None,
+                controlnet_residuals=cn_res_traj,
+            )
+            pred_null = model.model(
+                noisy_in, t_scaled, text_ctx, seq_len,
+                y=None, traj_emb=None, traj_seq_lens=None,
+                controlnet_residuals=cn_res_null,
+            )
 
         delta_pred = sum((a - b).norm().item()
                          for a, b in zip(pred_traj, pred_null))
