@@ -19,7 +19,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
+
+# Allow running from any directory (e.g. ``python eval/diagnose_stream_control.py``).
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.dirname(_script_dir)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 import numpy as np
 import torch
