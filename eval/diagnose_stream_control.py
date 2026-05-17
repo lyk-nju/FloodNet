@@ -313,6 +313,21 @@ def _load_babel_sample(raw_data_dir: str, sample_id: str):
     return sample
 
 
+def _wrap_flat_sample_for_suffix(sample: dict) -> dict:
+    """Wrap flat-sample scalar fields into batch-style dict for \
+    ``build_stream_suffix_conditioning``."""
+    out = dict(sample)
+    for key in ("token_length", "traj_length", "feature_length"):
+        v = out.get(key)
+        if v is not None and not hasattr(v, "shape"):
+            out[key] = torch.tensor([v])
+    for key in ("traj", "traj_features", "token_mask", "traj_mask"):
+        v = out.get(key)
+        if v is not None and torch.is_tensor(v) and v.ndim == 1:
+            out[key] = v.unsqueeze(0)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # helpers: metrics
 # ---------------------------------------------------------------------------
@@ -417,6 +432,10 @@ def run_stream_step(
         ]
     text_ctrl = StreamTextRolloutController(segments)
 
+    # build_stream_suffix_conditioning expects batch-style fields (tensor
+    # with batch dim).  Wrap the flat sample once.
+    _batch_sample = _wrap_flat_sample_for_suffix(sample)
+
     # For pred_root mode: maintain the same root-accumulation state as web_demo.
     if use_pred_root:
         stream_recovery = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
@@ -461,7 +480,7 @@ def run_stream_step(
         else:
             # GT-root path: use suffix from dataset.
             traj_input = build_stream_suffix_conditioning(
-                sample, commit_idx, prefer_xyz=True
+                _batch_sample, commit_idx, prefer_xyz=True
             )
             if horizon_tokens is not None:
                 traj_input = clip_traj_input_to_horizon(traj_input, horizon_tokens)
