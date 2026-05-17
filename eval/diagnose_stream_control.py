@@ -927,6 +927,9 @@ def main():
                 controlnet_residuals=cn_res_null,
             )
 
+        print(f"  [control-residual] with-traj norm={cn_norm_traj:.4f}  "
+              f"without-traj norm={cn_norm_null:.4f}  delta={cn_delta:.4f}")
+
         delta_pred = sum((a - b).norm().item()
                          for a, b in zip(pred_traj, pred_null))
         pred_traj_norm = sum(a.norm().item() for a in pred_traj)
