@@ -1518,35 +1518,31 @@ def main():
 
     if args.step_bypass_buf:
         print("\n=== Bypass-buffer ablation ===")
-        torch.cuda.empty_cache()
         token_length = sample["token_length"]
-        total_frames = 1 + 4 * (token_length - 1) if token_length > 1 else 1
+        gen_sl = token_length + model.chunk_size
 
-        vae.clear_cache()
-        model.init_generated(token_length, batch_size=1,
-                            num_denoise_steps=args.num_denoise_steps)
-        model.generated = model.generated.to(device)
-
-        # Pre-compute traj_emb using stream_generate's exact path.
+        # Pre-compute traj_emb using stream_generate's exact path
+        # (frame-level traj_features -> _build_traj_emb).
         _full_x = {
             "traj_features": sample["traj_features"].unsqueeze(0).to(device),
             "feature_length": torch.tensor([token_length], device=device),
             "token_mask": sample["token_mask"].unsqueeze(0).to(device),
             "traj_mask": sample["traj_mask"].unsqueeze(0).to(device),
         }
-        gen_sl = token_length + model.chunk_size
         traj_emb_fixed = model._build_traj_emb(_full_x, gen_sl, device)
         traj_sl_fixed = model._get_traj_seq_lens(_full_x, gen_sl, device)
 
-        # Pre-encode text.
+        # Pre-encode text (global, one context per sample, matching stream_generate).
         text_ctx = [u.to(model.param_dtype) for u in
                      model.encode_text_with_cache([sample["text"]], device)]
         text_null = [u.to(model.param_dtype) for u in
                       model.encode_text_with_cache([""], device)]
 
-        # Denoising loop: matches stream_generate structure, but uses
-        # init_generated's buffer (same starting point as step path).
-        # Must run under autocast like the normal training/inference path.
+        # Use a LOCAL generated buffer (same shape as stream_generate's),
+        # NOT model.generated from init_generated.
+        generated = torch.randn(1, gen_sl, model.input_dim, device=device)
+        generated = model.preprocess(generated)
+
         dt = 1.0 / args.num_denoise_steps
         max_t = 1 + (token_length - 1) / model.chunk_size
         total_steps = int(max_t / dt)
@@ -1559,27 +1555,25 @@ def main():
             noise_level = model._get_noise_levels(device, gen_sl, time_steps)
             t_scaled = noise_level * model.time_embedding_scale
 
-            noisy_input = [model.generated[0, :, :end_index, ...]]
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                pred = model._denoise_with_cfg(
-                    noisy_input, t_scaled,
-                    text_ctx, text_null,
-                    traj_emb_fixed, traj_sl_fixed,
-                    gen_sl, 1,
-                )
+            noisy_input = [generated[0, :, :end_index, ...]]
+            pred = model._denoise_with_cfg(
+                noisy_input, t_scaled,
+                text_ctx, text_null,
+                traj_emb_fixed, traj_sl_fixed,
+                gen_sl, 1,
+            )
 
-            for i in range(1):  # batch_size = 1
-                pv = pred[i][:, start_index:end_index, ...]
-                if model.prediction_type == "vel":
-                    model.generated[i, :, start_index:end_index, ...] += pv * dt
-                elif model.prediction_type == "x0":
-                    nl = (noise_level[i, start_index:end_index]
-                          .unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-                          .clamp(min=1e-6))
-                    pv = (pv - model.generated[i, :, start_index:end_index, ...]) / nl
-                    model.generated[i, :, start_index:end_index, ...] += pv * dt
+            pv = pred[0][:, start_index:end_index, ...]
+            if model.prediction_type == "vel":
+                generated[0, :, start_index:end_index, ...] += pv * dt
+            elif model.prediction_type == "x0":
+                nl = (noise_level[0, start_index:end_index]
+                      .unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+                      .clamp(min=1e-6))
+                pv = (pv - generated[0, :, start_index:end_index, ...]) / nl
+                generated[0, :, start_index:end_index, ...] += pv * dt
 
-        final_latent = model.generated[0, :, :token_length, ...]
+        final_latent = generated[0, :, :token_length, ...]
         decoded = vae.decode(
             model.postprocess(final_latent.unsqueeze(0))
         )[0].float().cpu().numpy()
