@@ -651,6 +651,14 @@ def main():
         "include future horizon (tests whether truncated traj window is the root cause).",
     )
     parser.add_argument(
+        "--step_bypass_buf",
+        action="store_true",
+        default=False,
+        help="Ablation: use stream_generate's traj encoding path "
+        "(frame-level traj_features -> encode_traj_batch) inside "
+        "stream_generate_step's denoising loop, bypassing TrajStreamBuffer entirely.",
+    )
+    parser.add_argument(
         "--step_fixed_model_window",
         action="store_true",
         default=False,
@@ -1500,6 +1508,97 @@ def main():
             "modes": all_records,
         }
         summary_path = os.path.join(out_root, "summary_future_traj.json")
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2, default=str)
+        print(f"\n{'Mode':<35} {'ADE':>8} {'FDE':>8}")
+        print("-" * 53)
+        for rec in all_records:
+            print(f"{rec['mode']:<35} {rec['ADE']:>8.4f} {rec['FDE']:>8.4f}")
+        return
+
+    if args.step_bypass_buf:
+        print("\n=== Bypass-buffer ablation ===")
+        token_length = sample["token_length"]
+        total_frames = 1 + 4 * (token_length - 1) if token_length > 1 else 1
+
+        vae.clear_cache()
+        model.init_generated(token_length, batch_size=1,
+                            num_denoise_steps=args.num_denoise_steps)
+
+        # Pre-compute traj_emb using stream_generate's exact path.
+        _full_x = {
+            "traj_features": sample["traj_features"].unsqueeze(0).to(device),
+            "feature_length": torch.tensor([token_length], device=device),
+            "token_mask": sample["token_mask"].unsqueeze(0).to(device),
+            "traj_mask": sample["traj_mask"].unsqueeze(0).to(device),
+        }
+        gen_sl = token_length + model.chunk_size
+        traj_emb_fixed = model._build_traj_emb(_full_x, gen_sl, device)
+        traj_sl_fixed = model._get_traj_seq_lens(_full_x, gen_sl, device)
+
+        # Pre-encode text.
+        text_ctx = [u.to(model.param_dtype) for u in
+                     model.encode_text_with_cache([sample["text"]], device)]
+        text_null = [u.to(model.param_dtype) for u in
+                      model.encode_text_with_cache([""], device)]
+
+        # Denoising loop: matches stream_generate structure, but uses
+        # init_generated's buffer (same starting point as step path).
+        dt = 1.0 / args.num_denoise_steps
+        max_t = 1 + (token_length - 1) / model.chunk_size
+        total_steps = int(max_t / dt)
+
+        for step in range(total_steps):
+            t = step * dt
+            start_index = max(0, int(model.chunk_size * (t - 1)) + 1)
+            end_index = int(model.chunk_size * t) + 1
+            time_steps = torch.full((1,), t, device=device)
+            noise_level = model._get_noise_levels(device, gen_sl, time_steps)
+            t_scaled = noise_level * model.time_embedding_scale
+
+            noisy_input = [model.generated[0, :, :end_index, ...]]
+            pred = model._denoise_with_cfg(
+                noisy_input, t_scaled,
+                text_ctx, text_null,
+                traj_emb_fixed, traj_sl_fixed,
+                gen_sl, 1,
+            )
+
+            for i in range(1):  # batch_size = 1
+                pv = pred[i][:, start_index:end_index, ...]
+                if model.prediction_type == "vel":
+                    model.generated[i, :, start_index:end_index, ...] += pv * dt
+                elif model.prediction_type == "x0":
+                    nl = (noise_level[i, start_index:end_index]
+                          .unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+                          .clamp(min=1e-6))
+                    pv = (pv - model.generated[i, :, start_index:end_index, ...]) / nl
+                    model.generated[i, :, start_index:end_index, ...] += pv * dt
+
+        final_latent = model.generated[0, :, :token_length, ...]
+        decoded = vae.decode(
+            model.postprocess(final_latent.unsqueeze(0))
+        )[0].float().cpu().numpy()
+        pred_root = extract_root_trajectory_263(decoded)
+
+        metrics = _build_mode_metrics(
+            pred_root, gt_root, target_traj, "step_bypass_buf_gtroot",
+            None, "gt",
+            traj_encoder_path="traj_features (frame-level, pre-computed, no buffer)",
+        )
+        print(f"  ADE={metrics['ADE']:.4f}  FDE={metrics['FDE']:.4f}")
+        mode_dir = os.path.join(out_root, "step_bypass_buf_gtroot")
+        _save_artifacts(mode_dir, decoded, pred_root,
+                        gt_root[:len(pred_root)], target_traj[:len(pred_root)], metrics)
+
+        all_records = [metrics]
+        summary = {
+            "sample_id": args.sample_id, "dataset": args.dataset,
+            "ckpt": args.ckpt, "vae_ckpt": args.vae_ckpt,
+            "ablation": "bypass_buffer",
+            "modes": all_records,
+        }
+        summary_path = os.path.join(out_root, "summary_bypass_buf.json")
         with open(summary_path, "w") as f:
             json.dump(summary, f, indent=2, default=str)
         print(f"\n{'Mode':<35} {'ADE':>8} {'FDE':>8}")
