@@ -629,6 +629,13 @@ def main():
         default=False,
         help="Compare traj_emb statistics between generate and stream_generate_step paths.",
     )
+    parser.add_argument(
+        "--debug_control_effect",
+        action="store_true",
+        default=False,
+        help="Trace ControlNet residual and CFG delta magnitudes "
+        "inside _denoise_with_cfg during stream_generate_step.",
+    )
     parser.add_argument("--traj_horizon_tokens", type=int, default=20)
     parser.add_argument("--num_denoise_steps", type=int, default=10)
     parser.add_argument("--seed", type=int, default=1234)
@@ -860,6 +867,80 @@ def main():
             _x = model._traj_buf._xyz_buf[0, :10, :]
             print(f"  [traj-buf xyz first 10 tokens] mean={_x.mean().item():.4f} "
                   f"nonzero={(_x.abs().sum(dim=-1) > 0).sum().item()}/10")
+
+        return
+
+    if args.debug_control_effect:
+        print("\n=== ControlNet effect debug ===")
+        _bs = _wrap_flat_sample_for_suffix(sample)
+
+        # 1. Run one generate() denoise step with traj and without, compare
+        #    ControlNet residuals directly.
+        feat = _bs["token"].unsqueeze(0).to(device)  # (1, T, C)
+        feat_len = torch.tensor([sample["token_length"]], device=device)
+        seq_len = feat.shape[1]
+
+        # Prepare a single-window state at time t ≈ 0.5
+        time_steps = torch.tensor([0.5], device=device)
+        noise_level = model._get_noise_levels(device, seq_len, time_steps)
+        noisy_x, _ = model.add_noise(feat, noise_level)
+        noisy_pre = model.preprocess(noisy_x)  # (B, C, T, 1, 1)
+        noisy_in = [noisy_pre[b] for b in range(noisy_pre.shape[0])]
+
+        text_list = [sample["text"]] if isinstance(sample["text"], str) else [sample["text"][0]]
+        text_ctx = model.encode_text_with_cache(text_list, device)
+        text_null = model.encode_text_with_cache([""], device)
+
+        traj_emb = model._build_traj_emb(_bs, seq_len + model.chunk_size, device)
+        traj_sl = model._get_traj_seq_lens(_bs, seq_len + model.chunk_size, device)
+        t_scaled = noise_level * model.time_embedding_scale
+
+        # --- ControlNet residual with traj ---
+        cn_res_traj = model._controlnet_forward(
+            noisy_in, t_scaled, text_ctx, seq_len, traj_emb, traj_sl,
+        )
+        cn_norm_traj = sum(r.norm().item() for r in cn_res_traj)
+
+        # --- ControlNet residual without traj (null traj = None) ---
+        cn_res_null = model._controlnet_forward(
+            noisy_in, t_scaled, text_ctx, seq_len, None, None,
+        )
+        cn_norm_null = sum(r.norm().item() for r in cn_res_null)
+
+        cn_delta = sum((a - b).norm().item()
+                       for a, b in zip(cn_res_traj, cn_res_null))
+
+        print(f"  [control-residual] with-traj norm={cn_norm_traj:.4f}  "
+              f"without-traj norm={cn_norm_null:.4f}  delta={cn_delta:.4f}")
+
+        # --- Backbone pred with traj vs null-traj ControlNet ---
+        pred_traj = model.model(
+            noisy_in, t_scaled, text_ctx, seq_len,
+            y=None, traj_emb=None, traj_seq_lens=None,
+            controlnet_residuals=cn_res_traj,
+        )
+        pred_null = model.model(
+            noisy_in, t_scaled, text_ctx, seq_len,
+            y=None, traj_emb=None, traj_seq_lens=None,
+            controlnet_residuals=cn_res_null,
+        )
+
+        delta_pred = sum((a - b).norm().item()
+                         for a, b in zip(pred_traj, pred_null))
+        pred_traj_norm = sum(a.norm().item() for a in pred_traj)
+
+        # Per-token delta (mean across feature dims of the velocity).
+        _dp = pred_traj[0] - pred_null[0]  # (C, T, 1, 1)
+        _tok_norms = _dp.squeeze(-1).squeeze(-1).norm(dim=0)  # (T,)
+        print(f"  [pred-delta] total norm={delta_pred:.4f}  "
+              f"pred-traj norm={pred_traj_norm:.4f}")
+        print(f"  [pred-delta per-token]  "
+              f"min={_tok_norms.min().item():.6f}  "
+              f"mean={_tok_norms.mean().item():.6f}  "
+              f"max={_tok_norms.max().item():.6f}")
+        print(f"  [diagnosis] cn_delta={'LARGE' if cn_delta > 0.1 else 'small'}  "
+              f"pred_delta={'LARGE' if delta_pred > 0.1 else 'small'}")
+
         return
 
     # Encoding path labels per mode family.
