@@ -636,6 +636,13 @@ def main():
         help="Trace ControlNet residual and CFG delta magnitudes "
         "inside _denoise_with_cfg during stream_generate_step.",
     )
+    parser.add_argument(
+        "--step_global_text",
+        action="store_true",
+        default=False,
+        help="Ablation: collapse frame-aligned text to global text in "
+        "stream_generate_step (tests whether text layout is the root cause).",
+    )
     parser.add_argument("--traj_horizon_tokens", type=int, default=20)
     parser.add_argument("--num_denoise_steps", type=int, default=10)
     parser.add_argument("--seed", type=int, default=1234)
@@ -946,6 +953,111 @@ def main():
         print(f"  [diagnosis] cn_delta={'LARGE' if cn_delta > 0.1 else 'small'}  "
               f"pred_delta={'LARGE' if delta_pred > 0.1 else 'small'}")
 
+        # --- Compare latent tokens: generate() vs stream_generate_step() ---
+        model.init_generated(args.history_length, batch_size=1,
+                            num_denoise_steps=args.num_denoise_steps)
+        vae.clear_cache()
+        latents_step = []
+        _bs2 = _wrap_flat_sample_for_suffix(sample)
+        _txt = sample["text"] if isinstance(sample["text"], str) else sample["text"][0]
+        first_chunk = True
+        for ci in range(min(10, sample["token_length"])):
+            ti = build_stream_suffix_conditioning(_bs2, ci, prefer_xyz=True)
+            sp = build_stream_step_model_input(_txt, traj_input=ti)
+            out = model.stream_generate_step(sp, first_chunk=first_chunk)
+            latents_step.append(out["generated"][0].float().cpu())
+            first_chunk = False
+        latents_step = torch.cat(latents_step, dim=0)  # (N, C)
+
+        # Compare with generate() latents (first N tokens)
+        model_batch = _make_model_batch(sample, device)
+        gen_out = model.generate(model_batch, num_denoise_steps=args.num_denoise_steps)
+        latents_gen = gen_out["generated"][0].float().cpu()  # (T, C)
+
+        n_cmp = min(len(latents_step), len(latents_gen))
+        l2_diff = (latents_step[:n_cmp] - latents_gen[:n_cmp]).norm(dim=-1)
+        cos_sim = torch.nn.functional.cosine_similarity(
+            latents_step[:n_cmp].float(), latents_gen[:n_cmp].float(), dim=-1
+        )
+        print(f"  [latent-compare] generate vs step (first {n_cmp} tokens):")
+        print(f"    gen token stats: mean={latents_gen[:n_cmp].mean():.6f} "
+              f"std={latents_gen[:n_cmp].std():.6f}")
+        print(f"    step token stats: mean={latents_step[:n_cmp].mean():.6f} "
+              f"std={latents_step[:n_cmp].std():.6f}")
+        print(f"    L2-diff: min={l2_diff.min():.6f} mean={l2_diff.mean():.6f} "
+              f"max={l2_diff.max():.6f}")
+        print(f"    cosine-sim: min={cos_sim.min():.4f} mean={cos_sim.mean():.4f}")
+        print(f"  [diagnosis] latent-diff={'SMALL (<1.0 means similar)' if l2_diff.mean() < 1.0 else 'LARGE (>1.0 means diverged)'}")
+        return
+
+    if args.step_global_text:
+        print("\n=== Global-text ablation ===")
+        _orig_dn = model._denoise_with_cfg
+
+        def _global_text_dn(noisy_input, t_scaled, text_cond_ctx, text_null_ctx,
+                            traj_emb, traj_seq_lens, seq_len, batch_size):
+            # Collapse frame-aligned text to global: keep only first token's
+            # context per sample.
+            if len(text_cond_ctx) > batch_size and len(text_cond_ctx) % seq_len == 0:
+                text_cond_ctx = text_cond_ctx[:batch_size]
+            if len(text_null_ctx) > batch_size:
+                text_null_ctx = text_null_ctx[:batch_size]
+            return _orig_dn(noisy_input, t_scaled, text_cond_ctx, text_null_ctx,
+                            traj_emb, traj_seq_lens, seq_len, batch_size)
+
+        model._denoise_with_cfg = _global_text_dn
+
+        pred_motion, pred_root = run_stream_step(
+            model, vae, sample, device,
+            history_length=args.history_length,
+            num_denoise_steps=args.num_denoise_steps,
+            horizon_tokens=None, use_pred_root=False,
+            use_features_path=False, no_traj=False, collect_latents=False,
+        )
+        metrics = _build_mode_metrics(
+            pred_root, gt_root, target_traj, "step_global_text_gtroot",
+            None, "gt", traj_encoder_path="xyz (global text)",
+        )
+        print(f"  ADE={metrics['ADE']:.4f}  FDE={metrics['FDE']:.4f}")
+        model._denoise_with_cfg = _orig_dn
+
+        # Also run with no-traj for comparison.
+        model._denoise_with_cfg = _global_text_dn
+        pred_motion2, pred_root2 = run_stream_step(
+            model, vae, sample, device,
+            history_length=args.history_length,
+            num_denoise_steps=args.num_denoise_steps,
+            horizon_tokens=None, use_pred_root=False,
+            use_features_path=False, no_traj=True, collect_latents=False,
+        )
+        metrics2 = _build_mode_metrics(
+            pred_root2, gt_root, target_traj, "step_global_text_no_traj",
+            None, "none", traj_encoder_path="none (global text, no traj)",
+        )
+        print(f"  ADE={metrics2['ADE']:.4f}  FDE={metrics2['FDE']:.4f}")
+        model._denoise_with_cfg = _orig_dn
+
+        mode_dir = os.path.join(out_root, "step_global_text_gtroot")
+        _save_artifacts(mode_dir, pred_motion, pred_root,
+                        gt_root[:len(pred_root)], target_traj[:len(pred_root)], metrics)
+        mode_dir2 = os.path.join(out_root, "step_global_text_no_traj")
+        _save_artifacts(mode_dir2, pred_motion2, pred_root2,
+                        gt_root[:len(pred_root2)], target_traj[:len(pred_root2)], metrics2)
+
+        all_records = [metrics, metrics2]
+        summary = {
+            "sample_id": args.sample_id, "dataset": args.dataset,
+            "ckpt": args.ckpt, "vae_ckpt": args.vae_ckpt,
+            "ablation": "global_text",
+            "modes": all_records,
+        }
+        summary_path = os.path.join(out_root, "summary_global_text.json")
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2, default=str)
+        print(f"\n{'Mode':<35} {'ADE':>8} {'FDE':>8}")
+        print("-" * 53)
+        for rec in all_records:
+            print(f"{rec['mode']:<35} {rec['ADE']:>8.4f} {rec['FDE']:>8.4f}")
         return
 
     # Encoding path labels per mode family.
