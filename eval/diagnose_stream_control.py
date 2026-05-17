@@ -575,6 +575,12 @@ def main():
         choices=["humanml3d", "babel"],
         help="Dataset to load the sample from (default: humanml3d)",
     )
+    parser.add_argument(
+        "--precomputed_text_emb_path",
+        default=None,
+        help="Path to pre-tokenized T5 embeddings .pt file. "
+        "When set, enables use_precomputed_text_emb and skips live T5.",
+    )
     args = parser.parse_args()
 
     seed_everything(args.seed)
@@ -584,6 +590,15 @@ def main():
 
     cfg = load_config(config_path=args.config)
     OmegaConf.update(cfg.config, "test_vae_ckpt", args.vae_ckpt)
+    if args.precomputed_text_emb_path:
+        OmegaConf.update(
+            cfg.config, "model.params.use_precomputed_text_emb", True
+        )
+        OmegaConf.update(
+            cfg.config,
+            "model.params.precomputed_text_emb_path",
+            args.precomputed_text_emb_path,
+        )
     out_root = os.path.join(args.out_dir, args.sample_id)
 
     print(f"Loading VAE from {args.vae_ckpt} ...")
