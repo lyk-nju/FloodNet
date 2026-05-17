@@ -17,13 +17,6 @@ from torch_ema import ExponentialMovingAverage
 from utils.initialize import instantiate, load_config
 from utils.motion_process import StreamJointRecovery263
 from utils.stream_rollout import build_stream_step_model_input
-from utils.stream_traj import (
-    build_remaining_polyline,
-    dedupe_polyline,
-    estimate_token_step_distance,
-    project_point_to_polyline,
-    resample_polyline,
-)
 
 
 class FrameBuffer:
@@ -350,32 +343,93 @@ class ModelManager:
         return root_xyz
 
     def _estimate_token_step_distance(self) -> float:
-        """Thin wrapper — see ``utils.stream_traj.estimate_token_step_distance``."""
-        return estimate_token_step_distance(
-            list(self.root_xz_history),
-            default=self.default_token_step,
-            min_step=self.min_token_step,
-            max_step=self.max_token_step,
-        )
+        if len(self.root_xz_history) >= 5:
+            history = np.asarray(self.root_xz_history, dtype=np.float32)
+            frame_steps = np.linalg.norm(np.diff(history, axis=0), axis=1)
+            frame_steps = frame_steps[np.isfinite(frame_steps)]
+            if frame_steps.size > 0:
+                recent = frame_steps[-min(12, frame_steps.size) :]
+                token_step = float(np.median(recent) * 4.0)
+                return float(np.clip(token_step, self.min_token_step, self.max_token_step))
+        return self.default_token_step
 
     @staticmethod
     def _project_point_to_polyline(point_xyz: np.ndarray, waypoints_xyz: np.ndarray):
-        """Thin wrapper — see ``utils.stream_traj.project_point_to_polyline``."""
-        return project_point_to_polyline(point_xyz, waypoints_xyz)
+        """Project a 3D point onto the XZ plane of a polyline.
+
+        Returns (projected_xyz, segment_index, t_parameter)."""
+        point_xz = point_xyz[[0, 2]]
+        if len(waypoints_xyz) == 1:
+            return waypoints_xyz[0].copy(), 0, 1.0
+
+        best_dist = None
+        best_proj = None
+        best_seg = 0
+        best_t = 0.0
+        for seg_idx in range(len(waypoints_xyz) - 1):
+            a = waypoints_xyz[seg_idx]
+            b = waypoints_xyz[seg_idx + 1]
+            a_xz = a[[0, 2]]
+            b_xz = b[[0, 2]]
+            ab = b_xz - a_xz
+            ab_len_sq = float(np.dot(ab, ab))
+            if ab_len_sq <= 1e-8:
+                t = 0.0
+                proj = a.copy()
+            else:
+                t = float(np.clip(np.dot(point_xz - a_xz, ab) / ab_len_sq, 0.0, 1.0))
+                proj = a + (b - a) * t
+            dist = float(np.linalg.norm(point_xz - proj[[0, 2]]))
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_proj = proj
+                best_seg = seg_idx
+                best_t = t
+        return best_proj, best_seg, best_t
 
     @staticmethod
     def _dedupe_polyline(points: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-        """Thin wrapper — see ``utils.stream_traj.dedupe_polyline``."""
-        return dedupe_polyline(points, eps)
+        if len(points) <= 1:
+            return points
+        keep = [0]
+        for idx in range(1, len(points)):
+            if np.linalg.norm(points[idx, [0, 2]] - points[keep[-1], [0, 2]]) > eps:
+                keep.append(idx)
+        return points[keep]
 
     def _build_remaining_polyline(self, root_xyz: np.ndarray, waypoints_xyz: np.ndarray) -> np.ndarray:
-        """Thin wrapper — see ``utils.stream_traj.build_remaining_polyline``."""
-        return build_remaining_polyline(root_xyz, waypoints_xyz)
+        projected, seg_idx, seg_t = self._project_point_to_polyline(root_xyz, waypoints_xyz)
+        suffix = [projected.astype(np.float32)]
+        if len(waypoints_xyz) > 1:
+            if seg_t < 1.0 - 1e-6:
+                suffix.append(waypoints_xyz[seg_idx + 1].astype(np.float32))
+                suffix.extend(waypoints_xyz[seg_idx + 2 :].astype(np.float32))
+            else:
+                suffix.extend(waypoints_xyz[seg_idx + 1 :].astype(np.float32))
+        path = np.vstack([root_xyz.astype(np.float32), np.asarray(suffix, dtype=np.float32)])
+        return self._dedupe_polyline(path)
 
     @staticmethod
     def _resample_polyline(points_xyz: np.ndarray, num_tokens: int, token_step: float) -> np.ndarray:
-        """Thin wrapper — see ``utils.stream_traj.resample_polyline``."""
-        return resample_polyline(points_xyz, num_tokens, token_step)
+        if num_tokens <= 0:
+            return np.zeros((0, 3), dtype=np.float32)
+        if len(points_xyz) == 0:
+            return np.zeros((num_tokens, 3), dtype=np.float32)
+        if len(points_xyz) == 1:
+            return np.repeat(points_xyz.astype(np.float32), num_tokens, axis=0)
+
+        seg_lens = np.linalg.norm(np.diff(points_xyz[:, [0, 2]], axis=0), axis=1)
+        cum = np.concatenate([np.zeros(1, dtype=np.float32), np.cumsum(seg_lens).astype(np.float32)])
+        total_len = float(cum[-1])
+        if total_len <= 1e-6:
+            return np.repeat(points_xyz[:1].astype(np.float32), num_tokens, axis=0)
+
+        sample_d = np.arange(num_tokens, dtype=np.float32) * float(token_step)
+        sample_d = np.clip(sample_d, 0.0, total_len)
+        out = np.empty((num_tokens, 3), dtype=np.float32)
+        for dim in range(3):
+            out[:, dim] = np.interp(sample_d, cum, points_xyz[:, dim]).astype(np.float32)
+        return out
 
     def _build_stream_traj_input(self):
         with self.traj_state_lock:

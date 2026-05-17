@@ -88,76 +88,25 @@ class StreamTextRolloutController:
         return self.segments[-1].text
 
 
-def build_stream_suffix_conditioning(
-    sample_batch: Dict, commit_index: int, *, prefer_xyz: bool = False
-) -> Dict:
-    """Build suffix trajectory conditioning for stream_generate_step.
-
-    When *prefer_xyz* is True, the ``traj_features`` branch is skipped and the
-    ``traj`` xyz path is forced (matching the web_demo :class:`TrajStreamBuffer`
-    xyz encoding path for diagnostic alignment).
-    """
+def build_stream_suffix_conditioning(sample_batch: Dict, commit_index: int) -> Dict:
     payload: Dict = {}
     token_mask = sample_batch.get("token_mask", None)
     if token_mask is not None:
         payload["token_mask"] = _slice_batch_suffix(token_mask, commit_index)
-
-    if not prefer_xyz:
-        traj_features = sample_batch.get("traj_features", None)
-        if traj_features is not None:
-            payload["traj_features"] = _slice_batch_suffix(
-                _to_token_level_traj_features(sample_batch), commit_index
-            )
-            return payload
 
     traj = sample_batch.get("traj", None)
     if traj is not None:
         payload["traj"] = _slice_batch_suffix(
             _to_token_level_traj(sample_batch), commit_index
         )
+        return payload
+
+    traj_features = sample_batch.get("traj_features", None)
+    if traj_features is not None:
+        payload["traj_features"] = _slice_batch_suffix(
+            _to_token_level_traj_features(sample_batch), commit_index
+        )
     return payload
-
-
-def clip_traj_input_to_horizon(
-    traj_input: Dict | None, horizon_tokens: int
-) -> Dict | None:
-    """Clip a trajectory conditioning dict to at most *horizon_tokens* future positions.
-
-    Returns None if *traj_input* is None or contains no trajectory data.
-    """
-    if traj_input is None:
-        return None
-    out = {}
-    for key in ("traj", "traj_features"):
-        value = traj_input.get(key)
-        if value is None:
-            continue
-        if torch.is_tensor(value):
-            if value.ndim == 2 and value.shape[0] > horizon_tokens:
-                value = value[:horizon_tokens]
-            elif value.ndim == 3 and value.shape[1] > horizon_tokens:
-                value = value[:, :horizon_tokens]
-        elif isinstance(value, np.ndarray):
-            if value.ndim == 1 and value.shape[0] > horizon_tokens:
-                value = value[:horizon_tokens]
-            elif value.ndim >= 2 and value.shape[-2] > horizon_tokens:
-                value = value[..., :horizon_tokens, :]
-        out[key] = value
-    for key in ("token_mask",):
-        value = traj_input.get(key)
-        if value is None:
-            continue
-        if torch.is_tensor(value):
-            if value.ndim == 2 and value.shape[1] > horizon_tokens:
-                value = value[:, :horizon_tokens]
-            elif value.ndim == 1 and value.shape[0] > horizon_tokens:
-                value = value[:horizon_tokens]
-        out[key] = value
-    return out if out else None
-
-
-# Re-export so eval modules can reach it without duplicating the function.
-_clip_traj_input_to_horizon = clip_traj_input_to_horizon
 
 
 def _slice_batch_suffix(value, commit_index: int):

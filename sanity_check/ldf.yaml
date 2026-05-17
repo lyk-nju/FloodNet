@@ -1,0 +1,166 @@
+dirs:
+  deps: /data/home/shengqiuProf_user_yuankai/FloodDiffusion/deps
+  outputs: ./outputs
+  raw_data: /data/home/shengqiuProf_user_yuankai/FloodDiffusion/raw_data
+wandb_info:
+  key: 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
+  project: FloodNet
+  entity: laiyuankia-nanjing-university
+exp_name: ldf
+seed: 1234
+debug: false
+train: true
+save_dir: ./outputs/20260512_012428_ldf
+resume_ckpt: /data/home/shengqiuProf_user_yuankai/FloodNet/outputs/20260430_125027_ldf/step_step=335000.ckpt
+test_ckpt: /data/home/shengqiuProf_user_yuankai/FloodNet/outputs/20260430_125027_ldf/step_step=335000.ckpt
+test_vae_ckpt: /data/home/shengqiuProf_user_yuankai/FloodDiffusion/vae_1d_z4_step=300000.ckpt
+test_vae:
+  target: models.vae_wan_1d.VAEWanModel
+  ema_decay: 0.99
+  params:
+    input_dim: 263
+    z_dim: 4
+test_setting:
+  render: true
+  simple: true
+  recover_dim: 263
+  HumanML3D:
+    compare_folders:
+    - ${dirs.raw_data}/HumanML3D/animations
+    compare_names:
+    - Ground Truth
+val_repeat: 1
+logger:
+  wandb:
+    wandb_key: ${wandb_info.key}
+    project: ${wandb_info.project}
+    entity: ${wandb_info.entity}
+trainer:
+  max_steps: 400000
+  accelerator: gpu
+  devices:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  log_every_n_steps: 100
+  precision: bf16-mixed
+t2m_metric: false
+validation:
+  validation_steps: 4000
+  test_steps: 4000
+  save_every_n_steps: 4000
+  save_top_k: 100
+  eval_generation_metrics: true
+  eval_num_runs: 10
+  eval_seg_size: 20
+  eval_forward_control_loss: true
+  eval_forward_control_loss_window_mode: mean_chunk_windows
+metrics:
+  dim: 263
+  t2m:
+    evaluate_text: true
+    fid_target: original
+    metric_mean_path: ${dirs.deps}/t2m/meta/mean.npy
+    metric_std_path: ${dirs.deps}/t2m/meta/std.npy
+    wordvectorizer:
+      target: metrics.tools.word_vectorizer.WordVectorizer
+      params:
+        meta_root: ${dirs.deps}/glove
+        prefix: our_vab
+      max_text_len: 20
+    textencoder:
+      target: metrics.tools.t2m_evaluator.TextEncoderBiGRUCo
+      ckpt: ${dirs.deps}/t2m/humanml3d/text_encoder.pt
+      params:
+        word_size: 300
+        pos_size: 15
+        hidden_size: 512
+        output_size: 512
+    moveencoder:
+      target: metrics.tools.t2m_evaluator.MovementConvEncoder
+      ckpt: ${dirs.deps}/t2m/humanml3d/movement_encoder.pt
+      params:
+        input_size: 259
+        hidden_size: 512
+        output_size: 512
+    motionencoder:
+      target: metrics.tools.t2m_evaluator.MotionEncoderBiGRUCo
+      ckpt: ${dirs.deps}/t2m/humanml3d/motion_encoder.pt
+      params:
+        input_size: 512
+        hidden_size: 1024
+        output_size: 512
+data:
+  target: datasets.humanml3d.HumanML3DDataset
+  collate_fn: datasets.humanml3d.collate_fn
+  train_bs: 8
+  val_bs: 32
+  test_bs: 4
+  num_workers: 4
+  mask_ratio: 1.0
+  train_meta_paths:
+  - ${dirs.raw_data}/HumanML3D/train_difficult.txt
+  val_meta_paths:
+  - ${dirs.raw_data}/HumanML3D/val.txt
+  test_probe_meta_paths:
+    test:
+    - ${dirs.raw_data}/HumanML3D/test_min.txt
+    train:
+    - ${dirs.raw_data}/HumanML3D/train_min.txt
+  feature_path: new_joint_vecs
+  token_path: TOKENS_20251030_085836_vae_wan_z4
+  text_path: texts
+  random_length: 0
+  min_length: 40
+  max_length: 200
+  smooth_traj_sigma: 0.0
+model:
+  target: models.diffusion_forcing_wan.DiffForcingWanModel
+  ema_decay: 0.99
+  params:
+    use_precomputed_text_emb: true
+    precomputed_text_emb_path: ${dirs.raw_data}/HumanML3D/t5_text_embeddings.pt
+    checkpoint_path: ${dirs.deps}/t5_umt5-xxl-enc-bf16/models_t5_umt5-xxl-enc-bf16.pth
+    tokenizer_path: ${dirs.deps}/t5_umt5-xxl-enc-bf16/google/umt5-xxl
+    input_dim: 4
+    noise_steps: 10
+    freeze_backbone: true
+    traj_encoder_in_dim: 4
+    traj_out_dim: 64
+    traj_dropout: 0.1
+    use_traj_emb_cache: true
+    control_loss_weight: 5.0
+    scheduled_sampling_prob: 0.0
+    cfg_scale_traj: 3.0
+    cfg_scale_text: 5.0
+    self_forcing_enabled: true
+    self_forcing_stride_tokens: 1
+    self_forcing_detach_between_steps: true
+    self_forcing_k_schedule:
+    - - 0.0
+      - 2
+    - - 0.4
+      - 3
+    - - 0.7
+      - 5
+control_loss_train_mode: 1
+resume_reset_optimizer: true
+optimizer:
+  target: AdamW
+  params:
+    lr: 0.0001
+    betas:
+    - 0.9
+    - 0.999
+    weight_decay: 0.0
+    eps: 1.0e-08
+lr_scheduler:
+  target: diffusers.optimization.get_cosine_schedule_with_warmup
+  params:
+    num_warmup_steps: 1000
+    num_training_steps: ${trainer.max_steps}

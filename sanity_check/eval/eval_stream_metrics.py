@@ -40,7 +40,6 @@ try:
         StreamTextRolloutController,
         build_stream_step_model_input,
         build_stream_suffix_conditioning,
-        clip_traj_input_to_horizon,
     )
 except ImportError:  # pragma: no cover - script entrypoints use top-level imports
     from metrics.stream import (
@@ -64,7 +63,6 @@ except ImportError:  # pragma: no cover - script entrypoints use top-level impor
         StreamTextRolloutController,
         build_stream_step_model_input,
         build_stream_suffix_conditioning,
-        clip_traj_input_to_horizon,
     )
 
 
@@ -278,6 +276,20 @@ def _to_python_int(value) -> int:
     return int(value)
 
 
+def _clip_traj_input_to_horizon(traj_input: Dict, horizon: int) -> None:
+    """Clip traj_input tensors to at most `horizon` future tokens (in-place).
+
+    Mirrors web_demo's _build_stream_traj_input which only provides traj_horizon_tokens
+    future positions rather than the full remaining suffix.
+    """
+    for key in ("traj", "traj_features", "token_mask"):
+        val = traj_input.get(key, None)
+        if val is None:
+            continue
+        if torch.is_tensor(val):
+            traj_input[key] = val[:, :horizon] if val.ndim >= 2 else val[:horizon]
+        elif isinstance(val, np.ndarray):
+            traj_input[key] = val[:, :horizon] if val.ndim >= 2 else val[:horizon]
 
 
 def run_stream_generate_sample(model, vae, sample_batch: Dict, device: torch.device, num_denoise_steps: Optional[int]):
@@ -338,7 +350,7 @@ def run_stream_generate_step_sample(
             current_text = text_rollout.get_text_for_commit_index(commit_index)
             traj_input = build_stream_suffix_conditioning(sample_batch, commit_index)
             if traj_horizon_tokens is not None and traj_horizon_tokens > 0:
-                traj_input = clip_traj_input_to_horizon(traj_input, traj_horizon_tokens)
+                _clip_traj_input_to_horizon(traj_input, traj_horizon_tokens)
             step_payload = build_stream_step_model_input(
                 current_text,
                 traj_input=traj_input,
@@ -581,7 +593,6 @@ def main():
             }
 
             if compute_offline_baseline:
-                _seed_eval_locally(sample_seed)
                 with torch.no_grad():
                     offline_out = run_offline_generate_sample(
                         model=model,
@@ -674,4 +685,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
