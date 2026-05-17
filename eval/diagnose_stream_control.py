@@ -591,6 +591,13 @@ def main():
     parser.add_argument("--sample_id", default="000021")
     parser.add_argument("--out_dir", default="outputs/diagnose_stream")
     parser.add_argument("--history_length", type=int, default=30)
+    parser.add_argument(
+        "--ablate_history",
+        type=str,
+        default=None,
+        help="Comma-separated history_length values for context-window ablation. "
+        "When set, runs step_full_xyz_gtroot at each value (bypasses the full matrix).",
+    )
     parser.add_argument("--traj_horizon_tokens", type=int, default=20)
     parser.add_argument("--num_denoise_steps", type=int, default=10)
     parser.add_argument("--seed", type=int, default=1234)
@@ -645,6 +652,48 @@ def main():
 
     gt_root = extract_root_trajectory_263(sample["feature"].numpy())
     target_traj = sample["traj"].numpy()  # (T, 3) xyz
+
+    # --- history-length ablation (bypasses full matrix) ---
+    if args.ablate_history:
+        hl_values = [int(x.strip()) for x in args.ablate_history.split(",")]
+        print(f"\nHistory-length ablation: {hl_values}")
+        all_records = []
+        for hl in hl_values:
+            mode_name = f"step_full_xyz_gtroot_hl{hl}"
+            print(f"\n--- {mode_name} ---")
+            pred_motion, pred_root = run_stream_step(
+                model, vae, sample, device,
+                history_length=hl,
+                num_denoise_steps=args.num_denoise_steps,
+                horizon_tokens=None,
+                use_pred_root=False,
+            )
+            metrics = _build_mode_metrics(
+                pred_root, gt_root, target_traj, mode_name, None, "gt",
+                traj_encoder_path="",
+            )
+            print(f"  ADE={metrics['ADE']:.4f}  FDE={metrics['FDE']:.4f}")
+            mode_dir = os.path.join(out_root, mode_name)
+            _save_artifacts(
+                mode_dir, pred_motion, pred_root,
+                gt_root[:len(pred_root)], target_traj[:len(pred_root)], metrics,
+            )
+            all_records.append(metrics)
+        summary = {
+            "sample_id": args.sample_id, "dataset": args.dataset,
+            "ckpt": args.ckpt, "vae_ckpt": args.vae_ckpt, "config": args.config,
+            "ablation": "history_length",
+            "modes": all_records,
+        }
+        summary_path = os.path.join(out_root, "summary_hl_ablation.json")
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2, default=str)
+        print(f"\nAblation summary saved to {summary_path}")
+        print(f"\n{'Mode':<35} {'ADE':>8} {'FDE':>8}")
+        print("-" * 53)
+        for rec in all_records:
+            print(f"{rec['mode']:<35} {rec['ADE']:>8.4f} {rec['FDE']:>8.4f}")
+        return
 
     # Encoding path labels per mode family.
     _TPATH_GENERATE = (
