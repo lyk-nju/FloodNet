@@ -643,6 +643,13 @@ def main():
         help="Ablation: collapse frame-aligned text to global text in "
         "stream_generate_step (tests whether text layout is the root cause).",
     )
+    parser.add_argument(
+        "--step_future_traj_window",
+        action="store_true",
+        default=False,
+        help="Ablation: extend stream_generate_step trajectory window to "
+        "include future horizon (tests whether truncated traj window is the root cause).",
+    )
     parser.add_argument("--traj_horizon_tokens", type=int, default=20)
     parser.add_argument("--num_denoise_steps", type=int, default=10)
     parser.add_argument("--seed", type=int, default=1234)
@@ -1052,6 +1059,217 @@ def main():
             "modes": all_records,
         }
         summary_path = os.path.join(out_root, "summary_global_text.json")
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2, default=str)
+        print(f"\n{'Mode':<35} {'ADE':>8} {'FDE':>8}")
+        print("-" * 53)
+        for rec in all_records:
+            print(f"{rec['mode']:<35} {rec['ADE']:>8.4f} {rec['FDE']:>8.4f}")
+        return
+
+    if args.step_future_traj_window:
+        print("\n=== Future-traj-window ablation ===")
+        _orig_step = model.stream_generate_step
+
+        def _patched_step(x, first_chunk=True):
+            device = next(model.parameters()).device
+            if first_chunk:
+                model.generated = model.generated.to(device)
+            model._traj_buf.update(x, model.commit_index, device)
+
+            if model.use_text_cond and "text" in x:
+                text_list = x["text"]
+                new_text_context = model.encode_text_with_cache(text_list, device)
+                new_text_context = [u.to(model.param_dtype) for u in new_text_context]
+            else:
+                new_text_context = [""] * model.batch_size
+                new_text_context = model.encode_text_with_cache(new_text_context, device)
+                new_text_context = [u.to(model.param_dtype) for u in new_text_context]
+
+            text_null_list = [""] * model.batch_size
+            text_null_context = model.encode_text_with_cache(text_null_list, device)
+            text_null_context = [u.to(model.param_dtype) for u in text_null_context]
+
+            for i in range(model.batch_size):
+                if first_chunk:
+                    model.text_condition_list[i].extend(
+                        [new_text_context[i]] * model.chunk_size
+                    )
+                else:
+                    model.text_condition_list[i].extend([new_text_context[i]])
+
+            end_step = (
+                (model.commit_index + model.chunk_size)
+                * model.num_denoise_steps
+                / model.chunk_size
+            )
+            while model.current_step < end_step:
+                current_time = model.current_step * model.dt
+                start_index = max(0, int(model.chunk_size * (current_time - 1)) + 1)
+                end_index = int(model.chunk_size * current_time) + 1
+                time_steps = torch.full((model.batch_size,), current_time, device=device)
+
+                noise_level_full = model._get_noise_levels(device, end_index, time_steps)
+                noise_level = noise_level_full[:, -model.seq_len:]
+                noise_level_for_update = noise_level_full
+
+                noisy_input = []
+                for i in range(model.batch_size):
+                    noisy_input.append(
+                        model.generated[i, :, :end_index, ...][:, -model.seq_len:]
+                    )
+
+                text_condition = []
+                for i in range(model.batch_size):
+                    text_condition.extend(
+                        model.text_condition_list[i][:end_index][-model.seq_len:]
+                    )
+
+                # ====== ABLATION: use FULL seq_len for traj window ======
+                traj_emb = model._traj_buf.build_traj_emb(end_index, model.seq_len, device)
+                # Also try building with extended end to include future:
+                # build_traj_emb(N, seq_len) gives [N-seq_len, N).
+                # We want [end_index-seq_len, end_index + extra) → N = end_index + seq_len
+                # But limited by what the buffer actually has.
+                _extra_end = min(
+                    end_index + model.seq_len,
+                    model._traj_buf.buf_len,
+                )
+                traj_emb_full = model._traj_buf.build_traj_emb(
+                    _extra_end, model.seq_len, device
+                )
+                if traj_emb_full is not None:
+                    traj_emb = traj_emb_full
+
+                if traj_emb is not None:
+                    valid_lens = model._traj_buf.get_traj_valid_lens(
+                        min(end_index + model.seq_len, model._traj_buf.buf_len),
+                        model.seq_len, device,
+                    )
+                    traj_seq_lens = (
+                        valid_lens
+                        if valid_lens is not None
+                        else torch.full(
+                            (model.batch_size,), model.seq_len,
+                            device=device, dtype=torch.long,
+                        )
+                    )
+                else:
+                    traj_seq_lens = None
+
+                model_sl = model.seq_len  # ABLATION: full window
+                t_scaled = noise_level * model.time_embedding_scale
+                predicted_result = model._denoise_with_cfg(
+                    noisy_input, t_scaled,
+                    text_condition, text_null_context,
+                    traj_emb, traj_seq_lens, model_sl, model.batch_size,
+                )
+
+                for i in range(model.batch_size):
+                    predicted_result_i = predicted_result[i]
+                    if end_index > model.seq_len:
+                        predicted_result_i = torch.cat(
+                            [
+                                torch.zeros(
+                                    predicted_result_i.shape[0],
+                                    end_index - model.seq_len,
+                                    predicted_result_i.shape[2],
+                                    predicted_result_i.shape[3],
+                                    device=device,
+                                ),
+                                predicted_result_i,
+                            ],
+                            dim=1,
+                        )
+                    if model.prediction_type == "vel":
+                        predicted_vel = predicted_result_i[:, start_index:end_index, ...]
+                        model.generated[i, :, start_index:end_index, ...] += (
+                            predicted_vel * model.dt
+                        )
+                    elif model.prediction_type == "x0":
+                        nl = (
+                            noise_level_for_update[i, start_index:end_index]
+                            .unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+                            .clamp(min=1e-6)
+                        )
+                        predicted_vel = (
+                            predicted_result_i[:, start_index:end_index, ...]
+                            - model.generated[i, :, start_index:end_index, ...]
+                        ) / nl
+                        model.generated[i, :, start_index:end_index, ...] += (
+                            predicted_vel * model.dt
+                        )
+                    elif model.prediction_type == "noise":
+                        denom = (
+                            1 + model.dt
+                            - noise_level_for_update[i, start_index:end_index]
+                            .unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+                        ).clamp(min=1e-6)
+                        predicted_vel = (
+                            model.generated[i, :, start_index:end_index, ...]
+                            - predicted_result_i[:, start_index:end_index, ...]
+                        ) / denom
+                        model.generated[i, :, start_index:end_index, ...] += (
+                            predicted_vel * model.dt
+                        )
+                model.current_step += 1
+
+            output = model.generated[
+                :, :, model.commit_index : model.commit_index + 1, ...
+            ]
+            output = model.postprocess(output)
+            out = {"generated": output}
+            model.commit_index += 1
+
+            if model.commit_index == model.seq_len * 2:
+                model.generated = torch.cat(
+                    [
+                        model.generated[:, :, model.seq_len:, ...],
+                        torch.randn(
+                            model.batch_size, model.input_dim,
+                            model.seq_len, 1, 1, device=device,
+                        ),
+                    ],
+                    dim=2,
+                )
+                model._traj_buf.roll(model.seq_len, device)
+                model.current_step -= (
+                    model.seq_len * model.num_denoise_steps / model.chunk_size
+                )
+                model.commit_index -= model.seq_len
+                for i in range(model.batch_size):
+                    model.text_condition_list[i] = model.text_condition_list[i][
+                        model.seq_len:
+                    ]
+            return out
+
+        model.stream_generate_step = _patched_step
+
+        pred_motion, pred_root = run_stream_step(
+            model, vae, sample, device,
+            history_length=args.history_length,
+            num_denoise_steps=args.num_denoise_steps,
+            horizon_tokens=None, use_pred_root=False,
+            use_features_path=False, no_traj=False, collect_latents=False,
+        )
+        metrics = _build_mode_metrics(
+            pred_root, gt_root, target_traj, "step_future_traj_window_gtroot",
+            None, "gt", traj_encoder_path="xyz (full traj window)",
+        )
+        print(f"  ADE={metrics['ADE']:.4f}  FDE={metrics['FDE']:.4f}")
+        model.stream_generate_step = _orig_step
+        mode_dir = os.path.join(out_root, "step_future_traj_window_gtroot")
+        _save_artifacts(mode_dir, pred_motion, pred_root,
+                        gt_root[:len(pred_root)], target_traj[:len(pred_root)], metrics)
+
+        all_records = [metrics]
+        summary = {
+            "sample_id": args.sample_id, "dataset": args.dataset,
+            "ckpt": args.ckpt, "vae_ckpt": args.vae_ckpt,
+            "ablation": "future_traj_window",
+            "modes": all_records,
+        }
+        summary_path = os.path.join(out_root, "summary_future_traj.json")
         with open(summary_path, "w") as f:
             json.dump(summary, f, indent=2, default=str)
         print(f"\n{'Mode':<35} {'ADE':>8} {'FDE':>8}")
