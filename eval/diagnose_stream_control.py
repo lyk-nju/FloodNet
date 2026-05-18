@@ -2781,6 +2781,11 @@ def main():
             mode_dir = os.path.join(out_root, f"mid_update_{_mode_label}")
             _save_artifacts(mode_dir, pred_motion, pred_root,
                             gt_root[:len(pred_root)], target_traj[:len(pred_root)], metrics)
+            if args.render_video and pred_motion.size > 0:
+                _mp4 = os.path.join(mode_dir, "pred_motion.mp4")
+                render_single_video(motion=pred_motion, save_path=_mp4,
+                                    dim=263, render_setting={})
+                print(f"    video saved to {_mp4}")
             all_records.append(metrics)
 
         summary = {
