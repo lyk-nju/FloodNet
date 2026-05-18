@@ -1319,6 +1319,11 @@ def main():
                         help="Token time step in seconds.")
     parser.add_argument("--segment_boundary_smooth_frames", type=int, default=4,
                         help="Frames of Gaussian smoothing across segment boundaries.")
+    parser.add_argument("--mid_session_update", action="store_true", default=False,
+                        help="Ablation: split GT trajectory at --split_token, "
+                        "reset timestamped plan mid-session, measure pre/post ADE.")
+    parser.add_argument("--split_token", type=int, default=15,
+                        help="Token index for --mid_session_update split.")
     args = parser.parse_args()
 
     seed_everything(args.seed)
@@ -2699,6 +2704,101 @@ def main():
             )
         return
 
+    if args.mid_session_update:
+        print(f"\n=== Mid-session trajectory update (split at token "
+              f"{args.split_token}) ===")
+        tl = sample["token_length"]
+        split_tok = max(5, min(args.split_token, tl - args.traj_horizon_tokens - 1))
+        gt_root_arr = sample["traj"].numpy()
+        total_f = len(gt_root_arr)
+        times_full = np.arange(total_f, dtype=np.float32) / 20.0
+        waypoints_full = gt_root_arr
+        wp_idx = np.arange(0, total_f, max(1, int(args.waypoint_dt * 20.0)))
+        wp_t = np.arange(len(wp_idx), dtype=np.float32) * args.waypoint_dt
+
+        # --- Mode A: continuous timestamped plan (baseline) ---
+        print(f"\n--- timestamped_gt_plan (continuous) ---")
+        all_records = []
+        for _mode_label, _update_at in [("cont", None), ("split", split_tok)]:
+            total_frames = 1 + 4 * (tl - 1) if tl > 1 else 1
+            vae.clear_cache()
+            model.init_generated(args.history_length, batch_size=1,
+                                num_denoise_steps=args.num_denoise_steps)
+            model.generated = model.generated.to(device)
+            stream_rec = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
+            all_dec, all_pr = [], []
+            first_chunk = True
+            _plan_v = 0
+
+            for ci in range(tl):
+                if _update_at is not None and ci == _update_at:
+                    _plan_v += 1
+                _plan_start = 0 if _plan_v == 0 else split_tok
+                _elapsed = ci - _plan_start
+                qt = (float(_elapsed) * args.token_dt
+                      + np.arange(args.traj_horizon_tokens, dtype=np.float32) * args.token_dt)
+                ft = sample_timestamped_trajectory(times_full, waypoints_full, qt)
+                # Root alignment: shift so first plan position maps to current root.
+                cur_root = np.zeros(3, dtype=np.float32)
+                cur_root[[0, 2]] = stream_rec.r_pos_accum[[0, 2]].astype(np.float32)
+                anchor = sample_timestamped_trajectory(
+                    times_full, waypoints_full, np.asarray([qt[0]], dtype=np.float32))[0]
+                ft = cur_root + (ft - anchor.astype(np.float32))
+
+                ti = {"traj": torch.from_numpy(ft).float().unsqueeze(0),
+                      "token_mask": torch.ones(1, args.traj_horizon_tokens)}
+                sp = build_stream_step_model_input(
+                    sample["text"] if isinstance(sample["text"], str) else sample["text"][0],
+                    traj_input=ti)
+                out = model.stream_generate_step(sp, first_chunk=first_chunk)
+                dec = (vae.stream_decode(out["generated"][0][None, :].to(device),
+                                         first_chunk=first_chunk)[0].float().cpu().numpy())
+                first_chunk = False
+                for frm in dec:
+                    stream_rec.process_frame(frm)
+                all_dec.append(dec)
+                all_pr.append(extract_root_trajectory_263(dec))
+
+            vae.clear_cache()
+            pred_motion = (np.concatenate(all_dec, axis=0)[:total_frames]
+                           if all_dec else np.zeros((0, 263)))
+            pred_root = (np.concatenate(all_pr, axis=0)[:total_frames]
+                         if all_pr else np.zeros((0, 3)))
+
+            # Per-segment metrics.
+            pre_root, gt_pre = pred_root[:split_tok], gt_root[:split_tok]
+            post_root, gt_post = (pred_root[split_tok:split_tok * 2],
+                                  gt_root[split_tok:split_tok * 2])
+            metrics = _build_mode_metrics(
+                pred_root, gt_root, target_traj,
+                f"mid_update_{_mode_label}_split{args.split_token}", None, "gt",
+                traj_encoder_path=f"timestamped, split={_update_at}")
+            metrics["ADE_pre_split"] = _compute_ade(pre_root, gt_pre) if len(pre_root) > 1 else float("nan")
+            metrics["ADE_post_split"] = _compute_ade(post_root, gt_post) if len(post_root) > 1 else float("nan")
+            print(f"  ADE={metrics['ADE']:.4f}  pre={metrics['ADE_pre_split']:.4f}  "
+                  f"post={metrics['ADE_post_split']:.4f}")
+
+            mode_dir = os.path.join(out_root, f"mid_update_{_mode_label}")
+            _save_artifacts(mode_dir, pred_motion, pred_root,
+                            gt_root[:len(pred_root)], target_traj[:len(pred_root)], metrics)
+            all_records.append(metrics)
+
+        summary = {
+            "sample_id": args.sample_id, "split_token": split_tok,
+            "ckpt": args.ckpt, "vae_ckpt": args.vae_ckpt,
+            "ablation": "mid_session_update",
+            "modes": {m["mode"]: {k: v for k, v in m.items()} for m in all_records},
+        }
+        summary_path = os.path.join(out_root, "summary_mid_update.json")
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2, default=str)
+        print(f"\n{'Mode':<48} {'ADE':>8} {'pre':>8} {'post':>8}")
+        print("-" * 76)
+        for m in all_records:
+            print(f"{m['mode']:<48} {m['ADE']:>8.4f} "
+                  f"{m.get('ADE_pre_split', float('nan')):>8.4f} "
+                  f"{m.get('ADE_post_split', float('nan')):>8.4f}")
+        return
 
     # Encoding path labels per mode family.
     _TPATH_GENERATE = (
