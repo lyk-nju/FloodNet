@@ -84,6 +84,57 @@ def build_remaining_polyline(
     return dedupe_polyline(path)
 
 
+def build_projected_suffix_polyline(
+    root_xyz: np.ndarray, waypoints_xyz: np.ndarray
+) -> np.ndarray:
+    """Build the remaining path from the projection of ``root_xyz``.
+
+    Unlike :func:`build_remaining_polyline`, this does not insert the current
+    root as the first vertex.  It preserves along-path progress and leaves
+    lateral recovery to the caller.
+    """
+    projected, seg_idx, seg_t = project_point_to_polyline(root_xyz, waypoints_xyz)
+    suffix = [projected.astype(np.float32)]
+    if len(waypoints_xyz) > 1:
+        if seg_t < 1.0 - 1e-6:
+            suffix.append(waypoints_xyz[seg_idx + 1].astype(np.float32))
+            suffix.extend(waypoints_xyz[seg_idx + 2:].astype(np.float32))
+        else:
+            suffix.extend(waypoints_xyz[seg_idx + 1:].astype(np.float32))
+    return dedupe_polyline(np.asarray(suffix, dtype=np.float32))
+
+
+def build_recovery_future_traj(
+    root_xyz: np.ndarray,
+    waypoints_xyz: np.ndarray,
+    num_tokens: int,
+    token_step: float,
+    *,
+    recovery_tokens: int = 6,
+) -> np.ndarray:
+    """Build future targets that compensate closed-loop root drift.
+
+    The existing web-demo path first samples ``current_root -> projected_path``.
+    That can consume near-term targets on lateral return and reduce forward
+    progress.  This helper instead samples along the projected suffix path, then
+    blends targets from the current root to the suffix over ``recovery_tokens``.
+
+    The first token stays at the current root, matching current streaming
+    semantics where the trajectory suffix is written at ``commit_index``.
+    """
+    if num_tokens <= 0:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    root = np.asarray(root_xyz, dtype=np.float32).reshape(3)
+    suffix = build_projected_suffix_polyline(root, waypoints_xyz)
+    path_targets = resample_polyline(suffix, num_tokens, token_step)
+
+    denom = float(max(1, int(recovery_tokens)))
+    alpha = np.minimum(1.0, np.arange(num_tokens, dtype=np.float32) / denom)
+    alpha = alpha[:, None]
+    return ((1.0 - alpha) * root[None, :] + alpha * path_targets).astype(np.float32)
+
+
 def resample_polyline(
     points_xyz: np.ndarray, num_tokens: int, token_step: float
 ) -> np.ndarray:
@@ -117,6 +168,57 @@ def resample_polyline(
     out = np.empty((num_tokens, 3), dtype=np.float32)
     for dim in range(3):
         out[:, dim] = np.interp(sample_d, cum, points_xyz[:, dim]).astype(np.float32)
+    return out
+
+
+def sample_timestamped_trajectory(
+    times: np.ndarray,
+    points_xyz: np.ndarray,
+    query_times: np.ndarray,
+) -> np.ndarray:
+    """Sample a time-parameterized trajectory by linear interpolation.
+
+    Args:
+        times: (N,) monotonically increasing seconds.
+        points_xyz: (N, 3) world-space trajectory points.
+        query_times: (M,) seconds to sample.
+
+    Returns:
+        (M, 3) world-space points. Queries outside the time range clamp to the
+        endpoint values, matching ``np.interp`` semantics.
+    """
+    query_times = np.asarray(query_times, dtype=np.float32)
+    if query_times.size == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    times = np.asarray(times, dtype=np.float32).reshape(-1)
+    points = np.asarray(points_xyz, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"points_xyz must have shape (N, 3), got {points.shape}")
+    if len(times) != len(points):
+        raise ValueError(
+            f"times/points length mismatch: {len(times)} vs {len(points)}"
+        )
+    if len(times) == 0:
+        return np.zeros((len(query_times), 3), dtype=np.float32)
+    if len(times) == 1:
+        return np.repeat(points[:1], len(query_times), axis=0).astype(np.float32)
+
+    order = np.argsort(times)
+    times = times[order]
+    points = points[order]
+
+    # Drop duplicate timestamps; np.interp expects a strictly increasing x-axis.
+    keep = np.ones(len(times), dtype=bool)
+    keep[1:] = np.diff(times) > 1e-8
+    times = times[keep]
+    points = points[keep]
+    if len(times) == 1:
+        return np.repeat(points[:1], len(query_times), axis=0).astype(np.float32)
+
+    out = np.empty((len(query_times), 3), dtype=np.float32)
+    for dim in range(3):
+        out[:, dim] = np.interp(query_times, times, points[:, dim]).astype(np.float32)
     return out
 
 

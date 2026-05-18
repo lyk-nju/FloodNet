@@ -53,8 +53,11 @@ from utils.stream_rollout import (
 )
 from utils.stream_traj import (
     build_remaining_polyline,
+    build_recovery_future_traj,
     estimate_token_step_distance,
+    project_point_to_polyline,
     resample_polyline,
+    sample_timestamped_trajectory,
 )
 from utils.traj_batch import root_to_traj_feats
 
@@ -355,6 +358,35 @@ def _compute_root_path_length(root: np.ndarray) -> float:
     return float(np.sum(np.linalg.norm(np.diff(root[:, [0, 2]], axis=0), axis=1)))
 
 
+def _compute_oracle_token_step(sample: dict) -> float:
+    """Estimate token-step distance from GT token-level root motion.
+
+    This is diagnostic-only.  If oracle step improves pred-root behaviour, the
+    web path's online velocity estimate is part of the issue.
+    """
+    traj = sample["traj"].numpy().astype(np.float32)
+    token_length = int(sample["token_length"])
+    if token_length <= 1 or len(traj) <= 1:
+        return 0.25
+    frame_indices = [
+        0,
+        *[min(4 * token_idx, len(traj) - 1) for token_idx in range(1, token_length)],
+    ]
+    token_root = traj[frame_indices, :]
+    steps = np.linalg.norm(np.diff(token_root[:, [0, 2]], axis=0), axis=1)
+    steps = steps[np.isfinite(steps) & (steps > 1e-6)]
+    if steps.size == 0:
+        return 0.25
+    return float(np.clip(np.median(steps), 0.05, 1.50))
+
+
+def _make_gt_timestamped_traj(sample: dict, motion_fps: float = 20.0):
+    """Build a timestamped trajectory from dataset GT root frames."""
+    traj = sample["traj"].numpy().astype(np.float32)
+    times = np.arange(len(traj), dtype=np.float32) / float(motion_fps)
+    return times, traj
+
+
 # ---------------------------------------------------------------------------
 # generation modes
 # ---------------------------------------------------------------------------
@@ -411,6 +443,12 @@ def run_stream_step(
     use_features_path: bool = False,
     no_traj: bool = False,
     collect_latents: bool = False,
+    predroot_mode: str = "current_polyline",
+    recovery_tokens: int = 6,
+    oracle_token_step: float | None = None,
+    timestamped_traj: tuple[np.ndarray, np.ndarray] | None = None,
+    token_dt: float = 0.2,
+    trace_sink: list | None = None,
 ):
     """Run stream_generate_step() with configurable horizon and root source.
 
@@ -420,6 +458,10 @@ def run_stream_step(
     When *no_traj* is True, skips trajectory conditioning entirely.
     When *collect_latents* is True, returns latent tokens instead of decoded
     motion (for offline-decode comparison).
+    *predroot_mode* selects how the closed-loop future trajectory is rebuilt
+    from the predicted root.  ``current_polyline`` mirrors web_demo; ``recovery``
+    preserves path progress while blending lateral error back to the path;
+    ``timestamped`` samples a time-parameterized trajectory at token times.
     """
     token_length = sample["token_length"]
     total_frames = 1 + 4 * (token_length - 1) if token_length > 1 else 1
@@ -478,9 +520,71 @@ def run_stream_step(
                 h = max(1, token_length - commit_idx)
             current_root = np.zeros(3, dtype=np.float32)
             current_root[[0, 2]] = stream_recovery.r_pos_accum[[0, 2]].astype(np.float32)
-            polyline = build_remaining_polyline(current_root, gt_polyline)
-            token_step = estimate_token_step_distance(root_xz_history)
-            future_traj = resample_polyline(polyline, h, token_step)
+            token_step = (
+                float(oracle_token_step)
+                if oracle_token_step is not None
+                else estimate_token_step_distance(root_xz_history)
+            )
+            if predroot_mode == "current_polyline":
+                polyline = build_remaining_polyline(current_root, gt_polyline)
+                future_traj = resample_polyline(polyline, h, token_step)
+            elif predroot_mode == "recovery":
+                future_traj = build_recovery_future_traj(
+                    current_root,
+                    gt_polyline,
+                    h,
+                    token_step,
+                    recovery_tokens=recovery_tokens,
+                )
+            elif predroot_mode == "timestamped":
+                if timestamped_traj is None:
+                    raise ValueError("timestamped_traj is required for timestamped mode")
+                traj_times, traj_xyz = timestamped_traj
+                query_times = (
+                    float(commit_idx) * float(token_dt)
+                    + np.arange(h, dtype=np.float32) * float(token_dt)
+                )
+                future_traj = sample_timestamped_trajectory(
+                    traj_times, traj_xyz, query_times
+                )
+            else:
+                raise ValueError(f"Unknown predroot_mode: {predroot_mode}")
+            if trace_sink is not None:
+                projected, seg_idx, seg_t = project_point_to_polyline(
+                    current_root, gt_polyline
+                )
+                if len(future_traj) > 1:
+                    _future_steps = np.linalg.norm(
+                        np.diff(future_traj[:, [0, 2]], axis=0), axis=1
+                    )
+                    _future_token_step = float(np.median(_future_steps))
+                else:
+                    _future_token_step = 0.0
+                trace_sink.append(
+                    {
+                        "commit_index": int(commit_idx),
+                        "mode": predroot_mode,
+                        "token_step": float(token_step),
+                        "future_token_step": _future_token_step,
+                        "recovery_tokens": int(recovery_tokens),
+                        "current_root": current_root.tolist(),
+                        "projected_root": projected.astype(np.float32).tolist(),
+                        "query_time": float(commit_idx) * float(token_dt),
+                        "segment_index": int(seg_idx),
+                        "segment_t": float(seg_t),
+                        "cross_track_error": float(
+                            np.linalg.norm(
+                                current_root[[0, 2]] - projected[[0, 2]]
+                            )
+                        ),
+                        "future_first": future_traj[0].tolist()
+                        if len(future_traj)
+                        else None,
+                        "future_last": future_traj[-1].tolist()
+                        if len(future_traj)
+                        else None,
+                    }
+                )
             traj_input = {
                 "traj": torch.from_numpy(future_traj).float().unsqueeze(0),
                 "token_mask": torch.ones(1, future_traj.shape[0]),
@@ -667,8 +771,45 @@ def main():
         help="Ablation: keep stream_generate_step's WanModel seq_len fixed to "
         "history_length while preserving the existing traj window.",
     )
+    parser.add_argument(
+        "--predroot_recovery_ablation",
+        action="store_true",
+        default=False,
+        help="Ablation: compare web-demo pred-root trajectory rebuilding with "
+        "projected-path recovery compensation.",
+    )
+    parser.add_argument(
+        "--predroot_token_step_sweep",
+        type=str,
+        default=None,
+        help="Comma-separated fixed token_step values for pred-root current-polyline "
+        "diagnosis, e.g. '0.06,0.08,0.10,0.12,0.15,0.20'. "
+        "Bypasses the full diagnostic matrix.",
+    )
+    parser.add_argument(
+        "--predroot_timestamped_ablation",
+        action="store_true",
+        default=False,
+        help="Ablation: build future trajectory by timestamp interpolation from "
+        "dataset GT root, matching web-demo-like stream_generate_step without "
+        "distance-based token_step estimation.",
+    )
+    parser.add_argument(
+        "--timestamped_fixed_token_step",
+        type=float,
+        default=0.10,
+        help="Fixed token_step baseline included in --predroot_timestamped_ablation.",
+    )
+    parser.add_argument(
+        "--recovery_tokens",
+        type=int,
+        default=6,
+        help="Number of future tokens used to blend closed-loop root drift back "
+        "to the projected path in --predroot_recovery_ablation.",
+    )
     parser.add_argument("--traj_horizon_tokens", type=int, default=20)
     parser.add_argument("--num_denoise_steps", type=int, default=10)
+    parser.add_argument("--motion_fps", type=float, default=20.0)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--raw_data_dir", required=True)
     parser.add_argument(
@@ -1582,6 +1723,400 @@ def main():
         print("-" * 53)
         for rec in all_records:
             print(f"{rec['mode']:<35} {rec['ADE']:>8.4f} {rec['FDE']:>8.4f}")
+        return
+
+    if args.predroot_recovery_ablation:
+        print("\n=== Pred-root recovery ablation ===")
+        oracle_step = _compute_oracle_token_step(sample)
+        print(f"  oracle token_step={oracle_step:.4f}")
+        mode_specs = [
+            (
+                f"predroot_current_h{args.traj_horizon_tokens}",
+                "current_polyline",
+                None,
+                "web-demo current_root->projection polyline",
+            ),
+            (
+                f"predroot_current_oracle_h{args.traj_horizon_tokens}",
+                "current_polyline",
+                oracle_step,
+                "web-demo polyline with GT oracle token_step",
+            ),
+            (
+                f"predroot_recovery_r{args.recovery_tokens}_h{args.traj_horizon_tokens}",
+                "recovery",
+                None,
+                "projected suffix + lateral-error recovery blend",
+            ),
+            (
+                f"predroot_recovery_oracle_r{args.recovery_tokens}_h{args.traj_horizon_tokens}",
+                "recovery",
+                oracle_step,
+                "recovery blend with GT oracle token_step",
+            ),
+        ]
+        all_records = []
+        for mode_name, pred_mode, token_step_override, traj_path in mode_specs:
+            print(f"\n--- {mode_name} ---")
+            trace: list[dict] = []
+            seed_everything(args.seed)
+            pred_motion, pred_root = run_stream_step(
+                model,
+                vae,
+                sample,
+                device,
+                history_length=args.history_length,
+                num_denoise_steps=args.num_denoise_steps,
+                horizon_tokens=args.traj_horizon_tokens,
+                use_pred_root=True,
+                predroot_mode=pred_mode,
+                recovery_tokens=args.recovery_tokens,
+                oracle_token_step=token_step_override,
+                trace_sink=trace,
+            )
+            metrics = _build_mode_metrics(
+                pred_root,
+                gt_root,
+                target_traj,
+                mode_name,
+                args.traj_horizon_tokens,
+                "pred",
+                traj_encoder_path=traj_path,
+            )
+            metrics["predroot_mode"] = pred_mode
+            metrics["recovery_tokens"] = int(args.recovery_tokens)
+            metrics["oracle_token_step"] = (
+                None if token_step_override is None else float(token_step_override)
+            )
+            if trace:
+                metrics["mean_cross_track_error"] = float(
+                    np.mean([row["cross_track_error"] for row in trace])
+                )
+                metrics["max_cross_track_error"] = float(
+                    np.max([row["cross_track_error"] for row in trace])
+                )
+            print(f"  ADE={metrics['ADE']:.4f}  FDE={metrics['FDE']:.4f}")
+            if trace:
+                print(
+                    "  cross_track="
+                    f"{metrics['mean_cross_track_error']:.4f}/"
+                    f"{metrics['max_cross_track_error']:.4f} mean/max"
+                )
+            mode_dir = os.path.join(out_root, mode_name)
+            _save_artifacts(
+                mode_dir,
+                pred_motion,
+                pred_root,
+                gt_root[: len(pred_root)],
+                target_traj[: len(pred_root)],
+                metrics,
+            )
+            with open(os.path.join(mode_dir, "predroot_trace.json"), "w") as f:
+                json.dump(trace, f, indent=2, default=str)
+            all_records.append(metrics)
+
+        summary = {
+            "sample_id": args.sample_id,
+            "dataset": args.dataset,
+            "ckpt": args.ckpt,
+            "vae_ckpt": args.vae_ckpt,
+            "config": args.config,
+            "ablation": "predroot_recovery",
+            "history_length": args.history_length,
+            "traj_horizon_tokens": args.traj_horizon_tokens,
+            "recovery_tokens": args.recovery_tokens,
+            "oracle_token_step": oracle_step,
+            "modes": all_records,
+        }
+        summary_path = os.path.join(out_root, "summary_predroot_recovery.json")
+        os.makedirs(out_root, exist_ok=True)
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2, default=str)
+        print(f"\nSummary saved to {summary_path}")
+        print(f"\n{'Mode':<48} {'ADE':>8} {'FDE':>8} {'XTE':>8}")
+        print("-" * 76)
+        for rec in all_records:
+            print(
+                f"{rec['mode']:<48} {rec['ADE']:>8.4f} "
+                f"{rec['FDE']:>8.4f} "
+                f"{rec.get('mean_cross_track_error', float('nan')):>8.4f}"
+            )
+        return
+
+    if args.predroot_token_step_sweep:
+        print("\n=== Pred-root token-step sweep ===")
+        fixed_steps = [
+            float(x.strip())
+            for x in args.predroot_token_step_sweep.split(",")
+            if x.strip()
+        ]
+        oracle_step = _compute_oracle_token_step(sample)
+        print(f"  oracle token_step={oracle_step:.4f}")
+        all_records = []
+
+        sweep_specs = [(None, "online_estimate")]
+        sweep_specs.extend((step, f"fixed_{step:.4f}") for step in fixed_steps)
+        sweep_specs.append((oracle_step, "oracle"))
+
+        for step_value, label in sweep_specs:
+            mode_name = f"predroot_step_{label}_h{args.traj_horizon_tokens}"
+            print(f"\n--- {mode_name} ---")
+            trace: list[dict] = []
+            seed_everything(args.seed)
+            pred_motion, pred_root = run_stream_step(
+                model,
+                vae,
+                sample,
+                device,
+                history_length=args.history_length,
+                num_denoise_steps=args.num_denoise_steps,
+                horizon_tokens=args.traj_horizon_tokens,
+                use_pred_root=True,
+                predroot_mode="current_polyline",
+                oracle_token_step=step_value,
+                trace_sink=trace,
+            )
+            metrics = _build_mode_metrics(
+                pred_root,
+                gt_root,
+                target_traj,
+                mode_name,
+                args.traj_horizon_tokens,
+                "pred",
+                traj_encoder_path="web-demo current_root->projection polyline",
+            )
+            metrics["fixed_token_step"] = (
+                None if step_value is None else float(step_value)
+            )
+            if trace:
+                token_steps = [row["token_step"] for row in trace]
+                metrics["mean_token_step"] = float(np.mean(token_steps))
+                metrics["min_token_step"] = float(np.min(token_steps))
+                metrics["max_token_step"] = float(np.max(token_steps))
+                metrics["mean_cross_track_error"] = float(
+                    np.mean([row["cross_track_error"] for row in trace])
+                )
+                metrics["max_cross_track_error"] = float(
+                    np.max([row["cross_track_error"] for row in trace])
+                )
+            print(f"  ADE={metrics['ADE']:.4f}  FDE={metrics['FDE']:.4f}")
+            if trace:
+                print(
+                    "  token_step="
+                    f"{metrics['mean_token_step']:.4f}/"
+                    f"{metrics['min_token_step']:.4f}/"
+                    f"{metrics['max_token_step']:.4f} mean/min/max"
+                )
+            mode_dir = os.path.join(out_root, mode_name)
+            _save_artifacts(
+                mode_dir,
+                pred_motion,
+                pred_root,
+                gt_root[: len(pred_root)],
+                target_traj[: len(pred_root)],
+                metrics,
+            )
+            with open(os.path.join(mode_dir, "predroot_trace.json"), "w") as f:
+                json.dump(trace, f, indent=2, default=str)
+            all_records.append(metrics)
+
+        summary = {
+            "sample_id": args.sample_id,
+            "dataset": args.dataset,
+            "ckpt": args.ckpt,
+            "vae_ckpt": args.vae_ckpt,
+            "config": args.config,
+            "ablation": "predroot_token_step_sweep",
+            "history_length": args.history_length,
+            "traj_horizon_tokens": args.traj_horizon_tokens,
+            "fixed_steps": fixed_steps,
+            "oracle_token_step": oracle_step,
+            "modes": all_records,
+        }
+        summary_path = os.path.join(out_root, "summary_predroot_token_step_sweep.json")
+        os.makedirs(out_root, exist_ok=True)
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2, default=str)
+        print(f"\nSummary saved to {summary_path}")
+        print(f"\n{'Mode':<48} {'ADE':>8} {'FDE':>8} {'step':>8}")
+        print("-" * 76)
+        for rec in all_records:
+            print(
+                f"{rec['mode']:<48} {rec['ADE']:>8.4f} "
+                f"{rec['FDE']:>8.4f} "
+                f"{rec.get('mean_token_step', float('nan')):>8.4f}"
+            )
+        return
+
+    if args.predroot_timestamped_ablation:
+        print("\n=== Pred-root timestamped trajectory ablation ===")
+        oracle_step = _compute_oracle_token_step(sample)
+        token_dt = 4.0 / float(args.motion_fps)
+        timestamped_traj = _make_gt_timestamped_traj(sample, motion_fps=args.motion_fps)
+        print(f"  oracle token_step={oracle_step:.4f}")
+        print(f"  token_dt={token_dt:.4f}s  motion_fps={args.motion_fps:.2f}")
+
+        all_records = []
+
+        # First add a GT-root ceiling under the same H-token horizon.
+        print(f"\n--- gtroot_h{args.traj_horizon_tokens} ---")
+        seed_everything(args.seed)
+        pred_motion, pred_root = run_stream_step(
+            model,
+            vae,
+            sample,
+            device,
+            history_length=args.history_length,
+            num_denoise_steps=args.num_denoise_steps,
+            horizon_tokens=args.traj_horizon_tokens,
+            use_pred_root=False,
+        )
+        metrics = _build_mode_metrics(
+            pred_root,
+            gt_root,
+            target_traj,
+            f"gtroot_h{args.traj_horizon_tokens}",
+            args.traj_horizon_tokens,
+            "gt",
+            traj_encoder_path="GT suffix xyz, clipped horizon",
+        )
+        print(f"  ADE={metrics['ADE']:.4f}  FDE={metrics['FDE']:.4f}")
+        mode_dir = os.path.join(out_root, metrics["mode"])
+        _save_artifacts(
+            mode_dir,
+            pred_motion,
+            pred_root,
+            gt_root[: len(pred_root)],
+            target_traj[: len(pred_root)],
+            metrics,
+        )
+        all_records.append(metrics)
+
+        mode_specs = [
+            (
+                f"predroot_current_h{args.traj_horizon_tokens}",
+                "current_polyline",
+                None,
+                None,
+                "web-demo current root + online token_step",
+            ),
+            (
+                f"predroot_fixed_{args.timestamped_fixed_token_step:.4f}_h{args.traj_horizon_tokens}",
+                "current_polyline",
+                float(args.timestamped_fixed_token_step),
+                None,
+                "web-demo current root + fixed token_step",
+            ),
+            (
+                f"predroot_oracle_h{args.traj_horizon_tokens}",
+                "current_polyline",
+                oracle_step,
+                None,
+                "web-demo current root + GT oracle token_step",
+            ),
+            (
+                f"timestamped_gt_h{args.traj_horizon_tokens}",
+                "timestamped",
+                None,
+                timestamped_traj,
+                "GT timestamped root sampled at token times",
+            ),
+        ]
+
+        for mode_name, pred_mode, token_step_override, ts_traj, traj_path in mode_specs:
+            print(f"\n--- {mode_name} ---")
+            trace: list[dict] = []
+            seed_everything(args.seed)
+            pred_motion, pred_root = run_stream_step(
+                model,
+                vae,
+                sample,
+                device,
+                history_length=args.history_length,
+                num_denoise_steps=args.num_denoise_steps,
+                horizon_tokens=args.traj_horizon_tokens,
+                use_pred_root=True,
+                predroot_mode=pred_mode,
+                oracle_token_step=token_step_override,
+                timestamped_traj=ts_traj,
+                token_dt=token_dt,
+                trace_sink=trace,
+            )
+            metrics = _build_mode_metrics(
+                pred_root,
+                gt_root,
+                target_traj,
+                mode_name,
+                args.traj_horizon_tokens,
+                "pred" if pred_mode != "timestamped" else "timestamped_gt",
+                traj_encoder_path=traj_path,
+            )
+            metrics["predroot_mode"] = pred_mode
+            metrics["fixed_token_step"] = (
+                None if token_step_override is None else float(token_step_override)
+            )
+            metrics["token_dt"] = float(token_dt)
+            if trace:
+                metrics["mean_future_token_step"] = float(
+                    np.mean([row["future_token_step"] for row in trace])
+                )
+                metrics["mean_cross_track_error"] = float(
+                    np.mean([row["cross_track_error"] for row in trace])
+                )
+                metrics["max_cross_track_error"] = float(
+                    np.max([row["cross_track_error"] for row in trace])
+                )
+            print(f"  ADE={metrics['ADE']:.4f}  FDE={metrics['FDE']:.4f}")
+            if trace:
+                print(
+                    "  future_step="
+                    f"{metrics['mean_future_token_step']:.4f}  "
+                    "cross_track="
+                    f"{metrics['mean_cross_track_error']:.4f}/"
+                    f"{metrics['max_cross_track_error']:.4f} mean/max"
+                )
+            mode_dir = os.path.join(out_root, mode_name)
+            _save_artifacts(
+                mode_dir,
+                pred_motion,
+                pred_root,
+                gt_root[: len(pred_root)],
+                target_traj[: len(pred_root)],
+                metrics,
+            )
+            with open(os.path.join(mode_dir, "predroot_trace.json"), "w") as f:
+                json.dump(trace, f, indent=2, default=str)
+            all_records.append(metrics)
+
+        summary = {
+            "sample_id": args.sample_id,
+            "dataset": args.dataset,
+            "ckpt": args.ckpt,
+            "vae_ckpt": args.vae_ckpt,
+            "config": args.config,
+            "ablation": "predroot_timestamped",
+            "history_length": args.history_length,
+            "traj_horizon_tokens": args.traj_horizon_tokens,
+            "motion_fps": args.motion_fps,
+            "token_dt": token_dt,
+            "oracle_token_step": oracle_step,
+            "timestamped_fixed_token_step": args.timestamped_fixed_token_step,
+            "modes": all_records,
+        }
+        summary_path = os.path.join(out_root, "summary_predroot_timestamped.json")
+        os.makedirs(out_root, exist_ok=True)
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2, default=str)
+        print(f"\nSummary saved to {summary_path}")
+        print(f"\n{'Mode':<48} {'ADE':>8} {'FDE':>8} {'step':>8} {'XTE':>8}")
+        print("-" * 86)
+        for rec in all_records:
+            print(
+                f"{rec['mode']:<48} {rec['ADE']:>8.4f} "
+                f"{rec['FDE']:>8.4f} "
+                f"{rec.get('mean_future_token_step', float('nan')):>8.4f} "
+                f"{rec.get('mean_cross_track_error', float('nan')):>8.4f}"
+            )
         return
 
     # Encoding path labels per mode family.
