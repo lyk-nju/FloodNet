@@ -485,9 +485,6 @@ class ModelManager:
         world-space; model-side TrajStreamBuffer still performs its own
         history-window anchor subtract.
         """
-        if self.traj_repeat_policy != "translate_from_current_root":
-            return sample_timestamped_trajectory(traj_times, waypoints, query_times)
-
         times = np.asarray(traj_times, dtype=np.float32).reshape(-1)
         points = np.asarray(waypoints, dtype=np.float32)
         queries = np.asarray(query_times, dtype=np.float32).reshape(-1)
@@ -497,8 +494,6 @@ class ModelManager:
         start_t = float(times[0])
         end_t = float(times[-1])
         duration = end_t - start_t
-        if duration <= 1e-6:
-            return sample_timestamped_trajectory(times, points, queries)
 
         def sample_unwrapped(query_values: np.ndarray) -> np.ndarray:
             query_values = np.asarray(query_values, dtype=np.float32).reshape(-1)
@@ -509,6 +504,18 @@ class ModelManager:
             return local + cycle[:, None].astype(np.float32) * (points[-1] - points[0])
 
         current_root = self._get_current_root_xyz().astype(np.float32)
+
+        if self.traj_repeat_policy != "translate_from_current_root":
+            # Align first queried position to current root but WITHOUT cycle
+            # unwrapping — the plan ends at its natural endpoint.
+            result = sample_timestamped_trajectory(times, points, queries)
+            anchor = sample_timestamped_trajectory(
+                times, points,
+                np.asarray([queries[0]], dtype=np.float32),
+            )[0]
+            return (current_root + (result - anchor)).astype(np.float32)
+
+        # translate_from_current_root: same root alignment plus cycle repeat.
         unwrapped = sample_unwrapped(queries)
         anchor = sample_unwrapped(np.asarray([queries[0]], dtype=np.float32))[0]
         self.traj_repeat_anchor_root = current_root.copy()
