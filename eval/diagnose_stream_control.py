@@ -967,8 +967,13 @@ def _run_babel_long_session(args, model, vae, device, out_root):
                             "pred_path_length": _compute_root_path_length(pr),
                             "gt_path_length": _compute_root_path_length(gr)})
 
+        _mode_label = mode
+        if mode == "duration_waypoints":
+            _mode_label = f"{mode}_wp{args.waypoint_dt:.3f}"
+        elif mode == "timestamped_gt_plan":
+            _mode_label = f"{mode}_tdt{args.token_dt:.3f}"
         metrics = _build_mode_metrics(
-            pred_root, gt_root, target_traj, mode, None, "gt",
+            pred_root, gt_root, target_traj, _mode_label, None, "gt",
             traj_encoder_path=f"babel-{mode}")
         metrics["segments"] = seg_met
         metrics["pred_path_length"] = float(_compute_root_path_length(pred_root))
@@ -981,7 +986,7 @@ def _run_babel_long_session(args, model, vae, device, out_root):
             if sm:
                 print(f"    [{sm['text'][:40]}] ADE={sm['ADE']:.4f}")
 
-        mode_dir = os.path.join(out_root, mode)
+        mode_dir = os.path.join(out_root, _mode_label)
         _save_artifacts(mode_dir, pred_motion, pred_root,
                         gt_root[:len(pred_root)], target_traj[:len(pred_root)], metrics)
         np.save(os.path.join(mode_dir, "gt_motion.npy"),
@@ -1227,8 +1232,6 @@ def main():
             "model.params.precomputed_text_emb_path",
             args.precomputed_text_emb_path,
         )
-    out_root = os.path.join(args.out_dir, args.sample_id)
-
     print(f"Loading VAE from {args.vae_ckpt} ...")
     vae = _load_vae(cfg, device)
     print(f"Loading model from {args.ckpt} ...")
@@ -1236,8 +1239,12 @@ def main():
 
     # ── BABEL multi-sample fast path ──────────────────────────────────
     if args.sample_ids:
+        base = args.sample_ids.split(",")[0].strip().rsplit("_", 1)[0]
+        out_root = os.path.join(args.out_dir, base)
         _run_babel_long_session(args, model, vae, device, out_root)
         return
+
+    out_root = os.path.join(args.out_dir, args.sample_id)
 
     print(f"Loading sample {args.sample_id} (dataset={args.dataset}) ...")
     sample = _load_sample(args.raw_data_dir, args.sample_id, dataset=args.dataset)
