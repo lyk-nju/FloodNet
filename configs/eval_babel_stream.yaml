@@ -3,6 +3,11 @@ seed: 1234
 debug: false
 train: false
 
+dirs:
+    deps: /data1/yuankai/text2Motion/FloodDiffusion/deps
+    outputs: ./outputs
+    raw_data: /data1/yuankai/text2Motion/FloodDiffusion/raw_data
+
 test_ckpt: "${dirs.outputs}/20251107_021814_ldf_stream/step_step=240000.ckpt"
 test_vae_ckpt: "${dirs.outputs}/vae_1d_z4_step=300000.ckpt"
 

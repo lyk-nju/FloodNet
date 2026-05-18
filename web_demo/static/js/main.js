@@ -39,6 +39,7 @@ class MotionApp {
         this.drawnWaypoints = []; // Array of [x, y, z]
         this.drawnWaypointMinDist = 0.05; // Avoid duplicate points while dragging.
         this.trajPointSpheres = [];
+        this.trajTargetMarkers = [];
         this.trajectoryPushThrottleMs = 120;
         this.lastTrajectoryPushTime = 0;
         this.trajectoryPushInFlight = false;
@@ -49,6 +50,7 @@ class MotionApp {
         this.updateStatus();
         this.setupBeforeUnload();
 
+        console.log('FloodNet web_demo JS build: trajectory-debug-20260517');
         console.log('Session ID:', this.sessionId);
     }
 
@@ -197,6 +199,15 @@ class MotionApp {
 
         // Trajectory target line (light, semi-transparent, normalized to character root)
         this.trajTargetLine = null;
+        this.trajTargetGroup = new THREE.Group();
+        this.scene.add(this.trajTargetGroup);
+        this.trajTargetPointGeometry = new THREE.SphereGeometry(0.055, 14, 14);
+        this.trajTargetPointMaterial = new THREE.MeshStandardMaterial({
+            color: 0x00c8ff,
+            metalness: 0.1,
+            roughness: 0.25,
+            emissive: 0x003344
+        });
         this.initTrajectoryTargetLine();
 
         // Handle window resize
@@ -224,6 +235,14 @@ class MotionApp {
         this.trajTargetLine = new THREE.Line(geometry, material);
         this.trajTargetLine.frustumCulled = false;
         this.scene.add(this.trajTargetLine);
+    }
+
+    clearTrajectoryTargetMarkers() {
+        if (!this.trajTargetGroup) return;
+        for (const marker of this.trajTargetMarkers) {
+            this.trajTargetGroup.remove(marker);
+        }
+        this.trajTargetMarkers = [];
     }
 
     initUI() {
@@ -351,13 +370,21 @@ class MotionApp {
                 this.statusEl.textContent = 'Running';
                 this.startFrameLoop();
 
-                // If there's trajectory in textarea (or from drag), apply it immediately after start.
-                // Otherwise users need to click "Update Trajectory" manually.
-                const initTraj = this.parseWaypointsFromTextarea();
-                if (initTraj && initTraj.length > 0) {
-                    this.drawnWaypoints = initTraj;
-                    this.syncTrajectorySpheresFromWaypoints(initTraj);
-                    this.pushTrajectoryToBackend(initTraj, true);
+                if (data.debug_preset) {
+                    if (data.text && this.motionText) {
+                        this.motionText.value = data.text;
+                    }
+                    this.updateTrajectoryTargetLine(data.trajectory);
+                    console.log('Debug preset loaded:', data.debug_preset);
+                } else {
+                    // If there's trajectory in textarea (or from drag), apply it immediately after start.
+                    // Otherwise users need to click "Update Trajectory" manually.
+                    const initTraj = this.parseWaypointsFromTextarea();
+                    if (initTraj && initTraj.length > 0) {
+                        this.drawnWaypoints = initTraj;
+                        this.syncTrajectorySpheresFromWaypoints(initTraj);
+                        this.pushTrajectoryToBackend(initTraj, true);
+                    }
                 }
             } else if (response.status === 409 && data.conflict) {
                 // Another session is running, show warning UI
@@ -465,8 +492,10 @@ class MotionApp {
             const data = await response.json();
             if (data.status === 'success') {
                 console.log('Trajectory updated:', waypoints.length, 'waypoints');
+                console.log('Trajectory target response length:', data.trajectory ? data.trajectory.length : 0);
                 this.drawnWaypoints = waypoints;
-                this.syncTrajectorySpheresFromWaypoints();
+                this.syncTrajectorySpheresFromWaypoints(waypoints);
+                this.updateTrajectoryTargetLine(data.trajectory);
             } else {
                 alert('Error: ' + (data.message || 'Failed to update trajectory'));
             }
@@ -490,6 +519,7 @@ class MotionApp {
             const data = await response.json();
             if (data.status === 'success') {
                 this.clearDrawnTrajectoryUI();
+                this.updateTrajectoryTargetLine(data.trajectory);
                 this.drawnWaypoints = [];
                 console.log('Trajectory cleared');
             }
@@ -706,7 +736,7 @@ class MotionApp {
                             this.taskYCaptured = true;
                         }
 
-                        // Update trajectory target line (normalized to current root)
+                        // Update target line from latest model-space trajectory.
                         this.updateTrajectoryTargetLine(data.trajectory);
 
                         // Auto-follow (if user hasn't interacted for a while)
@@ -744,21 +774,28 @@ class MotionApp {
 
         const geometry = this.trajTargetLine.geometry;
         const positions = geometry.attributes.position.array;
-        const rootX = this.currentRootPos.x;
-        const rootZ = this.currentRootPos.z;
-
         if (!trajPoints || trajPoints.length === 0) {
             geometry.setDrawRange(0, 0);
             geometry.attributes.position.needsUpdate = true;
+            this.clearTrajectoryTargetMarkers();
             return;
         }
 
         const n = Math.min(trajPoints.length, 20);
+        this.clearTrajectoryTargetMarkers();
         for (let i = 0; i < n; i++) {
-            // Normalize to character root: character is (0,0), y on ground
-            positions[i * 3]     = trajPoints[i][0] - rootX;
-            positions[i * 3 + 1] = 0.02;  // slightly above ground
-            positions[i * 3 + 2] = trajPoints[i][2] - rootZ;
+            // Backend returns world-space trajectory points.
+            const x = trajPoints[i][0];
+            const y = 0.08;  // visibly above grid/floor
+            const z = trajPoints[i][2];
+            positions[i * 3]     = x;
+            positions[i * 3 + 1] = y;
+            positions[i * 3 + 2] = z;
+
+            const marker = new THREE.Mesh(this.trajTargetPointGeometry, this.trajTargetPointMaterial);
+            marker.position.set(x, y, z);
+            this.trajTargetGroup.add(marker);
+            this.trajTargetMarkers.push(marker);
         }
         geometry.setDrawRange(0, n);
         geometry.attributes.position.needsUpdate = true;
@@ -857,7 +894,7 @@ class MotionApp {
         this.trajectoryPushInFlight = true;
         this.lastTrajectoryPushTime = now;
         try {
-            await fetch('/api/update_trajectory', {
+            const response = await fetch('/api/update_trajectory', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -866,6 +903,13 @@ class MotionApp {
                     mode: 'replace_future'
                 })
             });
+            const data = await response.json();
+            if (data.status === 'success') {
+                console.log('Trajectory push accepted; target response length:', data.trajectory ? data.trajectory.length : 0);
+                this.updateTrajectoryTargetLine(data.trajectory);
+            } else {
+                console.error('pushTrajectoryToBackend failed:', data.message || data);
+            }
         } catch (err) {
             console.error('pushTrajectoryToBackend failed:', err);
         } finally {
@@ -952,6 +996,9 @@ class MotionApp {
 
             if (data.initialized) {
                 this.bufferSizeEl.textContent = `${data.buffer_size} / ${data.target_size}`;
+                if (data.trajectory_debug && data.trajectory_debug.active) {
+                    this.statusEl.textContent = `Running · traj ${data.trajectory_debug.display_len || 0}`;
+                }
 
                 // Update current smoothing display
                 if (data.smoothing_alpha !== undefined) {

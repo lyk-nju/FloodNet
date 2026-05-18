@@ -23,6 +23,7 @@ from utils.stream_traj import (
     estimate_token_step_distance,
     project_point_to_polyline,
     resample_polyline,
+    sample_timestamped_trajectory,
 )
 
 
@@ -109,10 +110,26 @@ class ModelManager:
         self.current_traj_mode = "replace_future"
         self.traj_plan_version = 0
         self.traj_horizon_tokens = int(traj_mask_cfg.get("horizon_tokens", 20))
+        self.traj_time_mode = str(traj_mask_cfg.get("time_mode", "timestamped"))
+        self.waypoint_dt = float(traj_mask_cfg.get("waypoint_dt", 0.05))
+        self.token_dt = float(traj_mask_cfg.get("token_dt", 0.20))
+        self.traj_repeat_policy = str(traj_mask_cfg.get("repeat_policy", "hold"))
         self.default_token_step = float(traj_mask_cfg.get("default_token_step", 0.25))
         self.min_token_step = float(traj_mask_cfg.get("min_token_step", 0.05))
         self.max_token_step = float(traj_mask_cfg.get("max_token_step", 1.50))
+        self.current_traj_times = None
+        self.traj_plan_start_commit_index = 0
+        self.traj_repeat_anchor_root = None
+        self.traj_repeat_anchor_cycle = None
         self.root_xz_history = deque(maxlen=120)
+        print(
+            "Trajectory config: "
+            f"time_mode={self.traj_time_mode}, "
+            f"waypoint_dt={self.waypoint_dt:.3f}s, "
+            f"token_dt={self.token_dt:.3f}s, "
+            f"horizon_tokens={self.traj_horizon_tokens}, "
+            f"repeat_policy={self.traj_repeat_policy}"
+        )
         
         # Model generation state
         self.first_chunk = True
@@ -319,13 +336,23 @@ class ModelManager:
             if waypoints is None or len(waypoints) == 0:
                 self.current_traj_waypoints = None
                 self.current_traj_array = None
+                self.current_traj_times = None
+                self.traj_repeat_anchor_root = None
+                self.traj_repeat_anchor_cycle = None
+                with self._display_traj_lock:
+                    self._display_traj = None
                 print("Trajectory control cleared")
-                return
+                return None
 
             waypoints = np.asarray(waypoints, dtype=np.float32)
             if waypoints.ndim == 1:
                 waypoints = waypoints.reshape(1, -1)
-            if waypoints.shape[1] == 2:
+            explicit_times = None
+            if waypoints.shape[1] == 4:
+                # Explicit timestamped format: [t, x, y, z].
+                explicit_times = waypoints[:, 0].astype(np.float32)
+                waypoints = waypoints[:, 1:4]
+            elif waypoints.shape[1] == 2:
                 waypoints = np.c_[
                     waypoints[:, 0],
                     np.zeros(len(waypoints), dtype=np.float32),
@@ -333,16 +360,35 @@ class ModelManager:
                 ]
             if waypoints.shape[1] != 3:
                 raise ValueError(
-                    f"Trajectory waypoints must have shape (N,2) or (N,3); got {waypoints.shape}"
+                    "Trajectory waypoints must have shape (N,2), (N,3), "
+                    f"or timestamped (N,4); got {waypoints.shape}"
                 )
 
             self.current_traj_waypoints = waypoints.copy()
             self.current_traj_array = waypoints.copy()
+            if explicit_times is None:
+                self.current_traj_times = (
+                    np.arange(len(waypoints), dtype=np.float32) * self.waypoint_dt
+                )
+            else:
+                self.current_traj_times = explicit_times.copy()
+                if len(self.current_traj_times):
+                    self.current_traj_times = self.current_traj_times - self.current_traj_times[0]
+            self.traj_plan_start_commit_index = int(
+                getattr(self.model, "commit_index", 0)
+            )
+            self.traj_repeat_anchor_root = None
+            self.traj_repeat_anchor_cycle = None
 
         print(
             f"Trajectory updated: {len(waypoints)} waypoints, "
-            f"mode={mode}, horizon={self.traj_horizon_tokens} tokens"
+            f"mode={mode}, horizon={self.traj_horizon_tokens} tokens, "
+            f"time_mode={self.traj_time_mode}, waypoint_dt={self.waypoint_dt:.3f}s"
         )
+        preview = self._build_stream_traj_input()
+        if preview is None:
+            return None
+        return self.get_display_traj()
 
     def _get_current_root_xyz(self) -> np.ndarray:
         root_xyz = np.zeros(3, dtype=np.float32)
@@ -377,22 +423,85 @@ class ModelManager:
         """Thin wrapper — see ``utils.stream_traj.resample_polyline``."""
         return resample_polyline(points_xyz, num_tokens, token_step)
 
+    def _sample_timestamped_with_repeat(
+        self,
+        traj_times: np.ndarray,
+        waypoints: np.ndarray,
+        query_times: np.ndarray,
+    ) -> np.ndarray:
+        """Sample timestamped waypoints, optionally as a rolling local template.
+
+        `translate_from_current_root` treats the user/debug trajectory as a
+        timed local motion template.  At every streaming step, the first queried
+        template phase is aligned to the current generated root, and the future
+        horizon is expressed as relative displacement from that phase.
+
+        This keeps repeated plans under the character instead of leaving them in
+        the original world location.  The returned trajectory remains
+        world-space; model-side TrajStreamBuffer still performs its own
+        history-window anchor subtract.
+        """
+        if self.traj_repeat_policy != "translate_from_current_root":
+            return sample_timestamped_trajectory(traj_times, waypoints, query_times)
+
+        times = np.asarray(traj_times, dtype=np.float32).reshape(-1)
+        points = np.asarray(waypoints, dtype=np.float32)
+        queries = np.asarray(query_times, dtype=np.float32).reshape(-1)
+        if len(times) < 2 or len(points) < 2 or len(queries) == 0:
+            return sample_timestamped_trajectory(times, points, queries)
+
+        start_t = float(times[0])
+        end_t = float(times[-1])
+        duration = end_t - start_t
+        if duration <= 1e-6:
+            return sample_timestamped_trajectory(times, points, queries)
+
+        def sample_unwrapped(query_values: np.ndarray) -> np.ndarray:
+            query_values = np.asarray(query_values, dtype=np.float32).reshape(-1)
+            cycle = np.floor((query_values - start_t) / duration).astype(np.int64)
+            cycle = np.maximum(cycle, 0)
+            local_t = ((query_values - start_t) % duration) + start_t
+            local = sample_timestamped_trajectory(times, points, local_t)
+            return local + cycle[:, None].astype(np.float32) * (points[-1] - points[0])
+
+        current_root = self._get_current_root_xyz().astype(np.float32)
+        unwrapped = sample_unwrapped(queries)
+        anchor = sample_unwrapped(np.asarray([queries[0]], dtype=np.float32))[0]
+        self.traj_repeat_anchor_root = current_root.copy()
+        self.traj_repeat_anchor_cycle = int(
+            max(0, np.floor((float(queries[0]) - start_t) / duration))
+        )
+        return (current_root + (unwrapped - anchor)).astype(np.float32)
+
     def _build_stream_traj_input(self):
         with self.traj_state_lock:
             if self.current_traj_waypoints is None:
                 return None
             waypoints = self.current_traj_waypoints.copy()
+            traj_times = None if self.current_traj_times is None else self.current_traj_times.copy()
             plan_version = self.traj_plan_version
             traj_mode = self.current_traj_mode
+            plan_start_commit = self.traj_plan_start_commit_index
 
-        current_root = self._get_current_root_xyz()
-        token_step = self._estimate_token_step_distance()
-        polyline = self._build_remaining_polyline(current_root, waypoints)
-        future_traj = self._resample_polyline(
-            polyline,
-            num_tokens=self.traj_horizon_tokens,
-            token_step=token_step,
-        )
+        if self.traj_time_mode == "timestamped" and traj_times is not None:
+            commit_index = int(getattr(self.model, "commit_index", 0))
+            elapsed_tokens = max(0, commit_index - int(plan_start_commit))
+            query_times = (
+                float(elapsed_tokens) * self.token_dt
+                + np.arange(self.traj_horizon_tokens, dtype=np.float32) * self.token_dt
+            )
+            future_traj = self._sample_timestamped_with_repeat(
+                traj_times, waypoints, query_times
+            )
+        else:
+            current_root = self._get_current_root_xyz()
+            token_step = self._estimate_token_step_distance()
+            polyline = self._build_remaining_polyline(current_root, waypoints)
+            future_traj = self._resample_polyline(
+                polyline,
+                num_tokens=self.traj_horizon_tokens,
+                token_step=token_step,
+            )
         token_mask = np.ones((1, future_traj.shape[0]), dtype=np.float32)
 
         with self._display_traj_lock:
@@ -403,6 +512,7 @@ class ModelManager:
             "token_mask": token_mask,
             "traj_mode": traj_mode,
             "traj_plan_version": plan_version,
+            "traj_repeat_policy": self.traj_repeat_policy,
         }
     
     def pause_generation(self):
@@ -467,8 +577,13 @@ class ModelManager:
         with self.traj_state_lock:
             self.current_traj_waypoints = None
             self.current_traj_array = None
+            self.current_traj_times = None
             self.current_traj_mode = "replace_future"
+            self.traj_repeat_anchor_root = None
+            self.traj_repeat_anchor_cycle = None
             self.traj_plan_version += 1
+        with self._display_traj_lock:
+            self._display_traj = None
         
         if history_length is not None:
             self.history_length = history_length
@@ -592,6 +707,9 @@ class ModelManager:
             "is_generating": self.is_generating,
             "current_text": self.current_text,
             "trajectory_active": self.current_traj_waypoints is not None,
+            "trajectory_time_mode": self.traj_time_mode,
+            "trajectory_repeat_policy": self.traj_repeat_policy,
+            "trajectory_horizon_tokens": self.traj_horizon_tokens,
             "smoothing_alpha": self.smoothing_alpha,
             "denoise_steps": self.denoise_steps,
         }

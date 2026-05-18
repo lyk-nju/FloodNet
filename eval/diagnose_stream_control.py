@@ -338,10 +338,13 @@ def _merge_babel_samples(raw_data_dir: str, sample_ids_str: str) -> dict:
     # Merge text_data with cumulative time offsets.
     text_data = []
     boundary_frames = []  # frame indices of segment boundaries
+    sample_spans = []
     for i, sid in enumerate(sample_ids):
         feat = np.load(os.path.join(data_dir, "motions", f"{sid}.npy")).astype(np.float32)
         tok = np.load(os.path.join(data_dir, "TOKENS_20251030_085836_vae_wan_z4",
                                    f"{sid}.npy")).astype(np.float32)
+        feat_start = feat_offset
+        token_start = token_offset
         features.append(feat)
         tokens_list.append(tok)
 
@@ -373,6 +376,13 @@ def _merge_babel_samples(raw_data_dir: str, sample_ids_str: str) -> dict:
             boundary_frames.append(feat_offset)
         feat_offset += len(feat)
         token_offset += len(tok)
+        sample_spans.append({
+            "sample_id": sid,
+            "frame_start": int(feat_start),
+            "frame_end": int(feat_offset),
+            "token_start": int(token_start),
+            "token_end": int(token_offset),
+        })
 
     merged_feat = np.concatenate(features, axis=0)
     merged_token = np.concatenate(tokens_list, axis=0)
@@ -437,13 +447,15 @@ def _merge_babel_samples(raw_data_dir: str, sample_ids_str: str) -> dict:
         "traj_mask": torch.ones(len(traj_xyz), dtype=torch.float32),
         "_sample_ids": sample_ids,
         "_boundary_frames": boundary_frames,
+        "_sample_spans": sample_spans,
     }
     return sample
 
 
 def _build_timestamped_traj_input(sample: dict, commit_idx: int,
                                   horizon_tokens: int, token_dt: float,
-                                  *, times=None, waypoints=None):
+                                  *, times=None, waypoints=None,
+                                  query_time_offset: float = 0.0):
     """Sample future H tokens from a timestamped trajectory plan."""
     token_length = sample["token_length"]
     if commit_idx >= token_length:
@@ -454,12 +466,61 @@ def _build_timestamped_traj_input(sample: dict, commit_idx: int,
         times = np.arange(total_frames, dtype=np.float32) / 20.0
         waypoints = gt_root
     n = min(horizon_tokens, token_length - commit_idx)
-    query_times = np.arange(n, dtype=np.float32) * token_dt + commit_idx * token_dt
+    query_times = (
+        np.arange(n, dtype=np.float32) * token_dt
+        + commit_idx * token_dt
+        - float(query_time_offset)
+    )
     future_traj = sample_timestamped_trajectory(times, waypoints, query_times)
     return {
         "traj": torch.from_numpy(future_traj).float().unsqueeze(0),
         "token_mask": torch.ones(1, n),
     }
+
+
+def _build_babel_segment_waypoint_plans(sample: dict, waypoint_dt: float,
+                                        motion_fps: float):
+    """Build one timestamped waypoint plan per original BABEL segment.
+
+    This mirrors web-demo usage where each present segment can be treated as a
+    separate trajectory update.  Time therefore resets inside each source
+    sample instead of running over the merged global path.
+    """
+    gt_root = sample["traj"].numpy()
+    stride_frames = max(1, int(float(waypoint_dt) * float(motion_fps)))
+    plans = []
+    for span in sample.get("_sample_spans", []):
+        fs = int(span["frame_start"])
+        fe = int(span["frame_end"])
+        local_root = gt_root[fs:fe]
+        if len(local_root) == 0:
+            continue
+        local_idx = np.arange(0, len(local_root), stride_frames)
+        if len(local_idx) == 0 or local_idx[-1] != len(local_root) - 1:
+            local_idx = np.concatenate(
+                [local_idx, np.array([len(local_root) - 1], dtype=local_idx.dtype)]
+            )
+        waypoints = local_root[local_idx].astype(np.float32)
+        times = np.arange(len(waypoints), dtype=np.float32) * float(waypoint_dt)
+        plans.append({
+            "sample_id": span["sample_id"],
+            "token_start": int(span["token_start"]),
+            "token_end": int(span["token_end"]),
+            "frame_start": fs,
+            "frame_end": fe,
+            "times": times,
+            "waypoints": waypoints,
+        })
+    return plans
+
+
+def _select_babel_segment_plan(plans: list[dict], commit_idx: int):
+    for plan in plans:
+        if plan["token_start"] <= commit_idx < plan["token_end"]:
+            return plan
+    if not plans:
+        return None
+    return plans[-1]
 
 
 def _wrap_flat_sample_for_suffix(sample: dict) -> dict:
@@ -915,9 +976,17 @@ def _run_babel_long_session(args, model, vae, device, out_root):
         all_dec, all_pr = [], []
         first_chunk = True
 
-        gt_root_arr = sample["traj"].numpy()
-        wp_idx = np.arange(0, len(gt_root_arr), max(1, int(args.waypoint_dt * 20.0)))
-        wp_t = np.arange(len(wp_idx), dtype=np.float32) * args.waypoint_dt
+        # BABEL long-session mode historically used --waypoint_dt, while the
+        # single-sample timestamped ablation used --duration_waypoint_stride_seconds.
+        # Accept both so old commands do not silently keep the wrong stride.
+        babel_waypoint_dt = (
+            args.duration_waypoint_stride_seconds
+            if args.duration_waypoint_stride_seconds != 1.0
+            else args.waypoint_dt
+        )
+        segment_waypoint_plans = _build_babel_segment_waypoint_plans(
+            sample, babel_waypoint_dt, args.motion_fps
+        )
 
         for ci in range(tl):
             cur_text = text_ctrl.get_text_for_commit_index(ci)
@@ -926,22 +995,41 @@ def _run_babel_long_session(args, model, vae, device, out_root):
             elif mode == "gt_suffix":
                 _bs = _wrap_flat_sample_for_suffix(sample)
                 ti = build_stream_suffix_conditioning(_bs, ci, prefer_xyz=True)
+                if args.traj_horizon_tokens is not None and args.traj_horizon_tokens > 0:
+                    ti = clip_traj_input_to_horizon(ti, args.traj_horizon_tokens)
             elif mode == "timestamped_gt_plan":
                 ti = _build_timestamped_traj_input(
                     sample, ci, args.traj_horizon_tokens, args.token_dt)
             elif mode == "duration_waypoints":
-                ti = _build_timestamped_traj_input(
-                    sample, ci, args.traj_horizon_tokens, args.token_dt,
-                    times=wp_t, waypoints=gt_root_arr[wp_idx])
+                plan = _select_babel_segment_plan(segment_waypoint_plans, ci)
+                if plan is None:
+                    ti = None
+                else:
+                    # Simulate a trajectory update at each original BABEL
+                    # present-segment boundary: local plan time starts at 0.
+                    ti = _build_timestamped_traj_input(
+                        sample,
+                        ci,
+                        args.traj_horizon_tokens,
+                        args.token_dt,
+                        times=plan["times"],
+                        waypoints=plan["waypoints"],
+                        query_time_offset=plan["token_start"] * args.token_dt,
+                    )
             sp = build_stream_step_model_input(cur_text, traj_input=ti)
             out = model.stream_generate_step(sp, first_chunk=first_chunk)
             dec = (vae.stream_decode(out["generated"][0][None, :].to(device),
                                      first_chunk=first_chunk)[0].float().cpu().numpy())
             first_chunk = False
+            pred_root_chunk = []
             for frm in dec:
                 stream_recovery.process_frame(frm)
+                pred_root_chunk.append(
+                    stream_recovery.r_pos_accum.astype(np.float32).copy()
+                )
             all_dec.append(dec)
-            all_pr.append(extract_root_trajectory_263(dec))
+            if pred_root_chunk:
+                all_pr.append(np.stack(pred_root_chunk, axis=0))
 
         vae.clear_cache()
         pred_motion = (np.concatenate(all_dec, axis=0)[:total_frames]
@@ -969,7 +1057,7 @@ def _run_babel_long_session(args, model, vae, device, out_root):
 
         _mode_label = mode
         if mode == "duration_waypoints":
-            _mode_label = f"{mode}_wp{args.waypoint_dt:.3f}"
+            _mode_label = f"{mode}_wp{babel_waypoint_dt:.3f}"
         elif mode == "timestamped_gt_plan":
             _mode_label = f"{mode}_tdt{args.token_dt:.3f}"
         metrics = _build_mode_metrics(
@@ -980,6 +1068,23 @@ def _run_babel_long_session(args, model, vae, device, out_root):
         metrics["gt_path_length"] = float(_compute_root_path_length(gt_root))
         metrics["path_length_ratio"] = (
             metrics["pred_path_length"] / max(metrics["gt_path_length"], 1e-6))
+        if mode == "duration_waypoints":
+            metrics["duration_waypoint_scope"] = "per_babel_sample"
+            metrics["duration_waypoint_dt"] = float(babel_waypoint_dt)
+            metrics["duration_waypoint_count"] = int(
+                sum(len(plan["waypoints"]) for plan in segment_waypoint_plans)
+            )
+            metrics["duration_waypoint_plans"] = [
+                {
+                    "sample_id": plan["sample_id"],
+                    "frame_start": int(plan["frame_start"]),
+                    "frame_end": int(plan["frame_end"]),
+                    "token_start": int(plan["token_start"]),
+                    "token_end": int(plan["token_end"]),
+                    "num_waypoints": int(len(plan["waypoints"])),
+                }
+                for plan in segment_waypoint_plans
+            ]
         print(f"  ADE={metrics['ADE']:.4f}  FDE={metrics['FDE']:.4f}  "
               f"path_ratio={metrics['path_length_ratio']:.4f}")
         for sm in seg_met:
@@ -1042,7 +1147,7 @@ def _run_babel_long_session(args, model, vae, device, out_root):
         "config": args.config, "ckpt": args.ckpt, "vae_ckpt": args.vae_ckpt,
         "history_length": args.history_length,
         "traj_horizon_tokens": args.traj_horizon_tokens,
-        "waypoint_dt": args.waypoint_dt, "token_dt": args.token_dt,
+        "waypoint_dt": babel_waypoint_dt, "token_dt": args.token_dt,
         "modes": {m["mode"]: {k: v for k, v in m.items()
                               if k not in ("segments",)}
                   for m in all_records},

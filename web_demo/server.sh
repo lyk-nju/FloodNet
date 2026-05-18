@@ -5,7 +5,6 @@ PID_FILE="server.pid"
 LOG_FILE="app.log"
 CONFIG_FILE="${2:-../configs/stream.yaml}"
 PORT="${PORT:-5000}"
-DEMO_CONFIG_FILE="${DEMO_CONFIG_FILE:-configs/traj_mask.yaml}"
 
 # Allow overriding GPU via env, otherwise keep user's setting.
 # (Do not hardcode a single GPU index here.)
@@ -51,7 +50,7 @@ case "$1" in
         # Run from web_demo/ so relative paths work as expected.
         SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
         cd "$SCRIPT_DIR" || exit 1
-        nohup "$PY_BIN" app.py --config "$CONFIG_FILE" --demo-config "$DEMO_CONFIG_FILE" --port "$PORT" > "$LOG_FILE" 2>&1 &
+        nohup "$PY_BIN" app.py --config "$CONFIG_FILE" --port "$PORT" > "$LOG_FILE" 2>&1 &
         echo $! > "$PID_FILE"
         sleep 3
         
@@ -117,10 +116,9 @@ case "$1" in
         echo "  status               - Check server status"
         echo ""
         echo "Examples:"
-        echo "  $0 start                           # Use default config (configs/stream.yaml)"
-        echo "  $0 start configs/stream_tiny.yaml  # Use custom config"
-        echo "  $0 restart configs/stream_tiny.yaml  # Restart with custom config"
+        echo "  $0 start                              # Use default config (../configs/stream.yaml)"
+        echo "  $0 start ../configs/stream_tiny.yaml  # Use custom config"
+        echo "  $0 restart ../configs/stream.yaml"
         exit 1
         ;;
 esac
-

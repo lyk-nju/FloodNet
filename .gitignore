@@ -52,3 +52,5 @@ eval/result
 
 # markdown
 *.md
+!TODO.md
+!eval/babel_todo.md

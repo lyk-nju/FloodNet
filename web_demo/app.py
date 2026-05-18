@@ -8,17 +8,20 @@ import time
 import threading
 import argparse
 import os
+import numpy as np
 from omegaconf import OmegaConf
 from model_manager import get_model_manager
+from utils.motion_process import extract_root_trajectory_263
 
 app = Flask(__name__)
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 CORS(app)
 
 # Global model manager (lazy loaded)
 model_manager = None
 model_config_path = None  # Will be set once at startup
-demo_config_path = None  # Will be set once at startup
 traj_mask_cfg = None
+debug_preset_cfg = None
 model_init_lock = threading.Lock()
 
 # Session tracking - only one active session can generate at a time
@@ -51,23 +54,97 @@ def init_model():
 
 def load_traj_mask_cfg(path: str):
     """
-    Load trajectory mask config.
+    Load web-demo trajectory config from the main model config.
     Expected format:
       traj_mask:
         enabled: bool
-        keep_ratio_min: float
-        keep_ratio_max: float
-        keep_first_last: bool
+        time_mode: timestamped
+        waypoint_dt: float
+        token_dt: float
+        repeat_policy: str
     """
     if not path:
         return {}
     if not os.path.exists(path):
-        print(f"Traj mask config not found: {path}. Using defaults (disabled or default ratios).")
+        print(f"Config not found: {path}. Using default trajectory settings.")
         return {}
     cfg = OmegaConf.load(path)
     if "traj_mask" in cfg:
         return OmegaConf.to_container(cfg.traj_mask, resolve=True)
-    return OmegaConf.to_container(cfg, resolve=True)
+    print(f"No traj_mask section in {path}. Using default trajectory settings.")
+    return {}
+
+
+def load_debug_preset_cfg(path: str):
+    """Load optional web-demo debug preset from the model config."""
+    if not path or not os.path.exists(path):
+        return {}
+    cfg = OmegaConf.load(path)
+    section = cfg.get("web_demo_debug", None)
+    if section is None:
+        return {}
+    return OmegaConf.to_container(section, resolve=True)
+
+
+def _load_first_caption(text_path: str) -> str:
+    with open(text_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            return line.split("#")[0].strip()
+    return ""
+
+
+def load_debug_preset_sample():
+    """Load a timestamped GT trajectory preset for web-demo sanity checks."""
+    cfg = debug_preset_cfg or {}
+    if not bool(cfg.get("enabled", False)):
+        return None
+
+    dataset = str(cfg.get("dataset", "humanml3d")).lower()
+    sample_id = str(cfg.get("sample_id", "001168"))
+    raw_data_dir = cfg.get("raw_data_dir")
+    if not raw_data_dir:
+        raise ValueError("web_demo_debug.raw_data_dir is required when debug preset is enabled")
+
+    motion_fps = float(cfg.get("motion_fps", 20.0))
+    if dataset != "humanml3d":
+        raise ValueError(f"Unsupported web_demo_debug.dataset: {dataset}")
+
+    data_dir = os.path.join(raw_data_dir, "HumanML3D")
+    feature_path = os.path.join(
+        data_dir,
+        str(cfg.get("feature_path", "new_joint_vecs")),
+        f"{sample_id}.npy",
+    )
+    text_path = os.path.join(
+        data_dir,
+        str(cfg.get("text_path", "texts")),
+        f"{sample_id}.txt",
+    )
+    feature = np.load(feature_path).astype(np.float32)
+    root = extract_root_trajectory_263(feature).astype(np.float32)
+    times = np.arange(len(root), dtype=np.float32) / motion_fps
+    timestamped_traj = np.concatenate([times[:, None], root], axis=1)
+    text = str(cfg.get("text", "")).strip() or _load_first_caption(text_path)
+    return {
+        "dataset": dataset,
+        "sample_id": sample_id,
+        "text": text,
+        "trajectory": timestamped_traj,
+        "num_frames": int(len(feature)),
+        "duration_seconds": float(times[-1]) if len(times) else 0.0,
+    }
+
+
+@app.after_request
+def add_no_cache_headers(response):
+    """Avoid stale JS/CSS while iterating on the web demo."""
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 
 def consumption_monitor():
@@ -156,6 +233,16 @@ def start_generation():
         
         # Initialize model if needed
         mm = init_model()
+        debug_sample = load_debug_preset_sample()
+        if debug_sample is not None:
+            text = debug_sample["text"]
+            print(
+                f"[Session {session_id}] web_demo_debug enabled: "
+                f"{debug_sample['dataset']}:{debug_sample['sample_id']} "
+                f"frames={debug_sample['num_frames']} "
+                f"duration={debug_sample['duration_seconds']:.2f}s",
+                flush=True,
+            )
         
         # Check if another session is already generating
         need_force_takeover = False
@@ -216,6 +303,12 @@ def start_generation():
                 'status': 'error',
                 'message': 'Model reset failed because the previous generation thread is still alive.'
             }), 503
+        debug_target_traj = None
+        if debug_sample is not None:
+            debug_target_traj = mm.update_trajectory(
+                debug_sample["trajectory"],
+                mode="replace_future",
+            )
         mm.start_generation(text, history_length=history_length)
         
         # Initialize consumption tracking (no nested locks)
@@ -229,7 +322,15 @@ def start_generation():
         return jsonify({
             'status': 'success',
             'message': f'Generation started with text: {text}, history_length: {history_length}',
-            'session_id': session_id
+            'session_id': session_id,
+            'text': text,
+            'debug_preset': None if debug_sample is None else {
+                'dataset': debug_sample['dataset'],
+                'sample_id': debug_sample['sample_id'],
+                'num_frames': debug_sample['num_frames'],
+                'duration_seconds': debug_sample['duration_seconds'],
+            },
+            'trajectory': None if debug_target_traj is None else debug_target_traj.tolist(),
         })
     except Exception as e:
         if 'session_id' in locals() and session_claimed:
@@ -322,12 +423,19 @@ def update_trajectory():
                     'message': 'Not the active session'
                 }), 403
         
-        model_manager.update_trajectory(waypoints, mode=mode)
+        target_traj = model_manager.update_trajectory(waypoints, mode=mode)
+        target_len = 0 if target_traj is None else len(target_traj)
+        print(
+            f"[Session {session_id}] update_trajectory mode={mode} "
+            f"waypoints={0 if not waypoints else len(waypoints)} target_len={target_len}",
+            flush=True,
+        )
         
         return jsonify({
             'status': 'success',
             'message': 'Trajectory updated' if waypoints else 'Trajectory cleared',
             'mode': mode,
+            'trajectory': target_traj.tolist() if target_traj is not None else None,
         })
     except Exception as e:
         return jsonify({
@@ -578,20 +686,20 @@ def get_status():
 if __name__ == '__main__':
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Flask server for real-time 3D motion generation')
-    parser.add_argument('--config', type=str, default='configs/stream.yaml',
-                        help='Path to config yaml file (default: configs/stream.yaml)')
-    parser.add_argument('--demo-config', type=str, default='configs/traj_mask.yaml',
-                        help='Path to web_demo config yaml (trajectory mask config)')
+    parser.add_argument('--config', type=str, default='../configs/stream.yaml',
+                        help='Path to config yaml file (default: ../configs/stream.yaml)')
     parser.add_argument('--port', type=int, default=5000,
                         help='Port to run the server on (default: 5000)')
     args = parser.parse_args()
 
     model_config_path = args.config
-    demo_config_path = args.demo_config
-    traj_mask_cfg = load_traj_mask_cfg(demo_config_path)
+    traj_mask_cfg = load_traj_mask_cfg(model_config_path)
+    debug_preset_cfg = load_debug_preset_cfg(model_config_path)
     
     print("Starting Flask server...")
     print(f"Config file: {model_config_path}")
-    print(f"Demo config file: {demo_config_path}")
+    print("Trajectory config source: traj_mask section in main config")
+    if debug_preset_cfg and bool(debug_preset_cfg.get("enabled", False)):
+        print(f"Web demo debug preset enabled: {debug_preset_cfg}")
     print("Note: Model will be loaded on first generation request")
     app.run(host='0.0.0.0', port=args.port, debug=False, threaded=True)
