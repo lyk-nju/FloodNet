@@ -2745,15 +2745,28 @@ def main():
         split_tok = max(5, min(args.split_token, tl - args.traj_horizon_tokens - 1))
         gt_root_arr = sample["traj"].numpy()
         total_f = len(gt_root_arr)
-        times_full = np.arange(total_f, dtype=np.float32) / 20.0
-        waypoints_full = gt_root_arr
-        wp_idx = np.arange(0, total_f, max(1, int(args.waypoint_dt * 20.0)))
-        wp_t = np.arange(len(wp_idx), dtype=np.float32) * args.waypoint_dt
 
-        # --- Mode A: continuous timestamped plan (baseline) ---
-        print(f"\n--- timestamped_gt_plan (continuous) ---")
+        # Time-based waypoints: original 20fps GT frames, t = frame_idx / 20.
+        _time_pts = gt_root_arr
+        _time_t = np.arange(total_f, dtype=np.float32) / 20.0
+        # Arc-length waypoints: uniformly spaced along path, same count.
+        segs = np.linalg.norm(np.diff(gt_root_arr[:, [0, 2]], axis=0), axis=1)
+        cum_arc = np.concatenate([np.zeros(1), np.cumsum(segs)])
+        total_arc = cum_arc[-1]
+        num_arc = max(2, total_f)
+        _arc_pts = np.column_stack([
+            np.interp(np.linspace(0, total_arc, num_arc), cum_arc, gt_root_arr[:, d])
+            for d in range(3)
+        ]).astype(np.float32)
+        _arc_t = np.arange(num_arc, dtype=np.float32) / 20.0
+
         all_records = []
-        for _mode_label, _update_at in [("cont", None), ("split", split_tok)]:
+        for _mode_label, _update_at, _wp, _times in [
+            ("time_cont", None, _time_pts, _time_t),
+            ("time_split", split_tok, _time_pts, _time_t),
+            ("arc_cont", None, _arc_pts, _arc_t),
+            ("arc_split", split_tok, _arc_pts, _arc_t),
+        ]:
             total_frames = 1 + 4 * (tl - 1) if tl > 1 else 1
             vae.clear_cache()
             model.init_generated(args.history_length, batch_size=1,
@@ -2771,12 +2784,12 @@ def main():
                 _elapsed = ci - _plan_start
                 qt = (float(_elapsed) * args.token_dt
                       + np.arange(args.traj_horizon_tokens, dtype=np.float32) * args.token_dt)
-                ft = sample_timestamped_trajectory(times_full, waypoints_full, qt)
+                ft = sample_timestamped_trajectory(_times, _wp, qt)
                 # Pred root alignment: same as web_demo mid-session update.
                 cur_root = np.zeros(3, dtype=np.float32)
                 cur_root[[0, 2]] = stream_rec.r_pos_accum[[0, 2]].astype(np.float32)
                 anchor = sample_timestamped_trajectory(
-                    times_full, waypoints_full, np.asarray([qt[0]], dtype=np.float32))[0]
+                    _times, _wp, np.asarray([qt[0]], dtype=np.float32))[0]
                 ft = cur_root + (ft - anchor.astype(np.float32))
 
                 ti = {"traj": torch.from_numpy(ft).float().unsqueeze(0),
