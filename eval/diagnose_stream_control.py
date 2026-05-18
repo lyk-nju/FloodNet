@@ -2977,11 +2977,52 @@ def main():
                          "trail_lateral_mean": trail_lateral_mean,
                          "trail_angle": args.trail_angle,
                          "trail_tokens": extra_tokens})
+        # Path metrics on trail segment.
+        trail_chamfer = _path_chamfer(trail_pred, trail_pts) if len(trail_pred) > 1 else float("nan")
+        trail_arc_ade = _path_arc_ade(trail_pred, trail_pts) if len(trail_pred) > 1 else float("nan")
+        print(f"  trail_chamfer={trail_chamfer:.4f}  trail_arc_ADE={trail_arc_ade:.4f}")
+
         if args.render_video and pred_motion.size > 0:
             _mp4 = os.path.join(mode_dir, "pred_motion.mp4")
             render_single_video(motion=pred_motion, save_path=_mp4,
                                 dim=263, render_setting={})
             print(f"    video saved to {_mp4}")
+            # Trajectory comparison video.
+            _n = min(len(pred_root), len(trail_pts))
+            if _n > 1:
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+                from matplotlib.animation import FFMpegWriter
+                _t_mp4 = os.path.join(mode_dir, "traj_compare.mp4")
+                _f2, _a2 = plt.subplots(figsize=(7, 7))
+                _all_x = [trail_pts[:_n, 0], pred_root[:_n, 0]]
+                _all_z = [trail_pts[:_n, 2], pred_root[:_n, 2]]
+                _xl = (min(a.min() for a in _all_x) - 0.5, max(a.max() for a in _all_x) + 0.5)
+                _zl = (min(a.min() for a in _all_z) - 0.5, max(a.max() for a in _all_z) + 0.5)
+                _wr = FFMpegWriter(fps=20)
+                _sf = max(1, _n // 150)
+                with _wr.saving(_f2, _t_mp4, dpi=100):
+                    for _f in range(1, _n + 1, _sf):
+                        _a2.clear()
+                        _a2.plot(trail_pts[:min(_f, _n), 0], trail_pts[:min(_f, _n), 2],
+                                 "g-", lw=1.5, alpha=0.7, label="target")
+                        _a2.plot(pred_root[:min(_f, _n), 0], pred_root[:min(_f, _n), 2],
+                                 "r-", lw=1.5, alpha=0.7, label="pred")
+                        _a2.plot(trail_pts[0, 0], trail_pts[0, 2], "go", ms=6)
+                        # Mark sample/trail boundary.
+                        _bd = len(gt_root_sample)
+                        if 0 < _bd < _n:
+                            _a2.axvline(x=trail_pts[min(_bd, _n - 1), 0],
+                                        color="gray", ls="--", alpha=0.5, label="boundary")
+                        _a2.set_xlim(_xl)
+                        _a2.set_ylim(_zl)
+                        _a2.set_aspect("equal")
+                        _a2.legend(loc="upper right")
+                        _a2.set_title(f"trail {int(args.trail_angle)}deg  f{min(_f,_n)}/{_n}")
+                        _wr.grab_frame()
+                plt.close(_f2)
+                print(f"    traj video saved to {_t_mp4}")
         return
 
     # Encoding path labels per mode family.
