@@ -61,6 +61,7 @@ from utils.stream_traj import (
     sample_timestamped_trajectory,
 )
 from utils.traj_batch import root_to_traj_feats
+from utils.visualize import render_single_video
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -833,7 +834,13 @@ def main():
         type=float,
         default=1.0,
         help="Waypoint sampling stride used by --predroot_timestamped_ablation "
-        "to emulate spatial waypoints + total duration.",
+        "when building timestamped trajectories.",
+    )
+    parser.add_argument(
+        "--render_video",
+        action="store_true",
+        default=False,
+        help="Save rendered .mp4 videos alongside artifacts (slow).",
     )
     parser.add_argument(
         "--recovery_tokens",
@@ -2142,6 +2149,13 @@ def main():
                 target_traj[: len(pred_root)],
                 metrics,
             )
+            if args.render_video and pred_motion.size > 0:
+                _mp4 = os.path.join(mode_dir, "pred_motion.mp4")
+                render_single_video(
+                    motion=pred_motion, save_path=_mp4,
+                    dim=263, render_setting={},
+                )
+                print(f"    video saved to {_mp4}")
             with open(os.path.join(mode_dir, "predroot_trace.json"), "w") as f:
                 json.dump(trace, f, indent=2, default=str)
             all_records.append(metrics)
