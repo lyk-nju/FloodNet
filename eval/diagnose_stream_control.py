@@ -924,9 +924,8 @@ def _run_babel_long_session(args, model, vae, device, out_root):
             if mode == "no_traj":
                 ti = None
             elif mode == "gt_suffix":
-                remain = tl - ci
-                ti = {"traj": sample["traj"][4 * ci:].unsqueeze(0).float(),
-                      "token_mask": torch.ones(1, max(1, remain))}
+                _bs = _wrap_flat_sample_for_suffix(sample)
+                ti = build_stream_suffix_conditioning(_bs, ci, prefer_xyz=True)
             elif mode == "timestamped_gt_plan":
                 ti = _build_timestamped_traj_input(
                     sample, ci, args.traj_horizon_tokens, args.token_dt)
