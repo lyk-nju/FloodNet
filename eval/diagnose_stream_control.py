@@ -878,6 +878,187 @@ def _build_mode_metrics(pred_root, gt_root, target_traj, mode_name, horizon, roo
 # main
 # ---------------------------------------------------------------------------
 
+
+def _run_babel_long_session(args, model, vae, device, out_root):
+    """BABEL multi-sample long-session eval with timestamped trajectory modes."""
+    _babel_modes = (
+        ["gt_suffix", "timestamped_gt_plan", "duration_waypoints", "no_traj"]
+        if args.babel_mode == "all" else [args.babel_mode]
+    )
+
+    print(f"\nMerging BABEL samples: {args.sample_ids}")
+    sample = _merge_babel_samples(args.raw_data_dir, args.sample_ids)
+    print(f"  frames={sample['feature_length']}, tokens={sample['token_length']}, "
+          f"texts={len(sample['text'])}")
+    for i, t in enumerate(sample["text"]):
+        print(f"    [{i}] '{t[:60]}' -> frame {sample['feature_text_end'][i]}")
+    if sample.get("_boundary_frames"):
+        print(f"  boundaries smoothed: {sample['_boundary_frames']}")
+
+    gt_root = extract_root_trajectory_263(sample["feature"].numpy())
+    target_traj = sample["traj"].numpy()
+    all_records = []
+
+    for mode in _babel_modes:
+        print(f"\n--- {mode} ---")
+        tl = sample["token_length"]
+        total_frames = 1 + 4 * (tl - 1) if tl > 1 else 1
+        segments = [StreamTextSegment(text=t, token_end=te)
+                    for t, te in zip(sample["text"], sample["token_text_end"])]
+        text_ctrl = StreamTextRolloutController(segments)
+
+        vae.clear_cache()
+        model.init_generated(args.history_length, batch_size=1,
+                            num_denoise_steps=args.num_denoise_steps)
+        model.generated = model.generated.to(device)
+        stream_recovery = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
+        all_dec, all_pr = [], []
+        first_chunk = True
+
+        gt_root_arr = sample["traj"].numpy()
+        wp_idx = np.arange(0, len(gt_root_arr), max(1, int(args.waypoint_dt * 20.0)))
+        wp_t = np.arange(len(wp_idx), dtype=np.float32) * args.waypoint_dt
+
+        for ci in range(tl):
+            cur_text = text_ctrl.get_text_for_commit_index(ci)
+            if mode == "no_traj":
+                ti = None
+            elif mode == "gt_suffix":
+                remain = tl - ci
+                ti = {"traj": sample["traj"][4 * ci:].unsqueeze(0).float(),
+                      "token_mask": torch.ones(1, max(1, remain))}
+            elif mode == "timestamped_gt_plan":
+                ti = _build_timestamped_traj_input(
+                    sample, ci, args.traj_horizon_tokens, args.token_dt)
+            elif mode == "duration_waypoints":
+                ti = _build_timestamped_traj_input(
+                    sample, ci, args.traj_horizon_tokens, args.token_dt,
+                    times=wp_t, waypoints=gt_root_arr[wp_idx])
+            sp = build_stream_step_model_input(cur_text, traj_input=ti)
+            out = model.stream_generate_step(sp, first_chunk=first_chunk)
+            dec = (vae.stream_decode(out["generated"][0][None, :].to(device),
+                                     first_chunk=first_chunk)[0].float().cpu().numpy())
+            first_chunk = False
+            for frm in dec:
+                stream_recovery.process_frame(frm)
+            all_dec.append(dec)
+            all_pr.append(extract_root_trajectory_263(dec))
+
+        vae.clear_cache()
+        pred_motion = (np.concatenate(all_dec, axis=0)[:total_frames]
+                       if all_dec else np.zeros((0, 263)))
+        pred_root = (np.concatenate(all_pr, axis=0)[:total_frames]
+                     if all_pr else np.zeros((0, 3)))
+
+        seg_pairs = []
+        for i, t in enumerate(sample["text"]):
+            sf = sample["feature_text_end"][i - 1] if i > 0 else 0
+            ef = sample["feature_text_end"][i]
+            seg_pairs.append({"text": t, "start_frame": sf, "end_frame": ef})
+        seg_met = []
+        for sp in seg_pairs:
+            sf2, ef2 = sp["start_frame"], sp["end_frame"]
+            ef2 = min(ef2, len(pred_root), len(gt_root))
+            if ef2 <= sf2:
+                seg_met.append(None)
+                continue
+            pr, gr = pred_root[sf2:ef2], gt_root[sf2:ef2]
+            seg_met.append({"text": sp["text"], "start_frame": sf2, "end_frame": ef2,
+                            "ADE": _compute_ade(pr, gr), "FDE": _compute_fde(pr, gr),
+                            "pred_path_length": _compute_root_path_length(pr),
+                            "gt_path_length": _compute_root_path_length(gr)})
+
+        metrics = _build_mode_metrics(
+            pred_root, gt_root, target_traj, mode, None, "gt",
+            traj_encoder_path=f"babel-{mode}")
+        metrics["segments"] = seg_met
+        metrics["pred_path_length"] = float(_compute_root_path_length(pred_root))
+        metrics["gt_path_length"] = float(_compute_root_path_length(gt_root))
+        metrics["path_length_ratio"] = (
+            metrics["pred_path_length"] / max(metrics["gt_path_length"], 1e-6))
+        print(f"  ADE={metrics['ADE']:.4f}  FDE={metrics['FDE']:.4f}  "
+              f"path_ratio={metrics['path_length_ratio']:.4f}")
+        for sm in seg_met:
+            if sm:
+                print(f"    [{sm['text'][:40]}] ADE={sm['ADE']:.4f}")
+
+        mode_dir = os.path.join(out_root, mode)
+        _save_artifacts(mode_dir, pred_motion, pred_root,
+                        gt_root[:len(pred_root)], target_traj[:len(pred_root)], metrics)
+        np.save(os.path.join(mode_dir, "gt_motion.npy"),
+                sample["feature"].numpy()[:len(pred_motion)])
+        all_records.append(metrics)
+
+        if args.render_video and pred_motion.size > 0:
+            _mp4 = os.path.join(mode_dir, "pred_motion.mp4")
+            render_single_video(motion=pred_motion, save_path=_mp4,
+                                dim=263, render_setting={})
+            render_single_video(
+                motion=sample["feature"].numpy()[:len(pred_motion)],
+                save_path=os.path.join(mode_dir, "gt_motion.mp4"),
+                dim=263, render_setting={})
+            _n = min(len(pred_root), len(gt_root))
+            if _n > 1:
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+                from matplotlib.animation import FFMpegWriter
+                _t_mp4 = os.path.join(mode_dir, "traj_compare.mp4")
+                _f2, _a2 = plt.subplots(figsize=(7, 7))
+                _axa = [gt_root[:_n, 0], pred_root[:_n, 0]]
+                _aza = [gt_root[:_n, 2], pred_root[:_n, 2]]
+                _xl = (min(a.min() for a in _axa) - 0.5, max(a.max() for a in _axa) + 0.5)
+                _zl = (min(a.min() for a in _aza) - 0.5, max(a.max() for a in _aza) + 0.5)
+                _wr = FFMpegWriter(fps=20)
+                _sf = max(1, _n // 150)
+                with _wr.saving(_f2, _t_mp4, dpi=100):
+                    for _f in range(1, _n + 1, _sf):
+                        _a2.clear()
+                        _a2.plot(gt_root[:min(_f, _n), 0], gt_root[:min(_f, _n), 2],
+                                 "g-", lw=1.5, alpha=0.7, label="target")
+                        _a2.plot(pred_root[:min(_f, _n), 0], pred_root[:min(_f, _n), 2],
+                                 "r-", lw=1.5, alpha=0.7, label="pred")
+                        _a2.plot(gt_root[0, 0], gt_root[0, 2], "go", ms=6)
+                        _a2.plot(pred_root[min(_f - 1, _n - 1), 0],
+                                 pred_root[min(_f - 1, _n - 1), 2], "r.", ms=8)
+                        for sp2 in seg_pairs:
+                            if 0 < sp2["start_frame"] < _n:
+                                _a2.axvline(x=gt_root[sp2["start_frame"], 0],
+                                            color="gray", ls=":", alpha=0.3)
+                        _a2.set_xlim(_xl)
+                        _a2.set_ylim(_zl)
+                        _a2.set_aspect("equal")
+                        _a2.legend(loc="upper right")
+                        _a2.set_title(f"{mode}  frame {min(_f, _n)}/{_n}")
+                        _wr.grab_frame()
+                plt.close(_f2)
+
+    summary = {
+        "base_name": sample["name"], "sample_ids_str": args.sample_ids,
+        "config": args.config, "ckpt": args.ckpt, "vae_ckpt": args.vae_ckpt,
+        "history_length": args.history_length,
+        "traj_horizon_tokens": args.traj_horizon_tokens,
+        "waypoint_dt": args.waypoint_dt, "token_dt": args.token_dt,
+        "modes": {m["mode"]: {k: v for k, v in m.items()
+                              if k not in ("segments",)}
+                  for m in all_records},
+        "text_schedule": [
+            {"text": t, "end_frame": int(fe), "end_token": int(te)}
+            for t, fe, te in zip(sample["text"], sample["feature_text_end"],
+                                 sample["token_text_end"])
+        ],
+    }
+    summary_path = os.path.join(out_root, "summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2, default=str)
+    print(f"\nSummary saved to {summary_path}")
+    print(f"\n{'Mode':<25} {'ADE':>8} {'FDE':>8} {'path_ratio':>10}")
+    print("-" * 55)
+    for m in all_records:
+        print(f"{m['mode']:<25} {m['ADE']:>8.4f} {m['FDE']:>8.4f} "
+              f"{m.get('path_length_ratio', float('nan')):>10.4f}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Stream control diagnostic matrix on a single sample"
@@ -1053,6 +1234,12 @@ def main():
     vae = _load_vae(cfg, device)
     print(f"Loading model from {args.ckpt} ...")
     model = _load_model(cfg, args.ckpt, device)
+
+    # ── BABEL multi-sample fast path ──────────────────────────────────
+    if args.sample_ids:
+        _run_babel_long_session(args, model, vae, device, out_root)
+        return
+
     print(f"Loading sample {args.sample_id} (dataset={args.dataset}) ...")
     sample = _load_sample(args.raw_data_dir, args.sample_id, dataset=args.dataset)
     _text_preview = (
@@ -2401,210 +2588,6 @@ def main():
             )
         return
 
-    # ── BABEL long-session web-demo-like eval ──────────────────────────
-    if args.sample_ids and args.babel_mode:
-        _babel_modes = (
-            ["gt_suffix", "timestamped_gt_plan", "duration_waypoints", "no_traj"]
-            if args.babel_mode == "all"
-            else [args.babel_mode]
-        )
-
-        # Merge samples into one long session.
-        print(f"\nMerging BABEL samples: {args.sample_ids}")
-        sample = _merge_babel_samples(args.raw_data_dir, args.sample_ids)
-        print(f"  frames={sample['feature_length']}, tokens={sample['token_length']}, "
-              f"texts={len(sample['text'])}")
-        for i, t in enumerate(sample["text"]):
-            print(f"    [{i}] '{t[:60]}' -> frame {sample['feature_text_end'][i]}")
-        if sample.get("_boundary_frames"):
-            print(f"  segment boundaries (smoothed): {sample['_boundary_frames']}")
-
-        gt_root = extract_root_trajectory_263(sample["feature"].numpy())
-        target_traj = sample["traj"].numpy()
-
-        all_records = []
-        for mode in _babel_modes:
-            print(f"\n--- {mode} ---")
-            token_length = sample["token_length"]
-            total_frames = 1 + 4 * (token_length - 1) if token_length > 1 else 1
-
-            segments = [
-                StreamTextSegment(text=t, token_end=te)
-                for t, te in zip(sample["text"], sample["token_text_end"])
-            ]
-            text_ctrl = StreamTextRolloutController(segments)
-
-            vae.clear_cache()
-            model.init_generated(args.history_length, batch_size=1,
-                                num_denoise_steps=args.num_denoise_steps)
-            model.generated = model.generated.to(device)
-            stream_recovery = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
-            all_decoded, all_pred_root = [], []
-            first_chunk = True
-
-            for commit_idx in range(token_length):
-                current_text = text_ctrl.get_text_for_commit_index(commit_idx)
-
-                if mode == "no_traj":
-                    traj_input = None
-                elif mode == "gt_suffix":
-                    remain = token_length - commit_idx
-                    traj_input = {
-                        "traj": sample["traj"][4 * commit_idx:].unsqueeze(0).float(),
-                        "token_mask": torch.ones(1, max(1, remain)),
-                    }
-                elif mode == "timestamped_gt_plan":
-                    traj_input = _build_timestamped_traj_input(
-                        sample, commit_idx, args.traj_horizon_tokens, args.token_dt)
-                elif mode == "duration_waypoints":
-                    gt_root_arr = sample["traj"].numpy()
-                    total_f = len(gt_root_arr)
-                    wp_idx = np.arange(0, total_f,
-                                       max(1, int(args.waypoint_dt * 20.0)))
-                    wp_t = np.arange(len(wp_idx), dtype=np.float32) * args.waypoint_dt
-                    traj_input = _build_timestamped_traj_input(
-                        sample, commit_idx, args.traj_horizon_tokens, args.token_dt,
-                        times=wp_t, waypoints=gt_root_arr[wp_idx],
-                    )
-
-                sp = build_stream_step_model_input(current_text, traj_input=traj_input)
-                output = model.stream_generate_step(sp, first_chunk=first_chunk)
-                decoded = (vae.stream_decode(
-                    output["generated"][0][None, :].to(device),
-                    first_chunk=first_chunk)[0].float().cpu().numpy())
-                first_chunk = False
-
-                for frame in decoded:
-                    stream_recovery.process_frame(frame)
-                all_decoded.append(decoded)
-                all_pred_root.append(extract_root_trajectory_263(decoded))
-
-            vae.clear_cache()
-            pred_motion = (np.concatenate(all_decoded, axis=0)[:total_frames]
-                           if all_decoded else np.zeros((0, 263)))
-            pred_root = (np.concatenate(all_pred_root, axis=0)[:total_frames]
-                         if all_pred_root else np.zeros((0, 3)))
-
-            # Per-segment metrics.
-            seg_pairs = []
-            for i, t in enumerate(sample["text"]):
-                sf = sample["feature_text_end"][i - 1] if i > 0 else 0
-                ef = sample["feature_text_end"][i]
-                seg_pairs.append({"text": t, "start_frame": sf, "end_frame": ef})
-            seg_metrics = []
-            for sp in seg_pairs:
-                sf2, ef2 = sp["start_frame"], sp["end_frame"]
-                ef2 = min(ef2, len(pred_root), len(gt_root))
-                if ef2 <= sf2:
-                    seg_metrics.append(None)
-                    continue
-                pr, gr = pred_root[sf2:ef2], gt_root[sf2:ef2]
-                seg_metrics.append({
-                    "text": sp["text"], "start_frame": sf2, "end_frame": ef2,
-                    "ADE": _compute_ade(pr, gr), "FDE": _compute_fde(pr, gr),
-                    "pred_path_length": _compute_root_path_length(pr),
-                    "gt_path_length": _compute_root_path_length(gr),
-                })
-
-            metrics = _build_mode_metrics(
-                pred_root, gt_root, target_traj, mode, None, "gt",
-                traj_encoder_path=f"babel-{mode}",
-            )
-            metrics["segments"] = seg_metrics
-            metrics["pred_path_length"] = float(_compute_root_path_length(pred_root))
-            metrics["gt_path_length"] = float(_compute_root_path_length(gt_root))
-            metrics["path_length_ratio"] = (
-                metrics["pred_path_length"] / max(metrics["gt_path_length"], 1e-6))
-            print(f"  ADE={metrics['ADE']:.4f}  FDE={metrics['FDE']:.4f}  "
-                  f"path_ratio={metrics['path_length_ratio']:.4f}")
-            for sm in seg_metrics:
-                if sm:
-                    print(f"    [{sm['text'][:40]}] ADE={sm['ADE']:.4f}")
-
-            mode_dir = os.path.join(out_root, mode)
-            _save_artifacts(mode_dir, pred_motion, pred_root,
-                            gt_root[:len(pred_root)], target_traj[:len(pred_root)],
-                            metrics)
-            np.save(os.path.join(mode_dir, "gt_motion.npy"),
-                    sample["feature"].numpy()[:len(pred_motion)])
-            all_records.append(metrics)
-
-            if args.render_video and pred_motion.size > 0:
-                _mp4 = os.path.join(mode_dir, "pred_motion.mp4")
-                render_single_video(motion=pred_motion, save_path=_mp4,
-                                    dim=263, render_setting={})
-                _gt_mp4 = os.path.join(mode_dir, "gt_motion.mp4")
-                render_single_video(
-                    motion=sample["feature"].numpy()[:len(pred_motion)],
-                    save_path=_gt_mp4, dim=263, render_setting={})
-                # Traj compare animate.
-                _n = min(len(pred_root), len(gt_root))
-                if _n > 1:
-                    import matplotlib
-                    matplotlib.use("Agg")
-                    import matplotlib.pyplot as plt
-                    from matplotlib.animation import FFMpegWriter
-                    _traj_mp4 = os.path.join(mode_dir, "traj_compare.mp4")
-                    _fig2, _ax2 = plt.subplots(figsize=(7, 7))
-                    _all_x = [gt_root[:_n, 0], pred_root[:_n, 0]]
-                    _all_z = [gt_root[:_n, 2], pred_root[:_n, 2]]
-                    _xlim = (min(a.min() for a in _all_x) - 0.5,
-                             max(a.max() for a in _all_x) + 0.5)
-                    _zlim = (min(a.min() for a in _all_z) - 0.5,
-                             max(a.max() for a in _all_z) + 0.5)
-                    _writer = FFMpegWriter(fps=20)
-                    _step_f = max(1, _n // 150)
-                    with _writer.saving(_fig2, _traj_mp4, dpi=100):
-                        for _f in range(1, _n + 1, _step_f):
-                            _ax2.clear()
-                            _ax2.plot(gt_root[:min(_f, _n), 0],
-                                      gt_root[:min(_f, _n), 2],
-                                      "g-", linewidth=1.5, alpha=0.7, label="target")
-                            _ax2.plot(pred_root[:min(_f, _n), 0],
-                                      pred_root[:min(_f, _n), 2],
-                                      "r-", linewidth=1.5, alpha=0.7, label="pred")
-                            _ax2.plot(gt_root[0, 0], gt_root[0, 2], "go", markersize=6)
-                            _ax2.plot(pred_root[min(_f - 1, _n - 1), 0],
-                                      pred_root[min(_f - 1, _n - 1), 2], "r.", markersize=8)
-                            for sp2 in seg_pairs:
-                                if 0 < sp2["start_frame"] < _n:
-                                    _ax2.axvline(x=gt_root[sp2["start_frame"], 0],
-                                                 color="gray", linestyle=":", alpha=0.3)
-                            _ax2.set_xlim(_xlim)
-                            _ax2.set_ylim(_zlim)
-                            _ax2.set_aspect("equal")
-                            _ax2.legend(loc="upper right")
-                            _ax2.set_title(f"{mode}  frame {min(_f, _n)}/{_n}")
-                            _writer.grab_frame()
-                    plt.close(_fig2)
-                    print(f"    traj video saved to {_traj_mp4}")
-
-        summary = {
-            "base_name": sample["name"], "sample_ids_str": args.sample_ids,
-            "config": args.config, "ckpt": args.ckpt, "vae_ckpt": args.vae_ckpt,
-            "history_length": args.history_length,
-            "traj_horizon_tokens": args.traj_horizon_tokens,
-            "waypoint_dt": args.waypoint_dt, "token_dt": args.token_dt,
-            "modes": {m["mode"]: {k: v for k, v in m.items()
-                                  if k not in ("segments",)}
-                      for m in all_records},
-            "text_schedule": [
-                {"text": t, "end_frame": int(fe), "end_token": int(te)}
-                for t, fe, te in zip(sample["text"], sample["feature_text_end"],
-                                     sample["token_text_end"])
-            ],
-        }
-        summary_path = os.path.join(out_root, "summary.json")
-        with open(summary_path, "w") as f:
-            json.dump(summary, f, indent=2, default=str)
-        print(f"\nSummary saved to {summary_path}")
-
-        print(f"\n{'Mode':<25} {'ADE':>8} {'FDE':>8} {'path_ratio':>10}")
-        print("-" * 55)
-        for m in all_records:
-            print(f"{m['mode']:<25} {m['ADE']:>8.4f} {m['FDE']:>8.4f} "
-                  f"{m.get('path_length_ratio', float('nan')):>10.4f}")
-        return
 
     # Encoding path labels per mode family.
     _TPATH_GENERATE = (
