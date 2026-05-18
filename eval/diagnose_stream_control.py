@@ -2156,6 +2156,51 @@ def main():
                     dim=263, render_setting={},
                 )
                 print(f"    video saved to {_mp4}")
+                # Also render trajectory comparison (pred + target).
+                _n = min(len(pred_root), len(gt_root))
+                if _n > 1:
+                    import matplotlib
+                    matplotlib.use("Agg")
+                    import matplotlib.pyplot as plt
+                    from matplotlib.animation import FFMpegWriter
+                    _traj_png = os.path.join(mode_dir, "traj_compare.png")
+                    _fig, _ax = plt.subplots(figsize=(6, 6))
+                    _ax.plot(gt_root[:_n, 0], gt_root[:_n, 2], "g-", linewidth=1.5, alpha=0.7, label="target")
+                    _ax.plot(pred_root[:_n, 0], pred_root[:_n, 2], "r-", linewidth=1.5, alpha=0.7, label="pred")
+                    _ax.plot(gt_root[0, 0], gt_root[0, 2], "go", markersize=6, label="start")
+                    _ax.plot(gt_root[_n-1, 0], gt_root[_n-1, 2], "gx", markersize=10, label="end")
+                    _ax.set_aspect("equal")
+                    _ax.legend()
+                    _ax.set_title(f"{mode_name}")
+                    _fig.savefig(_traj_png, dpi=100, bbox_inches="tight")
+                    plt.close(_fig)
+                    print(f"    traj plot saved to {_traj_png}")
+
+                    # Animated trajectory growth video.
+                    _traj_mp4 = os.path.join(mode_dir, "traj_compare.mp4")
+                    _fig2, _ax2 = plt.subplots(figsize=(6, 6))
+                    _all_x = [gt_root[:_n, 0], pred_root[:_n, 0]]
+                    _all_z = [gt_root[:_n, 2], pred_root[:_n, 2]]
+                    _xlim = (min(a.min() for a in _all_x) - 0.5, max(a.max() for a in _all_x) + 0.5)
+                    _zlim = (min(a.min() for a in _all_z) - 0.5, max(a.max() for a in _all_z) + 0.5)
+                    _writer = FFMpegWriter(fps=20)
+                    _step = max(1, _n // 120)  # ~6s video
+                    with _writer.saving(_fig2, _traj_mp4, dpi=100):
+                        for _f in range(1, _n + 1, _step):
+                            _ax2.clear()
+                            _ax2.plot(gt_root[:min(_f, _n), 0], gt_root[:min(_f, _n), 2], "g-", linewidth=1.5, alpha=0.7, label="target")
+                            _ax2.plot(pred_root[:min(_f, _n), 0], pred_root[:min(_f, _n), 2], "r-", linewidth=1.5, alpha=0.7, label="pred")
+                            _ax2.plot(gt_root[0, 0], gt_root[0, 2], "go", markersize=6)
+                            _ax2.plot(gt_root[min(_f-1, _n-1), 0], gt_root[min(_f-1, _n-1), 2], "g.", markersize=8)
+                            _ax2.plot(pred_root[min(_f-1, _n-1), 0], pred_root[min(_f-1, _n-1), 2], "r.", markersize=8)
+                            _ax2.set_xlim(_xlim)
+                            _ax2.set_ylim(_zlim)
+                            _ax2.set_aspect("equal")
+                            _ax2.legend(loc="upper right")
+                            _ax2.set_title(f"{mode_name}  frame {min(_f,_n)}/{_n}")
+                            _writer.grab_frame()
+                    plt.close(_fig2)
+                    print(f"    traj video saved to {_traj_mp4}")
             with open(os.path.join(mode_dir, "predroot_trace.json"), "w") as f:
                 json.dump(trace, f, indent=2, default=str)
             all_records.append(metrics)
