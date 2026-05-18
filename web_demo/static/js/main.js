@@ -959,7 +959,6 @@ class MotionApp {
         if (added) {
             this.syncTextareaFromWaypoints(this.drawnWaypoints);
             this.syncTrajectorySpheresFromWaypoints(this.drawnWaypoints);
-            this.pushTrajectoryToBackend(this.drawnWaypoints, true);
         }
 
         this.lastUserInteraction = Date.now();
@@ -974,7 +973,6 @@ class MotionApp {
         // Keep UI responsive; backend updates are throttled.
         this.syncTextareaFromWaypoints(this.drawnWaypoints);
         this.syncTrajectorySpheresFromWaypoints(this.drawnWaypoints);
-        this.pushTrajectoryToBackend(this.drawnWaypoints, false);
 
         this.lastUserInteraction = Date.now();
     }
@@ -984,7 +982,7 @@ class MotionApp {
         this.isDrawingTrajectory = false;
         this.controls.enabled = true;
 
-        if (this.drawnWaypoints && this.drawnWaypoints.length > 0) {
+        if (this.drawnWaypoints && this.drawnWaypoints.length >= 2) {
             this.pushTrajectoryToBackend(this.drawnWaypoints, true);
         }
     }

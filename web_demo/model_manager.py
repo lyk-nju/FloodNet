@@ -112,6 +112,8 @@ class ModelManager:
         self.traj_horizon_tokens = int(traj_mask_cfg.get("horizon_tokens", 20))
         self.traj_time_mode = str(traj_mask_cfg.get("time_mode", "timestamped"))
         self.waypoint_dt = float(traj_mask_cfg.get("waypoint_dt", 0.05))
+        self.manual_duration_seconds = float(traj_mask_cfg.get("manual_duration_seconds", 3.0))
+        self.manual_resample_arclength = bool(traj_mask_cfg.get("manual_resample_arclength", True))
         self.token_dt = float(traj_mask_cfg.get("token_dt", 0.20))
         self.traj_repeat_policy = str(traj_mask_cfg.get("repeat_policy", "hold"))
         self.default_token_step = float(traj_mask_cfg.get("default_token_step", 0.25))
@@ -126,6 +128,7 @@ class ModelManager:
             "Trajectory config: "
             f"time_mode={self.traj_time_mode}, "
             f"waypoint_dt={self.waypoint_dt:.3f}s, "
+            f"manual_duration={self.manual_duration_seconds:.2f}s, "
             f"token_dt={self.token_dt:.3f}s, "
             f"horizon_tokens={self.traj_horizon_tokens}, "
             f"repeat_policy={self.traj_repeat_policy}"
@@ -318,12 +321,43 @@ class ModelManager:
             # This allows continuous generation with text changes
             print(f"Text updated: '{old_text}' -> '{text}' (continuous generation)")
 
-    def update_trajectory(self, waypoints, mode="replace_future"):
+    @staticmethod
+    def _path_length_xz(points_xyz: np.ndarray) -> float:
+        points = np.asarray(points_xyz, dtype=np.float32)
+        if len(points) < 2:
+            return 0.0
+        return float(np.linalg.norm(np.diff(points[:, [0, 2]], axis=0), axis=1).sum())
+
+    def _resample_uniform_arclength(self, points_xyz: np.ndarray, num_points: int) -> np.ndarray:
+        points = dedupe_polyline(np.asarray(points_xyz, dtype=np.float32))
+        if len(points) == 0:
+            return np.zeros((0, 3), dtype=np.float32)
+        if len(points) == 1 or num_points <= 1:
+            return points[:1].astype(np.float32)
+        total_len = self._path_length_xz(points)
+        if total_len <= 1e-6:
+            return np.repeat(points[:1].astype(np.float32), num_points, axis=0)
+        return resample_polyline(
+            points,
+            num_tokens=int(num_points),
+            token_step=total_len / float(num_points - 1),
+        )
+
+    def update_trajectory(
+        self,
+        waypoints,
+        mode="replace_future",
+        *,
+        source="manual",
+        duration_seconds=None,
+    ):
         """Update trajectory control from world-space waypoints.
 
         V1 semantics:
         - `mode=replace_future`: replace only the future plan used by streaming inference.
         - The latent state is preserved; only future trajectory conditioning is updated.
+        - Manual non-timestamped paths are normalized to uniform arclength over
+          a fixed duration, so browser event density does not change target speed.
         """
         mode = mode or "replace_future"
         if mode != "replace_future":
@@ -364,9 +398,16 @@ class ModelManager:
                     f"or timestamped (N,4); got {waypoints.shape}"
                 )
 
-            self.current_traj_waypoints = waypoints.copy()
-            self.current_traj_array = waypoints.copy()
             if explicit_times is None:
+                if source == "manual" and self.manual_resample_arclength:
+                    duration = self.manual_duration_seconds
+                    if duration_seconds is not None:
+                        duration = float(duration_seconds)
+                    duration = max(self.waypoint_dt, float(duration))
+                    num_points = max(2, int(round(duration / self.waypoint_dt)) + 1)
+                    waypoints = self._resample_uniform_arclength(waypoints, num_points)
+                else:
+                    waypoints = dedupe_polyline(waypoints)
                 self.current_traj_times = (
                     np.arange(len(waypoints), dtype=np.float32) * self.waypoint_dt
                 )
@@ -374,6 +415,8 @@ class ModelManager:
                 self.current_traj_times = explicit_times.copy()
                 if len(self.current_traj_times):
                     self.current_traj_times = self.current_traj_times - self.current_traj_times[0]
+            self.current_traj_waypoints = waypoints.copy()
+            self.current_traj_array = waypoints.copy()
             self.traj_plan_start_commit_index = int(
                 getattr(self.model, "commit_index", 0)
             )
@@ -382,8 +425,9 @@ class ModelManager:
 
         print(
             f"Trajectory updated: {len(waypoints)} waypoints, "
-            f"mode={mode}, horizon={self.traj_horizon_tokens} tokens, "
-            f"time_mode={self.traj_time_mode}, waypoint_dt={self.waypoint_dt:.3f}s"
+            f"mode={mode}, source={source}, horizon={self.traj_horizon_tokens} tokens, "
+            f"time_mode={self.traj_time_mode}, waypoint_dt={self.waypoint_dt:.3f}s, "
+            f"duration={(len(waypoints) - 1) * self.waypoint_dt:.2f}s"
         )
         preview = self._build_stream_traj_input()
         if preview is None:

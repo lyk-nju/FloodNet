@@ -12,6 +12,7 @@ import numpy as np
 from omegaconf import OmegaConf
 from model_manager import get_model_manager
 from utils.motion_process import extract_root_trajectory_263
+from utils.stream_traj import resample_polyline
 
 app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
@@ -96,6 +97,25 @@ def _load_first_caption(text_path: str) -> str:
     return ""
 
 
+def _resample_uniform_arclength(points_xyz: np.ndarray, num_points: int) -> np.ndarray:
+    """Resample a world-space XZ polyline to uniformly spaced points."""
+    points = np.asarray(points_xyz, dtype=np.float32)
+    if num_points <= 0 or len(points) == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    if num_points == 1 or len(points) == 1:
+        return points[:1].astype(np.float32)
+
+    seg_lens = np.linalg.norm(np.diff(points[:, [0, 2]], axis=0), axis=1)
+    total_len = float(seg_lens.sum())
+    if total_len <= 1e-6:
+        return np.repeat(points[:1].astype(np.float32), num_points, axis=0)
+    return resample_polyline(
+        points,
+        num_tokens=num_points,
+        token_step=total_len / float(num_points - 1),
+    )
+
+
 def load_debug_preset_sample():
     """Load a HumanML3D root trajectory preset for web-demo sanity checks.
 
@@ -130,6 +150,7 @@ def load_debug_preset_sample():
     )
     feature = np.load(feature_path).astype(np.float32)
     root = extract_root_trajectory_263(feature).astype(np.float32)
+    root = _resample_uniform_arclength(root, len(root))
     waypoint_dt = float((traj_mask_cfg or {}).get("waypoint_dt", 0.05))
     text = str(cfg.get("text", "")).strip() or _load_first_caption(text_path)
     return {
@@ -313,6 +334,7 @@ def start_generation():
             debug_target_traj = mm.update_trajectory(
                 debug_sample["trajectory"],
                 mode="replace_future",
+                source="debug_preset",
             )
         mm.start_generation(text, history_length=history_length)
         
@@ -408,6 +430,8 @@ def update_trajectory():
         session_id = data.get('session_id')
         waypoints = data.get('waypoints')
         mode = data.get('mode', 'replace_future')
+        source = data.get('source', 'manual')
+        duration_seconds = data.get('duration_seconds')
         
         if not session_id:
             return jsonify({
@@ -428,7 +452,12 @@ def update_trajectory():
                     'message': 'Not the active session'
                 }), 403
         
-        target_traj = model_manager.update_trajectory(waypoints, mode=mode)
+        target_traj = model_manager.update_trajectory(
+            waypoints,
+            mode=mode,
+            source=source,
+            duration_seconds=duration_seconds,
+        )
         target_len = 0 if target_traj is None else len(target_traj)
         print(
             f"[Session {session_id}] update_trajectory mode={mode} "

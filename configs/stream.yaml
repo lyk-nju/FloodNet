@@ -29,6 +29,8 @@ traj_mask:
     enabled: false
     time_mode: timestamped
     waypoint_dt: 0.05
+    manual_duration_seconds: 5.0
+    manual_resample_arclength: true
     token_dt: 0.20
     horizon_tokens: 20
     repeat_policy: translate_from_current_root
