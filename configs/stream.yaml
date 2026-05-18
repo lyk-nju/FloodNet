@@ -40,7 +40,9 @@ traj_mask:
     max_token_step: 0.12
 
 # Optional web-demo sanity preset.  When enabled, /api/start ignores the UI text
-# and starts from this dataset sample's text plus timestamped GT root trajectory.
+# and starts from this dataset sample's text plus GT root trajectory points.
+# The timestamp axis is assigned by traj_mask.waypoint_dt, exactly like a
+# user-drawn path.
 # Keep disabled for normal interactive use.
 web_demo_debug:
     enabled: true
@@ -49,4 +51,3 @@ web_demo_debug:
     raw_data_dir: /data1/yuankai/text2Motion/FloodDiffusion/raw_data
     feature_path: new_joint_vecs
     text_path: texts
-    motion_fps: 20.0

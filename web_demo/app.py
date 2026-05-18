@@ -97,7 +97,13 @@ def _load_first_caption(text_path: str) -> str:
 
 
 def load_debug_preset_sample():
-    """Load a timestamped GT trajectory preset for web-demo sanity checks."""
+    """Load a HumanML3D root trajectory preset for web-demo sanity checks.
+
+    The preset intentionally passes only world-space root points to the normal
+    web trajectory path.  ModelManager then assigns timestamps with
+    traj_mask.waypoint_dt, matching user-drawn paths instead of using a separate
+    debug-only timestamp source.
+    """
     cfg = debug_preset_cfg or {}
     if not bool(cfg.get("enabled", False)):
         return None
@@ -108,7 +114,6 @@ def load_debug_preset_sample():
     if not raw_data_dir:
         raise ValueError("web_demo_debug.raw_data_dir is required when debug preset is enabled")
 
-    motion_fps = float(cfg.get("motion_fps", 20.0))
     if dataset != "humanml3d":
         raise ValueError(f"Unsupported web_demo_debug.dataset: {dataset}")
 
@@ -125,16 +130,16 @@ def load_debug_preset_sample():
     )
     feature = np.load(feature_path).astype(np.float32)
     root = extract_root_trajectory_263(feature).astype(np.float32)
-    times = np.arange(len(root), dtype=np.float32) / motion_fps
-    timestamped_traj = np.concatenate([times[:, None], root], axis=1)
+    waypoint_dt = float((traj_mask_cfg or {}).get("waypoint_dt", 0.05))
     text = str(cfg.get("text", "")).strip() or _load_first_caption(text_path)
     return {
         "dataset": dataset,
         "sample_id": sample_id,
         "text": text,
-        "trajectory": timestamped_traj,
+        "trajectory": root,
         "num_frames": int(len(feature)),
-        "duration_seconds": float(times[-1]) if len(times) else 0.0,
+        "duration_seconds": float(max(0, len(root) - 1) * waypoint_dt),
+        "waypoint_dt": waypoint_dt,
     }
 
 
