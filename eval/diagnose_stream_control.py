@@ -54,6 +54,7 @@ from utils.stream_rollout import (
 from utils.stream_traj import (
     build_remaining_polyline,
     build_recovery_future_traj,
+    assign_times_by_arclength,
     estimate_token_step_distance,
     project_point_to_polyline,
     resample_polyline,
@@ -385,6 +386,33 @@ def _make_gt_timestamped_traj(sample: dict, motion_fps: float = 20.0):
     traj = sample["traj"].numpy().astype(np.float32)
     times = np.arange(len(traj), dtype=np.float32) / float(motion_fps)
     return times, traj
+
+
+def _make_duration_waypoint_traj(
+    sample: dict,
+    *,
+    motion_fps: float = 20.0,
+    waypoint_stride_seconds: float = 1.0,
+):
+    """Approximate GT with spatial waypoints plus only total duration.
+
+    Waypoints are sampled from the GT root at a coarse fixed time stride, then
+    timestamps are reassigned by arclength over the total clip duration.  This
+    emulates a user providing spatial waypoints and total duration, without
+    manually timestamping each point.
+    """
+    gt_times, gt_traj = _make_gt_timestamped_traj(sample, motion_fps=motion_fps)
+    if len(gt_traj) == 0:
+        return gt_times, gt_traj, gt_traj
+
+    total_duration = float(gt_times[-1]) if len(gt_times) > 1 else 0.0
+    stride_frames = max(1, int(round(float(waypoint_stride_seconds) * motion_fps)))
+    idx = list(range(0, len(gt_traj), stride_frames))
+    if idx[-1] != len(gt_traj) - 1:
+        idx.append(len(gt_traj) - 1)
+    waypoints = gt_traj[idx].astype(np.float32)
+    times = assign_times_by_arclength(waypoints, total_duration)
+    return times, waypoints, waypoints
 
 
 # ---------------------------------------------------------------------------
@@ -799,6 +827,13 @@ def main():
         type=float,
         default=0.10,
         help="Fixed token_step baseline included in --predroot_timestamped_ablation.",
+    )
+    parser.add_argument(
+        "--duration_waypoint_stride_seconds",
+        type=float,
+        default=1.0,
+        help="Waypoint sampling stride used by --predroot_timestamped_ablation "
+        "to emulate spatial waypoints + total duration.",
     )
     parser.add_argument(
         "--recovery_tokens",
@@ -1953,8 +1988,19 @@ def main():
         oracle_step = _compute_oracle_token_step(sample)
         token_dt = 4.0 / float(args.motion_fps)
         timestamped_traj = _make_gt_timestamped_traj(sample, motion_fps=args.motion_fps)
+        duration_times, duration_waypoints, _ = _make_duration_waypoint_traj(
+            sample,
+            motion_fps=args.motion_fps,
+            waypoint_stride_seconds=args.duration_waypoint_stride_seconds,
+        )
+        duration_traj = (duration_times, duration_waypoints)
         print(f"  oracle token_step={oracle_step:.4f}")
         print(f"  token_dt={token_dt:.4f}s  motion_fps={args.motion_fps:.2f}")
+        print(
+            "  duration-waypoint: "
+            f"{len(duration_waypoints)} points, "
+            f"stride={args.duration_waypoint_stride_seconds:.2f}s"
+        )
 
         all_records = []
 
@@ -2021,6 +2067,13 @@ def main():
                 timestamped_traj,
                 "GT timestamped root sampled at token times",
             ),
+            (
+                f"duration_waypoints_s{args.duration_waypoint_stride_seconds:g}_h{args.traj_horizon_tokens}",
+                "timestamped",
+                None,
+                duration_traj,
+                "coarse spatial waypoints + total duration, arclength timing",
+            ),
         ]
 
         for mode_name, pred_mode, token_step_override, ts_traj, traj_path in mode_specs:
@@ -2056,6 +2109,11 @@ def main():
                 None if token_step_override is None else float(token_step_override)
             )
             metrics["token_dt"] = float(token_dt)
+            if mode_name.startswith("duration_waypoints"):
+                metrics["duration_waypoint_count"] = int(len(duration_waypoints))
+                metrics["duration_waypoint_stride_seconds"] = float(
+                    args.duration_waypoint_stride_seconds
+                )
             if trace:
                 metrics["mean_future_token_step"] = float(
                     np.mean([row["future_token_step"] for row in trace])
@@ -2101,6 +2159,8 @@ def main():
             "token_dt": token_dt,
             "oracle_token_step": oracle_step,
             "timestamped_fixed_token_step": args.timestamped_fixed_token_step,
+            "duration_waypoint_stride_seconds": args.duration_waypoint_stride_seconds,
+            "duration_waypoint_count": int(len(duration_waypoints)),
             "modes": all_records,
         }
         summary_path = os.path.join(out_root, "summary_predroot_timestamped.json")

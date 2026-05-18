@@ -222,6 +222,33 @@ def sample_timestamped_trajectory(
     return out
 
 
+def assign_times_by_arclength(
+    waypoints_xyz: np.ndarray,
+    total_duration: float,
+) -> np.ndarray:
+    """Assign timestamps to waypoints by XZ arclength fraction.
+
+    This models a user giving spatial waypoints plus total duration, but no
+    per-waypoint timestamps.  Speed is constant along the waypoint polyline.
+    """
+    points = np.asarray(waypoints_xyz, dtype=np.float32)
+    if len(points) == 0:
+        return np.zeros((0,), dtype=np.float32)
+    if len(points) == 1:
+        return np.zeros((1,), dtype=np.float32)
+
+    seg_lens = np.linalg.norm(np.diff(points[:, [0, 2]], axis=0), axis=1)
+    cum = np.concatenate(
+        [np.zeros(1, dtype=np.float32), np.cumsum(seg_lens).astype(np.float32)]
+    )
+    total_len = float(cum[-1])
+    if total_len <= 1e-6:
+        return np.linspace(
+            0.0, float(total_duration), len(points), dtype=np.float32
+        )
+    return (cum / total_len * float(total_duration)).astype(np.float32)
+
+
 def estimate_token_step_distance(
     root_xz_history: list,
     *,
