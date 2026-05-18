@@ -557,6 +557,40 @@ def _compute_fde(pred_root: np.ndarray, gt_root: np.ndarray) -> float:
     return float(np.linalg.norm(pred_root[n - 1, [0, 2]] - gt_root[n - 1, [0, 2]]))
 
 
+def _path_arc_ade(pred_root: np.ndarray, gt_root: np.ndarray,
+                  num_samples: int = 100) -> float:
+    """Arc-length reparameterized ADE between two paths."""
+    n = min(len(pred_root), len(gt_root))
+    if n < 2:
+        return _compute_ade(pred_root, gt_root)
+    xz_p = pred_root[:n, [0, 2]] if pred_root.shape[1] >= 3 else pred_root[:n]
+    xz_g = gt_root[:n, [0, 2]] if gt_root.shape[1] >= 3 else gt_root[:n]
+    def _resample(path, ns):
+        segs = np.linalg.norm(np.diff(path, axis=0), axis=1)
+        cum = np.concatenate([np.zeros(1), np.cumsum(segs)])
+        total = cum[-1]
+        if total < 1e-8:
+            return np.tile(path[:1], (ns, 1))
+        q = np.linspace(0, total, ns)
+        return np.column_stack([np.interp(q, cum, path[:, d]) for d in range(path.shape[1])])
+    rp = _resample(xz_p, num_samples)
+    rg = _resample(xz_g, num_samples)
+    return float(np.mean(np.linalg.norm(rp - rg, axis=1)))
+
+
+def _path_chamfer(pred_root: np.ndarray, gt_root: np.ndarray) -> float:
+    """One-sided Chamfer distance: mean min-dist from pred to gt path."""
+    n = min(len(pred_root), len(gt_root))
+    if n < 2:
+        return _compute_ade(pred_root, gt_root)
+    xz_p = pred_root[:n, [0, 2]] if pred_root.shape[1] >= 3 else pred_root[:n]
+    xz_g = gt_root[:n, [0, 2]] if gt_root.shape[1] >= 3 else gt_root[:n]
+    from scipy.spatial import cKDTree
+    tree = cKDTree(xz_g)
+    dists, _ = tree.query(xz_p)
+    return float(np.mean(dists))
+
+
 def _compute_root_path_length(root: np.ndarray) -> float:
     if len(root) < 2:
         return 0.0
@@ -2738,7 +2772,7 @@ def main():
                 qt = (float(_elapsed) * args.token_dt
                       + np.arange(args.traj_horizon_tokens, dtype=np.float32) * args.token_dt)
                 ft = sample_timestamped_trajectory(times_full, waypoints_full, qt)
-                # Root alignment: shift so first plan position maps to current root.
+                # Pred root alignment: same as web_demo mid-session update.
                 cur_root = np.zeros(3, dtype=np.float32)
                 cur_root[[0, 2]] = stream_rec.r_pos_accum[[0, 2]].astype(np.float32)
                 anchor = sample_timestamped_trajectory(
@@ -2775,8 +2809,13 @@ def main():
                 traj_encoder_path=f"timestamped, split={_update_at}")
             metrics["ADE_pre_split"] = _compute_ade(pre_root, gt_pre) if len(pre_root) > 1 else float("nan")
             metrics["ADE_post_split"] = _compute_ade(post_root, gt_post) if len(post_root) > 1 else float("nan")
+            # Path-based metrics (arc-length reparam / chamfer).
+            metrics["path_arc_ade"] = _path_arc_ade(pred_root, gt_root)
+            metrics["path_chamfer"] = _path_chamfer(pred_root, gt_root)
             print(f"  ADE={metrics['ADE']:.4f}  pre={metrics['ADE_pre_split']:.4f}  "
-                  f"post={metrics['ADE_post_split']:.4f}")
+                  f"post={metrics['ADE_post_split']:.4f}  "
+                  f"arc_ADE={metrics['path_arc_ade']:.4f}  "
+                  f"chamfer={metrics['path_chamfer']:.4f}")
 
             mode_dir = os.path.join(out_root, f"mid_update_{_mode_label}")
             _save_artifacts(mode_dir, pred_motion, pred_root,
@@ -2797,12 +2836,14 @@ def main():
         summary_path = os.path.join(out_root, "summary_mid_update.json")
         with open(summary_path, "w") as f:
             json.dump(summary, f, indent=2, default=str)
-        print(f"\n{'Mode':<48} {'ADE':>8} {'pre':>8} {'post':>8}")
-        print("-" * 76)
+        print(f"\n{'Mode':<38} {'ADE':>8} {'pre':>8} {'post':>8} {'arc_ADE':>8} {'chamfer':>8}")
+        print("-" * 82)
         for m in all_records:
-            print(f"{m['mode']:<48} {m['ADE']:>8.4f} "
+            print(f"{m['mode']:<38} {m['ADE']:>8.4f} "
                   f"{m.get('ADE_pre_split', float('nan')):>8.4f} "
-                  f"{m.get('ADE_post_split', float('nan')):>8.4f}")
+                  f"{m.get('ADE_post_split', float('nan')):>8.4f} "
+                  f"{m.get('path_arc_ade', float('nan')):>8.4f} "
+                  f"{m.get('path_chamfer', float('nan')):>8.4f}")
         return
 
     # Encoding path labels per mode family.
