@@ -441,9 +441,12 @@ def run_stream_step(
     # with batch dim).  Wrap the flat sample once.
     _batch_sample = _wrap_flat_sample_for_suffix(sample)
 
-    # For pred_root mode: maintain the same root-accumulation state as web_demo.
+    # Match web_demo root semantics: stream output frames are incremental 263D
+    # features, so root position must be accumulated across decoded chunks.
+    # Calling extract_root_trajectory_263() per chunk would reset the root at
+    # every token and corrupt step-path ADE/FDE.
+    stream_recovery = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
     if use_pred_root:
-        stream_recovery = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
         gt_polyline = sample["traj"].numpy()  # (T, 3) world-space GT polyline
 
     vae.clear_cache()
@@ -512,16 +515,15 @@ def run_stream_step(
             )
             all_decoded.append(decoded)
 
-            # Accumulate root position for pred_root closed loop.
-            if use_pred_root:
-                for frame in decoded:
-                    stream_recovery.process_frame(frame)
-                    root_xz_history.append(
-                        stream_recovery.r_pos_accum[[0, 2]].astype(np.float32).copy()
-                    )
-
-            pred_root_chunk = extract_root_trajectory_263(decoded)
-            all_pred_root.append(pred_root_chunk)
+            pred_root_chunk = []
+            for frame in decoded:
+                stream_recovery.process_frame(frame)
+                root_pos = stream_recovery.r_pos_accum.astype(np.float32).copy()
+                pred_root_chunk.append(root_pos)
+                if use_pred_root:
+                    root_xz_history.append(root_pos[[0, 2]].copy())
+            if pred_root_chunk:
+                all_pred_root.append(np.stack(pred_root_chunk, axis=0))
 
         first_chunk = False
 
