@@ -1519,70 +1519,47 @@ def main():
     if args.step_bypass_buf:
         print("\n=== Bypass-buffer ablation ===")
         token_length = sample["token_length"]
-        gen_sl = token_length + model.chunk_size
 
-        # Pre-compute traj_emb using stream_generate's exact path
-        # (frame-level traj_features -> _build_traj_emb).
-        _full_x = {
-            "traj_features": sample["traj_features"].unsqueeze(0).to(device),
-            "feature_length": torch.tensor([token_length], device=device),
-            "token_mask": sample["token_mask"].unsqueeze(0).to(device),
-            "traj_mask": sample["traj_mask"].unsqueeze(0).to(device),
-        }
-        traj_emb_fixed = model._build_traj_emb(_full_x, gen_sl, device)
-        traj_sl_fixed = model._get_traj_seq_lens(_full_x, gen_sl, device)
+        # 1. Populate TrajStreamBuffer with a few steps (same xyz path as
+        #    stream_generate_step), then capture the buffer's traj_emb.
+        model.init_generated(args.history_length, batch_size=1,
+                            num_denoise_steps=args.num_denoise_steps)
+        model.generated = model.generated.to(device)
+        _bs = _wrap_flat_sample_for_suffix(sample)
+        _txt = sample["text"] if isinstance(sample["text"], str) else sample["text"][0]
+        first_chunk = True
+        for ci in range(min(5, token_length)):
+            ti = build_stream_suffix_conditioning(_bs, ci, prefer_xyz=True)
+            sp = build_stream_step_model_input(_txt, traj_input=ti)
+            model.stream_generate_step(sp, first_chunk=first_chunk)
+            first_chunk = False
+        _buf_emb = model._traj_buf.build_traj_emb(
+            model.commit_index + model.chunk_size, model.seq_len, device
+        )
+        _buf_sl = model._traj_buf.get_traj_valid_lens(
+            model.commit_index + model.chunk_size, model.seq_len, device,
+        )
 
-        # Pre-encode text (global, one context per sample, matching stream_generate).
-        text_ctx = [u.to(model.param_dtype) for u in
-                     model.encode_text_with_cache([sample["text"]], device)]
-        text_null = [u.to(model.param_dtype) for u in
-                      model.encode_text_with_cache([""], device)]
+        # 2. Patch _build_traj_emb so generate() uses the buffer's emb,
+        #    then call generate() which is known not to OOM.
+        _orig_build = model._build_traj_emb
+        def _patched_build(x, sl, dev):
+            return _buf_emb
+        model._build_traj_emb = _patched_build
 
-        # Use a LOCAL generated buffer (same shape as stream_generate's),
-        # NOT model.generated from init_generated.
-        generated = torch.randn(1, gen_sl, model.input_dim, device=device)
-        generated = model.preprocess(generated)
-
-        dt = 1.0 / args.num_denoise_steps
-        max_t = 1 + (token_length - 1) / model.chunk_size
-        total_steps = int(max_t / dt)
-
-        for step in range(total_steps):
-            t = step * dt
-            start_index = max(0, int(model.chunk_size * (t - 1)) + 1)
-            end_index = int(model.chunk_size * t) + 1
-            time_steps = torch.full((1,), t, device=device)
-            noise_level = model._get_noise_levels(device, gen_sl, time_steps)
-            t_scaled = noise_level * model.time_embedding_scale
-
-            noisy_input = [generated[0, :, :end_index, ...]]
-            pred = model._denoise_with_cfg(
-                noisy_input, t_scaled,
-                text_ctx, text_null,
-                traj_emb_fixed, traj_sl_fixed,
-                gen_sl, 1,
-            )
-
-            pv = pred[0][:, start_index:end_index, ...]
-            if model.prediction_type == "vel":
-                generated[0, :, start_index:end_index, ...] += pv * dt
-            elif model.prediction_type == "x0":
-                nl = (noise_level[0, start_index:end_index]
-                      .unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-                      .clamp(min=1e-6))
-                pv = (pv - generated[0, :, start_index:end_index, ...]) / nl
-                generated[0, :, start_index:end_index, ...] += pv * dt
-
-        final_latent = generated[0, :, :token_length, ...]
+        model_batch = _make_model_batch(sample, device)
+        out = model.generate(model_batch, num_denoise_steps=args.num_denoise_steps)
+        model._build_traj_emb = _orig_build
+        generated_latent = out["generated"][0]
         decoded = vae.decode(
-            model.postprocess(final_latent.unsqueeze(0))
+            generated_latent[None, :].to(device)
         )[0].float().cpu().numpy()
         pred_root = extract_root_trajectory_263(decoded)
 
         metrics = _build_mode_metrics(
             pred_root, gt_root, target_traj, "step_bypass_buf_gtroot",
             None, "gt",
-            traj_encoder_path="traj_features (frame-level, pre-computed, no buffer)",
+            traj_encoder_path="traj from buffer xyz path, via generate loop",
         )
         print(f"  ADE={metrics['ADE']:.4f}  FDE={metrics['FDE']:.4f}")
         mode_dir = os.path.join(out_root, "step_bypass_buf_gtroot")
