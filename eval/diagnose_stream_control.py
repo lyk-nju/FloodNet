@@ -1358,6 +1358,13 @@ def main():
                         "reset timestamped plan mid-session, measure pre/post ADE.")
     parser.add_argument("--split_token", type=int, default=15,
                         help="Token index for --mid_session_update split.")
+    parser.add_argument("--synthetic_trail", action="store_true", default=False,
+                        help="Ablation: after sample ends, extend with a synthetic "
+                        "trajectory segment rotated by --trail_angle degrees.")
+    parser.add_argument("--trail_angle", type=float, default=50.0,
+                        help="Degrees to rotate the synthetic trail extension.")
+    parser.add_argument("--trail_tokens", type=int, default=50,
+                        help="Number of extra tokens for synthetic trail extension.")
     args = parser.parse_args()
 
     seed_everything(args.seed)
@@ -2857,6 +2864,124 @@ def main():
                   f"{m.get('ADE_post_split', float('nan')):>8.4f} "
                   f"{m.get('path_arc_ade', float('nan')):>8.4f} "
                   f"{m.get('path_chamfer', float('nan')):>8.4f}")
+        return
+
+    if args.synthetic_trail:
+        print(f"\n=== Synthetic trail extension (angle={args.trail_angle}°, "
+              f"tokens={args.trail_tokens}) ===")
+        tl = sample["token_length"]
+        total_frames = 1 + 4 * (tl - 1) if tl > 1 else 1
+        extra_tokens = args.trail_tokens
+
+        vae.clear_cache()
+        model.init_generated(args.history_length, batch_size=1,
+                            num_denoise_steps=args.num_denoise_steps)
+        model.generated = model.generated.to(device)
+        stream_rec = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
+        all_dec, all_pr = [], []
+        first_chunk = True
+
+        # Get GT heading at last frame for trail direction.
+        gt_root_arr = sample["traj"].numpy()
+        last_gt_root = gt_root_arr[-1]
+        # Heading from last two frames.
+        d_gt = gt_root_arr[-1, [0, 2]] - gt_root_arr[max(0, len(gt_root_arr) - 5), [0, 2]]
+        gt_heading = np.arctan2(float(d_gt[1]), float(d_gt[0]))
+        trail_heading = gt_heading + np.deg2rad(args.trail_angle)
+
+        # Generate through the full sample first (GT suffix).
+        for ci in range(tl):
+            _bs = _wrap_flat_sample_for_suffix(sample)
+            ti = build_stream_suffix_conditioning(_bs, ci, prefer_xyz=True)
+            sp = build_stream_step_model_input(
+                sample["text"] if isinstance(sample["text"], str) else sample["text"][0],
+                traj_input=ti)
+            out = model.stream_generate_step(sp, first_chunk=first_chunk)
+            dec = (vae.stream_decode(out["generated"][0][None, :].to(device),
+                                     first_chunk=first_chunk)[0].float().cpu().numpy())
+            first_chunk = False
+            for frm in dec:
+                stream_rec.process_frame(frm)
+            all_dec.append(dec)
+            all_pr.append(extract_root_trajectory_263(dec))
+
+        # Extend with synthetic trail.
+        cur_root = np.zeros(3, dtype=np.float32)
+        cur_root[[0, 2]] = stream_rec.r_pos_accum[[0, 2]].astype(np.float32)
+        trail_step = 0.25  # meters per token
+        trail_pts = np.array([
+            [cur_root[0] + i * trail_step * np.cos(trail_heading),
+             0.0,
+             cur_root[2] + i * trail_step * np.sin(trail_heading)]
+            for i in range(extra_tokens + 1)
+        ], dtype=np.float32)
+        trail_times = np.arange(len(trail_pts), dtype=np.float32) * args.token_dt
+
+        for ci in range(extra_tokens):
+            qt = (float(ci) * args.token_dt
+                  + np.arange(args.traj_horizon_tokens, dtype=np.float32) * args.token_dt)
+            ft = sample_timestamped_trajectory(trail_times, trail_pts, qt)
+            # Align to predicted root.
+            croot = np.zeros(3, dtype=np.float32)
+            croot[[0, 2]] = stream_rec.r_pos_accum[[0, 2]].astype(np.float32)
+            anchor = sample_timestamped_trajectory(
+                trail_times, trail_pts, np.asarray([qt[0]], dtype=np.float32))[0]
+            ft = croot + (ft - anchor.astype(np.float32))
+            ti = {"traj": torch.from_numpy(ft).float().unsqueeze(0),
+                  "token_mask": torch.ones(1, args.traj_horizon_tokens)}
+            sp = build_stream_step_model_input(
+                sample["text"] if isinstance(sample["text"], str) else sample["text"][0],
+                traj_input=ti)
+            out = model.stream_generate_step(sp, first_chunk=first_chunk)
+            dec = (vae.stream_decode(out["generated"][0][None, :].to(device),
+                                     first_chunk=first_chunk)[0].float().cpu().numpy())
+            first_chunk = False
+            for frm in dec:
+                stream_rec.process_frame(frm)
+            all_dec.append(dec)
+            all_pr.append(extract_root_trajectory_263(dec))
+
+        vae.clear_cache()
+        pred_motion = (np.concatenate(all_dec, axis=0)[:total_frames + extra_tokens * 4]
+                       if all_dec else np.zeros((0, 263)))
+        pred_root = (np.concatenate(all_pr, axis=0)[:total_frames + extra_tokens * 4]
+                     if all_pr else np.zeros((0, 3)))
+
+        # GT for the sample portion only.
+        gt_root_sample = extract_root_trajectory_263(sample["feature"].numpy())
+        sample_ade = _compute_ade(pred_root[:len(gt_root_sample)], gt_root_sample)
+        # Trail: measure how well pred follows the straight line.
+        trail_pred = pred_root[len(gt_root_sample):]
+        if len(trail_pred) > 1:
+            trail_start = trail_pts[0, [0, 2]]
+            trail_dir = np.array([np.cos(trail_heading), np.sin(trail_heading)])
+            trail_lateral = [
+                np.abs(np.cross(trail_dir, p[[0, 2]] - trail_start))
+                for p in trail_pred
+            ]
+            trail_lateral_mean = float(np.mean(trail_lateral))
+            trail_dist = [
+                float(np.linalg.norm(p[[0, 2]] - trail_start))
+                for p in trail_pred
+            ]
+        else:
+            trail_lateral_mean = float("nan")
+
+        print(f"  sample_ADE={sample_ade:.4f}  trail_lateral_mean={trail_lateral_mean:.4f}")
+
+        mode_dir = os.path.join(out_root, f"synthetic_trail_{int(args.trail_angle)}deg")
+        _save_artifacts(mode_dir, pred_motion, pred_root,
+                        gt_root_sample, target_traj[:len(gt_root_sample)],
+                        {"mode": f"synthetic_trail_{int(args.trail_angle)}deg",
+                         "sample_ADE": sample_ade,
+                         "trail_lateral_mean": trail_lateral_mean,
+                         "trail_angle": args.trail_angle,
+                         "trail_tokens": extra_tokens})
+        if args.render_video and pred_motion.size > 0:
+            _mp4 = os.path.join(mode_dir, "pred_motion.mp4")
+            render_single_video(motion=pred_motion, save_path=_mp4,
+                                dim=263, render_setting={})
+            print(f"    video saved to {_mp4}")
         return
 
     # Encoding path labels per mode family.
