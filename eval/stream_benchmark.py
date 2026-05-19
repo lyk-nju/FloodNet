@@ -250,7 +250,8 @@ def _run_step(model, vae, sample, device, *, hl, nds, mode, **_kw):
     return pm, pr, gr
 
 
-def _run_real(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode):
+def _run_real(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode,
+              rotate_plan_deg=0.0):
     tl = sample["token_length"]
     tfs = 1 + 4 * (tl - 1) if tl > 1 else 1
     gr_arr = sample["traj"].numpy()
@@ -258,6 +259,8 @@ def _run_real(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode):
     npt = max(2, int(dur / wpdt) + 1)
     plan_pts = resample_polyline_by_arclength(gr_arr, npt)
     plan_t = assign_uniform_timestamps(npt, wpdt)
+    if rotate_plan_deg:
+        plan_pts = _rotate_xz(plan_pts, plan_pts[0], float(rotate_plan_deg))
     gr = extract_root_trajectory_263(sample["feature"].numpy()[:tfs])
     vae.clear_cache()
     model.init_generated(hl, batch_size=1, num_denoise_steps=nds)
@@ -543,7 +546,9 @@ def main():
                 motion_263=pm, target_source="original_gt_root",
             )
         elif case.suite == "real":
-            pm, pr, gr, pt, pp = _run_real(model, vae, sample, dev, mode=case.mode, **kw)
+            _rot = case.mode_kwargs.get("rotate_plan_deg", 0.0)
+            pm, pr, gr, pt, pp = _run_real(model, vae, sample, dev, mode=case.mode,
+                                           rotate_plan_deg=float(_rot), **kw)
             rec = build_plan_metrics(
                 pr, original_gt_root=gr, plan_times=pt, plan_points_xyz=pp,
                 target_frames=sample["feature_length"], motion_fps=args.motion_fps,

@@ -79,6 +79,11 @@ REAL_CASES = [
         name="real_no_traj_001168", suite="real",
         sample_id="001168", dataset="humanml3d", mode="real_no_traj",
     ),
+    StreamBenchmarkCase(
+        name="real_predroot_rot90_001168", suite="real",
+        sample_id="001168", dataset="humanml3d", mode="real_predroot",
+        mode_kwargs={"rotate_plan_deg": 90.0},
+    ),
 ]
 
 TURN_CASES = [
