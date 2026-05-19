@@ -232,6 +232,7 @@ class BabelDataset(Dataset):
                     if sf < traj_length:
                         traj_mask[sf:ef] = token_mask[k]
                 output["traj_mask"] = traj_mask
+                output["traj_loss_mask"] = traj_mask.copy()
         else:
             token_start = 0
 
@@ -489,7 +490,8 @@ def collate_fn(batch):
     keys = batch[0].keys()
 
     for key in keys:
-        if key in ["feature", "token", "traj", "traj_features"]:
+        if key in ["feature", "token", "traj", "traj_cond", "traj_loss_gt",
+                   "traj_features"]:
             # Pad sequences
             items = [
                 torch.from_numpy(b[key]) if isinstance(b[key], np.ndarray) else b[key]
@@ -498,7 +500,7 @@ def collate_fn(batch):
             output[key] = torch.nn.utils.rnn.pad_sequence(
                 items, batch_first=True, padding_value=0
             )
-        elif key in ["traj_mask", "token_mask"]:
+        elif key in ["traj_mask", "traj_loss_mask", "token_mask"]:
             items = [
                 torch.from_numpy(b[key])
                 if isinstance(b[key], np.ndarray)

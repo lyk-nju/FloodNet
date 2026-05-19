@@ -138,10 +138,13 @@ class CustomLightningModule(BasicLightningModule):
             )
 
     def _compute_control_loss(self, pred_list, batch):
-        if pred_list is None or "traj" not in batch:
+        if pred_list is None:
             return None
-        traj = batch["traj"]
-        traj_mask = batch["traj_mask"]
+        traj_loss_gt = batch.get("traj_loss_gt", batch.get("traj"))
+        if traj_loss_gt is None:
+            return None
+        traj = traj_loss_gt
+        traj_mask = batch.get("traj_loss_mask", batch.get("traj_mask"))
         traj_length = batch["traj_length"]
         train_mode = self.cfg.get("control_loss_train_mode", 3)
         chunk_size_tokens = getattr(self.model, "chunk_size", None)
