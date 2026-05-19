@@ -36,6 +36,7 @@ from utils.motion_process import StreamJointRecovery263, extract_root_trajectory
 from utils.stream_rollout import (
     StreamTextSegment, StreamTextRolloutController,
     build_stream_step_model_input,
+    build_stream_suffix_conditioning,
 )
 from utils.stream_traj import (
     StreamTrajectoryPlan,
@@ -198,21 +199,30 @@ def _run_step(model, vae, sample, device, *, hl, nds, mode):
     vae.clear_cache()
     model.init_generated(hl, batch_size=1, num_denoise_steps=nds)
     model.generated = model.generated.to(device)
+    _bs = {  # batch-style wrapper for build_stream_suffix_conditioning
+        "traj": sample["traj"].unsqueeze(0),
+        "token_length": torch.tensor([tl]),
+        "traj_length": torch.tensor([sample["traj_length"]]),
+        "token_mask": sample["token_mask"].unsqueeze(0),
+        "traj_mask": sample["traj_mask"].unsqueeze(0),
+    }
     sr = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
     decs, _roots = [], []
     fc = True
     for ci in range(tl):
         if mode == "step_no_traj":
             ti = None
-        elif mode == "step_predroot" and len(_roots) > 0:
-            pr_cur = _roots[-1]
-            gt_ci = sample["traj"].numpy()[min(ci * 4, len(sample["traj"]) - 1)].astype(np.float32)
-            offset = pr_cur.astype(np.float32) - gt_ci
-            ts = sample["traj"][4 * ci:].unsqueeze(0).float()
-            ti = {"traj": ts + torch.from_numpy(offset), "token_mask": torch.ones(1, max(1, tl - ci))}
+        elif mode == "step_predroot":
+            ti = build_stream_suffix_conditioning(_bs, ci, prefer_xyz=True)
+            if ti is not None and len(_roots) > 0:
+                pr_cur = _roots[-1]
+                gt_ci = sample["traj"].numpy()[min(ci * 4, len(sample["traj"]) - 1)].astype(np.float32)
+                offset = pr_cur.astype(np.float32) - gt_ci
+                t = ti["traj"]
+                if torch.is_tensor(t):
+                    ti["traj"] = t + torch.from_numpy(offset).float().to(t)
         else:
-            ti = {"traj": sample["traj"][4 * ci:].unsqueeze(0).float(),
-                  "token_mask": torch.ones(1, max(1, tl - ci))}
+            ti = build_stream_suffix_conditioning(_bs, ci, prefer_xyz=True)
         sp = build_stream_step_model_input(
             sample["text"] if isinstance(sample["text"], str) else sample["text"][0],
             traj_input=ti)
@@ -304,11 +314,16 @@ def _run_turn(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode, 
     total_tfs = 1 + 4 * (total_tl - 1) if total_tl > 1 else 1
     # Extend plans linearly beyond original length.
     if total_tl > tl:
-        orig_extra = np.tile(plan_pts[-1:], (total_tl - tl, 1))
-        plan_pts = np.concatenate([plan_pts, orig_extra], axis=0)
+        # Extrapolate along last velocity for each plan branch.
+        for _p_arr, _p_name in [(plan_pts, "plan"), (rot_pts, "rot")]:
+            _vel = _p_arr[-1] - _p_arr[max(0, len(_p_arr) - 5)]
+            _extra = np.arange(1, total_tl - tl + 1, dtype=np.float32)[:, None] * _vel[None, :] / 5.0
+            _p_new = _p_arr[-1][None, :] + _extra.cumsum(axis=0)
+            if _p_name == "plan":
+                plan_pts = np.concatenate([plan_pts, _p_new.astype(np.float32)], axis=0)
+            else:
+                rot_pts = np.concatenate([rot_pts, _p_new.astype(np.float32)], axis=0)
         plan_t = assign_uniform_timestamps(len(plan_pts), wpdt)
-        rot_extra = np.tile(rot_pts[-1:], (total_tl - tl, 1))
-        rot_pts = np.concatenate([rot_pts, rot_extra], axis=0)
         rot_t = np.arange(len(rot_pts), dtype=np.float32) * wpdt
     gr = extract_root_trajectory_263(sample["feature"].numpy()[:tfs])
     vae.clear_cache()
