@@ -38,6 +38,7 @@ from utils.stream_rollout import (
     build_stream_step_model_input,
 )
 from utils.stream_traj import (
+    StreamTrajectoryPlan,
     assign_uniform_timestamps,
     resample_polyline_by_arclength,
     sample_plan_future,
@@ -241,7 +242,7 @@ def _run_real(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode):
         else:
             cr = np.zeros(3, dtype=np.float32)
             cr[[0, 2]] = sr.r_pos_accum[[0, 2]].astype(np.float32)
-            ft = sample_plan_future(plan_t, plan_pts, ci, cr, hz, tdt, True)
+            ft = sample_plan_future(StreamTrajectoryPlan(times=plan_t, points_xyz=plan_pts, start_commit_index=0, version=0, source="bench"), current_commit=ci, current_root_xyz=cr, horizon_tokens=hz, token_dt=tdt, reanchor_to_current_root=True)
             ti = {"traj": torch.from_numpy(ft).float().unsqueeze(0),
                   "token_mask": torch.ones(1, hz)}
         sp = build_stream_step_model_input(
@@ -289,7 +290,7 @@ def _run_turn(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode, 
         use_t = np.arange(len(use), dtype=np.float32) * wpdt
         cr = np.zeros(3, dtype=np.float32)
         cr[[0, 2]] = sr.r_pos_accum[[0, 2]].astype(np.float32)
-        ft = sample_plan_future(use_t, use, ci, cr, hz, tdt, True)
+        ft = sample_plan_future(StreamTrajectoryPlan(times=use_t, points_xyz=use, start_commit_index=0, version=0, source="bench"), current_commit=ci, current_root_xyz=cr, horizon_tokens=hz, token_dt=tdt, reanchor_to_current_root=True)
         ti = {"traj": torch.from_numpy(ft).float().unsqueeze(0), "token_mask": torch.ones(1, hz)}
         sp = build_stream_step_model_input(
             sample["text"] if isinstance(sample["text"], str) else sample["text"][0],
@@ -339,7 +340,7 @@ def _run_babel(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode)
         else:
             cr = np.zeros(3, dtype=np.float32)
             cr[[0, 2]] = sr.r_pos_accum[[0, 2]].astype(np.float32)
-            ft = sample_plan_future(plan_t, plan_pts, ci, cr, hz, tdt, True)
+            ft = sample_plan_future(StreamTrajectoryPlan(times=plan_t, points_xyz=plan_pts, start_commit_index=0, version=0, source="bench"), current_commit=ci, current_root_xyz=cr, horizon_tokens=hz, token_dt=tdt, reanchor_to_current_root=True)
             ti = {"traj": torch.from_numpy(ft).float().unsqueeze(0), "token_mask": torch.ones(1, hz)}
         sp = build_stream_step_model_input(txt, traj_input=ti)
         out = model.stream_generate_step(sp, first_chunk=fc)

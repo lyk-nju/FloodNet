@@ -135,4 +135,6 @@ def get_cases(suites=None, preset=None):
         return [c for c in FULL_CASES if c.suite in suites]
     if preset == "smoke":
         return list(SMOKE_CASES)
+    if preset == "full":
+        return list(FULL_CASES)
     return list(SMOKE_CASES)

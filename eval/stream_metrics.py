@@ -98,7 +98,12 @@ def compute_lateral_velocity_ratio(motion_263: np.ndarray) -> float:
     """Mean |lateral| / mean speed in body-local frame."""
     if len(motion_263) < 3:
         return float("nan")
-    vel_xz = np.diff(motion_263[:, [0, 2]], axis=0)
+    from utils.motion_process import extract_root_trajectory_263_torch
+    import torch as _torch
+    root = extract_root_trajectory_263_torch(
+        _torch.from_numpy(motion_263).float().unsqueeze(0)
+    )[0].cpu().numpy()
+    vel_xz = np.diff(root[:, [0, 2]], axis=0)
     yaw = estimate_body_yaw(motion_263)
     yaw_mid = 0.5 * (yaw[:-1] + yaw[1:])
     cos_y, sin_y = np.cos(yaw_mid), np.sin(yaw_mid)

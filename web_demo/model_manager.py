@@ -355,6 +355,7 @@ class ModelManager:
 
     def update_trajectory(
         self, waypoints, mode="replace_future", *, source="manual",
+        duration_seconds=None,
     ):
         """Update trajectory control (Task 001: delayed blended replace).
 
@@ -395,17 +396,21 @@ class ModelManager:
         points = ensure_xyz(raw)
         current_root = self._get_current_root_xyz()
         edit_commit = self._get_commit_index()
-        delay = self.traj_update_delay_tokens
+        with self.traj_state_lock:
+            _prev_plan = self.active_traj_plan
+        delay = 0 if _prev_plan is None else self.traj_update_delay_tokens
         effective_commit = edit_commit + delay
 
         if explicit_times is not None:
             times = explicit_times - explicit_times[0]
         else:
+            _dur = (float(duration_seconds) if duration_seconds is not None
+                     else self.manual_duration_seconds)
             times, points = normalize_manual_waypoints(
                 points,
                 current_root_xyz=current_root,
                 waypoint_dt=self.waypoint_dt,
-                manual_duration_seconds=self.manual_duration_seconds,
+                manual_duration_seconds=_dur,
                 resample_arclength=self.manual_resample_arclength,
             )
 
@@ -418,9 +423,8 @@ class ModelManager:
         )
 
         with self.traj_state_lock:
-            old_plan = self.active_traj_plan
             self.pending_update_event = TrajectoryUpdateEvent(
-                old_plan=old_plan,
+                old_plan=_prev_plan,
                 new_plan=new_plan,
                 edit_commit_index=edit_commit,
                 effective_commit_index=effective_commit,
