@@ -298,13 +298,25 @@ def _run_turn(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode, 
     rot_t = np.arange(len(rot_pts), dtype=np.float32) * wpdt
     ed = int(delay_tokens) if isinstance(delay_tokens, (int, float)) else 20
     eb = int(blend_tokens) if isinstance(blend_tokens, (int, float)) else 4
+    # Extend past the blend zone for post-turn observation.
+    extra = max(0, split_tok + ed + eb - tl)
+    total_tl = tl + extra + 8
+    total_tfs = 1 + 4 * (total_tl - 1) if total_tl > 1 else 1
+    # Extend plans linearly beyond original length.
+    if total_tl > tl:
+        orig_extra = np.tile(plan_pts[-1:], (total_tl - tl, 1))
+        plan_pts = np.concatenate([plan_pts, orig_extra], axis=0)
+        plan_t = assign_uniform_timestamps(len(plan_pts), wpdt)
+        rot_extra = np.tile(rot_pts[-1:], (total_tl - tl, 1))
+        rot_pts = np.concatenate([rot_pts, rot_extra], axis=0)
+        rot_t = np.arange(len(rot_pts), dtype=np.float32) * wpdt
     gr = extract_root_trajectory_263(sample["feature"].numpy()[:tfs])
     vae.clear_cache()
     model.init_generated(hl, batch_size=1, num_denoise_steps=nds)
     model.generated = model.generated.to(device)
     sr = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
     decs, _roots, fc = [], [], True
-    for ci in range(tl):
+    for ci in range(total_tl):
         cr = np.zeros(3, dtype=np.float32)
         cr[[0, 2]] = sr.r_pos_accum[[0, 2]].astype(np.float32)
         # 3-zone delayed blend: delay -> blend -> replace
@@ -334,9 +346,9 @@ def _run_turn(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode, 
             _roots.append(sr.r_pos_accum.copy())
         decs.append(dec)
     vae.clear_cache()
-    pm = np.concatenate(decs, axis=0)[:tfs] if decs else np.zeros((0, 263))
-    pr = np.array(_roots, dtype=np.float32)[:tfs] if _roots else np.zeros((0, 3))
-    return pm, pr, gr, plan_t, rot_pts
+    pm = np.concatenate(decs, axis=0)[:total_tfs] if decs else np.zeros((0, 263))
+    pr = np.array(_roots, dtype=np.float32)[:total_tfs] if _roots else np.zeros((0, 3))
+    return pm, pr, gr, plan_t, rot_pts, total_tfs
 
 
 def _run_babel(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode):
@@ -477,12 +489,12 @@ def main():
             db_val = case.mode_kwargs.get("mid_update_blend_tokens", 4)
             if isinstance(dt_val, str):
                 dt_val = int(dt_val.split(",")[0])
-            pm, pr, gr, pt, pp = _run_turn(model, vae, sample, dev, mode=case.mode,
+            pm, pr, gr, pt, pp, ttfs = _run_turn(model, vae, sample, dev, mode=case.mode,
                                            angle=ang, delay_tokens=int(dt_val),
                                            blend_tokens=int(db_val), **kw)
             rec = build_plan_metrics(
                 pr, original_gt_root=gr, plan_times=pt, plan_points_xyz=pp,
-                target_frames=sample["feature_length"], motion_fps=args.motion_fps,
+                target_frames=ttfs, motion_fps=args.motion_fps,
                 motion_263=pm,
             )
         elif case.suite == "babel":
