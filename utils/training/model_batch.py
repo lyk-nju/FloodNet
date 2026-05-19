@@ -2,7 +2,13 @@ from __future__ import annotations
 
 
 def _copy_trajectory_fields(batch, model_batch):
-    if "traj" in batch:
+    # Prioritize traj_cond (ControlNet condition) over traj (legacy).
+    if "traj_cond" in batch:
+        model_batch["traj"] = batch["traj_cond"]
+        model_batch["traj_length"] = batch["traj_length"]
+        model_batch["traj_mask"] = batch.get("traj_mask",
+                                               batch.get("traj_loss_mask"))
+    elif "traj" in batch:
         model_batch["traj"] = batch["traj"]
         model_batch["traj_length"] = batch["traj_length"]
         model_batch["traj_mask"] = batch["traj_mask"]

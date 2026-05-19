@@ -1,6 +1,6 @@
-# FloodNet TODO：Web Demo Runtime 与 Stream Benchmark
+# FloodNet TODO：Web Demo Runtime、Stream Benchmark 与 Stream Finetune
 
-本文件包含两个连续任务：
+本文件包含三段连续任务：
 
 ```text
 Task 1:
@@ -10,6 +10,11 @@ Task 1:
 Task 2:
     在 Task 1 稳定后，再统一 benchmark runner 和 metrics，
     一条命令跑 step / real / turn / babel 四类 suite。
+
+Task 3:
+    在 runtime 和 benchmark 都稳定后，再进入训练接口准备：
+    先分离 traj_cond / traj_loss_gt，避免后续 stream finetune
+    把相对轨迹条件误用成 absolute control loss target。
 ```
 
 执行原则：
@@ -19,6 +24,7 @@ Task 2:
 2. 再确保 benchmark 和 metric 测的是同一个 target。
 3. Task 1 不做 benchmark 大重构。
 4. Task 2 不改模型、不改训练。
+5. Task 3 只做训练接口 source-of-truth 分离，不改变训练分布。
 ```
 
 ---
@@ -1727,3 +1733,446 @@ python eval/stream_benchmark.py \
 ## Review update
 
 待实现。
+
+---
+
+# Active Task 003：分离 `traj_cond` / `traj_loss_gt` 训练接口
+
+## Task
+
+为后续 pred-root closed-loop / stream distribution finetune 做训练接口准备：明确区分“送给 ControlNet 的轨迹条件”和“用于 control loss 的绝对轨迹监督”，先把 `traj_cond` / `traj_loss_gt` / mask 的 source of truth 拆清楚。
+
+---
+
+## Status
+
+`open`
+
+---
+
+## Problem
+
+当前训练链路里 `batch["traj"]` 同时承担两种职责：
+
+```text
+1. 作为 ControlNet 的 trajectory condition；
+2. 作为 control_loss_train_mode=1 的 absolute root position target。
+```
+
+这在当前普通训练中是安全的，因为 `traj` 仍是 absolute world/root trajectory。
+
+但后续 stream finetune 会引入 web-demo-like 条件，例如：
+
+```python
+traj_cond = traj_xyz - traj_xyz[anchor_frame]
+```
+
+也就是 condition 可能是：
+
+```text
+relative anchor trajectory
+horizon-only trajectory
+masked / delayed / blended trajectory
+pred-root noisy trajectory
+```
+
+如果此时 control loss 仍直接使用同一个 `traj` 字段，就会出现坐标系错误：
+
+```text
+decoded motion root: absolute
+loss target traj: relative / horizon-local / pred-root shifted
+```
+
+这会直接破坏 `control_loss_train_mode=1` 的 absolute control loss 语义，也会让后续 finetune 的诊断结果不可解释。
+
+本任务的目标不是开始 finetune，而是先把接口边界修正：
+
+```text
+traj_cond     = 条件输入 source of truth
+traj_loss_gt  = control loss target source of truth
+```
+
+---
+
+## Scope
+
+本 task 只做训练数据字段和消费路径的兼容性改造。
+
+包含：
+
+```text
+1. Dataset / collate 输出兼容字段；
+2. model input preparation 优先使用 traj_cond；
+3. ControlNet trajectory encoding 优先使用 traj_cond；
+4. control loss 优先使用 traj_loss_gt；
+5. traj_mask 和 traj_loss_mask 分离；
+6. 旧 batch 只有 traj / traj_mask 时保持完全兼容；
+7. 增加最小测试，证明旧配置不崩、新字段会被正确消费。
+```
+
+不包含：
+
+```text
+1. 不改变默认训练分布；
+2. 不默认启用 relative trajectory；
+3. 不实现 pred-root rolling anchor；
+4. 不实现 stream finetune dataset sampling；
+5. 不新增 heading-aware loss；
+6. 不修改 checkpoint 结构；
+7. 不改 web_demo / benchmark runner 行为。
+```
+
+---
+
+## Required changes
+
+## 1. 明确 batch 字段语义
+
+统一字段约定：
+
+```python
+batch["traj"]
+```
+
+兼容旧字段。短期仍保留，旧配置下仍表示 absolute root trajectory。
+
+```python
+batch["traj_cond"]
+```
+
+送给 ControlNet / trajectory encoder 的条件轨迹。未来可以是 relative、horizon-only、masked、pred-root shifted。
+
+```python
+batch["traj_loss_gt"]
+```
+
+送给 `control_loss_train_mode=1` 的 absolute root trajectory target。即使 `traj_cond` 被相对化，这个字段也必须保持 absolute。
+
+```python
+batch["traj_mask"]
+```
+
+condition 可见 mask。用于 trajectory condition encoder。
+
+```python
+batch["traj_loss_mask"]
+```
+
+control loss 监督 mask。用于 absolute target loss。
+
+默认兼容规则：
+
+```python
+traj_cond = batch.get("traj_cond", batch["traj"])
+traj_loss_gt = batch.get("traj_loss_gt", batch["traj"])
+traj_mask = batch.get("traj_mask")
+traj_loss_mask = batch.get("traj_loss_mask", traj_mask)
+```
+
+---
+
+## 2. Dataset 输出兼容字段
+
+目标文件：
+
+```text
+FloodNet/datasets/humanml3d.py
+FloodNet/datasets/babel.py
+FloodNet/datasets/generate.py
+FloodNet/datasets/multi.py
+```
+
+当前默认数据集不改变训练分布，只新增等价字段：
+
+```python
+output["traj"] = traj_xyz
+output["traj_cond"] = traj_xyz
+output["traj_loss_gt"] = traj_xyz
+
+output["traj_mask"] = traj_mask
+output["traj_loss_mask"] = traj_mask
+```
+
+要求：
+
+```text
+1. 旧字段 traj / traj_mask 保留；
+2. 新字段和旧字段 shape 一致；
+3. collate 能 pad traj_cond / traj_loss_gt / traj_loss_mask；
+4. 没有新字段的旧缓存 / 旧 batch 仍能跑；
+5. BABEL / HumanML3D / generate dataset 语义一致。
+```
+
+注意：
+
+```text
+这一步不要做 relative traj，不要采 anchor，不要改 mask 分布。
+```
+
+---
+
+## 3. model input preparation 优先使用 `traj_cond`
+
+目标文件：
+
+```text
+FloodNet/utils/training/model_batch.py
+FloodNet/utils/traj_batch.py
+FloodNet/models/diffusion_forcing_wan.py
+```
+
+当前训练入口通常通过 `prepare_model_input(batch)` 把字段传给模型。需要让模型输入优先使用 `traj_cond`：
+
+```python
+def prepare_model_input(batch):
+    model_batch = {}
+
+    if "traj_cond" in batch:
+        model_batch["traj"] = batch["traj_cond"]
+    elif "traj" in batch:
+        model_batch["traj"] = batch["traj"]
+
+    if "traj_mask" in batch:
+        model_batch["traj_mask"] = batch["traj_mask"]
+
+    if "traj_features" in batch:
+        model_batch["traj_features"] = batch["traj_features"]
+
+    return model_batch
+```
+
+原则：
+
+```text
+1. 模型内部仍可继续认 x["traj"]，避免大改；
+2. 但训练 preparation 层要把 traj_cond 映射到模型输入的 traj；
+3. 这样后续 finetune 只需要构造 traj_cond，不需要改模型主干接口；
+4. 如果未来要彻底改名，再单独做重构，不在本 task 里做。
+```
+
+---
+
+## 4. control loss 使用 `traj_loss_gt`
+
+目标文件：
+
+```text
+FloodNet/train_ldf.py
+FloodNet/utils/training/self_forcing.py
+FloodNet/utils/training/control_loss.py
+```
+
+当前 `_compute_control_loss()` 中直接使用：
+
+```python
+traj = batch["traj"]
+traj_mask = batch["traj_mask"]
+```
+
+需要改成：
+
+```python
+traj_loss_gt = batch.get("traj_loss_gt", batch["traj"])
+traj_loss_mask = batch.get("traj_loss_mask", batch.get("traj_mask"))
+```
+
+并传给 `compute_control_loss_xz(...)`：
+
+```python
+return compute_control_loss_xz(
+    pred_list,
+    traj_loss_gt,
+    traj_loss_mask,
+    batch["traj_length"],
+    vae,
+    device,
+    train_mode=train_mode,
+    chunk_size_tokens=chunk_size_tokens,
+)
+```
+
+要求：
+
+```text
+1. mode1 absolute loss 永远使用 absolute traj_loss_gt；
+2. traj_cond 相对化后不会污染 loss target；
+3. traj_loss_mask 不存在时 fallback 到 traj_mask；
+4. 旧 batch 只有 traj / traj_mask 时行为不变。
+```
+
+---
+
+## 5. 长度字段保持兼容
+
+目标文件：
+
+```text
+FloodNet/datasets/*
+FloodNet/utils/training/control_loss.py
+```
+
+第一版不新增复杂长度字段，继续使用现有：
+
+```python
+batch["traj_length"]
+```
+
+要求：
+
+```text
+1. traj_cond / traj_loss_gt 默认长度相同；
+2. 后续 horizon-only traj_cond 如果长度不同，必须在 Task 005 中单独设计 traj_cond_length；
+3. 本 task 不提前引入 traj_cond_length，避免接口过早复杂化。
+```
+
+---
+
+## 6. 最小测试
+
+目标目录：
+
+```text
+FloodNet/tests/
+```
+
+建议新增：
+
+```text
+FloodNet/tests/test_traj_source_fields.py
+```
+
+至少覆盖：
+
+```text
+1. 旧 batch 只有 traj / traj_mask 时：
+   - prepare_model_input(batch)["traj"] == batch["traj"]
+   - control loss 使用 batch["traj"]
+
+2. 新 batch 同时有 traj_cond / traj_loss_gt 时：
+   - prepare_model_input(batch)["traj"] == batch["traj_cond"]
+   - control loss 使用 batch["traj_loss_gt"]
+
+3. traj_cond 人为加 offset / relative 化时：
+   - 模型输入看到 offset 后的 traj_cond
+   - loss target 仍是 absolute traj_loss_gt
+
+4. traj_loss_mask 不存在时：
+   - fallback 到 traj_mask
+
+5. traj_loss_mask 存在时：
+   - control loss 使用 traj_loss_mask
+```
+
+如果暂时不方便构造完整 VAE decode，可以把 `compute_control_loss_xz()` 的输入做小型 fake pred / fake VAE，或把字段选择逻辑抽成小 helper 先测：
+
+```python
+def get_traj_condition_fields(batch):
+    ...
+
+def get_traj_loss_fields(batch):
+    ...
+```
+
+---
+
+## Do not do
+
+不要做这些事：
+
+```text
+1. 不要在本 task 引入 stream_finetune 配置；
+2. 不要把 traj_cond 改成 relative；
+3. 不要实现 anchor sampling；
+4. 不要实现 pred-root rolling anchor；
+5. 不要改变默认 ldf.yaml / stream.yaml 的训练行为；
+6. 不要把 benchmark / web_demo 的 trajectory runtime 逻辑塞进 dataset；
+7. 不要删除 batch["traj"]，它仍是兼容字段。
+```
+
+本 task 的唯一目标是：
+
+```text
+先把 condition source 和 loss source 分开，给后续 Task 004/005 的 stream finetune 留出安全接口。
+```
+
+---
+
+## Validation
+
+### 编译
+
+```bash
+cd /home/yuankai/Text2Motion/FloodNet
+
+/home/yuankai/.conda/envs/flooddiffusion/bin/python -m py_compile \
+  datasets/humanml3d.py \
+  datasets/babel.py \
+  datasets/generate.py \
+  datasets/multi.py \
+  utils/training/model_batch.py \
+  utils/training/control_loss.py \
+  utils/training/self_forcing.py \
+  models/diffusion_forcing_wan.py \
+  train_ldf.py
+```
+
+### 测试
+
+```bash
+cd /home/yuankai/Text2Motion/FloodNet
+
+/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest \
+  tests/test_traj_source_fields.py -q
+```
+
+如果已有测试目录暂时不完整，至少跑一个局部脚本确认：
+
+```text
+1. dataset sample 包含 traj / traj_cond / traj_loss_gt / traj_mask / traj_loss_mask；
+2. prepare_model_input 优先消费 traj_cond；
+3. _compute_control_loss 优先消费 traj_loss_gt；
+4. 删除新字段后旧 batch fallback 正常。
+```
+
+### 训练 smoke
+
+不要求完整训练，但至少应能跑到一个 batch forward/loss：
+
+```bash
+cd /home/yuankai/Text2Motion/FloodNet
+
+/home/yuankai/.conda/envs/flooddiffusion/bin/python train_ldf.py \
+  --config configs/ldf.yaml \
+  --fast_dev_run 1
+```
+
+如果当前入口不支持 `--fast_dev_run`，则写一个最小 dry-run 脚本或在 review update 中说明无法运行的原因。
+
+---
+
+## Done criteria
+
+满足以下条件才算完成：
+
+```text
+1. Dataset 默认输出 traj_cond / traj_loss_gt / traj_loss_mask。
+2. 旧字段 traj / traj_mask 仍保留。
+3. prepare_model_input 优先把 traj_cond 送给模型。
+4. 没有 traj_cond 时，模型仍使用 traj。
+5. control loss 优先使用 traj_loss_gt。
+6. 没有 traj_loss_gt 时，control loss fallback 到 traj。
+7. control loss 优先使用 traj_loss_mask。
+8. 没有 traj_loss_mask 时，control loss fallback 到 traj_mask。
+9. 默认训练分布不改变。
+10. 后续 relative / pred-root trajectory condition 不会污染 absolute mode1 target。
+11. 编译和最小测试通过。
+```
+
+---
+
+## Review update
+
+待实现。
+
+---
+

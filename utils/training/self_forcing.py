@@ -467,10 +467,13 @@ class SelfForcingTrainer:
 def _compute_control_loss(pred_list, batch, module):
     """Thin wrapper that resolves training-mode config then delegates to
     the pure XZ control-loss function."""
-    if pred_list is None or "traj" not in batch:
+    if pred_list is None:
         return None
-    traj = batch["traj"]
-    traj_mask = batch["traj_mask"]
+    traj_loss_gt = batch.get("traj_loss_gt", batch.get("traj"))
+    if traj_loss_gt is None:
+        return None
+    traj = traj_loss_gt
+    traj_mask = batch.get("traj_loss_mask", batch.get("traj_mask"))
     traj_length = batch["traj_length"]
     train_mode = module.cfg.get("control_loss_train_mode", 3)
     chunk_size_tokens = getattr(module.model, "chunk_size", None)

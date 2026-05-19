@@ -194,6 +194,8 @@ class BabelDataset(Dataset):
             ##############################
             traj = extract_root_trajectory_263(feature)
             output["traj"] = traj
+            output["traj_cond"] = traj
+            output["traj_loss_gt"] = traj
             output["traj_length"] = len(traj)
 
         ##############################
