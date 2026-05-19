@@ -317,8 +317,10 @@ def _run_turn(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode, 
     for _p_arr, _p_name in [(plan_pts, "plan"), (rot_pts, "rot")]:
         _n = len(_p_arr)
         if _needed_wp > _n:
-            _vel = _p_arr[-1] - _p_arr[max(0, _n - 5)]
-            _step = _vel / 5.0  # per-waypoint step matching original speed
+            _start_wp = max(0, _n - 5)
+            _vel = _p_arr[-1] - _p_arr[_start_wp]
+            _denom = max(1, _n - 1 - _start_wp)  # actual intervals spanned
+            _step = _vel / float(_denom)
             _n_extra = _needed_wp - _n
             _p_new = _p_arr[-1][None, :] + np.arange(1, _n_extra + 1, dtype=np.float32)[:, None] * _step[None, :]
             if _p_name == "plan":
