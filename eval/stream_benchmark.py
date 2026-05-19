@@ -312,19 +312,21 @@ def _run_turn(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode, 
     extra = max(0, split_tok + ed + eb - tl)
     total_tl = tl + extra + 8
     total_tfs = 1 + 4 * (total_tl - 1) if total_tl > 1 else 1
-    # Extend plans linearly beyond original length.
-    if total_tl > tl:
-        # Extrapolate along last velocity for each plan branch.
-        for _p_arr, _p_name in [(plan_pts, "plan"), (rot_pts, "rot")]:
-            _vel = _p_arr[-1] - _p_arr[max(0, len(_p_arr) - 5)]
-            _extra = np.arange(1, total_tl - tl + 1, dtype=np.float32)[:, None] * _vel[None, :] / 5.0
-            _p_new = _p_arr[-1][None, :] + _extra.cumsum(axis=0)
+    # Extend plans to cover the full query horizon past the blend zone.
+    _needed_wp = max(len(plan_pts), int((total_tl + hz) * tdt / wpdt) + 2)
+    for _p_arr, _p_name in [(plan_pts, "plan"), (rot_pts, "rot")]:
+        _n = len(_p_arr)
+        if _needed_wp > _n:
+            _vel = _p_arr[-1] - _p_arr[max(0, _n - 5)]
+            _step = _vel / 5.0  # per-waypoint step matching original speed
+            _n_extra = _needed_wp - _n
+            _p_new = _p_arr[-1][None, :] + np.arange(1, _n_extra + 1, dtype=np.float32)[:, None] * _step[None, :]
             if _p_name == "plan":
                 plan_pts = np.concatenate([plan_pts, _p_new.astype(np.float32)], axis=0)
             else:
                 rot_pts = np.concatenate([rot_pts, _p_new.astype(np.float32)], axis=0)
-        plan_t = assign_uniform_timestamps(len(plan_pts), wpdt)
-        rot_t = np.arange(len(rot_pts), dtype=np.float32) * wpdt
+    plan_t = assign_uniform_timestamps(len(plan_pts), wpdt)
+    rot_t = np.arange(len(rot_pts), dtype=np.float32) * wpdt
     gr = extract_root_trajectory_263(sample["feature"].numpy()[:tfs])
     vae.clear_cache()
     model.init_generated(hl, batch_size=1, num_denoise_steps=nds)
