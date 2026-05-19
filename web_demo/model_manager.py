@@ -839,6 +839,9 @@ class ModelManager:
         if plan is not None:
             status["active_plan_version"] = plan.version
             status["active_plan_source"] = plan.source
+        preview = self.get_display_traj()
+        if preview is not None:
+            status["model_used_traj_preview"] = preview[:min(20, len(preview))].tolist()
         if ev is not None:
             status["pending_plan_version"] = ev.version
             status["edit_commit_index"] = ev.edit_commit_index

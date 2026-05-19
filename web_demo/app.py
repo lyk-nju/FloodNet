@@ -335,6 +335,7 @@ def start_generation():
                 debug_sample["trajectory"],
                 mode="replace_future",
                 source="debug_preset",
+                duration_seconds=debug_sample.get("duration_seconds"),
             )
         mm.start_generation(text, history_length=history_length)
         

@@ -256,7 +256,7 @@ def _run_real(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode,
     tfs = 1 + 4 * (tl - 1) if tl > 1 else 1
     gr_arr = sample["traj"].numpy()
     dur = (sample["feature_length"] - 1) / fps
-    npt = max(2, int(dur / wpdt) + 1)
+    npt = max(2, int(round(dur / wpdt)) + 1)
     plan_pts = resample_polyline_by_arclength(gr_arr, npt)
     plan_t = assign_uniform_timestamps(npt, wpdt)
     if rotate_plan_deg:
@@ -311,7 +311,7 @@ def _run_turn(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode, 
     tfs = 1 + 4 * (tl - 1) if tl > 1 else 1
     gr_arr = sample["traj"].numpy()
     dur = (sample["feature_length"] - 1) / fps
-    npt = max(2, int(dur / wpdt) + 1)
+    npt = max(2, int(round(dur / wpdt)) + 1)
     plan_pts = resample_polyline_by_arclength(gr_arr, npt)
     plan_t = assign_uniform_timestamps(npt, wpdt)
     split_tok, sf = 15, max(1, 1 + 4 * 14)
@@ -387,7 +387,7 @@ def _run_babel(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode)
     tfs = 1 + 4 * (tl - 1) if tl > 1 else 1
     gr_arr = sample["traj"].numpy()
     dur = (sample["feature_length"] - 1) / fps
-    npt = max(2, int(dur / wpdt) + 1)
+    npt = max(2, int(round(dur / wpdt)) + 1)
     plan_pts = resample_polyline_by_arclength(gr_arr, npt)
     plan_t = assign_uniform_timestamps(npt, wpdt)
     segs = [StreamTextSegment(text=t, token_end=te)
