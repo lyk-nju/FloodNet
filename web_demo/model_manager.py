@@ -399,6 +399,12 @@ class ModelManager:
                 )
 
             if explicit_times is None:
+                if source == "manual" and len(waypoints) > 0:
+                    current_root = self._get_current_root_xyz()
+                    if np.linalg.norm(
+                        waypoints[0, [0, 2]] - current_root[[0, 2]]
+                    ) > 1e-4:
+                        waypoints = np.vstack([current_root[None, :], waypoints])
                 if source == "manual" and self.manual_resample_arclength:
                     duration = self.manual_duration_seconds
                     if duration_seconds is not None:
@@ -686,6 +692,8 @@ class ModelManager:
                         
                         # Generate one token (produces 4 frames from VAE)
                         traj_input = self._build_stream_traj_input()
+                        if traj_input is None and hasattr(self.model, "_traj_buf"):
+                            self.model._traj_buf.reset()
                         x = build_stream_step_model_input(
                             self.current_text, traj_input=traj_input
                         )

@@ -785,6 +785,37 @@ class DiffForcingWanModel(nn.Module):
             else None
         )
 
+        if traj_emb is None:
+            if ctx_double is not None:
+                noisy_double = list(noisy_input) + list(noisy_input)
+                t_double = torch.cat([t_scaled, t_scaled], dim=0)
+                pred_double = self.model(
+                    noisy_double, t_double, ctx_double, seq_len,
+                    y=None, traj_emb=None, traj_seq_lens=None,
+                    controlnet_residuals=None,
+                )
+                return [
+                    self.cfg_scale_text * pred_double[i]
+                    - (self.cfg_scale_text - 1) * pred_double[i + batch_size]
+                    for i in range(batch_size)
+                ]
+            pred = self.model(
+                noisy_input, t_scaled, text_cond_ctx, seq_len,
+                y=None, traj_emb=None, traj_seq_lens=None,
+                controlnet_residuals=None,
+            )
+            if self.cfg_scale_text != 1.0:
+                pred_null = self.model(
+                    noisy_input, t_scaled, text_null_ctx, seq_len,
+                    y=None, traj_emb=None, traj_seq_lens=None,
+                    controlnet_residuals=None,
+                )
+                return [
+                    self.cfg_scale_text * pv - (self.cfg_scale_text - 1) * pvn
+                    for pv, pvn in zip(pred, pred_null)
+                ]
+            return pred
+
         if ctx_double is not None:
             noisy_double = list(noisy_input) + list(noisy_input)
             t_double = torch.cat([t_scaled, t_scaled], dim=0)

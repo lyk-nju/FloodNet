@@ -18,7 +18,7 @@ model:
         input_dim: 4
         noise_steps: 10
         cfg_scale_text: 2.0
-        cfg_scale_traj: 1.7
+        cfg_scale_traj: 2.0
 
 # Web-demo trajectory semantics.  Keep this in the main stream config so the
 # model checkpoint, CFG scales, debug preset, and interactive trajectory policy
@@ -29,7 +29,7 @@ traj_mask:
     enabled: false
     time_mode: timestamped
     waypoint_dt: 0.05
-    manual_duration_seconds: 5.0
+    manual_duration_seconds: 4.0
     manual_resample_arclength: true
     token_dt: 0.20
     horizon_tokens: 20

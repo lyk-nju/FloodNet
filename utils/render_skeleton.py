@@ -438,6 +438,7 @@ def render_simple_skeleton_video(
     traj_xz: np.ndarray = None,
     cond_traj_mask: np.ndarray = None,
     cond_traj_point_radius: int = 5,
+    cond_traj_show_full: bool = False,
 ):
     traj = data[:, 0, [0, 2]]  # root joint XZ trajectory
 
@@ -445,6 +446,14 @@ def render_simple_skeleton_video(
     x_min, x_max = all_points[:, 0].min(), all_points[:, 0].max()
     z_min, z_max = all_points[:, 2].min(), all_points[:, 2].max()
     y_min, y_max = all_points[:, 1].min(), all_points[:, 1].max()
+
+    if traj_xz is not None:
+        _cond_xz = np.asarray(traj_xz, dtype=np.float32)
+        if _cond_xz.ndim == 2 and _cond_xz.shape[1] == 2 and len(_cond_xz) > 0:
+            x_min = min(x_min, float(_cond_xz[:, 0].min()))
+            x_max = max(x_max, float(_cond_xz[:, 0].max()))
+            z_min = min(z_min, float(_cond_xz[:, 1].min()))
+            z_max = max(z_max, float(_cond_xz[:, 1].max()))
 
     # Calculate motion ranges in all dimensions
     x_range = x_max - x_min
@@ -667,7 +676,8 @@ def render_simple_skeleton_video(
 
         # Conditioning trajectory on ground plane (red).
         if traj_xz is not None and cond_traj_mask is not None:
-            visible_idx = np.where(cond_traj_mask[: frame + 1] > 0.0)[0]
+            visible_limit = len(cond_traj_mask) if cond_traj_show_full else frame + 1
+            visible_idx = np.where(cond_traj_mask[:visible_limit] > 0.0)[0]
             for j in visible_idx:
                 xz = traj_xz[j]
                 center = world_to_screen([float(xz[0]), 0.0, float(xz[1])])

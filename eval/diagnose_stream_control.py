@@ -655,6 +655,117 @@ def _make_duration_waypoint_traj(
     return times, waypoints, waypoints
 
 
+def _resample_path_by_arclength(points_xyz: np.ndarray, num_points: int) -> np.ndarray:
+    """Resample a frame-level path to equal XZ arclength spacing."""
+    points = np.asarray(points_xyz, dtype=np.float32)
+    if num_points <= 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    if len(points) == 0:
+        return np.zeros((num_points, 3), dtype=np.float32)
+    if len(points) == 1:
+        return np.repeat(points[:1], num_points, axis=0).astype(np.float32)
+
+    segs = np.linalg.norm(np.diff(points[:, [0, 2]], axis=0), axis=1)
+    cum_arc = np.concatenate([np.zeros(1, dtype=np.float32), np.cumsum(segs).astype(np.float32)])
+    total_arc = float(cum_arc[-1])
+    if total_arc <= 1e-8:
+        return np.repeat(points[:1], num_points, axis=0).astype(np.float32)
+
+    query_arc = np.linspace(0.0, total_arc, num_points, dtype=np.float32)
+    return np.column_stack(
+        [np.interp(query_arc, cum_arc, points[:, dim]) for dim in range(3)]
+    ).astype(np.float32)
+
+
+def _rotate_path_about_anchor(points_xyz: np.ndarray, anchor_xyz: np.ndarray,
+                              angle_deg: float) -> np.ndarray:
+    """Rotate a path in the XZ plane around *anchor_xyz*."""
+    points = np.asarray(points_xyz, dtype=np.float32).copy()
+    anchor = np.asarray(anchor_xyz, dtype=np.float32).reshape(3)
+    if len(points) == 0:
+        return points
+
+    theta = np.deg2rad(float(angle_deg))
+    cos_t = float(np.cos(theta))
+    sin_t = float(np.sin(theta))
+    rel_xz = points[:, [0, 2]] - anchor[[0, 2]][None, :]
+    rot_x = cos_t * rel_xz[:, 0] - sin_t * rel_xz[:, 1]
+    rot_z = sin_t * rel_xz[:, 0] + cos_t * rel_xz[:, 1]
+    points[:, 0] = anchor[0] + rot_x
+    points[:, 2] = anchor[2] + rot_z
+    return points.astype(np.float32)
+
+
+def _token_split_to_frame(split_tok: int, total_frames: int) -> int:
+    """Map the first updated token index to the first updated frame index."""
+    if total_frames <= 0:
+        return 0
+    if split_tok <= 0:
+        return 0
+    # token 0 decodes to 1 frame; each later token contributes +4 frames.
+    return max(1, min(total_frames, 1 + 4 * (int(split_tok) - 1)))
+
+
+def _build_rotated_update_plan(
+    root_xyz: np.ndarray,
+    requested_split_tok: int,
+    effective_split_tok: int,
+    *,
+    angle_deg: float,
+    arclength_resample: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """Build a mid-session updated target by rotating the future suffix.
+
+    Returns:
+        full_target_root: full frame-level target path used for metrics.
+        plan_waypoints: suffix waypoints starting from the split anchor.
+        plan_times: suffix timestamps starting from 0 at the split anchor.
+        split_frame: first frame index generated under the updated plan.
+    """
+    root = np.asarray(root_xyz, dtype=np.float32)
+    total_frames = len(root)
+    requested_frame = _token_split_to_frame(requested_split_tok, total_frames)
+    effective_frame = _token_split_to_frame(effective_split_tok, total_frames)
+    if total_frames == 0:
+        return (
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0,), dtype=np.float32),
+            0,
+        )
+
+    requested_anchor_idx = max(0, min(total_frames - 1, requested_frame - 1))
+    effective_anchor_idx = max(0, min(total_frames - 1, effective_frame - 1))
+    suffix = root[requested_anchor_idx:].astype(np.float32)
+    offset = root[effective_anchor_idx] - suffix[0]
+    suffix = suffix + offset[None, :]
+    rotated = _rotate_path_about_anchor(suffix, suffix[0], angle_deg)
+    if arclength_resample:
+        rotated = _resample_path_by_arclength(rotated, len(rotated))
+
+    prefix = root[:effective_frame].astype(np.float32)
+    full_target = np.concatenate([prefix, rotated[1:]], axis=0)
+    plan_times = np.arange(len(rotated), dtype=np.float32) / 20.0
+    return full_target.astype(np.float32), rotated.astype(np.float32), plan_times, effective_frame
+
+
+def _extend_path_by_last_velocity(root_xyz: np.ndarray, extra_frames: int) -> np.ndarray:
+    """Append a constant-velocity tail to a frame-level root trajectory."""
+    root = np.asarray(root_xyz, dtype=np.float32)
+    if extra_frames <= 0 or len(root) == 0:
+        return root.astype(np.float32)
+    if len(root) == 1:
+        tail = np.repeat(root[-1:], extra_frames, axis=0)
+        return np.concatenate([root, tail], axis=0).astype(np.float32)
+
+    lookback = min(5, len(root) - 1)
+    step = (root[-1] - root[-1 - lookback]) / float(lookback)
+    tail = np.stack(
+        [root[-1] + step * float(i + 1) for i in range(extra_frames)], axis=0
+    )
+    return np.concatenate([root, tail.astype(np.float32)], axis=0).astype(np.float32)
+
+
 # ---------------------------------------------------------------------------
 # generation modes
 # ---------------------------------------------------------------------------
@@ -1355,9 +1466,18 @@ def main():
                         help="Frames of Gaussian smoothing across segment boundaries.")
     parser.add_argument("--mid_session_update", action="store_true", default=False,
                         help="Ablation: split GT trajectory at --split_token, "
-                        "reset timestamped plan mid-session, measure pre/post ADE.")
+                        "rotate the future suffix mid-session, and measure pre/post ADE.")
     parser.add_argument("--split_token", type=int, default=15,
                         help="Token index for --mid_session_update split.")
+    parser.add_argument("--update_angle", type=float, default=30.0,
+                        help="Degrees to rotate the future suffix for "
+                        "--mid_session_update.")
+    parser.add_argument("--mid_update_extra_tokens", type=int, default=20,
+                        help="Extra continuation tokens generated after the "
+                        "original sample for split modes in --mid_session_update.")
+    parser.add_argument("--mid_update_delay_tokens", default="0,5,20",
+                        help="Comma-separated update delays for --mid_session_update. "
+                        "0=immediate, 5=after current chunk, 20=after current horizon.")
     parser.add_argument("--synthetic_trail", action="store_true", default=False,
                         help="Ablation: after sample ends, extend with a synthetic "
                         "trajectory segment rotated by --trail_angle degrees.")
@@ -2747,34 +2867,122 @@ def main():
 
     if args.mid_session_update:
         print(f"\n=== Mid-session trajectory update (split at token "
-              f"{args.split_token}) ===")
+              f"{args.split_token}, rotate future by {args.update_angle:g}°) ===")
         tl = sample["token_length"]
         split_tok = max(5, min(args.split_token, tl - args.traj_horizon_tokens - 1))
         gt_root_arr = sample["traj"].numpy()
         total_f = len(gt_root_arr)
+        split_frame = _token_split_to_frame(split_tok, total_f)
 
         # Time-based waypoints: original 20fps GT frames, t = frame_idx / 20.
         _time_pts = gt_root_arr
         _time_t = np.arange(total_f, dtype=np.float32) / 20.0
         # Arc-length waypoints: uniformly spaced along path, same count.
-        segs = np.linalg.norm(np.diff(gt_root_arr[:, [0, 2]], axis=0), axis=1)
-        cum_arc = np.concatenate([np.zeros(1), np.cumsum(segs)])
-        total_arc = cum_arc[-1]
-        num_arc = max(2, total_f)
-        _arc_pts = np.column_stack([
-            np.interp(np.linspace(0, total_arc, num_arc), cum_arc, gt_root_arr[:, d])
-            for d in range(3)
-        ]).astype(np.float32)
-        _arc_t = np.arange(num_arc, dtype=np.float32) / 20.0
+        _num_arc = max(2, total_f)
+        _arc_pts = _resample_path_by_arclength(gt_root_arr, _num_arc)
+        _arc_t = np.arange(_num_arc, dtype=np.float32) / 20.0
+
+        angle_tag = f"{float(args.update_angle):g}".replace("-", "m").replace(".", "p")
+        extra_tokens = max(0, int(args.mid_update_extra_tokens))
+        delay_tokens = [
+            max(0, int(x.strip()))
+            for x in str(args.mid_update_delay_tokens).split(",")
+            if x.strip()
+        ]
+        if not delay_tokens:
+            delay_tokens = [0]
 
         all_records = []
-        for _mode_label, _update_at, _wp, _times in [
-            ("time_cont", None, _time_pts, _time_t),
-            ("time_split", split_tok, _time_pts, _time_t),
-            ("arc_cont", None, _arc_pts, _arc_t),
-            ("arc_split", split_tok, _arc_pts, _arc_t),
-        ]:
-            total_frames = 1 + 4 * (tl - 1) if tl > 1 else 1
+        mode_specs = [
+            ("time_cont", None, _time_pts, _time_t, _time_pts, _time_t, gt_root_arr, split_frame, 0),
+            ("arc_cont", None, _arc_pts, _arc_t, _arc_pts, _arc_t, gt_root_arr, split_frame, 0),
+        ]
+        for delay in delay_tokens:
+            effective_tok = min(max(split_tok + delay, split_tok), tl - 1)
+            _time_split_target, _time_split_pts, _time_split_t, _time_split_frame = (
+                _build_rotated_update_plan(
+                    gt_root_arr,
+                    split_tok,
+                    effective_tok,
+                    angle_deg=args.update_angle,
+                    arclength_resample=False,
+                )
+            )
+            _arc_split_target, _arc_split_pts, _arc_split_t, _arc_split_frame = (
+                _build_rotated_update_plan(
+                    gt_root_arr,
+                    split_tok,
+                    effective_tok,
+                    angle_deg=args.update_angle,
+                    arclength_resample=True,
+                )
+            )
+            mode_specs.extend([
+                (
+                    f"time_split_d{delay}",
+                    effective_tok,
+                    _time_pts,
+                    _time_t,
+                    _time_split_pts,
+                    _time_split_t,
+                    _time_split_target,
+                    _time_split_frame,
+                    delay,
+                ),
+                (
+                    f"arc_split_d{delay}",
+                    effective_tok,
+                    _arc_pts,
+                    _arc_t,
+                    _arc_split_pts,
+                    _arc_split_t,
+                    _arc_split_target,
+                    _arc_split_frame,
+                    delay,
+                ),
+            ])
+
+        for (
+            _mode_label,
+            _update_at,
+            _base_wp,
+            _base_times,
+            _update_wp,
+            _update_times,
+            _target_root,
+            _target_split_frame,
+            _delay_tokens,
+        ) in mode_specs:
+            is_split_mode = _update_at is not None
+            if is_split_mode:
+                original_suffix_tokens = max(1, tl - split_tok)
+                eval_tokens = int(_update_at) + original_suffix_tokens + extra_tokens
+            else:
+                eval_tokens = tl
+            total_frames = 1 + 4 * (eval_tokens - 1) if eval_tokens > 1 else 1
+            eval_target_root = (
+                _extend_path_by_last_velocity(_target_root, max(0, total_frames - len(_target_root)))
+                if is_split_mode
+                else _target_root
+            )
+            if is_split_mode:
+                # Keep the sampled future plan long enough for continuation
+                # tokens plus the lookahead horizon; otherwise interpolation
+                # would clamp at the original clip end while metrics use an
+                # extrapolated target path.
+                required_plan_frames = max(
+                    len(_update_wp),
+                    total_frames - _target_split_frame
+                    + 1
+                    + 4 * max(0, int(args.traj_horizon_tokens) - 1),
+                )
+                plan_wp = _extend_path_by_last_velocity(
+                    _update_wp, max(0, required_plan_frames - len(_update_wp))
+                )
+                plan_times = np.arange(len(plan_wp), dtype=np.float32) / 20.0
+            else:
+                plan_wp = _update_wp
+                plan_times = _update_times
             vae.clear_cache()
             model.init_generated(args.history_length, batch_size=1,
                                 num_denoise_steps=args.num_denoise_steps)
@@ -2782,21 +2990,25 @@ def main():
             stream_rec = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
             all_dec, all_pr = [], []
             first_chunk = True
-            _plan_v = 0
 
-            for ci in range(tl):
-                if _update_at is not None and ci == _update_at:
-                    _plan_v += 1
-                _plan_start = 0 if _plan_v == 0 else split_tok
+            for ci in range(eval_tokens):
+                if _update_at is None or ci < _update_at:
+                    _plan_wp = _base_wp
+                    _plan_times = _base_times
+                    _plan_start = 0
+                else:
+                    _plan_wp = plan_wp
+                    _plan_times = plan_times
+                    _plan_start = _update_at
                 _elapsed = ci - _plan_start
                 qt = (float(_elapsed) * args.token_dt
                       + np.arange(args.traj_horizon_tokens, dtype=np.float32) * args.token_dt)
-                ft = sample_timestamped_trajectory(_times, _wp, qt)
+                ft = sample_timestamped_trajectory(_plan_times, _plan_wp, qt)
                 # Pred root alignment: same as web_demo mid-session update.
                 cur_root = np.zeros(3, dtype=np.float32)
                 cur_root[[0, 2]] = stream_rec.r_pos_accum[[0, 2]].astype(np.float32)
                 anchor = sample_timestamped_trajectory(
-                    _times, _wp, np.asarray([qt[0]], dtype=np.float32))[0]
+                    _plan_times, _plan_wp, np.asarray([qt[0]], dtype=np.float32))[0]
                 ft = cur_root + (ft - anchor.astype(np.float32))
 
                 ti = {"traj": torch.from_numpy(ft).float().unsqueeze(0),
@@ -2808,10 +3020,13 @@ def main():
                 dec = (vae.stream_decode(out["generated"][0][None, :].to(device),
                                          first_chunk=first_chunk)[0].float().cpu().numpy())
                 first_chunk = False
+                pred_root_chunk = []
                 for frm in dec:
                     stream_rec.process_frame(frm)
+                    pred_root_chunk.append(stream_rec.r_pos_accum.astype(np.float32).copy())
                 all_dec.append(dec)
-                all_pr.append(extract_root_trajectory_263(dec))
+                if pred_root_chunk:
+                    all_pr.append(np.stack(pred_root_chunk, axis=0))
 
             vae.clear_cache()
             pred_motion = (np.concatenate(all_dec, axis=0)[:total_frames]
@@ -2820,18 +3035,32 @@ def main():
                          if all_pr else np.zeros((0, 3)))
 
             # Per-segment metrics.
-            pre_root, gt_pre = pred_root[:split_tok], gt_root[:split_tok]
-            post_root, gt_post = (pred_root[split_tok:split_tok * 2],
-                                  gt_root[split_tok:split_tok * 2])
+            pre_root, gt_pre = pred_root[:_target_split_frame], eval_target_root[:_target_split_frame]
+            post_root, gt_post = pred_root[_target_split_frame:], eval_target_root[_target_split_frame:]
             metrics = _build_mode_metrics(
-                pred_root, gt_root, target_traj,
-                f"mid_update_{_mode_label}_split{args.split_token}", None, "gt",
-                traj_encoder_path=f"timestamped, split={_update_at}")
+                pred_root, eval_target_root, eval_target_root,
+                f"mid_update_{_mode_label}_split{split_tok}_rot{angle_tag}", None, "gt",
+                traj_encoder_path=(
+                    f"timestamped, requested_split_token={split_tok}, "
+                    f"effective_split_token={_update_at}, delay={_delay_tokens}, "
+                    f"split_frame={_target_split_frame}, angle={args.update_angle:g}"
+                ),
+            )
             metrics["ADE_pre_split"] = _compute_ade(pre_root, gt_pre) if len(pre_root) > 1 else float("nan")
             metrics["ADE_post_split"] = _compute_ade(post_root, gt_post) if len(post_root) > 1 else float("nan")
             # Path-based metrics (arc-length reparam / chamfer).
-            metrics["path_arc_ade"] = _path_arc_ade(pred_root, gt_root)
-            metrics["path_chamfer"] = _path_chamfer(pred_root, gt_root)
+            metrics["path_arc_ade"] = _path_arc_ade(pred_root, eval_target_root)
+            metrics["path_chamfer"] = _path_chamfer(pred_root, eval_target_root)
+            metrics["requested_split_token"] = int(split_tok)
+            metrics["effective_split_token"] = int(_update_at) if _update_at is not None else None
+            metrics["update_delay_tokens"] = int(_delay_tokens)
+            metrics["split_frame"] = int(_target_split_frame)
+            metrics["eval_tokens"] = int(eval_tokens)
+            metrics["extra_tokens"] = int(extra_tokens if is_split_mode else 0)
+            metrics["update_kind"] = "rotated_suffix" if _update_at is not None else "none"
+            metrics["update_angle_deg"] = float(args.update_angle if _update_at is not None else 0.0)
+            metrics["ADE_vs_original_gt"] = _compute_ade(pred_root, gt_root_arr)
+            metrics["FDE_vs_original_gt"] = _compute_fde(pred_root, gt_root_arr)
             print(f"  ADE={metrics['ADE']:.4f}  pre={metrics['ADE_pre_split']:.4f}  "
                   f"post={metrics['ADE_post_split']:.4f}  "
                   f"arc_ADE={metrics['path_arc_ade']:.4f}  "
@@ -2839,16 +3068,22 @@ def main():
 
             mode_dir = os.path.join(out_root, f"mid_update_{_mode_label}")
             _save_artifacts(mode_dir, pred_motion, pred_root,
-                            gt_root[:len(pred_root)], target_traj[:len(pred_root)], metrics)
+                            eval_target_root[:len(pred_root)], eval_target_root[:len(pred_root)], metrics)
             if args.render_video and pred_motion.size > 0:
                 _mp4 = os.path.join(mode_dir, "pred_motion.mp4")
                 render_single_video(motion=pred_motion, save_path=_mp4,
-                                    dim=263, render_setting={})
+                                    dim=263,
+                                    render_setting={"cond_traj_show_full": True},
+                                    traj_xz=eval_target_root[:len(pred_motion), [0, 2]])
                 print(f"    video saved to {_mp4}")
             all_records.append(metrics)
 
         summary = {
             "sample_id": args.sample_id, "split_token": split_tok,
+            "split_frame": split_frame,
+            "update_angle_deg": float(args.update_angle),
+            "mid_update_delay_tokens": delay_tokens,
+            "mid_update_extra_tokens": int(extra_tokens),
             "ckpt": args.ckpt, "vae_ckpt": args.vae_ckpt,
             "ablation": "mid_session_update",
             "modes": {m["mode"]: {k: v for k, v in m.items()} for m in all_records},

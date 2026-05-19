@@ -42,6 +42,7 @@ def render_single_video(
             cond_traj_point_radius=int(
                 render_setting.get("cond_traj_point_radius", 5)
             ),
+            cond_traj_show_full=bool(render_setting.get("cond_traj_show_full", False)),
         )
     else:
         render_skeleton_video(
