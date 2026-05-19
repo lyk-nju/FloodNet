@@ -86,13 +86,13 @@ TURN_CASES = [
         name="turn_immediate_rot30_001168", suite="turn",
         sample_id="001168", dataset="humanml3d",
         mode="turn_immediate_rot30",
-        mode_kwargs={"update_angle": 30.0},
+        mode_kwargs={"update_angle": 30.0, "mid_update_delay_tokens": "0", "mid_update_blend_tokens": 0},
     ),
     StreamBenchmarkCase(
         name="turn_delay20_rot30_001168", suite="turn",
         sample_id="001168", dataset="humanml3d",
         mode="turn_delay20_rot30",
-        mode_kwargs={"update_angle": 30.0, "mid_update_delay_tokens": "20"},
+        mode_kwargs={"update_angle": 30.0, "mid_update_delay_tokens": "20", "mid_update_blend_tokens": 0},
     ),
     StreamBenchmarkCase(
         name="turn_delay20_blend4_rot30_001168", suite="turn",

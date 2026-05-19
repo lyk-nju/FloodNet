@@ -209,7 +209,7 @@ def _run_step(model, vae, sample, device, *, hl, nds, mode):
             gt_ci = sample["traj"].numpy()[min(ci * 4, len(sample["traj"]) - 1)].astype(np.float32)
             offset = pr_cur.astype(np.float32) - gt_ci
             ts = sample["traj"][4 * ci:].unsqueeze(0).float()
-            ti = {"traj": ts - torch.from_numpy(offset), "token_mask": torch.ones(1, max(1, tl - ci))}
+            ti = {"traj": ts + torch.from_numpy(offset), "token_mask": torch.ones(1, max(1, tl - ci))}
         else:
             ti = {"traj": sample["traj"][4 * ci:].unsqueeze(0).float(),
                   "token_mask": torch.ones(1, max(1, tl - ci))}
@@ -250,7 +250,10 @@ def _run_real(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode):
             ti = None
         else:
             cr = np.zeros(3, dtype=np.float32)
-            cr[[0, 2]] = sr.r_pos_accum[[0, 2]].astype(np.float32)
+            if mode == "real_gtroot":
+                cr = gr_arr[min(ci * 4, len(gr_arr) - 1)].astype(np.float32)
+            else:
+                cr[[0, 2]] = sr.r_pos_accum[[0, 2]].astype(np.float32)
             ft = sample_plan_future(StreamTrajectoryPlan(times=plan_t, points_xyz=plan_pts, start_commit_index=0, version=0, source="bench"), current_commit=ci, current_root_xyz=cr, horizon_tokens=hz, token_dt=tdt, reanchor_to_current_root=True)
             ti = {"traj": torch.from_numpy(ft).float().unsqueeze(0),
                   "token_mask": torch.ones(1, hz)}
