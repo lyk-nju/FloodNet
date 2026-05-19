@@ -199,11 +199,17 @@ def _run_step(model, vae, sample, device, *, hl, nds, mode):
     model.init_generated(hl, batch_size=1, num_denoise_steps=nds)
     model.generated = model.generated.to(device)
     sr = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
-    decs, prs = [], []
+    decs, _roots = [], []
     fc = True
     for ci in range(tl):
         if mode == "step_no_traj":
             ti = None
+        elif mode == "step_predroot" and len(_roots) > 0:
+            pr_cur = _roots[-1]
+            gt_ci = sample["traj"].numpy()[min(ci * 4, len(sample["traj"]) - 1)].astype(np.float32)
+            offset = pr_cur.astype(np.float32) - gt_ci
+            ts = sample["traj"][4 * ci:].unsqueeze(0).float()
+            ti = {"traj": ts - torch.from_numpy(offset), "token_mask": torch.ones(1, max(1, tl - ci))}
         else:
             ti = {"traj": sample["traj"][4 * ci:].unsqueeze(0).float(),
                   "token_mask": torch.ones(1, max(1, tl - ci))}
@@ -214,11 +220,13 @@ def _run_step(model, vae, sample, device, *, hl, nds, mode):
         dec = (vae.stream_decode(out["generated"][0][None, :].to(device),
                                  first_chunk=fc)[0].float().cpu().numpy())
         fc = False
-        for frm in dec: sr.process_frame(frm)
-        decs.append(dec); prs.append(extract_root_trajectory_263(dec))
+        for frm in dec:
+            sr.process_frame(frm)
+            _roots.append(sr.r_pos_accum.copy())
+        decs.append(dec)
     vae.clear_cache()
     pm = np.concatenate(decs, axis=0)[:tfs] if decs else np.zeros((0, 263))
-    pr = np.concatenate(prs, axis=0)[:tfs] if prs else np.zeros((0, 3))
+    pr = np.array(_roots, dtype=np.float32)[:tfs] if _roots else np.zeros((0, 3))
     gr = extract_root_trajectory_263(sample["feature"].numpy()[:tfs])
     return pm, pr, gr
 
@@ -236,7 +244,7 @@ def _run_real(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode):
     model.init_generated(hl, batch_size=1, num_denoise_steps=nds)
     model.generated = model.generated.to(device)
     sr = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
-    decs, prs, fc = [], [], True
+    decs, _roots, fc = [], [], True
     for ci in range(tl):
         if mode == "real_no_traj":
             ti = None
@@ -253,11 +261,13 @@ def _run_real(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode):
         dec = (vae.stream_decode(out["generated"][0][None, :].to(device),
                                  first_chunk=fc)[0].float().cpu().numpy())
         fc = False
-        for frm in dec: sr.process_frame(frm)
-        decs.append(dec); prs.append(extract_root_trajectory_263(dec))
+        for frm in dec:
+            sr.process_frame(frm)
+            _roots.append(sr.r_pos_accum.copy())
+        decs.append(dec)
     vae.clear_cache()
     pm = np.concatenate(decs, axis=0)[:tfs] if decs else np.zeros((0, 263))
-    pr = np.concatenate(prs, axis=0)[:tfs] if prs else np.zeros((0, 3))
+    pr = np.array(_roots, dtype=np.float32)[:tfs] if _roots else np.zeros((0, 3))
     return pm, pr, gr, plan_t, plan_pts
 
 
@@ -270,7 +280,8 @@ def _rotate_xz(points, anchor, deg):
     return pts
 
 
-def _run_turn(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode, angle):
+def _run_turn(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode, angle,
+              delay_tokens=20, blend_tokens=4):
     tl = sample["token_length"]
     tfs = 1 + 4 * (tl - 1) if tl > 1 else 1
     gr_arr = sample["traj"].numpy()
@@ -289,7 +300,7 @@ def _run_turn(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode, 
     model.init_generated(hl, batch_size=1, num_denoise_steps=nds)
     model.generated = model.generated.to(device)
     sr = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
-    decs, prs, fc = [], [], True
+    decs, _roots, fc = [], [], True
     for ci in range(tl):
         cr = np.zeros(3, dtype=np.float32)
         cr[[0, 2]] = sr.r_pos_accum[[0, 2]].astype(np.float32)
@@ -305,9 +316,8 @@ def _run_turn(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode, 
         _p = StreamTrajectoryPlan(times=ut,
                                    points_xyz=np.asarray(use, dtype=np.float32),
                                    start_commit_index=0, version=0, source="bench")
-        cr = np.zeros(3, dtype=np.float32)
-        cr[[0, 2]] = sr.r_pos_accum[[0, 2]].astype(np.float32)
-        ft = sample_plan_future(StreamTrajectoryPlan(times=use_t, points_xyz=use, start_commit_index=0, version=0, source="bench"), current_commit=ci, current_root_xyz=cr, horizon_tokens=hz, token_dt=tdt, reanchor_to_current_root=True)
+        ft = sample_plan_future(_p, current_commit=ci, current_root_xyz=cr,
+                                horizon_tokens=hz, token_dt=tdt, reanchor_to_current_root=True)
         ti = {"traj": torch.from_numpy(ft).float().unsqueeze(0), "token_mask": torch.ones(1, hz)}
         sp = build_stream_step_model_input(
             sample["text"] if isinstance(sample["text"], str) else sample["text"][0],
@@ -316,11 +326,13 @@ def _run_turn(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode, 
         dec = (vae.stream_decode(out["generated"][0][None, :].to(device),
                                  first_chunk=fc)[0].float().cpu().numpy())
         fc = False
-        for frm in dec: sr.process_frame(frm)
-        decs.append(dec); prs.append(extract_root_trajectory_263(dec))
+        for frm in dec:
+            sr.process_frame(frm)
+            _roots.append(sr.r_pos_accum.copy())
+        decs.append(dec)
     vae.clear_cache()
     pm = np.concatenate(decs, axis=0)[:tfs] if decs else np.zeros((0, 263))
-    pr = np.concatenate(prs, axis=0)[:tfs] if prs else np.zeros((0, 3))
+    pr = np.array(_roots, dtype=np.float32)[:tfs] if _roots else np.zeros((0, 3))
     return pm, pr, gr, plan_t, rot_pts
 
 
@@ -340,7 +352,7 @@ def _run_babel(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode)
     model.init_generated(hl, batch_size=1, num_denoise_steps=nds)
     model.generated = model.generated.to(device)
     sr = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
-    decs, prs, fc = [], [], True
+    decs, _roots, fc = [], [], True
     for ci in range(tl):
         txt = tc.get_text_for_commit_index(ci)
         if mode == "babel_no_traj":
@@ -364,11 +376,13 @@ def _run_babel(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode)
         dec = (vae.stream_decode(out["generated"][0][None, :].to(device),
                                  first_chunk=fc)[0].float().cpu().numpy())
         fc = False
-        for frm in dec: sr.process_frame(frm)
-        decs.append(dec); prs.append(extract_root_trajectory_263(dec))
+        for frm in dec:
+            sr.process_frame(frm)
+            _roots.append(sr.r_pos_accum.copy())
+        decs.append(dec)
     vae.clear_cache()
     pm = np.concatenate(decs, axis=0)[:tfs] if decs else np.zeros((0, 263))
-    pr = np.concatenate(prs, axis=0)[:tfs] if prs else np.zeros((0, 3))
+    pr = np.array(_roots, dtype=np.float32)[:tfs] if _roots else np.zeros((0, 3))
     return pm, pr, gr, plan_t, plan_pts
 
 

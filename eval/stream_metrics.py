@@ -89,7 +89,7 @@ def compute_path_chamfer(
 
 def estimate_body_yaw(motion_263: np.ndarray) -> np.ndarray:
     """Approximate body yaw from root rotation velocity in 263D format."""
-    rot_vel_y = motion_263[:, 6]
+    rot_vel_y = motion_263[:, 0]
     dt = 1.0 / 20.0
     return np.cumsum(rot_vel_y * dt)
 
