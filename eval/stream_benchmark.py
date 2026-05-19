@@ -429,6 +429,43 @@ def _run_babel(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode)
     return pm, pr, gr, plan_t, plan_pts
 
 
+def _render_traj_video(pred_root, target_root, out_path, title, *, split_tok=None):
+    """Render animated XZ trajectory comparison video."""
+    _n = min(len(pred_root), len(target_root))
+    if _n <= 1:
+        return
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FFMpegWriter
+    _f2, _a2 = plt.subplots(figsize=(7, 7))
+    _all_x = [target_root[:_n, 0], pred_root[:_n, 0]]
+    _all_z = [target_root[:_n, 2], pred_root[:_n, 2]]
+    _xl = (min(a.min() for a in _all_x) - 0.5, max(a.max() for a in _all_x) + 0.5)
+    _zl = (min(a.min() for a in _all_z) - 0.5, max(a.max() for a in _all_z) + 0.5)
+    _wr = FFMpegWriter(fps=20)
+    _sf = max(1, _n // 150)
+    with _wr.saving(_f2, out_path, dpi=100):
+        for _f in range(1, _n + 1, _sf):
+            _a2.clear()
+            _a2.plot(target_root[:min(_f, _n), 0], target_root[:min(_f, _n), 2],
+                     "g-", lw=1.5, alpha=0.7, label="target")
+            _a2.plot(pred_root[:min(_f, _n), 0], pred_root[:min(_f, _n), 2],
+                     "r-", lw=1.5, alpha=0.7, label="pred")
+            _a2.plot(target_root[0, 0], target_root[0, 2], "go", ms=6)
+            if split_tok is not None:
+                _sb = max(1, 1 + 4 * (split_tok - 1))
+                if 0 < _sb < _n:
+                    _a2.axvline(x=target_root[min(_sb, _n - 1), 0],
+                                color="gray", ls="--", alpha=0.5, label="split")
+            _a2.set_xlim(_xl); _a2.set_ylim(_zl)
+            _a2.set_aspect("equal")
+            _a2.legend(loc="upper right")
+            _a2.set_title(f"{title}  f{min(_f,_n)}/{_n}")
+            _wr.grab_frame()
+    plt.close(_f2)
+
+
 # ── main ───────────────────────────────────────────────────────────────
 
 def main():
@@ -479,6 +516,7 @@ def main():
     print(f"{len(cases)} case(s)  preset={args.preset}  suites={suites_list}")
 
     all_recs = []
+    _pm = _pr = _gr = _split = None
     for case in cases:
         print(f"\n--- {case.name} ({case.suite}/{case.mode}) ---")
         seed_everything(args.seed)
@@ -541,10 +579,17 @@ def main():
         all_recs.append(rec)
         print(f"  ADE={rec.get('ADE', float('nan')):.4f}  FDE={rec.get('FDE', float('nan')):.4f}")
 
-        if args.render_video and pm.size > 0:
+        _pm, _pr, _gr = pm, pr, gr
+        if case.suite == "turn":
+            _split = 15
+
+        if args.render_video and _pm is not None and _pm.size > 0:
             mp4 = os.path.join(vdir, f"{case.name}.mp4")
-            render_single_video(motion=pm, save_path=mp4, dim=263, render_setting={})
+            render_single_video(motion=_pm, save_path=mp4, dim=263, render_setting={})
             print(f"    video: {mp4}")
+            if _pr is not None and _gr is not None:
+                _render_traj_video(_pr, _gr, os.path.join(vdir, f"{case.name}_traj.mp4"),
+                                   case.name, split_tok=_split)
 
     summary = {"run_id": run_id, "config": args.config, "ckpt": args.ckpt,
                "vae_ckpt": args.vae_ckpt, "waypoint_dt": args.waypoint_dt,
