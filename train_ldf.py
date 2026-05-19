@@ -208,7 +208,7 @@ class CustomLightningModule(BasicLightningModule):
         # global_step sync (SF auto→manual)
         ##############################
         self._resume_step_offset = int(checkpoint.get("global_step", 0))
-        if self._sf_trainer is not None:
+        if getattr(self, "_sf_trainer", None) is not None:
             self._resume_step_offset = self._sf_trainer.on_load_checkpoint(checkpoint)
         else:
             rank_zero_info(
@@ -377,7 +377,7 @@ class CustomLightningModule(BasicLightningModule):
         return out
 
     def training_step(self, batch, batch_idx):
-        if self._sf_trainer is not None:
+        if getattr(self, "_sf_trainer", None) is not None:
             return self._sf_trainer.training_step(batch)
         return super().training_step(batch, batch_idx)
 

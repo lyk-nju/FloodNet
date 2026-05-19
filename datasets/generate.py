@@ -98,6 +98,7 @@ class GenerateDataset(Dataset):
         token_mask = self.sample_token_mask(token_length)
         output["token_mask"] = token_mask
         output["traj_mask"] = self.expand_token_mask_to_traj(token_mask, len(traj))
+        output["traj_loss_mask"] = output["traj_mask"].copy()
 
         if self.smooth_traj_sigma > 0.0:
             traj_xz_smooth = smooth_root_xz(
