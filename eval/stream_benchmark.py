@@ -202,7 +202,7 @@ def _merge_babel(raw_data_dir, sample_ids):
 
 # ── case runners ───────────────────────────────────────────────────────
 
-def _run_step(model, vae, sample, device, *, hl, nds, mode):
+def _run_step(model, vae, sample, device, *, hl, nds, mode, **_kw):
     tl = sample["token_length"]
     tfs = 1 + 4 * (tl - 1) if tl > 1 else 1
     vae.clear_cache()
