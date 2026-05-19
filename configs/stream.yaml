@@ -35,6 +35,11 @@ traj_mask:
     horizon_tokens: 20
     repeat_policy: translate_from_current_root
 
+    # Delayed blended trajectory update policy.
+    update_policy: delayed_blended_replace
+    update_delay_tokens: 20
+    update_blend_tokens: 4
+
     # Fallback for non-timestamped/polyline mode. Keep this conservative; 0.25
     # was too fast in pred-root closed-loop diagnostics.
     default_token_step: 0.10

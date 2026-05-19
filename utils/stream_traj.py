@@ -6,7 +6,53 @@ trajectory conditioning with the same logic as the live demo.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
+
+
+# ── Task 001 dataclasses ──────────────────────────────────────────────
+
+
+@dataclass
+class StreamTrajectoryPlan:
+    """A timestamped trajectory plan for streaming generation.
+
+    Attributes:
+        times: (N,) monotonically increasing seconds from plan-local t=0.
+        points_xyz: (N,3) world-space positions (arc-length resampled).
+        start_commit_index: the commit index where plan-local t=0 starts.
+        version: monotonic plan version for debugging.
+        source: ``manual`` / ``debug`` / ``repeat`` / ``update``.
+    """
+    times: np.ndarray
+    points_xyz: np.ndarray
+    start_commit_index: int
+    version: int
+    source: str
+
+
+@dataclass
+class TrajectoryUpdateEvent:
+    """A pending mid-session trajectory update.
+
+    Attributes:
+        old_plan: the currently active plan (may be None).
+        new_plan: the replacing plan with plan-local time origin at
+            *effective_commit_index*.
+        edit_commit_index: where the user triggered the update.
+        effective_commit_index: where new_plan's t=0 begins (edit + delay).
+        delay_tokens: number of tokens in the delay zone.
+        blend_tokens: number of tokens in the smooth transition zone.
+        version: monotonically increasing event version.
+    """
+    old_plan: StreamTrajectoryPlan | None
+    new_plan: StreamTrajectoryPlan
+    edit_commit_index: int
+    effective_commit_index: int
+    delay_tokens: int
+    blend_tokens: int
+    version: int
 
 
 def project_point_to_polyline(
@@ -282,3 +328,140 @@ def estimate_token_step_distance(
     recent = frame_steps[-min(12, frame_steps.size):]
     token_step = float(np.median(recent) * 4.0)
     return float(np.clip(token_step, min_step, max_step))
+
+
+# ── Task 001: unified trajectory runtime utilities ────────────────────
+
+
+def ensure_xyz(points: np.ndarray) -> np.ndarray:
+    """Convert 2D (N,2) or (N,4) to 3D (N,3) xyz."""
+    points = np.asarray(points, dtype=np.float32)
+    ndim_ncols = len(points.shape)
+    if ndim_ncols != 2:
+        raise ValueError(f"points must be 2D, got {points.shape}")
+    nc = points.shape[1]
+    if nc == 2:
+        return np.c_[points[:, 0], np.zeros(len(points), dtype=np.float32), points[:, 1]]
+    if nc == 4:
+        return points[:, 1:4].astype(np.float32)
+    if nc == 3:
+        return points.astype(np.float32)
+    raise ValueError(f"points must have 2,3,4 columns, got {nc}")
+
+
+def resample_polyline_by_arclength(points_xyz: np.ndarray, num_points: int) -> np.ndarray:
+    """Resample a polyline to *num_points* uniform XZ arc-length points."""
+    points = np.asarray(points_xyz, dtype=np.float32)
+    if num_points <= 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    if len(points) <= 1:
+        return np.repeat(points[:1], num_points, axis=0).astype(np.float32)
+    segs = np.linalg.norm(np.diff(points[:, [0, 2]], axis=0), axis=1)
+    cum = np.concatenate([np.zeros(1, dtype=np.float32), np.cumsum(segs)])
+    total = float(cum[-1])
+    if total < 1e-8:
+        return np.repeat(points[:1], num_points, axis=0).astype(np.float32)
+    q = np.linspace(0.0, total, num_points, dtype=np.float32)
+    return np.column_stack([np.interp(q, cum, points[:, d]) for d in range(3)]).astype(np.float32)
+
+
+def assign_uniform_timestamps(num_points: int, waypoint_dt: float = 0.05) -> np.ndarray:
+    """Return [0, dt, 2*dt, ...] for *num_points* points."""
+    return np.arange(num_points, dtype=np.float32) * float(waypoint_dt)
+
+
+def translate_plan_to_current_root(
+    plan_points_xyz: np.ndarray, current_root_xyz: np.ndarray,
+) -> np.ndarray:
+    """Shift plan so its first point equals *current_root_xyz*."""
+    plan = np.asarray(plan_points_xyz, dtype=np.float32)
+    root = np.asarray(current_root_xyz, dtype=np.float32).reshape(3)
+    if len(plan) == 0:
+        return plan
+    return (plan - plan[0][None, :] + root[None, :]).astype(np.float32)
+
+
+def normalize_manual_waypoints(
+    raw_points_xyz: np.ndarray,
+    *,
+    current_root_xyz: np.ndarray,
+    waypoint_dt: float = 0.05,
+    manual_duration_seconds: float = 5.0,
+    resample_arclength: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert hand-drawn waypoints into timestamped world-space plan.
+
+    Returns ``(times, points_xyz)``.
+    """
+    points = ensure_xyz(raw_points_xyz)
+    if resample_arclength and len(points) >= 2:
+        num_pts = max(2, int(manual_duration_seconds / float(waypoint_dt)) + 1)
+        points = resample_polyline_by_arclength(points, num_pts)
+    points = translate_plan_to_current_root(points, current_root_xyz)
+    times = assign_uniform_timestamps(len(points), waypoint_dt)
+    return times.astype(np.float32), points.astype(np.float32)
+
+
+def sample_plan_by_time(
+    plan_times: np.ndarray, plan_points_xyz: np.ndarray, query_times: np.ndarray,
+) -> np.ndarray:
+    """Sample a timestamped plan at *query_times* by linear interpolation."""
+    return sample_timestamped_trajectory(
+        np.asarray(plan_times, dtype=np.float32).reshape(-1),
+        np.asarray(plan_points_xyz, dtype=np.float32),
+        np.asarray(query_times, dtype=np.float32).reshape(-1),
+    )
+
+
+def smoothstep01(u: float) -> float:
+    """Hermite smoothstep on [0,1]."""
+    u = max(0.0, min(1.0, float(u)))
+    return u * u * (3.0 - 2.0 * u)
+
+
+def blend_future_trajs(
+    old_xyz: np.ndarray, new_xyz: np.ndarray, weight: float,
+) -> np.ndarray:
+    """XYZ linear blend of two future trajectories."""
+    w = float(weight)
+    if w <= 0.0:
+        return np.asarray(old_xyz, dtype=np.float32)
+    if w >= 1.0:
+        return np.asarray(new_xyz, dtype=np.float32)
+    old = np.asarray(old_xyz, dtype=np.float32)
+    new = np.asarray(new_xyz, dtype=np.float32)
+    n = min(len(old), len(new))
+    out = old.copy()
+    out[:n] = (1.0 - w) * old[:n] + w * new[:n]
+    return out.astype(np.float32)
+
+
+def sample_plan_future(
+    plan: StreamTrajectoryPlan,
+    *,
+    current_commit: int,
+    current_root_xyz: np.ndarray,
+    horizon_tokens: int,
+    token_dt: float,
+    reanchor_to_current_root: bool,
+) -> np.ndarray:
+    """Build the future H-token trajectory condition for the current step.
+
+    Uses plan-local time:  plan.start_commit_index → t=0.
+    When *reanchor_to_current_root* is True, translates the sampled
+    positions so the first queried point maps to *current_root_xyz*.
+    """
+    elapsed_tokens = max(0, current_commit - plan.start_commit_index)
+    query_times = (
+        float(elapsed_tokens) * token_dt
+        + np.arange(horizon_tokens, dtype=np.float32) * token_dt
+    )
+    future = sample_plan_by_time(plan.times, plan.points_xyz, query_times)
+    if reanchor_to_current_root and len(future) > 0:
+        root = np.asarray(current_root_xyz, dtype=np.float32).reshape(3)
+        anchor = sample_plan_by_time(
+            plan.times, plan.points_xyz,
+            np.asarray([query_times[0]], dtype=np.float32),
+        )[0]
+        future = root[None, :] + (future - anchor[None, :])
+    return future.astype(np.float32)

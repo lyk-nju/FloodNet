@@ -18,12 +18,19 @@ from utils.initialize import instantiate, load_config
 from utils.motion_process import StreamJointRecovery263
 from utils.stream_rollout import build_stream_step_model_input
 from utils.stream_traj import (
+    StreamTrajectoryPlan,
+    TrajectoryUpdateEvent,
+    blend_future_trajs,
     build_remaining_polyline,
     dedupe_polyline,
+    ensure_xyz,
     estimate_token_step_distance,
+    normalize_manual_waypoints,
     project_point_to_polyline,
     resample_polyline,
+    sample_plan_future,
     sample_timestamped_trajectory,
+    smoothstep01,
 )
 
 
@@ -99,31 +106,32 @@ class ModelManager:
         self.should_stop = False
         self.reset_pending = False  # True while waiting for thread to stop before reset
         
-        # Trajectory control.
-        # Public/demo semantics stay in world-space xz coordinates. For streaming inference,
-        # we resample a future token-horizon from the character's current root position and
-        # let the model-side streaming path normalize the full visible window back to a
-        # clip-local origin before encoding.
+        # ── Trajectory control (Task 001 refactor) ──────────────────────
         self.traj_state_lock = threading.Lock()
-        self.current_traj_waypoints = None
-        self.current_traj_array = None         # Latest world-space waypoint polyline, shape (N, 3)
+        self.active_traj_plan: StreamTrajectoryPlan | None = None
+        self.pending_update_event: TrajectoryUpdateEvent | None = None
+        self._trajectory_state = "none"
+        self._plan_version_counter = 0
+
         self.current_traj_mode = "replace_future"
-        self.traj_plan_version = 0
         self.traj_horizon_tokens = int(traj_mask_cfg.get("horizon_tokens", 20))
         self.traj_time_mode = str(traj_mask_cfg.get("time_mode", "timestamped"))
         self.waypoint_dt = float(traj_mask_cfg.get("waypoint_dt", 0.05))
-        self.manual_duration_seconds = float(traj_mask_cfg.get("manual_duration_seconds", 3.0))
+        self.manual_duration_seconds = float(traj_mask_cfg.get("manual_duration_seconds", 5.0))
         self.manual_resample_arclength = bool(traj_mask_cfg.get("manual_resample_arclength", True))
         self.token_dt = float(traj_mask_cfg.get("token_dt", 0.20))
-        self.traj_repeat_policy = str(traj_mask_cfg.get("repeat_policy", "hold"))
+        self.traj_repeat_policy = str(traj_mask_cfg.get("repeat_policy", "translate_from_current_root"))
+        self.traj_update_delay_tokens = int(traj_mask_cfg.get("update_delay_tokens", self.traj_horizon_tokens))
+        self.traj_update_blend_tokens = int(traj_mask_cfg.get("update_blend_tokens", 4))
         self.default_token_step = float(traj_mask_cfg.get("default_token_step", 0.25))
         self.min_token_step = float(traj_mask_cfg.get("min_token_step", 0.05))
         self.max_token_step = float(traj_mask_cfg.get("max_token_step", 1.50))
-        self.current_traj_times = None
-        self.traj_plan_start_commit_index = 0
+        self.root_xz_history = deque(maxlen=120)
         self.traj_repeat_anchor_root = None
         self.traj_repeat_anchor_cycle = None
-        self.root_xz_history = deque(maxlen=120)
+        # Backwards-compat helpers for app.py / status endpoints.
+        self.current_traj_waypoints = None
+        self.current_traj_times = None
         print(
             "Trajectory config: "
             f"time_mode={self.traj_time_mode}, "
@@ -131,7 +139,9 @@ class ModelManager:
             f"manual_duration={self.manual_duration_seconds:.2f}s, "
             f"token_dt={self.token_dt:.3f}s, "
             f"horizon_tokens={self.traj_horizon_tokens}, "
-            f"repeat_policy={self.traj_repeat_policy}"
+            f"repeat_policy={self.traj_repeat_policy}, "
+            f"update_delay={self.traj_update_delay_tokens}, "
+            f"update_blend={self.traj_update_blend_tokens}"
         )
         
         # Model generation state
@@ -344,100 +354,91 @@ class ModelManager:
         )
 
     def update_trajectory(
-        self,
-        waypoints,
-        mode="replace_future",
-        *,
-        source="manual",
-        duration_seconds=None,
+        self, waypoints, mode="replace_future", *, source="manual",
     ):
-        """Update trajectory control from world-space waypoints.
+        """Update trajectory control (Task 001: delayed blended replace).
 
-        V1 semantics:
-        - `mode=replace_future`: replace only the future plan used by streaming inference.
-        - The latent state is preserved; only future trajectory conditioning is updated.
-        - Manual non-timestamped paths are normalized to uniform arclength over
-          a fixed duration, so browser event density does not change target speed.
+        Does NOT immediately overwrite the active plan.  Instead creates a
+        pending ``TrajectoryUpdateEvent`` that takes effect after
+        ``update_delay_tokens`` tokens with a smooth blend transition.
+        ``waypoints is None`` clears trajectory.
         """
         mode = mode or "replace_future"
         if mode != "replace_future":
             raise ValueError(f"Unsupported trajectory mode: {mode}")
 
-        with self.traj_state_lock:
-            self.current_traj_mode = mode
-            self.traj_plan_version += 1
-
-            if waypoints is None or len(waypoints) == 0:
+        # ── Clear ────────────────────────────────────────────────────
+        if waypoints is None or len(waypoints) == 0:
+            with self.traj_state_lock:
+                self.active_traj_plan = None
+                self.pending_update_event = None
+                # Also clear backwards-compat fields.
                 self.current_traj_waypoints = None
-                self.current_traj_array = None
                 self.current_traj_times = None
-                self.traj_repeat_anchor_root = None
-                self.traj_repeat_anchor_cycle = None
-                with self._display_traj_lock:
-                    self._display_traj = None
-                print("Trajectory control cleared")
-                return None
+            if hasattr(self.model, "_traj_buf"):
+                self.model._traj_buf.reset()
+            self._trajectory_state = "none"
+            with self._display_traj_lock:
+                self._display_traj = None
+            print("Trajectory control cleared (plan + buffer reset)")
+            return None
 
-            waypoints = np.asarray(waypoints, dtype=np.float32)
-            if waypoints.ndim == 1:
-                waypoints = waypoints.reshape(1, -1)
-            explicit_times = None
-            if waypoints.shape[1] == 4:
-                # Explicit timestamped format: [t, x, y, z].
-                explicit_times = waypoints[:, 0].astype(np.float32)
-                waypoints = waypoints[:, 1:4]
-            elif waypoints.shape[1] == 2:
-                waypoints = np.c_[
-                    waypoints[:, 0],
-                    np.zeros(len(waypoints), dtype=np.float32),
-                    waypoints[:, 1],
-                ]
-            if waypoints.shape[1] != 3:
-                raise ValueError(
-                    "Trajectory waypoints must have shape (N,2), (N,3), "
-                    f"or timestamped (N,4); got {waypoints.shape}"
-                )
+        raw = np.asarray(waypoints, dtype=np.float32)
+        if raw.ndim == 1:
+            raw = raw.reshape(1, -1)
 
-            if explicit_times is None:
-                if source == "manual" and len(waypoints) > 0:
-                    current_root = self._get_current_root_xyz()
-                    if np.linalg.norm(
-                        waypoints[0, [0, 2]] - current_root[[0, 2]]
-                    ) > 1e-4:
-                        waypoints = np.vstack([current_root[None, :], waypoints])
-                if source == "manual" and self.manual_resample_arclength:
-                    duration = self.manual_duration_seconds
-                    if duration_seconds is not None:
-                        duration = float(duration_seconds)
-                    duration = max(self.waypoint_dt, float(duration))
-                    num_points = max(2, int(round(duration / self.waypoint_dt)) + 1)
-                    waypoints = self._resample_uniform_arclength(waypoints, num_points)
-                else:
-                    waypoints = dedupe_polyline(waypoints)
-                self.current_traj_times = (
-                    np.arange(len(waypoints), dtype=np.float32) * self.waypoint_dt
-                )
-            else:
-                self.current_traj_times = explicit_times.copy()
-                if len(self.current_traj_times):
-                    self.current_traj_times = self.current_traj_times - self.current_traj_times[0]
-            self.current_traj_waypoints = waypoints.copy()
-            self.current_traj_array = waypoints.copy()
-            self.traj_plan_start_commit_index = int(
-                getattr(self.model, "commit_index", 0)
+        # ── Timestamped (N,4) or spatial (N,2/3) ────────────────────
+        explicit_times = None
+        if raw.shape[1] == 4:
+            explicit_times = raw[:, 0].astype(np.float32)
+            raw = raw[:, 1:4]
+        points = ensure_xyz(raw)
+        current_root = self._get_current_root_xyz()
+        edit_commit = self._get_commit_index()
+        delay = self.traj_update_delay_tokens
+        effective_commit = edit_commit + delay
+
+        if explicit_times is not None:
+            times = explicit_times - explicit_times[0]
+        else:
+            times, points = normalize_manual_waypoints(
+                points,
+                current_root_xyz=current_root,
+                waypoint_dt=self.waypoint_dt,
+                manual_duration_seconds=self.manual_duration_seconds,
+                resample_arclength=self.manual_resample_arclength,
             )
-            self.traj_repeat_anchor_root = None
-            self.traj_repeat_anchor_cycle = None
+
+        new_plan = StreamTrajectoryPlan(
+            times=times.astype(np.float32),
+            points_xyz=points.astype(np.float32),
+            start_commit_index=effective_commit,
+            version=self._next_plan_version(),
+            source=str(source),
+        )
+
+        with self.traj_state_lock:
+            old_plan = self.active_traj_plan
+            self.pending_update_event = TrajectoryUpdateEvent(
+                old_plan=old_plan,
+                new_plan=new_plan,
+                edit_commit_index=edit_commit,
+                effective_commit_index=effective_commit,
+                delay_tokens=delay,
+                blend_tokens=self.traj_update_blend_tokens,
+                version=new_plan.version,
+            )
+            # Backwards-compat.
+            self.current_traj_waypoints = points
+            self.current_traj_times = times
+            self.current_traj_mode = mode
 
         print(
-            f"Trajectory updated: {len(waypoints)} waypoints, "
-            f"mode={mode}, source={source}, horizon={self.traj_horizon_tokens} tokens, "
-            f"time_mode={self.traj_time_mode}, waypoint_dt={self.waypoint_dt:.3f}s, "
-            f"duration={(len(waypoints) - 1) * self.waypoint_dt:.2f}s"
+            f"Trajectory updated: {len(points)} points, source={source}, "
+            f"horizon={self.traj_horizon_tokens}, "
+            f"edit_commit={edit_commit}, effective_commit={effective_commit}, "
+            f"delay={delay}, blend={self.traj_update_blend_tokens}"
         )
-        preview = self._build_stream_traj_input()
-        if preview is None:
-            return None
         return self.get_display_traj()
 
     def _get_current_root_xyz(self) -> np.ndarray:
@@ -530,46 +531,103 @@ class ModelManager:
         )
         return (current_root + (unwrapped - anchor)).astype(np.float32)
 
+    def _next_plan_version(self) -> int:
+        self._plan_version_counter += 1
+        return self._plan_version_counter
+
+    def _get_commit_index(self) -> int:
+        return int(getattr(self.model, "commit_index", 0))
+
     def _build_stream_traj_input(self):
+        current_commit = self._get_commit_index()
+        current_root = self._get_current_root_xyz()
+
         with self.traj_state_lock:
-            if self.current_traj_waypoints is None:
-                return None
-            waypoints = self.current_traj_waypoints.copy()
-            traj_times = None if self.current_traj_times is None else self.current_traj_times.copy()
-            plan_version = self.traj_plan_version
-            traj_mode = self.current_traj_mode
-            plan_start_commit = self.traj_plan_start_commit_index
+            event = self.pending_update_event
+            plan = self.active_traj_plan
 
-        if self.traj_time_mode == "timestamped" and traj_times is not None:
-            commit_index = int(getattr(self.model, "commit_index", 0))
-            elapsed_tokens = max(0, commit_index - int(plan_start_commit))
-            query_times = (
-                float(elapsed_tokens) * self.token_dt
-                + np.arange(self.traj_horizon_tokens, dtype=np.float32) * self.token_dt
+        if plan is None and event is None:
+            self._trajectory_state = "none"
+            return None
+
+        # ── No pending update: sample from active plan ──────────────────
+        if event is None:
+            future = sample_plan_future(
+                plan,
+                current_commit=current_commit,
+                current_root_xyz=current_root,
+                horizon_tokens=self.traj_horizon_tokens,
+                token_dt=self.token_dt,
+                reanchor_to_current_root=True,
             )
-            future_traj = self._sample_timestamped_with_repeat(
-                traj_times, waypoints, query_times
+            self._trajectory_state = "active"
+            token_mask = np.ones((1, self.traj_horizon_tokens), dtype=np.float32)
+            with self._display_traj_lock:
+                self._display_traj = future.copy()
+            return {
+                "traj": future[None, :, :],
+                "token_mask": token_mask,
+                "traj_mode": self.current_traj_mode,
+                "traj_plan_version": plan.version if plan else 0,
+            }
+
+        # ── Pending update: compute blend weight ────────────────────────
+        offset = current_commit - event.edit_commit_index
+        delay = event.delay_tokens
+        blend = event.blend_tokens
+        raw_w = 0.0
+        if offset >= delay + blend:
+            raw_w = 1.0
+        elif offset >= delay and blend > 0:
+            raw_w = smoothstep01((offset - delay) / blend)
+        w = float(raw_w)
+
+        # Sample old and new futures using plan-local time.
+        old_future = None
+        if event.old_plan is not None:
+            old_future = sample_plan_future(
+                event.old_plan,
+                current_commit=current_commit,
+                current_root_xyz=current_root,
+                horizon_tokens=self.traj_horizon_tokens,
+                token_dt=self.token_dt,
+                reanchor_to_current_root=True,
             )
+        new_future = sample_plan_future(
+            event.new_plan,
+            current_commit=current_commit,
+            current_root_xyz=current_root,
+            horizon_tokens=self.traj_horizon_tokens,
+            token_dt=self.token_dt,
+            reanchor_to_current_root=True,
+        )
+
+        future = blend_future_trajs(
+            old_future if old_future is not None else new_future,
+            new_future, w,
+        )
+
+        # ── Transition management ───────────────────────────────────────
+        if w <= 0.0:
+            self._trajectory_state = "delay"
+        elif w < 1.0:
+            self._trajectory_state = "blend"
         else:
-            current_root = self._get_current_root_xyz()
-            token_step = self._estimate_token_step_distance()
-            polyline = self._build_remaining_polyline(current_root, waypoints)
-            future_traj = self._resample_polyline(
-                polyline,
-                num_tokens=self.traj_horizon_tokens,
-                token_step=token_step,
-            )
-        token_mask = np.ones((1, future_traj.shape[0]), dtype=np.float32)
+            self._trajectory_state = "replaced"
+            with self.traj_state_lock:
+                self.active_traj_plan = event.new_plan
+                self.pending_update_event = None
 
+        token_mask = np.ones((1, self.traj_horizon_tokens), dtype=np.float32)
         with self._display_traj_lock:
-            self._display_traj = future_traj.copy()
-
+            self._display_traj = future.copy()
         return {
-            "traj": future_traj[None, :, :],
+            "traj": future[None, :, :],
             "token_mask": token_mask,
-            "traj_mode": traj_mode,
-            "traj_plan_version": plan_version,
-            "traj_repeat_policy": self.traj_repeat_policy,
+            "traj_mode": self.current_traj_mode,
+            "traj_plan_version": event.version,
+            "traj_update_blend_weight": w,
+            "trajectory_state": self._trajectory_state,
         }
     
     def pause_generation(self):
@@ -632,13 +690,12 @@ class ModelManager:
         self.first_chunk = True
         self.root_xz_history.clear()
         with self.traj_state_lock:
+            self.active_traj_plan = None
+            self.pending_update_event = None
             self.current_traj_waypoints = None
-            self.current_traj_array = None
             self.current_traj_times = None
             self.current_traj_mode = "replace_future"
-            self.traj_repeat_anchor_root = None
-            self.traj_repeat_anchor_cycle = None
-            self.traj_plan_version += 1
+        self._trajectory_state = "none"
         with self._display_traj_lock:
             self._display_traj = None
         
@@ -759,19 +816,38 @@ class ModelManager:
         return joints, traj
     
     def get_buffer_status(self):
-        """Get buffer status"""
-        return {
+        """Get buffer status (Task 001: exposes trajectory state + update metadata)."""
+        with self.traj_state_lock:
+            ev = self.pending_update_event
+            plan = self.active_traj_plan
+        status = {
             "buffer_size": self.frame_buffer.size(),
             "target_size": self.frame_buffer.target_size,
             "is_generating": self.is_generating,
             "current_text": self.current_text,
-            "trajectory_active": self.current_traj_waypoints is not None,
+            "trajectory_state": self._trajectory_state,
+            "trajectory_active": self.active_traj_plan is not None,
             "trajectory_time_mode": self.traj_time_mode,
-            "trajectory_repeat_policy": self.traj_repeat_policy,
             "trajectory_horizon_tokens": self.traj_horizon_tokens,
             "smoothing_alpha": self.smoothing_alpha,
             "denoise_steps": self.denoise_steps,
         }
+        if plan is not None:
+            status["active_plan_version"] = plan.version
+            status["active_plan_source"] = plan.source
+        if ev is not None:
+            status["pending_plan_version"] = ev.version
+            status["edit_commit_index"] = ev.edit_commit_index
+            status["effective_commit_index"] = ev.effective_commit_index
+            status["update_delay_tokens"] = ev.delay_tokens
+            status["update_blend_tokens"] = ev.blend_tokens
+            status["update_blend_weight"] = round(
+                smoothstep01(
+                    (self._get_commit_index() - ev.edit_commit_index - ev.delay_tokens)
+                    / max(ev.blend_tokens, 1)
+                ), 4,
+            ) if self._trajectory_state == "blend" else 0.0
+        return status
 
 
 # Global model manager instance
