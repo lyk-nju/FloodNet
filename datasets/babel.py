@@ -232,6 +232,7 @@ class BabelDataset(Dataset):
                     if sf < traj_length:
                         traj_mask[sf:ef] = token_mask[k]
                 output["traj_mask"] = traj_mask
+                output["traj_cond_mask"] = traj_mask.copy()
                 output["traj_loss_mask"] = traj_mask.copy()
         else:
             token_start = 0
@@ -500,7 +501,7 @@ def collate_fn(batch):
             output[key] = torch.nn.utils.rnn.pad_sequence(
                 items, batch_first=True, padding_value=0
             )
-        elif key in ["traj_mask", "traj_loss_mask", "token_mask"]:
+        elif key in ["traj_mask", "traj_cond_mask", "traj_loss_mask", "token_mask"]:
             items = [
                 torch.from_numpy(b[key])
                 if isinstance(b[key], np.ndarray)

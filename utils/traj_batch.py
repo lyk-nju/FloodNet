@@ -124,18 +124,21 @@ def encode_traj_batch(
 
     Returns None if x contains no trajectory fields.
     """
-    # --- source ---
+    # --- source: prioritize traj_cond paths ---
     if "traj_features" in x and x["traj_features"] is not None:
-        feats_frame = x["traj_features"].to(device)          # (B, T_frame, 4)
+        feats_frame = x["traj_features"].to(device)
+    elif "traj_cond" in x and x["traj_cond"] is not None:
+        feats_frame = root_to_traj_feats(x["traj_cond"].to(device))
     elif "traj" in x and x["traj"] is not None:
-        feats_frame = root_to_traj_feats(x["traj"].to(device))  # (B, T_frame, 4)
+        feats_frame = root_to_traj_feats(x["traj"].to(device))
     else:
         return None
 
-    # --- frame-level mask (traj_mask preferred; fall back to expanding token_mask) ---
+    # --- frame-level mask (traj_cond_mask preferred) ---
     mask_frame = None
-    if "traj_mask" in x and x["traj_mask"] is not None:
-        mask_frame = x["traj_mask"].to(device=device, dtype=torch.float32)
+    _cond_mask = x.get("traj_cond_mask", x.get("traj_mask"))
+    if _cond_mask is not None:
+        mask_frame = _cond_mask.to(device=device, dtype=torch.float32)
     elif "token_mask" in x and x["token_mask"] is not None:
         tm = x["token_mask"].to(device=device, dtype=torch.float32)
         B_tm, N_tm = tm.shape

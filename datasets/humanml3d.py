@@ -212,6 +212,7 @@ class HumanML3DDataset(Dataset):
                     if sf < traj_length:
                         traj_mask[sf:ef] = token_mask[k]
                 output["traj_mask"] = traj_mask
+                output["traj_cond_mask"] = traj_mask.copy()
                 output["traj_loss_mask"] = traj_mask.copy()
 
         ##############################
@@ -331,7 +332,7 @@ def collate_fn(batch):
             output[key] = torch.nn.utils.rnn.pad_sequence(
                 items, batch_first=True, padding_value=0
             )
-        elif key in ["traj_mask", "traj_loss_mask", "token_mask"]:
+        elif key in ["traj_mask", "traj_cond_mask", "traj_loss_mask", "token_mask"]:
             # Pad traj_mask to (B, T_max), padding 填 0
             items = [
                 torch.from_numpy(b[key])
