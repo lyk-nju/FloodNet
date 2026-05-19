@@ -50,6 +50,7 @@ from utils.stream_rollout import (
 from utils.stream_traj import (
     StreamTrajectoryPlan,
     assign_uniform_timestamps,
+    blend_future_trajs,
     resample_polyline_by_arclength,
     sample_plan_future,
     sample_timestamped_trajectory,
@@ -345,25 +346,34 @@ def _run_turn(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode, 
     vae.clear_cache()
     model.init_generated(hl, batch_size=1, num_denoise_steps=nds)
     model.generated = model.generated.to(device)
+    # Build old/new plans with web-demo effective-commit semantics.
+    edit_commit = split_tok
+    effective_commit = edit_commit + ed
+    old_plan = StreamTrajectoryPlan(
+        times=plan_t, points_xyz=plan_pts,
+        start_commit_index=0, version=0, source="bench_old",
+    )
+    new_plan = StreamTrajectoryPlan(
+        times=rot_t, points_xyz=rot_pts,
+        start_commit_index=effective_commit, version=1, source="bench_new",
+    )
     sr = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
     decs, _roots, fc = [], [], True
     for ci in range(total_tl):
         cr = np.zeros(3, dtype=np.float32)
         cr[[0, 2]] = sr.r_pos_accum[[0, 2]].astype(np.float32)
-        # 3-zone delayed blend: delay -> blend -> replace
-        if ci < split_tok + ed:
-            use, ut = plan_pts, plan_t
-        elif ci < split_tok + ed + eb and eb > 0:
-            w = smoothstep01(float(ci - split_tok - ed) / eb)
-            use = (1.0 - w) * plan_pts + w * rot_pts
-            ut = np.arange(len(use), dtype=np.float32) * wpdt
+        _reanchor = dict(current_commit=ci, current_root_xyz=cr,
+                         horizon_tokens=hz, token_dt=tdt, reanchor_to_current_root=True)
+        old_ft = sample_plan_future(old_plan, **_reanchor)
+        offset = ci - edit_commit
+        if offset < ed:
+            ft = old_ft
+        elif offset < ed + eb and eb > 0:
+            new_ft = sample_plan_future(new_plan, **_reanchor)
+            w = smoothstep01(float(offset - ed) / eb)
+            ft = blend_future_trajs(old_ft, new_ft, w)
         else:
-            use, ut = rot_pts, rot_t
-        _p = StreamTrajectoryPlan(times=ut,
-                                   points_xyz=np.asarray(use, dtype=np.float32),
-                                   start_commit_index=0, version=0, source="bench")
-        ft = sample_plan_future(_p, current_commit=ci, current_root_xyz=cr,
-                                horizon_tokens=hz, token_dt=tdt, reanchor_to_current_root=True)
+            ft = sample_plan_future(new_plan, **_reanchor)
         ti = {"traj": torch.from_numpy(ft).float().unsqueeze(0), "token_mask": torch.ones(1, hz)}
         sp = build_stream_step_model_input(
             sample["text"] if isinstance(sample["text"], str) else sample["text"][0],
