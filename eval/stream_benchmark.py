@@ -43,6 +43,7 @@ from utils.stream_traj import (
     resample_polyline_by_arclength,
     sample_plan_future,
     sample_timestamped_trajectory,
+    smoothstep01,
 )
 from utils.visualize import render_single_video
 from eval.stream_benchmarks import get_cases
@@ -278,7 +279,11 @@ def _run_turn(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode, 
     plan_pts = resample_polyline_by_arclength(gr_arr, npt)
     plan_t = assign_uniform_timestamps(npt, wpdt)
     split_tok, sf = 15, max(1, 1 + 4 * 14)
-    upd = np.concatenate([plan_pts[:sf], _rotate_xz(plan_pts[sf:], plan_pts[sf - 1], angle)], axis=0)
+    rot_pts = np.concatenate(
+        [plan_pts[:sf], _rotate_xz(plan_pts[sf:], plan_pts[sf - 1], angle)], axis=0)
+    rot_t = np.arange(len(rot_pts), dtype=np.float32) * wpdt
+    ed = int(delay_tokens) if isinstance(delay_tokens, (int, float)) else 20
+    eb = int(blend_tokens) if isinstance(blend_tokens, (int, float)) else 4
     gr = extract_root_trajectory_263(sample["feature"].numpy()[:tfs])
     vae.clear_cache()
     model.init_generated(hl, batch_size=1, num_denoise_steps=nds)
@@ -286,8 +291,20 @@ def _run_turn(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode, 
     sr = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
     decs, prs, fc = [], [], True
     for ci in range(tl):
-        use = upd if ci >= split_tok else plan_pts
-        use_t = np.arange(len(use), dtype=np.float32) * wpdt
+        cr = np.zeros(3, dtype=np.float32)
+        cr[[0, 2]] = sr.r_pos_accum[[0, 2]].astype(np.float32)
+        # 3-zone delayed blend: delay -> blend -> replace
+        if ci < split_tok + ed:
+            use, ut = plan_pts, plan_t
+        elif ci < split_tok + ed + eb and eb > 0:
+            w = smoothstep01(float(ci - split_tok - ed) / eb)
+            use = (1.0 - w) * plan_pts + w * rot_pts
+            ut = np.arange(len(use), dtype=np.float32) * wpdt
+        else:
+            use, ut = rot_pts, rot_t
+        _p = StreamTrajectoryPlan(times=ut,
+                                   points_xyz=np.asarray(use, dtype=np.float32),
+                                   start_commit_index=0, version=0, source="bench")
         cr = np.zeros(3, dtype=np.float32)
         cr[[0, 2]] = sr.r_pos_accum[[0, 2]].astype(np.float32)
         ft = sample_plan_future(StreamTrajectoryPlan(times=use_t, points_xyz=use, start_commit_index=0, version=0, source="bench"), current_commit=ci, current_root_xyz=cr, horizon_tokens=hz, token_dt=tdt, reanchor_to_current_root=True)
@@ -304,7 +321,7 @@ def _run_turn(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode, 
     vae.clear_cache()
     pm = np.concatenate(decs, axis=0)[:tfs] if decs else np.zeros((0, 263))
     pr = np.concatenate(prs, axis=0)[:tfs] if prs else np.zeros((0, 3))
-    return pm, pr, gr, plan_t, upd
+    return pm, pr, gr, plan_t, rot_pts
 
 
 def _run_babel(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode):
@@ -439,8 +456,13 @@ def main():
             )
         elif case.suite == "turn":
             ang = case.mode_kwargs.get("update_angle", 30.0)
+            dt_val = case.mode_kwargs.get("mid_update_delay_tokens", 20)
+            db_val = case.mode_kwargs.get("mid_update_blend_tokens", 4)
+            if isinstance(dt_val, str):
+                dt_val = int(dt_val.split(",")[0])
             pm, pr, gr, pt, pp = _run_turn(model, vae, sample, dev, mode=case.mode,
-                                           angle=ang, **kw)
+                                           angle=ang, delay_tokens=int(dt_val),
+                                           blend_tokens=int(db_val), **kw)
             rec = build_plan_metrics(
                 pr, original_gt_root=gr, plan_times=pt, plan_points_xyz=pp,
                 target_frames=sample["feature_length"], motion_fps=args.motion_fps,
