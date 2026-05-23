@@ -173,6 +173,24 @@ model:
 #   6 — active window, relative displacement, GT anchor    (loss = |pred_rel[t]-gt_rel[t]|², true disp error)
 control_loss_train_mode: 1
 
+# T_B_04: random horizon simulation (design.md §2.2.2/§2.2.3). Units are all
+# token-level. Truncates how many future tokens traj_cond exposes during
+# training, ramping toward the fixed inference horizon late in training.
+# NOTE: the horizon-mask hook into the traj-conditioning path is not yet wired
+# (model lacks cfg/global_step access + traj_mask_frame is internal to
+# encode_traj_batch); the schedule/mask functions live in
+# utils/training/horizon_sched.py and are unit-tested. See TODO T_B_04 status.
+horizon_sim:
+    enabled: true
+    unit: token
+    inference_horizon_tokens: 20       # inference fixed value (= 80 frame)
+    early_min_horizon_tokens: 20       # early lower bound (>= inference)
+    early_max_horizon_ratio: 1.0       # early upper = clip_tokens * ratio
+    late_min_horizon_tokens: 10        # late short-horizon lower bound
+    late_max_horizon_tokens: 20        # late upper bound
+    p_exact_inference_horizon: 0.5     # late: 50% exact = 20, else U[10,20]
+    warmup_ratio: 0.5                  # first 50% of steps = early phase
+
 # T_B_03: history-token corruption for streaming body training (design.md §2.1.3/§2.1.4).
 # Replaces the removed scheduled_sampling (T_B_01). Applied once at SF rollout
 # start to the history region (left of the active window), fixed across K steps.
