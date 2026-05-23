@@ -12,6 +12,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
+
+from utils.training.history_corruption import (
+    apply_history_corruption,
+    should_apply_corruption,
+)
 from lightning.pytorch.utilities import rank_zero_info
 
 from .control_loss import compute_control_loss_xz
@@ -96,6 +101,11 @@ class SelfForcingTrainer:
             model_batch, semantics.progress
         )
         runtime_metrics["self_forcing/k"] = float(effective_k)
+        # T_B_03: per-step corruption indicator (0/1); averaged by the logger it
+        # reports the effective corruption rate as the curriculum ramps.
+        runtime_metrics["history_corruption/applied"] = getattr(
+            self, "_last_corruption_applied", 0.0
+        )
         if self._last_replace_diff is not None:
             runtime_metrics["self_forcing/replace_abs_diff"] = float(
                 self._last_replace_diff
@@ -265,6 +275,28 @@ class SelfForcingTrainer:
         )
 
         current_feature = feature.clone()
+        # T_B_03 §2.1.5: optionally corrupt the history region ONCE at rollout
+        # start, kept fixed across the K steps (so all steps see a consistent
+        # "fake history"). Gated by the history_corruption cfg; `progress` is the
+        # training progress in [0,1] used for the curriculum bands (passed as
+        # global_step/total_steps = progress/1.0 so should_apply_corruption's
+        # progress == progress).
+        hc_cfg = self._module.cfg.get("history_corruption", {}) or {}
+        corruption_applied = False
+        if should_apply_corruption(progress, 1.0, hc_cfg):
+            current_feature = apply_history_corruption(
+                current_feature,
+                plan.start_end_indices,
+                mask_emb=model.model.mask_emb,
+                z_std=model.model.z_std,
+                chunk_size=model.chunk_size,
+                alpha_mask=hc_cfg.get("alpha_mask", 0.3),
+                alpha_noisy=hc_cfg.get("alpha_noisy", 0.3),
+                noise_sigma_factor=hc_cfg.get("noise_sigma_factor", 0.05),
+            )
+            corruption_applied = True
+        self._last_corruption_applied = float(corruption_applied)
+
         final_step_result = None
         for step_idx in range(plan.effective_k):
             end_indices = plan.start_end_indices + step_idx

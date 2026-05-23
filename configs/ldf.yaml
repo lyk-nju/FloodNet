@@ -173,6 +173,21 @@ model:
 #   6 — active window, relative displacement, GT anchor    (loss = |pred_rel[t]-gt_rel[t]|², true disp error)
 control_loss_train_mode: 1
 
+# T_B_03: history-token corruption for streaming body training (design.md §2.1.3/§2.1.4).
+# Replaces the removed scheduled_sampling (T_B_01). Applied once at SF rollout
+# start to the history region (left of the active window), fixed across K steps.
+history_corruption:
+    enabled: true
+    apply_prob: null            # null = use curriculum below; a float skips curriculum
+    alpha_mask: 0.3             # fraction of focus tokens replaced by mask_emb
+    alpha_noisy: 0.3            # fraction of focus tokens with additive N(0,(sigma·z_std)^2)
+    noise_sigma_factor: 0.05    # noise sigma = noise_sigma_factor * z_std
+    curriculum:
+        enabled: true
+        early_prob: 0.2         # progress < 1/3
+        mid_prob: 0.5           # 1/3 <= progress < 2/3
+        late_prob: 0.8          # progress >= 2/3
+
 resume_reset_optimizer: true
 optimizer:
     target: AdamW
