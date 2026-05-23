@@ -62,5 +62,13 @@ text_encoder:
   freeze: true
 
 data:
-  raw_data_dir: deps/HumanML3D_full/
-  stats_dir: deps/refiner_stats/
+  # raw_data_dir may be the raw_data ROOT (containing HumanML3D / BABEL_streamed)
+  # or the dataset dir itself; the loader resolves both (see
+  # scripts/compute_5d_stats.resolve_dataset_dir).
+  raw_data_dir: /home/yuankai/Text2Motion/FloodDiffusion/raw_data
+  dataset: humanml3d                    # humanml3d | babel
+  train_split_file: train.txt           # babel: train_processed.txt
+  val_split_file: val.txt               # babel: val_processed.txt
+  feature_path: new_joint_vecs          # babel: motions
+  text_path: texts
+  stats_dir: deps/refiner_stats

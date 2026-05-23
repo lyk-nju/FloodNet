@@ -157,52 +157,153 @@ def save_stats(stats: dict, output_dir: str | Path) -> None:
              out, stats["n_current_motion"], stats["n_waypoint"])
 
 
-def load_clips_from_dir(raw_data_dir: str | Path) -> list[dict]:
-    """Load HumanML3D-style clips from `raw_data_dir`.
+# Per-dataset layout defaults, derived from the real repo structure
+# (configs/ldf.yaml + datasets/humanml3d.py / datasets/babel.py):
+#   <dataset_dir>/<split_file>           — one sample id per line
+#   <dataset_dir>/<feature_path>/<id>.npy — (T, 263) motion features
+#   <dataset_dir>/<text_path>/<id>.txt    — '#'-delimited caption lines
+# HumanML3D feature dir is `new_joint_vecs`; BABEL_streamed is `motions`.
+DATASET_DEFAULTS: dict[str, dict] = {
+    "humanml3d": {
+        "subdir": "HumanML3D",
+        "feature_path": "new_joint_vecs",
+        "text_path": "texts",
+        "split_file": "train.txt",
+    },
+    "babel": {
+        "subdir": "BABEL_streamed",
+        "feature_path": "motions",        # ⚠ NOT new_joint_vecs (HumanML3D only)
+        "text_path": "texts",
+        "split_file": "train_processed.txt",
+    },
+}
 
-    Expected layout (extend at deployment):
-      raw_data_dir/
-        clips_meta.txt           — one clip name per line
-        motions/<name>.npy       — (T, 263) float32 motion features
-        texts/<name>.txt         — one or more text lines (first non-empty used)
 
-    This is a permissive stub: production deployments often have a specific
-    layout (per-dataset). Override / replace this function at integration time.
+def resolve_dataset_dir(raw_data_dir: str | Path, dataset: str) -> Path:
+    """Resolve the concrete dataset directory.
+
+    Accepts either the raw_data ROOT (which contains a `HumanML3D` /
+    `BABEL_streamed` subdir) OR the dataset directory itself. If
+    `<raw_data_dir>/<subdir>` exists it is used; otherwise `raw_data_dir` is
+    assumed to already be the dataset dir.
     """
+    if dataset not in DATASET_DEFAULTS:
+        raise ValueError(f"unknown dataset {dataset!r}; expected one of {list(DATASET_DEFAULTS)}")
     root = Path(raw_data_dir)
-    meta = root / "clips_meta.txt"
-    if not meta.is_file():
+    candidate = root / DATASET_DEFAULTS[dataset]["subdir"]
+    if candidate.is_dir():
+        return candidate
+    return root
+
+
+def _read_first_caption(text_file: Path) -> str:
+    """First non-empty caption from a HumanML3D/BABEL text file.
+
+    Text files are `#`-delimited: `caption#tokens#f_tag#to_tag` (see
+    datasets/humanml3d.py:load_text). v1 takes the **first non-empty line** and
+    keeps the part before the first `#`. If the file has no `#` (plain caption
+    format), the whole line is used. Missing file → empty string.
+    """
+    if not text_file.is_file():
+        return ""
+    with text_file.open() as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                return line.split("#", 1)[0].strip()
+    return ""
+
+
+def load_clips_from_dir(raw_data_dir: str | Path,
+                         *,
+                         dataset: str = "humanml3d",
+                         split_file: str | None = None,
+                         feature_path: str | None = None,
+                         text_path: str | None = None,
+                         max_samples: int = -1) -> list[dict]:
+    """Load clips from the real HumanML3D / BABEL layout.
+
+    Returns a list of `{"motion_263": Tensor[T, 263], "text": str}`.
+
+    Layout (per dataset):
+        <dataset_dir>/<split_file>            one sample id per line
+        <dataset_dir>/<feature_path>/<id>.npy  (T, 263) motion features
+        <dataset_dir>/<text_path>/<id>.txt     '#'-delimited caption lines
+
+    `raw_data_dir` may be the raw_data root (containing `HumanML3D` /
+    `BABEL_streamed`) or the dataset dir itself (see `resolve_dataset_dir`).
+    `split_file` / `feature_path` / `text_path` default per-dataset
+    (DATASET_DEFAULTS). `max_samples > 0` stops after that many valid clips
+    (dry-run / stats speed-up). Samples with a missing / malformed motion file
+    are skipped with a warning; a missing text file yields an empty caption.
+    """
+    defaults = DATASET_DEFAULTS.get(dataset)
+    if defaults is None:
+        raise ValueError(f"unknown dataset {dataset!r}; expected one of {list(DATASET_DEFAULTS)}")
+    split_file = split_file or defaults["split_file"]
+    feature_path = feature_path or defaults["feature_path"]
+    text_path = text_path or defaults["text_path"]
+
+    dataset_dir = resolve_dataset_dir(raw_data_dir, dataset)
+    split_path = dataset_dir / split_file
+    if not split_path.is_file():
         raise FileNotFoundError(
-            f"expected meta file {meta} (one clip name per line)"
+            f"split file not found: {split_path} "
+            f"(dataset={dataset}, dataset_dir={dataset_dir})"
         )
-    clips: list[dict] = []
-    with meta.open() as f:
+
+    with split_path.open() as f:
         names = [ln.strip() for ln in f if ln.strip()]
+
+    feature_dir = dataset_dir / feature_path
+    text_dir = dataset_dir / text_path
+
+    clips: list[dict] = []
+    n_missing_motion = 0
+    n_bad_shape = 0
     for name in names:
-        motion_path = root / "motions" / f"{name}.npy"
-        text_path = root / "texts" / f"{name}.txt"
-        if not motion_path.is_file():
-            log.warning("missing motion file %s, skipping clip", motion_path)
+        if max_samples > 0 and len(clips) >= max_samples:
+            break
+        motion_file = feature_dir / f"{name}.npy"
+        if not motion_file.is_file():
+            n_missing_motion += 1
+            log.warning("missing motion file %s, skipping clip", motion_file)
             continue
-        motion = np.load(motion_path).astype(np.float32)
+        motion = np.load(motion_file).astype(np.float32)
         if motion.ndim != 2 or motion.shape[1] != 263:
-            log.warning("clip %s has unexpected shape %s, skipping", name, motion.shape)
+            n_bad_shape += 1
+            log.warning("clip %s has unexpected shape %s (expected [T, 263]), skipping",
+                        name, motion.shape)
             continue
-        text = ""
-        if text_path.is_file():
-            with text_path.open() as tf:
-                for line in tf:
-                    line = line.strip()
-                    if line:
-                        text = line
-                        break
+        text = _read_first_caption(text_dir / f"{name}.txt")
         clips.append({"motion_263": torch.from_numpy(motion), "text": text})
+
+    if not clips:
+        log.warning(
+            "load_clips_from_dir produced 0 clips (dataset=%s, split=%s, "
+            "dataset_dir=%s, names_in_split=%d, missing_motion=%d, bad_shape=%d)",
+            dataset, split_file, dataset_dir, len(names), n_missing_motion, n_bad_shape,
+        )
+    else:
+        log.info("loaded %d clips (dataset=%s, split=%s, missing_motion=%d, bad_shape=%d)",
+                 len(clips), dataset, split_file, n_missing_motion, n_bad_shape)
     return clips
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--raw_data_dir", type=str, required=True)
+    parser.add_argument("--raw_data_dir", type=str, required=True,
+                         help="raw_data root (contains HumanML3D / BABEL_streamed) "
+                              "OR the dataset dir itself.")
+    parser.add_argument("--dataset", type=str, default="humanml3d",
+                         choices=sorted(DATASET_DEFAULTS.keys()))
+    parser.add_argument("--split_file", type=str, default=None,
+                         help="e.g. train.txt (humanml3d) / train_processed.txt (babel). "
+                              "Default per-dataset.")
+    parser.add_argument("--feature_path", type=str, default=None,
+                         help="feature subdir; default new_joint_vecs (humanml3d) / motions (babel).")
+    parser.add_argument("--text_path", type=str, default=None,
+                         help="text subdir; default texts.")
     parser.add_argument("--output_dir", type=str, default="deps/refiner_stats")
     parser.add_argument("--max_samples", type=int, default=-1,
                          help="-1 = all; positive integer = first N (dry-run)")
@@ -213,8 +314,15 @@ def main(argv=None):
 
     logging.basicConfig(level=args.log_level)
 
-    log.info("loading clips from %s", args.raw_data_dir)
-    clips = load_clips_from_dir(args.raw_data_dir)
+    log.info("loading clips from %s (dataset=%s)", args.raw_data_dir, args.dataset)
+    clips = load_clips_from_dir(
+        args.raw_data_dir,
+        dataset=args.dataset,
+        split_file=args.split_file,
+        feature_path=args.feature_path,
+        text_path=args.text_path,
+        max_samples=args.max_samples,
+    )
     log.info("loaded %d clips", len(clips))
 
     dataset = RefinerDataset(clips, normalize=False, seed=args.seed)

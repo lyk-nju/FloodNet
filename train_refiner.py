@@ -21,6 +21,7 @@ ldf-shared frozen text encoder via `text_encoder=`.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sys
 from pathlib import Path
 
@@ -102,10 +103,23 @@ class FrozenStubTextEncoder(nn.Module):
         for p in self.parameters():
             p.requires_grad_(False)
 
+    @staticmethod
+    def _stable_id(text: str, vocab: int) -> int:
+        """Process-stable hash of `text` → [0, vocab).
+
+        ⚠ Must NOT use builtin hash(): Python str hashing is salted per process
+        (PYTHONHASHSEED), so the same caption would map to different embedding
+        rows across runs / between training and benchmarking — silently
+        defeating any text conditioning when the encoder is reloaded. hashlib
+        is deterministic across processes.
+        """
+        digest = hashlib.md5(text.encode("utf-8")).digest()[:8]
+        return int.from_bytes(digest, "big") % vocab
+
     @torch.no_grad()
     def encode(self, texts: list[str], device=None) -> Tensor:
         ids = torch.tensor(
-            [hash(t) % self.vocab for t in texts], dtype=torch.long,
+            [self._stable_id(t, self.vocab) for t in texts], dtype=torch.long,
         )
         if device is not None:
             ids = ids.to(device)
@@ -248,18 +262,24 @@ def _load_cfg(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def build_datasets(cfg: dict):
-    """Build train/val RefinerDataset from cfg.data. Uses compute_5d_stats's
-    load_clips_from_dir for disk loading (override at integration if needed)."""
+def _build_one_dataset(cfg: dict, split_file: str, *, seed: int | None = None):
+    """Build a single RefinerDataset for a given split using the real loader."""
     from datasets.refiner_dataset import RefinerDataset
     from scripts.compute_5d_stats import load_clips_from_dir
 
     data_cfg = cfg.get("data", {})
     raw_dir = data_cfg["raw_data_dir"]
     stats_dir = data_cfg.get("stats_dir")
-    clips = load_clips_from_dir(raw_dir)
+    clips = load_clips_from_dir(
+        raw_dir,
+        dataset=data_cfg.get("dataset", "humanml3d"),
+        split_file=split_file,
+        feature_path=data_cfg.get("feature_path"),
+        text_path=data_cfg.get("text_path"),
+    )
     model_cfg = cfg["model"]
-    common = dict(
+    return RefinerDataset(
+        clips,
         n_hist=model_cfg["n_hist"],
         n_path=model_cfg["n_path"],
         max_tokens=model_cfg["max_tokens"],
@@ -268,9 +288,20 @@ def build_datasets(cfg: dict):
         full_plan_ratio=cfg.get("training", {}).get("sampling_mode_full_ratio", 0.5),
         normalize=stats_dir is not None,
         stats_dir=stats_dir,
+        seed=seed,
     )
-    ds = RefinerDataset(clips, **common)
-    return ds
+
+
+def build_datasets(cfg: dict):
+    """Build (train_ds, val_ds) RefinerDatasets from cfg.data via the real
+    HumanML3D/BABEL loader. val_ds is None if no val_split_file is configured.
+    """
+    data_cfg = cfg.get("data", {})
+    train_split = data_cfg.get("train_split_file", "train.txt")
+    val_split = data_cfg.get("val_split_file")
+    train_ds = _build_one_dataset(cfg, train_split)
+    val_ds = _build_one_dataset(cfg, val_split, seed=0) if val_split else None
+    return train_ds, val_ds
 
 
 def main(argv=None):
@@ -288,15 +319,28 @@ def main(argv=None):
     train_cfg = cfg.get("training", {})
     max_steps = args.max_steps if args.max_steps is not None else train_cfg.get("total_steps", 100000)
 
-    dataset = build_datasets(cfg)
-    loader = DataLoader(
-        dataset,
+    train_ds, val_ds = build_datasets(cfg)
+    train_loader = DataLoader(
+        train_ds,
         batch_size=train_cfg.get("batch_size", 64),
         shuffle=True,
         num_workers=train_cfg.get("num_workers", 4),
         collate_fn=refiner_collate,
         drop_last=True,
     )
+    # Build a val loader when a val split is configured, so the module's
+    # validation_step actually runs (review finding: previously only the train
+    # loader was passed and validation silently never ran).
+    val_loader = None
+    if val_ds is not None and len(val_ds) > 0:
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=train_cfg.get("val_batch_size", train_cfg.get("batch_size", 64)),
+            shuffle=False,
+            num_workers=train_cfg.get("num_workers", 4),
+            collate_fn=refiner_collate,
+            drop_last=False,
+        )
 
     module = RefinerLightningModule(cfg)
 
@@ -308,7 +352,7 @@ def main(argv=None):
         default_root_dir=args.output_dir,
         log_every_n_steps=10,
     )
-    trainer.fit(module, loader, ckpt_path=args.ckpt_path)
+    trainer.fit(module, train_loader, val_dataloaders=val_loader, ckpt_path=args.ckpt_path)
 
 
 if __name__ == "__main__":

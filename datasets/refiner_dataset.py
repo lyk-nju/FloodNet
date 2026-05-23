@@ -271,13 +271,37 @@ class RefinerDataset(Dataset):
         self._wp_norm_idx = torch.as_tensor(
             np.load(stats_dir / "waypoint_norm_indices.npy"), dtype=torch.long,
         )
+        # ⚠ Validate shapes / index ranges up front so a stale or mismatched
+        # stats_dir fails loudly here instead of via a cryptic IndexError deep
+        # in __getitem__ (or, worse, silently normalizing the wrong channels).
+        if self._cm_mean.shape != (5,) or self._cm_std.shape != (5,):
+            raise ValueError(
+                f"current_motion stats must be shape (5,), got "
+                f"mean={tuple(self._cm_mean.shape)} std={tuple(self._cm_std.shape)}"
+            )
+        if self._wp_mean.shape != (7,) or self._wp_std.shape != (7,):
+            raise ValueError(
+                f"waypoint stats must be shape (7,), got "
+                f"mean={tuple(self._wp_mean.shape)} std={tuple(self._wp_std.shape)}"
+            )
+        if self._cm_norm_idx.numel() and int(self._cm_norm_idx.max()) >= 5:
+            raise ValueError(f"current_motion_norm_indices out of range for dim 5: "
+                             f"{self._cm_norm_idx.tolist()}")
+        if self._wp_norm_idx.numel() and int(self._wp_norm_idx.max()) >= 7:
+            raise ValueError(f"waypoint_norm_indices out of range for dim 7: "
+                             f"{self._wp_norm_idx.tolist()}")
 
     def _apply_zscore(self, tensor: Tensor, mean: Tensor, std: Tensor,
                        norm_idx: Tensor) -> Tensor:
         """Z-score only the channels listed in norm_idx; leave others (cos/sin)
         bit-for-bit unchanged. Operates per-frame on the last dim.
+
+        mean/std are moved to `tensor`'s device/dtype so this works even if the
+        sample tensor lives on CUDA / is non-fp32 (stats are loaded as CPU fp32).
         """
         out = tensor.clone()
+        mean = mean.to(device=tensor.device, dtype=tensor.dtype)
+        std = std.to(device=tensor.device, dtype=tensor.dtype)
         for c in norm_idx.tolist():
             out[..., c] = (out[..., c] - mean[c]) / std[c]
         return out
@@ -347,7 +371,11 @@ class RefinerDataset(Dataset):
             anchor_frame = 0 if force_anchor_frame is None else int(force_anchor_frame)
             valid_history_frames = 1
             history_frame_indices = [anchor_frame]
-            max_valid_tokens = min(self.max_tokens, _max_tokens_in_frames(T))
+            # ⚠ bound by frames REMAINING after the anchor (T - anchor_frame), not
+            # the whole clip length T. With anchor_frame=0 (normal full mode) these
+            # are identical, but a forced/non-zero anchor must not let
+            # target_frame_count overrun the clip (else the assert below fires).
+            max_valid_tokens = min(self.max_tokens, _max_tokens_in_frames(T - anchor_frame))
         else:
             lo = self.n_hist - 1
             hi = T - min_full                              # inclusive upper bound

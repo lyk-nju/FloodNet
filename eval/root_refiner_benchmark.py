@@ -155,7 +155,13 @@ def run_benchmark(model, dataset, text_encoder, device="cpu",
     num_mae_sum = 0.0
 
     for idx in range(n):
-        sample = dataset[idx]
+        # ⚠ Use get_sample(force_no_path_aug=True) so the benchmark measures
+        # CLEAN inference: dataset[idx] would apply random trim/sparse path
+        # augmentation, making metrics non-deterministic and inflating errors.
+        if hasattr(dataset, "get_sample"):
+            sample = dataset.get_sample(idx, force_no_path_aug=True)
+        else:
+            sample = dataset[idx]
         text_emb = text_encoder.encode([sample["text"]], device=device)
         out = model(
             text_emb=text_emb,
@@ -258,6 +264,8 @@ def main(argv=None):
     parser.add_argument("--output_dir", type=str, default="outputs/refiner_bench")
     parser.add_argument("--max_samples", type=int, default=-1)
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--split_file", type=str, default=None,
+                         help="Eval split; defaults to data.val_split_file or the dataset default.")
     args = parser.parse_args(argv)
 
     import yaml
@@ -271,7 +279,14 @@ def main(argv=None):
     model, text_encoder = _load_model_from_ckpt(args.ckpt, args.device)
 
     data_cfg = cfg.get("data", {})
-    clips = load_clips_from_dir(data_cfg["raw_data_dir"])
+    split_file = args.split_file or data_cfg.get("val_split_file")
+    clips = load_clips_from_dir(
+        data_cfg["raw_data_dir"],
+        dataset=data_cfg.get("dataset", "humanml3d"),
+        split_file=split_file,
+        feature_path=data_cfg.get("feature_path"),
+        text_path=data_cfg.get("text_path"),
+    )
     model_cfg = cfg["model"]
     dataset = RefinerDataset(
         clips,
@@ -280,6 +295,7 @@ def main(argv=None):
         frames_per_token=model_cfg["frames_per_token"],
         normalize=data_cfg.get("stats_dir") is not None,
         stats_dir=data_cfg.get("stats_dir"),
+        seed=0,
     )
 
     result = run_benchmark(model, dataset, text_encoder, device=args.device,

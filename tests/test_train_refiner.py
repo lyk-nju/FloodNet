@@ -74,6 +74,83 @@ def test_stub_text_encoder_deterministic_and_frozen():
     assert all(not p.requires_grad for p in enc.parameters())
 
 
+def test_stub_text_encoder_id_is_process_stable_hashlib_not_builtin_hash():
+    """Lock-in for the review fix: _stable_id must use hashlib (process-stable),
+    NOT builtin hash() (PYTHONHASHSEED-salted). Verify against a precomputed
+    hashlib md5 value so a regression back to hash() is caught.
+    """
+    import hashlib
+
+    vocab = 4096
+    text = "a person walks forward"
+    expected = int.from_bytes(
+        hashlib.md5(text.encode("utf-8")).digest()[:8], "big",
+    ) % vocab
+    assert FrozenStubTextEncoder._stable_id(text, vocab) == expected
+    # And it must NOT equal builtin hash()'s result mapping (which is salted) —
+    # we can't assert inequality reliably, but we CAN assert determinism here.
+    assert FrozenStubTextEncoder._stable_id(text, vocab) == \
+        FrozenStubTextEncoder._stable_id(text, vocab)
+
+
+# ---------------------------------------------------------------------------
+# build_datasets: train/val tuple via the real-layout loader (fake HumanML3D)
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_humanml3d(root, train_names, val_names):
+    import numpy as np
+    ds = root / "HumanML3D"
+    (ds / "new_joint_vecs").mkdir(parents=True)
+    (ds / "texts").mkdir(parents=True)
+    (ds / "train.txt").write_text("\n".join(train_names) + "\n")
+    (ds / "val.txt").write_text("\n".join(val_names) + "\n")
+    for n in set(train_names) | set(val_names):
+        arr = np.zeros((50, 263), dtype=np.float32)
+        arr[:, 2] = 0.05
+        arr[:, 3] = 1.0
+        np.save(ds / "new_joint_vecs" / f"{n}.npy", arr)
+        (ds / "texts" / f"{n}.txt").write_text(f"a person does {n}#x#0#0\n")
+    return ds
+
+
+def test_build_datasets_returns_train_and_val(tmp_path):
+    from train_refiner import build_datasets
+
+    _make_fake_humanml3d(tmp_path, ["t1", "t2", "t3"], ["v1", "v2"])
+    cfg = _tiny_cfg()
+    cfg["data"] = {
+        "raw_data_dir": str(tmp_path),
+        "dataset": "humanml3d",
+        "train_split_file": "train.txt",
+        "val_split_file": "val.txt",
+        "feature_path": "new_joint_vecs",
+        "text_path": "texts",
+        # no stats_dir → normalize=False
+    }
+    train_ds, val_ds = build_datasets(cfg)
+    assert len(train_ds) == 3
+    assert val_ds is not None and len(val_ds) == 2
+
+
+def test_build_datasets_val_none_when_no_val_split(tmp_path):
+    from train_refiner import build_datasets
+
+    _make_fake_humanml3d(tmp_path, ["t1", "t2"], ["v1"])
+    cfg = _tiny_cfg()
+    cfg["data"] = {
+        "raw_data_dir": str(tmp_path),
+        "dataset": "humanml3d",
+        "train_split_file": "train.txt",
+        # val_split_file omitted
+        "feature_path": "new_joint_vecs",
+        "text_path": "texts",
+    }
+    train_ds, val_ds = build_datasets(cfg)
+    assert len(train_ds) == 2
+    assert val_ds is None
+
+
 # ---------------------------------------------------------------------------
 # Loss dict key alignment (round 6 P1-4 / P1-6 lock-in)
 # ---------------------------------------------------------------------------
