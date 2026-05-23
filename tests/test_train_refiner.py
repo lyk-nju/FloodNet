@@ -133,6 +133,25 @@ def test_build_datasets_returns_train_and_val(tmp_path):
     assert val_ds is not None and len(val_ds) == 2
 
 
+def test_module_raises_when_no_encoder_and_no_debug_stub():
+    """Real-training guard: without an explicit encoder and without
+    text_encoder.debug_stub, init must raise (not silently use the stub)."""
+    import pytest
+
+    cfg = _tiny_cfg()
+    cfg["text_encoder"] = {"share_with": "ldf"}   # debug_stub absent/false
+    with pytest.raises(NotImplementedError):
+        RefinerLightningModule(cfg)
+
+
+def test_module_uses_explicit_encoder_over_stub():
+    cfg = _tiny_cfg()
+    cfg["text_encoder"] = {"share_with": "ldf"}   # no debug_stub
+    enc = FrozenStubTextEncoder(emb_dim=cfg["model"]["text_emb_dim"])
+    module = RefinerLightningModule(cfg, text_encoder=enc)
+    assert module.text_encoder is enc
+
+
 def test_build_datasets_val_none_when_no_val_split(tmp_path):
     from train_refiner import build_datasets
 
@@ -169,6 +188,8 @@ def _tiny_cfg():
             "num_token": 1.0, "xyz": 5.0, "heading": 1.0,
             "fwd_delta": 0.5, "yaw_delta": 0.5, "smoothness": 0.0,
         },
+        # tests opt into the debug stub explicitly (real training must wire LDF).
+        "text_encoder": {"debug_stub": True},
     }
 
 

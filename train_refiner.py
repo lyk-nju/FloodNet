@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import logging
 import sys
 from pathlib import Path
 
@@ -37,6 +38,8 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from models.root_refiner import RootRefiner   # noqa: E402
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -157,11 +160,38 @@ class RefinerLightningModule(pl.LightningModule):
         self.min_tokens = model_cfg["min_tokens"]
         self.max_tokens = model_cfg["max_tokens"]
         text_emb_dim = model_cfg.get("text_emb_dim", 512)
-        self.text_encoder = text_encoder or FrozenStubTextEncoder(text_emb_dim)
+        self.text_encoder = self._resolve_text_encoder(cfg, text_encoder, text_emb_dim)
         self.loss_weights = dict(cfg.get("loss_weights", {}))
         self.heading_form = cfg.get("loss", {}).get("heading_form", "cosine")
         # Don't pickle the (possibly large) text encoder into hparams.
         self.save_hyperparameters(ignore=["text_encoder"])
+
+    @staticmethod
+    def _resolve_text_encoder(cfg: dict, text_encoder, text_emb_dim: int):
+        """Resolve the text encoder. Real training must NOT silently fall back
+        to the debug stub (hashed caption-id embeddings → no semantic
+        generalization). Resolution order:
+          1. explicit `text_encoder=` argument (e.g. the real LDF/T5 encoder);
+          2. cfg.text_encoder.debug_stub is true → FrozenStubTextEncoder + WARN;
+          3. otherwise → NotImplementedError telling the caller to wire a real
+             encoder or set debug_stub.
+        """
+        if text_encoder is not None:
+            return text_encoder
+        te_cfg = cfg.get("text_encoder", {}) or {}
+        if te_cfg.get("debug_stub", False):
+            log.warning(
+                "RefinerLightningModule: using FrozenStubTextEncoder (DEBUG ONLY: "
+                "hashed caption-id embeddings, NOT LDF/T5). This is fine for "
+                "smoke/overfit tests but will NOT generalize — real training must "
+                "pass a real frozen encoder or wire text_encoder.share_with."
+            )
+            return FrozenStubTextEncoder(text_emb_dim)
+        raise NotImplementedError(
+            "No text encoder available: text_encoder.debug_stub is not set and the "
+            "real LDF/T5 encoder is not wired in this standalone script. Either set "
+            "text_encoder.debug_stub: true (smoke/tests only) or pass text_encoder=."
+        )
 
     # ------------------------------------------------------------------
 
@@ -270,6 +300,15 @@ def _build_one_dataset(cfg: dict, split_file: str, *, seed: int | None = None):
     data_cfg = cfg.get("data", {})
     raw_dir = data_cfg["raw_data_dir"]
     stats_dir = data_cfg.get("stats_dir")
+    # ⚠ Explicit normalize switch (P1-5): default False so a missing stats_dir
+    # doesn't blow up the smoke. If normalize is requested, stats_dir must exist.
+    normalize = bool(data_cfg.get("normalize", False))
+    if normalize:
+        if not stats_dir or not Path(stats_dir).is_dir():
+            raise FileNotFoundError(
+                f"data.normalize is true but stats_dir={stats_dir!r} does not exist. "
+                f"Run scripts/compute_5d_stats.py first, or set data.normalize: false."
+            )
     clips = load_clips_from_dir(
         raw_dir,
         dataset=data_cfg.get("dataset", "humanml3d"),
@@ -286,8 +325,8 @@ def _build_one_dataset(cfg: dict, split_file: str, *, seed: int | None = None):
         min_tokens=model_cfg["min_tokens"],
         frames_per_token=model_cfg["frames_per_token"],
         full_plan_ratio=cfg.get("training", {}).get("sampling_mode_full_ratio", 0.5),
-        normalize=stats_dir is not None,
-        stats_dir=stats_dir,
+        normalize=normalize,
+        stats_dir=stats_dir if normalize else None,
         seed=seed,
     )
 
@@ -313,9 +352,25 @@ def main(argv=None):
     parser.add_argument("--ckpt_path", type=str, default=None,
                          help="Resume-from-checkpoint path.")
     parser.add_argument("--output_dir", type=str, default="outputs/root_refiner")
+    parser.add_argument("--raw_data_dir", type=str, default=None,
+                         help="Override data.raw_data_dir (e.g. on a host where the "
+                              "config's training-box path doesn't exist).")
+    parser.add_argument("--stats_dir", type=str, default=None,
+                         help="Override data.stats_dir.")
+    parser.add_argument("--normalize", type=str, default=None,
+                         choices=["true", "false"],
+                         help="Override data.normalize (true/false).")
     args = parser.parse_args(argv)
 
     cfg = _load_cfg(args.config)
+    # CLI overrides for single-host portability (config ships training-box paths).
+    cfg.setdefault("data", {})
+    if args.raw_data_dir is not None:
+        cfg["data"]["raw_data_dir"] = args.raw_data_dir
+    if args.stats_dir is not None:
+        cfg["data"]["stats_dir"] = args.stats_dir
+    if args.normalize is not None:
+        cfg["data"]["normalize"] = (args.normalize == "true")
     train_cfg = cfg.get("training", {})
     max_steps = args.max_steps if args.max_steps is not None else train_cfg.get("total_steps", 100000)
 

@@ -60,15 +60,26 @@ loss_weights:
 text_encoder:
   share_with: ldf
   freeze: true
+  # ⚠ The standalone train_refiner.py does NOT yet wire the real LDF/T5 frozen
+  # encoder. With debug_stub: true it uses FrozenStubTextEncoder (hashed
+  # caption-id embeddings) — fine for smoke / overfit tests, but real training
+  # MUST set this false and pass a real encoder (else the model just memorizes
+  # caption ids and won't generalize). When false and no encoder is wired,
+  # RefinerLightningModule raises a clear error.
+  debug_stub: true
 
 data:
   # raw_data_dir may be the raw_data ROOT (containing HumanML3D / BABEL_streamed)
   # or the dataset dir itself; the loader resolves both (see
   # scripts/compute_5d_stats.resolve_dataset_dir).
-  raw_data_dir: /home/yuankai/Text2Motion/FloodDiffusion/raw_data
+  # ⚠ This is the TRAINING-BOX path; override with --raw_data_dir on other hosts.
+  raw_data_dir: /data1/yuankai/text2Motion/FloodDiffusion/raw_data
   dataset: humanml3d                    # humanml3d | babel
   train_split_file: train.txt           # babel: train_processed.txt
   val_split_file: val.txt               # babel: val_processed.txt
   feature_path: new_joint_vecs          # babel: motions
   text_path: texts
+  # normalize gates z-score. Keep false until compute_5d_stats has populated
+  # stats_dir; set true for real training. If true, stats_dir must exist.
+  normalize: false
   stats_dir: deps/refiner_stats
