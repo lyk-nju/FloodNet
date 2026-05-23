@@ -17,6 +17,7 @@ from utils.training.history_corruption import (
     apply_history_corruption,
     should_apply_corruption,
 )
+from utils.training.horizon_sched import sample_random_horizon_tokens
 from lightning.pytorch.utilities import rank_zero_info
 
 from .control_loss import compute_control_loss_xz
@@ -105,6 +106,10 @@ class SelfForcingTrainer:
         # reports the effective corruption rate as the curriculum ramps.
         runtime_metrics["history_corruption/applied"] = getattr(
             self, "_last_corruption_applied", 0.0
+        )
+        # T_B_04: sampled horizon (tokens) this step; -1 when horizon_sim off.
+        runtime_metrics["horizon_sim/horizon_tokens"] = getattr(
+            self, "_last_horizon_tokens", -1.0
         )
         if self._last_replace_diff is not None:
             runtime_metrics["self_forcing/replace_abs_diff"] = float(
@@ -270,8 +275,23 @@ class SelfForcingTrainer:
         all_text_context = model._prepare_text_context(model_batch, seq_len, device, text_dropped_flags)
         traj_dropped = model._decide_traj_dropout(device)
         plan = self.plan_rollout(feature_length, device, progress)
+
+        # T_B_04: compute the horizon (token-level) here in the outer loop and
+        # pass it down — the model never reads global_step. v1: active_end=0
+        # (horizon measured from clip start), so the traj_cond exposes only the
+        # first `horizon_tokens` tokens of the plan, matching inference's
+        # limited future view. None = full traj_cond.
+        horizon_tokens = None
+        hs_cfg = self._module.cfg.get("horizon_sim", {}) or {}
+        if hs_cfg.get("enabled", False):
+            horizon_tokens = sample_random_horizon_tokens(
+                progress, 1.0, seq_len, hs_cfg,
+            )
+        self._last_horizon_tokens = float(horizon_tokens) if horizon_tokens is not None else -1.0
+
         traj_emb, traj_seq_lens, _ = model._prepare_traj_condition(
-            model_batch, seq_len, device, traj_dropped_override=traj_dropped
+            model_batch, seq_len, device, traj_dropped_override=traj_dropped,
+            horizon_tokens=horizon_tokens,
         )
 
         current_feature = feature.clone()

@@ -442,11 +442,12 @@ class DiffForcingWanModel(nn.Module):
         x = x.permute(0, 2, 1, 3, 4).contiguous().view(x.size(0), x.size(2), -1)
         return x
 
-    def _build_traj_emb(self, x, seq_len, device):
+    def _build_traj_emb(self, x, seq_len, device, horizon_tokens=None):
         if self.traj_encoder is None:
             return None
         return encode_traj_batch(
-            x, seq_len, device, self.local_traj_encoder, self.traj_encoder
+            x, seq_len, device, self.local_traj_encoder, self.traj_encoder,
+            horizon_tokens=horizon_tokens,
         )
 
     def _get_traj_seq_lens(self, x, seq_len, device):
@@ -547,8 +548,11 @@ class DiffForcingWanModel(nn.Module):
         return traj_dropped
 
     def _prepare_traj_condition(
-        self, x, seq_len, device, traj_dropped_override=None
+        self, x, seq_len, device, traj_dropped_override=None, horizon_tokens=None
     ):
+        # T_B_04: horizon_tokens (token-level) is computed by the training outer
+        # loop (SelfForcingTrainer) and passed in — the model never reads
+        # global_step. None = no horizon truncation (full traj_cond).
         traj_emb = None
         traj_seq_lens = None
         if traj_dropped_override is None:
@@ -557,7 +561,7 @@ class DiffForcingWanModel(nn.Module):
             traj_dropped = bool(traj_dropped_override)
 
         if not traj_dropped:
-            traj_emb = self._build_traj_emb(x, seq_len, device)
+            traj_emb = self._build_traj_emb(x, seq_len, device, horizon_tokens=horizon_tokens)
             traj_seq_lens = self._get_traj_seq_lens(x, seq_len, device)
 
         return traj_emb, traj_seq_lens, traj_dropped

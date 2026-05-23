@@ -111,18 +111,29 @@ def encode_traj_batch(
     device,
     local_traj_encoder: torch.nn.Module,
     traj_encoder: torch.nn.Module,
+    *,
+    horizon_tokens: int | None = None,
+    horizon_active_end_token: int = 0,
+    frames_per_token: int = 4,
 ) -> torch.Tensor | None:
     """Build trajectory embedding (B, seq_len, traj_out_dim) from a training batch dict.
 
     Pipeline:
       traj_features (B,T,4) or traj xyz (B,T,3)
-        → frame-level mask gate
+        → frame-level mask gate (+ optional T_B_04 horizon truncation)
         → frames_to_tokens  [skipped if already token-level]
         → local_traj_encoder
         → token-level mask gate
         → traj_encoder
 
     Returns None if x contains no trajectory fields.
+
+    Horizon simulation (T_B_04): when `horizon_tokens` is not None, the
+    frame-level traj mask is additionally zeroed at/after the cutoff frame
+    `token_start_frame(horizon_active_end_token + horizon_tokens)`, so the model
+    only sees `horizon_tokens` of future plan (default active_end=0 = horizon
+    measured from the clip start). `horizon_tokens=None` (the default) preserves
+    the original behavior exactly.
     """
     # --- source: prioritize traj_cond paths ---
     if "traj_features" in x and x["traj_features"] is not None:
@@ -151,11 +162,21 @@ def encode_traj_batch(
             if sf < tf:
                 mask_frame[:, sf:ef] = tm[:, k:k + 1].expand(-1, ef - sf)
 
-    if mask_frame is not None:
+    if mask_frame is not None or horizon_tokens is not None:
         tf = feats_frame.shape[1]
-        if mask_frame.shape[1] < tf:
+        if mask_frame is None:
+            # No base traj mask, but horizon truncation requested → start from
+            # all-visible and let the horizon cutoff zero the tail.
+            mask_frame = feats_frame.new_ones(feats_frame.shape[0], tf)
+        elif mask_frame.shape[1] < tf:
             pad = mask_frame.new_zeros(mask_frame.shape[0], tf - mask_frame.shape[1])
             mask_frame = torch.cat([mask_frame, pad], dim=1)
+        if horizon_tokens is not None:
+            # T_B_04: frame-level horizon truncation (in place on mask_frame).
+            from utils.training.horizon_sched import apply_horizon_mask_tokens
+            apply_horizon_mask_tokens(
+                mask_frame, horizon_active_end_token, horizon_tokens, frames_per_token,
+            )
         feats_frame = feats_frame * mask_frame[:, :tf].unsqueeze(-1).to(dtype=feats_frame.dtype)
 
     # --- frame → token grouping ---

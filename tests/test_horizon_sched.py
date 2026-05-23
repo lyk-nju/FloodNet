@@ -124,3 +124,28 @@ def test_warmup_boundary_uses_late_branch_at_exactly_half():
     rng = random.Random(1)
     vals = {sample_random_horizon_tokens(50, 100, 40, _CFG, rng=rng) for _ in range(300)}
     assert max(vals) <= 20   # late branch caps at 20, early would allow up to 40
+
+
+# ---------------------------------------------------------------------------
+# Integration: encode_traj_batch threads horizon_tokens to the frame mask
+# ---------------------------------------------------------------------------
+
+
+def test_encode_traj_batch_applies_horizon_truncation():
+    import torch.nn as nn
+
+    from utils.traj_batch import encode_traj_batch
+
+    B, seq_len, C = 2, 40, 4
+    x = {"traj_features": torch.ones(B, seq_len, C)}
+    ident = nn.Identity()
+    cutoff = token_start_frame(5)   # active_end=0, horizon=5 → 17
+
+    out = encode_traj_batch(x, seq_len, "cpu", ident, ident, horizon_tokens=5)
+    assert out.shape == (B, seq_len, C)
+    assert (out[:, :cutoff] == 1).all()    # visible before cutoff
+    assert (out[:, cutoff:] == 0).all()    # masked at/after cutoff
+
+    # horizon_tokens=None → original behavior (no truncation, all visible).
+    out_full = encode_traj_batch(x, seq_len, "cpu", ident, ident, horizon_tokens=None)
+    assert (out_full == 1).all()
