@@ -1,6 +1,5 @@
 import warnings
 
-import numpy as np
 import torch
 import torch.nn as nn
 
@@ -15,6 +14,39 @@ try:
 except ImportError:  # pragma: no cover - script entrypoints use top-level imports
     from utils.traj_batch import encode_traj_batch
     from utils.traj_stream_buffer import TrajStreamBuffer
+
+
+_SCHEDULED_SAMPLING_WARNED = False
+
+
+def warn_scheduled_sampling_deprecated(value) -> bool:
+    """Warn once per process that ``scheduled_sampling_prob`` is deprecated.
+
+    T_B_01 removed scheduled sampling (replaced by history_corruption, see
+    design.md §2.1.4). The config key is kept for backward-compat (so existing
+    configs load without raising) but ignored.
+
+    Only warns when a **nonzero** value was requested — 0.0 (the historical
+    default in every shipped config) means scheduled sampling was already off,
+    so there is nothing to migrate and warning on it every run would be pure
+    noise. Returns True iff a warning was emitted.
+    """
+    global _SCHEDULED_SAMPLING_WARNED
+    try:
+        nonzero = float(value) != 0.0
+    except (TypeError, ValueError):
+        nonzero = False
+    if nonzero and not _SCHEDULED_SAMPLING_WARNED:
+        warnings.warn(
+            "scheduled_sampling_prob is deprecated and ignored (removed in "
+            "T_B_01); replaced by history_corruption.apply_prob (see "
+            "design.md §2.1.4).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        _SCHEDULED_SAMPLING_WARNED = True
+        return True
+    return False
 
 
 def _expand_precomputed_caption_keys(emb: dict) -> dict:
@@ -101,7 +133,13 @@ class DiffForcingWanModel(nn.Module):
             )
             use_traj_emb_cache = bool(use_traj_kv_cache)
         self.use_traj_emb_cache = use_traj_emb_cache
-        self.scheduled_sampling_prob = float(scheduled_sampling_prob)
+        # T_B_01: scheduled_sampling is removed (replaced by history_corruption,
+        # design.md §2.1.4). The constructor param is retained so existing
+        # configs that still carry `scheduled_sampling_prob` load without raising
+        # (lightning_module splats **cfg.model.params), but it is ignored — warn
+        # if a caller actually requested a nonzero value.
+        warn_scheduled_sampling_deprecated(scheduled_sampling_prob)
+        self.scheduled_sampling_prob = 0.0
         self.self_forcing_enabled = bool(self_forcing_enabled)
         self.self_forcing_stride_tokens = int(self_forcing_stride_tokens)
         self.self_forcing_detach_between_steps = bool(
@@ -511,7 +549,6 @@ class DiffForcingWanModel(nn.Module):
     ):
         feature_length = x["feature_length"]
         batch_size, seq_len, _ = clean_feature.shape
-        device = clean_feature.device
 
         (
             noise_level,
@@ -521,60 +558,10 @@ class DiffForcingWanModel(nn.Module):
             end_indices,
         ) = self._slice_diffusion_window(clean_feature, feature_length, time_steps)
 
-        ss_override = x.get("_scheduled_sampling_override", None)
-        if ss_override is not None:
-            do_ss = bool(ss_override)
-        else:
-            do_ss = (
-                enable_scheduled_sampling
-                and self.training
-                and self.scheduled_sampling_prob > 0.0
-                and np.random.rand() < self.scheduled_sampling_prob
-            )
-        if do_ss:
-            with torch.no_grad():
-                cn_res_ss = (
-                    None
-                    if traj_dropped
-                    else self._controlnet_forward(
-                        noisy_feature_input,
-                        noise_level * self.time_embedding_scale,
-                        all_text_context,
-                        seq_len,
-                        traj_emb,
-                        traj_seq_lens,
-                    )
-                )
-                pred_ss = self.model(
-                    noisy_feature_input,
-                    noise_level * self.time_embedding_scale,
-                    all_text_context,
-                    seq_len,
-                    y=None,
-                    traj_emb=None,
-                    traj_seq_lens=None,
-                    controlnet_residuals=cn_res_ss,
-                )
-            for b in range(batch_size):
-                t_len = noisy_feature_input[b].shape[1]
-                ctx_len = t_len - self.chunk_size
-                if ctx_len <= 0:
-                    continue
-                if self.prediction_type == "vel":
-                    # Same low-β stability issue as the self-forcing rollout:
-                    # use z = noisy_x + β·vel instead of vel + ε.  See the
-                    # comment in _forward_single_window for details.
-                    beta_b = noise_level[b, :t_len].view(1, -1, 1, 1)
-                    x0_hat = (
-                        noisy_feature_input[b] + beta_b * pred_ss[b]
-                    ).detach()
-                elif self.prediction_type == "x0":
-                    x0_hat = pred_ss[b].detach()
-                else:
-                    continue
-                noisy_feature_input[b] = torch.cat(
-                    [x0_hat[:, :ctx_len], noisy_feature_input[b][:, ctx_len:]], dim=1
-                )
+        # (T_B_01: scheduled-sampling forward branch removed — it was dead since
+        # scheduled_sampling_prob defaulted to 0.0 everywhere, so do_ss was always
+        # False and noisy_feature_input passed through unchanged. The
+        # `_scheduled_sampling_override` input key is no longer consumed.)
 
         # Always call ControlNet so gradients flow when backbone is frozen.
         # When traj_dropped=True, traj_emb is already None; ControlNet learns

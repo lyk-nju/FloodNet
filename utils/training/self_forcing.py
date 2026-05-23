@@ -11,7 +11,6 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import numpy as np
 import torch
 from lightning.pytorch.utilities import rank_zero_info
 
@@ -65,63 +64,17 @@ class SelfForcingTrainer:
         return clip_val
 
     def training_step(self, batch: dict) -> torch.Tensor:
-        """Batch-level mixture: scheduled-sampling single-step OR self-forcing
-        K-step rollout, determined by Bernoulli gate on ``scheduled_sampling_prob``.
+        """Self-forcing K-step rollout training step.
 
-        When both are enabled they are *mutually exclusive* per batch — avoids
-        compounding rollout noise from both strategies in the same forward pass.
+        (T_B_01: the scheduled-sampling single-step branch + Bernoulli gate were
+        removed — they were dead code since ``scheduled_sampling_prob`` defaulted
+        to 0.0 in every config; replaced by history_corruption.apply_prob, see
+        design.md §2.1.4.)
         """
         self._check_preconditions()
 
         model_batch = prepare_model_input(batch)
-        ss_prob = getattr(self._module.model, "scheduled_sampling_prob", 0.0)
-        if ss_prob > 0 and np.random.rand() < ss_prob:
-            return self._scheduled_sampling_step(batch, model_batch)
         return self._self_forcing_step(batch, model_batch)
-
-    # ------------------------------------------------------------------
-    # Scheduled-sampling single step (manual opt, no rollout)
-    # ------------------------------------------------------------------
-
-    def _scheduled_sampling_step(
-        self, batch: dict, model_batch: dict
-    ) -> torch.Tensor:
-        module = self._module
-        net_start_time = time.time()
-        optimizer = module.optimizers()
-        lr_scheduler = module.lr_schedulers()
-        lr_for_step = float(optimizer.param_groups[0]["lr"])
-
-        model_batch["_scheduled_sampling_override"] = True
-        optimizer.zero_grad(set_to_none=True)
-
-        loss_dict = module._step(batch, is_training=True, model_batch=model_batch)
-        total_loss = loss_dict["total"]
-
-        module.manual_backward(total_loss)
-        trainable = [p for p in module.model.parameters() if p.requires_grad]
-        torch.nn.utils.clip_grad_norm_(trainable, self._resolve_grad_clip())
-        optimizer.step()
-        if lr_scheduler is not None:
-            lr_scheduler.step()
-
-        log_loss = {"total": total_loss.detach(), "mse": loss_dict["mse"].detach()}
-        if "control" in loss_dict:
-            log_loss["control"] = loss_dict["control"].detach()
-        extra_metrics = {
-            "scheduled_sampling/active": 1.0,
-            "self_forcing/active": 0.0,
-        }
-        if lr_scheduler is not None:
-            extra_metrics["lr_next"] = float(optimizer.param_groups[0]["lr"])
-        module._log_step_metrics(
-            log_loss,
-            optimizer,
-            net_start_time,
-            extra_metrics=extra_metrics,
-            lr_value=lr_for_step,
-        )
-        return total_loss
 
     # ------------------------------------------------------------------
     # Self-forcing K-step rollout
