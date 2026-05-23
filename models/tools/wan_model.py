@@ -649,6 +649,29 @@ class WanModel(ModelMixin, ConfigMixin):
             nn.init.zeros_(self.traj_in_proj.weight)
             nn.init.zeros_(self.traj_in_proj.bias)
 
+        # T_B_02: history-corruption support fields (consumed by T_B_03).
+        # Added AFTER init_weights() so the generic initializer doesn't touch them.
+        #   mask_emb: learned replacement vector for corrupted history tokens,
+        #             in the in_dim (VAE latent) space.
+        #   z_mean / z_std: VAE latent per-channel stats, loaded via load_z_stats.
+        # All three are persistent (in state_dict) per Done criteria; old ckpts
+        # that lack them are handled by DiffForcingWanModel.load_state_dict's
+        # backward-compat back-fill.
+        self.mask_emb = nn.Parameter(torch.randn(self.in_dim) * 0.02)
+        self.register_buffer("z_mean", torch.zeros(self.in_dim))
+        self.register_buffer("z_std", torch.ones(self.in_dim))
+
+    def load_z_stats(self, stats_dir: str) -> None:
+        """Load VAE latent stats (deps/body_stats/{z_mean,z_std}.npy) into buffers."""
+        import os
+
+        import numpy as np
+
+        z_mean = np.load(os.path.join(stats_dir, "z_mean.npy"))
+        z_std = np.load(os.path.join(stats_dir, "z_std.npy"))
+        self.z_mean.copy_(torch.as_tensor(z_mean, dtype=self.z_mean.dtype))
+        self.z_std.copy_(torch.as_tensor(z_std, dtype=self.z_std.dtype))
+
     def forward(
         self,
         x,

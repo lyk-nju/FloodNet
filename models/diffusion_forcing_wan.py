@@ -49,6 +49,39 @@ def warn_scheduled_sampling_deprecated(value) -> bool:
     return False
 
 
+# Optional fields added by later phases (T_B_02: history-corruption support).
+# Old (4D) checkpoints predate them, so a strict load would raise on the missing
+# keys. We back-fill them from the freshly-initialized module so older ckpts load
+# unchanged — the new fields simply keep their init values (mask_emb at its
+# random init; z_mean/z_std at 0/1 until load_z_stats is called).
+# Matched by leaf name so both bare (`mask_emb`, WanModel loaded directly) and
+# prefixed (`model.mask_emb`, WanModel nested in DiffForcingWanModel) keys work.
+_BACKWARD_COMPAT_OPTIONAL_NAMES = ("mask_emb", "z_mean", "z_std")
+
+
+def _is_optional_compat_key(key: str) -> bool:
+    """True if `key`'s final path component is a T_B_02 optional field name."""
+    return key.rsplit(".", 1)[-1] in _BACKWARD_COMPAT_OPTIONAL_NAMES
+
+
+def backfill_compat_state_dict(state_dict: dict, own_state: dict):
+    """Return (filled_state_dict, n_backfilled).
+
+    Copies `state_dict`, then for every key in `own_state` that (a) is absent
+    from the incoming `state_dict` and (b) is an optional T_B_02 field (matched
+    by leaf name), fills it from `own_state`. All other keys are left untouched
+    so a subsequent strict load still catches genuine missing / unexpected /
+    shape-mismatch errors.
+    """
+    filled = dict(state_dict)
+    n = 0
+    for k, v in own_state.items():
+        if k not in filled and _is_optional_compat_key(k):
+            filled[k] = v.clone() if hasattr(v, "clone") else v
+            n += 1
+    return filled, n
+
+
 def _expand_precomputed_caption_keys(emb: dict) -> dict:
     """Alias strip() keys so table matches HumanML3D captions after .strip()."""
     out = dict(emb)
@@ -262,6 +295,25 @@ class DiffForcingWanModel(nn.Module):
                 p.requires_grad = True
             for p in self.traj_encoder.parameters():
                 p.requires_grad = True
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Backward-compatible load: when loading an older ckpt (strict=True)
+        that predates the T_B_02 optional fields (model.mask_emb / model.z_mean /
+        model.z_std), back-fill them from this module's init values so the load
+        doesn't raise on missing keys. Genuine missing / unexpected / mismatched
+        keys are still caught by the strict load.
+        """
+        if strict:
+            state_dict, n = backfill_compat_state_dict(state_dict, self.state_dict())
+            if n:
+                warnings.warn(
+                    f"load_state_dict: back-filled {n} optional field(s) "
+                    f"(mask_emb/z_mean/z_std) from init — loading a checkpoint that "
+                    f"predates T_B_02. New fields keep init values until "
+                    f"load_z_stats() is called.",
+                    stacklevel=2,
+                )
+        return super().load_state_dict(state_dict, strict=strict)
 
     def _controlnet_forward(
         self,
