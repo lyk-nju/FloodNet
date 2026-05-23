@@ -1,0 +1,66 @@
+# RootRefiner training config (T_A_07).
+#
+# References:
+#   docs/design.md §9 — schema source of truth.
+#   docs/TODO.md §T_A_07 — full spec, default values.
+#
+# Hard constraints (do NOT silently drift):
+#   - canonicalization.mode = b_full + anchor = first_effective_frame  (§0.3 v1)
+#   - canonicalization.full_plan_valid_history_frames = 1
+#     (current_motion[-1] = anchor, history_mask only last position = 1;
+#      do NOT allow a min/max range here — that misleads implementors into
+#      thinking full-plan may still sample 1..4 history frames).
+#   - loss_weights uses `fwd_delta` / `yaw_delta` (per-frame deltas, NOT m/s).
+#     The earlier "speed" / "yaw_rate" naming was per-frame deltas all along
+#     and was renamed in round 6 P1-6 to remove the m/s physical-unit misread.
+#   - loss_weights.smoothness defaults to 0.0 for tiny-batch overfit and the
+#     first real training run (round 6 P1-5). Enable only for ablation / fine-tune
+#     once turn / stop / U-turn behavior is verified to not be smoothed out.
+
+model:
+  d_model: 256
+  n_layers: 6
+  n_heads: 8
+  ff_dim: 1024
+  dropout: 0.1
+  max_tokens: 49              # = 4 * 49 - 3 = 193 effective frames at prefix
+  min_tokens: 4               # = num_frames_for_tokens(4) = 13 frames
+  frames_per_token: 4         # causal VAE token width
+  n_path: 64                  # arclength-resampled user path length
+  n_hist: 20                  # history window length (current_motion)
+  text_emb_dim: 512
+
+canonicalization:
+  mode: b_full                # Anchor Convention v1
+  anchor: first_effective_frame
+  full_plan_valid_history_frames: 1   # ⚠ fixed, NOT a min/max range
+
+training:
+  batch_size: 64
+  lr: 1.0e-4
+  optimizer: adamw
+  weight_decay: 0.01
+  total_steps: 100000
+  sampling_mode_full_ratio: 0.5       # full-plan vs sliding split
+  gradient_clip_val: 1.0
+
+loss:
+  heading_form: cosine                # cosine | smooth_l1
+
+loss_weights:
+  num_token: 1.0
+  xyz: 5.0
+  heading: 1.0
+  fwd_delta: 0.5                      # per-frame forward delta (NOT m/s)
+  yaw_delta: 0.5                      # per-frame yaw delta (NOT rad/s)
+  smoothness: 0.0                     # ⚠ tiny-batch overfit + first training default.
+                                       # 正式训练 / ablation 才开: 0.005 ~ 0.01.
+                                       # T_A_05 tiny-batch overfit hard-check forces 0.
+
+text_encoder:
+  share_with: ldf
+  freeze: true
+
+data:
+  raw_data_dir: deps/HumanML3D_full/
+  stats_dir: deps/refiner_stats/
