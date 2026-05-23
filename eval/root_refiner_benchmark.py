@@ -1,0 +1,292 @@
+"""Refiner standalone benchmark (T_A_10, Benchmark A).
+
+Evaluates RootRefiner predictions against RefinerDataset targets WITHOUT the
+body model. Computes the metric suite from docs/TODO.md §T_A_10:
+
+    num_token_top1_accuracy / num_token_top3_accuracy / num_token_MAE
+    xyz_ADE / xyz_FDE
+    heading_error_deg (median)
+    fwd_speed_MAE      (per-frame fwd_delta channel; "speed" is the metric label)
+    lateral_speed_MAE  (metric only — perpendicular drift)
+    yaw_rate_MAE       (per-frame yaw_delta channel)
+    smoothness_acc_mean
+
+Outputs a JSON summary + per-sample CSV.
+
+⚠ Done-criteria thresholds (num_token top-1 > 0.5, heading_error_deg < 30°
+median) require a TRAINED checkpoint (T_A_09). With random weights the pipeline
+runs end-to-end but the numbers are meaningless — the smoke test only checks
+that metrics are finite and the report is written.
+
+References:
+- docs/TODO.md §T_A_10 lines 1441-1478.
+- docs/design.md §10.3 (Benchmark A metric definitions).
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import sys
+from pathlib import Path
+
+import torch
+from torch import Tensor
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from utils.local_frame import wrap_angle   # noqa: E402
+
+_RAD2DEG = 180.0 / math.pi
+
+
+# ---------------------------------------------------------------------------
+# Per-sample metric helpers (operate on a single sample's valid frames)
+# ---------------------------------------------------------------------------
+
+
+def _heading_to_yaw(cos_sin: Tensor) -> Tensor:
+    """[..., 2] (cos, sin) → yaw angle via atan2(sin, cos)."""
+    return torch.atan2(cos_sin[..., 1], cos_sin[..., 0])
+
+
+def _lateral_component(xyz: Tensor, yaw: Tensor) -> Tensor:
+    """Per-frame lateral (perpendicular-to-heading) displacement magnitude.
+
+    xyz: [T, 3] world/local positions; yaw: [T] heading per frame.
+    Returns [T-1] lateral displacement magnitudes (frame t uses heading[t-1]).
+    """
+    if xyz.shape[0] < 2:
+        return xyz.new_zeros(0)
+    delta_xz = xyz[1:, [0, 2]] - xyz[:-1, [0, 2]]            # [T-1, 2]
+    # perpendicular to heading_dir_xz(yaw) = [sin, cos]; perp = [cos, -sin]
+    yaw_prev = yaw[:-1]
+    perp = torch.stack([torch.cos(yaw_prev), -torch.sin(yaw_prev)], dim=-1)  # [T-1, 2]
+    lateral = (delta_xz * perp).sum(-1).abs()                # [T-1]
+    return lateral
+
+
+def compute_sample_metrics(pred_wp: Tensor, gt_wp: Tensor, mask: Tensor) -> dict:
+    """Metrics for a single sample over valid frames.
+
+    pred_wp / gt_wp: [T, 7]; mask: [T] bool. Returns dict of python floats.
+    Frames where mask is False are excluded. Empty-valid → metrics are NaN.
+    """
+    valid = mask.bool()
+    n_valid = int(valid.sum().item())
+    if n_valid == 0:
+        return {k: float("nan") for k in (
+            "xyz_ADE", "xyz_FDE", "heading_error_deg",
+            "fwd_speed_MAE", "yaw_rate_MAE", "lateral_speed_MAE", "smoothness",
+        )}
+
+    pv = pred_wp[valid]
+    gv = gt_wp[valid]
+
+    # xyz ADE / FDE.
+    xyz_err = (pv[:, 0:3] - gv[:, 0:3]).norm(dim=-1)          # [n_valid]
+    ade = xyz_err.mean().item()
+    fde = xyz_err[-1].item()
+
+    # heading error (deg).
+    pred_yaw = _heading_to_yaw(pv[:, 3:5])
+    gt_yaw = _heading_to_yaw(gv[:, 3:5])
+    head_err = wrap_angle(pred_yaw - gt_yaw).abs() * _RAD2DEG
+    heading_error_deg = head_err.median().item()
+
+    # fwd_delta / yaw_delta MAE (channels 5, 6).
+    fwd_mae = (pv[:, 5] - gv[:, 5]).abs().mean().item()
+    yaw_mae = (pv[:, 6] - gv[:, 6]).abs().mean().item()
+
+    # lateral drift MAE (metric only) — compare pred vs gt lateral displacement.
+    pred_lat = _lateral_component(pv[:, 0:3], pred_yaw)
+    gt_lat = _lateral_component(gv[:, 0:3], gt_yaw)
+    if pred_lat.numel() > 0:
+        lateral_mae = (pred_lat - gt_lat).abs().mean().item()
+    else:
+        lateral_mae = float("nan")
+
+    # smoothness: mean L2 of 2nd-order diff of predicted [fwd_delta, yaw_delta].
+    if pv.shape[0] >= 3:
+        dyn = pv[:, 5:7]
+        diff2 = dyn[2:] - 2 * dyn[1:-1] + dyn[:-2]
+        smoothness = (diff2 ** 2).sum(-1).mean().item()
+    else:
+        smoothness = 0.0
+
+    return {
+        "xyz_ADE": ade,
+        "xyz_FDE": fde,
+        "heading_error_deg": heading_error_deg,
+        "fwd_speed_MAE": fwd_mae,
+        "yaw_rate_MAE": yaw_mae,
+        "lateral_speed_MAE": lateral_mae,
+        "smoothness": smoothness,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Aggregate benchmark
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def run_benchmark(model, dataset, text_encoder, device="cpu",
+                   max_samples: int = -1) -> dict:
+    """Run inference over `dataset` and aggregate the metric suite.
+
+    `model` is a RootRefiner (eval mode). `text_encoder` must have
+    `.encode(list[str], device=...) -> [B, text_emb_dim]`.
+
+    Returns dict with `summary` (aggregate metrics) and `per_sample` (list).
+    """
+    model = model.to(device).eval()
+    min_tokens = model.min_tokens
+
+    n = len(dataset) if max_samples < 0 else min(max_samples, len(dataset))
+
+    per_sample = []
+    num_top1 = 0
+    num_top3 = 0
+    num_mae_sum = 0.0
+
+    for idx in range(n):
+        sample = dataset[idx]
+        text_emb = text_encoder.encode([sample["text"]], device=device)
+        out = model(
+            text_emb=text_emb,
+            xz_path=sample["xz_path"].unsqueeze(0).to(device),
+            path_mask=sample["path_mask"].unsqueeze(0).to(device),
+            path_stats=sample["path_stats"].unsqueeze(0).to(device),
+            current_motion=sample["current_motion"].unsqueeze(0).to(device),
+            history_mask=sample["history_mask"].unsqueeze(0).to(device),
+        )
+        logits = out["num_token_logits"][0]                  # [K]
+        pred_wp = out["waypoints"][0].cpu()                  # [max_frames, 7]
+        gt_wp = sample["target_waypoints"]
+        mask = sample["target_mask"]
+
+        # num_token metrics.
+        gt_class = int(sample["num_tokens"].item()) - min_tokens
+        gt_class = max(0, min(gt_class, logits.shape[-1] - 1))
+        pred_class = int(logits.argmax().item())
+        top3 = torch.topk(logits, k=min(3, logits.shape[-1])).indices.tolist()
+        num_top1 += int(pred_class == gt_class)
+        num_top3 += int(gt_class in top3)
+        num_mae_sum += abs(pred_class - gt_class)
+
+        m = compute_sample_metrics(pred_wp, gt_wp, mask)
+        m["idx"] = idx
+        m["pred_num_tokens"] = pred_class + min_tokens
+        m["gt_num_tokens"] = gt_class + min_tokens
+        per_sample.append(m)
+
+    # Aggregate (nan-safe mean over per-sample metrics).
+    def _nanmean(key):
+        vals = [s[key] for s in per_sample if not math.isnan(s[key])]
+        return float(sum(vals) / len(vals)) if vals else float("nan")
+
+    def _nanmedian(key):
+        vals = sorted(s[key] for s in per_sample if not math.isnan(s[key]))
+        if not vals:
+            return float("nan")
+        mid = len(vals) // 2
+        if len(vals) % 2 == 1:
+            return float(vals[mid])
+        return float((vals[mid - 1] + vals[mid]) / 2)
+
+    summary = {
+        "n_samples": n,
+        "num_token_top1_accuracy": num_top1 / n if n else float("nan"),
+        "num_token_top3_accuracy": num_top3 / n if n else float("nan"),
+        "num_token_MAE": num_mae_sum / n if n else float("nan"),
+        "xyz_ADE": _nanmean("xyz_ADE"),
+        "xyz_FDE": _nanmean("xyz_FDE"),
+        "heading_error_deg": _nanmedian("heading_error_deg"),
+        "fwd_speed_MAE": _nanmean("fwd_speed_MAE"),
+        "lateral_speed_MAE": _nanmean("lateral_speed_MAE"),
+        "yaw_rate_MAE": _nanmean("yaw_rate_MAE"),
+        "smoothness_acc_mean": _nanmean("smoothness"),
+    }
+    return {"summary": summary, "per_sample": per_sample}
+
+
+def write_report(result: dict, output_dir: str | Path) -> None:
+    """Write summary.json + per_sample.csv."""
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    with (out / "summary.json").open("w") as f:
+        json.dump(result["summary"], f, indent=2)
+    per_sample = result["per_sample"]
+    if per_sample:
+        keys = list(per_sample[0].keys())
+        with (out / "per_sample.csv").open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=keys)
+            writer.writeheader()
+            writer.writerows(per_sample)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def _load_model_from_ckpt(ckpt_path: str, device: str):
+    """Load RootRefiner weights from a Lightning checkpoint or raw state_dict."""
+    from train_refiner import RefinerLightningModule
+
+    ckpt = torch.load(ckpt_path, map_location=device)
+    if "hyper_parameters" in ckpt and "cfg" in ckpt["hyper_parameters"]:
+        cfg = ckpt["hyper_parameters"]["cfg"]
+        module = RefinerLightningModule(cfg)
+        module.load_state_dict(ckpt["state_dict"])
+        return module.refiner, module.text_encoder
+    raise ValueError(
+        f"checkpoint {ckpt_path} missing hyper_parameters.cfg; "
+        "pass a Lightning checkpoint saved by train_refiner.py"
+    )
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--ckpt", type=str, required=True)
+    parser.add_argument("--config", type=str, default="configs/root_refiner.yaml")
+    parser.add_argument("--output_dir", type=str, default="outputs/refiner_bench")
+    parser.add_argument("--max_samples", type=int, default=-1)
+    parser.add_argument("--device", type=str, default="cpu")
+    args = parser.parse_args(argv)
+
+    import yaml
+
+    from datasets.refiner_dataset import RefinerDataset
+    from scripts.compute_5d_stats import load_clips_from_dir
+
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+
+    model, text_encoder = _load_model_from_ckpt(args.ckpt, args.device)
+
+    data_cfg = cfg.get("data", {})
+    clips = load_clips_from_dir(data_cfg["raw_data_dir"])
+    model_cfg = cfg["model"]
+    dataset = RefinerDataset(
+        clips,
+        n_hist=model_cfg["n_hist"], n_path=model_cfg["n_path"],
+        max_tokens=model_cfg["max_tokens"], min_tokens=model_cfg["min_tokens"],
+        frames_per_token=model_cfg["frames_per_token"],
+        normalize=data_cfg.get("stats_dir") is not None,
+        stats_dir=data_cfg.get("stats_dir"),
+    )
+
+    result = run_benchmark(model, dataset, text_encoder, device=args.device,
+                            max_samples=args.max_samples)
+    write_report(result, args.output_dir)
+    print(json.dumps(result["summary"], indent=2))
+
+
+if __name__ == "__main__":
+    main()
