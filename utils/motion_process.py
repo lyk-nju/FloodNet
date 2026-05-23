@@ -89,6 +89,66 @@ def extract_root_trajectory_263_torch(feature_263: torch.Tensor) -> torch.Tensor
     return r_pos
 
 
+def root_to_traj_feats_7d(root_quat: torch.Tensor, root_xyz: torch.Tensor) -> torch.Tensor:
+    """263D recovery → new 7D world-frame trajectory features.
+
+    Args:
+        root_quat: [..., T, 4] from `recover_root_rot_pos` ([cos(a), 0, sin(a), 0]
+                   with a = HumanML3D r_rot_ang half-angle).
+        root_xyz:  [..., T, 3] from `recover_root_rot_pos`.
+
+    Returns:
+        [..., T, 7] = [x, y, z, cos(physical_yaw), sin(physical_yaw),
+                       fwd_delta, yaw_delta]
+
+    Unit convention (v1, consistent with HumanML3D 263D root velocity):
+        fwd_delta = per-frame forward displacement (NOT divided by dt).
+        yaw_delta = per-frame yaw change (NOT divided by dt).
+        Convert to fwd_speed (m/s) / yaw_rate (rad/s) at the caller side by
+        dividing by `frame_dt = 1 / fps`.
+
+    First-frame padding (HARD CONSTRAINT, round 8 P0-2 lock-in):
+        fwd_delta[..., 0]  == 0
+        yaw_delta[..., 0]  == 0
+    The previous prototype used `fwd_delta[0] = fwd_delta[1]` (repeat-next)
+    while keeping `yaw_delta[0] = 0`, which made the two channels inconsistent
+    and misled debugging at the anchor frame. v1 zeros both, matching the
+    physical intuition that frame 0 has no preceding frame.
+
+    Uses `utils.local_frame` for all physical-yaw geometry; this module
+    intentionally does NOT reimplement quaternion → physical yaw to avoid
+    drift from the canonical implementation.
+
+    Note: do NOT confuse with legacy `utils.traj_batch.root_to_traj_feats`
+    (which returns path-direction unit vectors, NOT physical yaw cos/sin).
+    """
+    from utils.local_frame import (
+        heading_dir_xz,
+        root_quat_to_physical_yaw,
+        wrap_angle,
+    )
+
+    physical_yaw = root_quat_to_physical_yaw(root_quat)
+    cos_h = torch.cos(physical_yaw)
+    sin_h = torch.sin(physical_yaw)
+
+    # Per-frame xz delta (forward difference); first frame zero (no preceding).
+    delta_xz = torch.zeros_like(root_xyz[..., :, [0, 2]])
+    delta_xz[..., 1:, :] = root_xyz[..., 1:, [0, 2]] - root_xyz[..., :-1, [0, 2]]
+
+    # Project xz delta onto heading direction to get signed forward delta.
+    fwd_dir = heading_dir_xz(physical_yaw)                            # [..., T, 2]
+    fwd_delta = (delta_xz * fwd_dir).sum(-1, keepdim=True)            # [..., T, 1]
+    # fwd_delta[..., 0, :] == 0  (because delta_xz[..., 0, :] == 0).
+
+    yaw_delta = torch.zeros_like(physical_yaw)
+    yaw_delta[..., 1:] = wrap_angle(physical_yaw[..., 1:] - physical_yaw[..., :-1])
+    # yaw_delta[..., 0] == 0.
+
+    return torch.cat(
+        [root_xyz, cos_h[..., None], sin_h[..., None], fwd_delta, yaw_delta[..., None]],
+        dim=-1,
+    )
 
 
 def extract_root_trajectory_length(feature_263: np.ndarray | torch.Tensor, xy_only: bool = True) -> float:
