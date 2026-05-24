@@ -264,7 +264,10 @@ class CustomLightningModule(BasicLightningModule):
         # EMA
         ##############################
         # With new traj params, ema_state has wrong param count → reinit from scratch.
-        if "ema_state" in checkpoint and not has_new_cond_params:
+        # Also reinit when traj weights were expanded 4D→7D (n_traj_exp>0): the old
+        # EMA shadow_params hold 4D traj-encoder shadows that can't map onto the
+        # expanded 7D params (count/shape mismatch in load/copy_to).
+        if "ema_state" in checkpoint and not has_new_cond_params and n_traj_exp == 0:
             self.ema.load_state_dict(checkpoint["ema_state"])
             rank_zero_info("init ema from ckpt")
         else:
