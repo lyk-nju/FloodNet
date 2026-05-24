@@ -35,11 +35,14 @@ class TrajStreamBuffer:
 
     def __init__(
         self,
-        batch_size: int,
-        buf_len: int,
-        local_traj_encoder: torch.nn.Module,
-        traj_encoder: torch.nn.Module,
+        batch_size: int | None = None,
+        buf_len: int | None = None,
+        local_traj_encoder: torch.nn.Module | None = None,
+        traj_encoder: torch.nn.Module | None = None,
         use_emb_cache: bool = True,
+        *,
+        device: torch.device | str = "cpu",
+        dtype: torch.dtype = torch.float32,
     ):
         self.batch_size = batch_size
         self.buf_len = buf_len
@@ -53,8 +56,120 @@ class TrajStreamBuffer:
         self._version: int = 0
         self._emb_cache: dict = {}
 
+        # T_C_01: RootPlan-aware 7D condition provider state. device/dtype are
+        # injected here (not at set_root_plan) so the no-traj branch works from
+        # session start (before any plan) with body-consistent device/dtype.
+        self._active_plan = None
+        self._device = torch.device(device)
+        self._dtype = dtype
+
     # ------------------------------------------------------------------
-    # public API
+    # T_C_01: RootPlan-aware 7D condition provider (Stage 2 main path).
+    # Stateless transform RootPlan → body-window-local 7D condition. Does NOT
+    # call the Refiner, text encoder, or advance the timeline — the upper layer
+    # (ModelManager) owns those and passes head_state / body_anchor_state in.
+    # ------------------------------------------------------------------
+
+    def set_root_plan(self, root_plan) -> None:
+        """Cache the active plan, moving its tensor fields to this buffer's
+        device/dtype (the Refiner may return a CPU RootPlan while body runs on
+        CUDA — the active-plan branch would otherwise hit a device mismatch)."""
+        import dataclasses
+
+        self._active_plan = dataclasses.replace(
+            root_plan,
+            waypoints_local_7d=root_plan.waypoints_local_7d.to(
+                device=self._device, dtype=self._dtype),
+            anchor_world_xz=root_plan.anchor_world_xz.to(
+                device=self._device, dtype=self._dtype),
+            anchor_world_yaw=root_plan.anchor_world_yaw.to(
+                device=self._device, dtype=self._dtype),
+        )
+
+    def clear(self) -> None:
+        self._active_plan = None
+
+    def has_active_plan(self) -> bool:
+        return self._active_plan is not None
+
+    def _return_no_traj(self, expected_horizon_frame_slice, *,
+                        device=None, dtype=None):
+        """Standard no-traj output: zero 7D condition + all-False mask. Single
+        source for both no-plan and inactive-plan branches (consistent
+        device/dtype/mask-dtype)."""
+        if expected_horizon_frame_slice is None:
+            raise ValueError("no-traj fallback requires expected_horizon_frame_slice")
+        H = expected_horizon_frame_slice.stop - expected_horizon_frame_slice.start
+        device = device or self._device
+        dtype = dtype or self._dtype
+        return (
+            torch.zeros(H, 7, device=device, dtype=dtype),
+            torch.zeros(H, device=device, dtype=torch.bool),
+        )
+
+    def get_body_traj_cond(self, *, head_state, body_anchor_state,
+                           horizon_tokens: int,
+                           expected_horizon_frame_slice=None):
+        """RootPlan → (traj_cond_7d_frame [H,7], traj_cond_frame_mask [H]).
+
+        UNBATCHED output (caller unsqueezes to [1,H,7]/[1,H]). Dual-anchor:
+        current_plan_token is derived from head_state (Refiner anchor); the final
+        world→local canonicalize uses body_anchor_state (body-window history0).
+        expected_horizon_frame_slice ONLY sets the output frame count; the
+        plan-local slice is derived from current_plan_token (decoupled).
+        """
+        from utils.local_frame import canonicalize_7d, uncanonicalize_7d
+        from utils.root_plan import slice_plan_with_mask
+        from utils.token_frame import token_range_to_frame_slice, token_start_frame
+
+        # no-traj: no active plan
+        if self._active_plan is None:
+            return self._return_no_traj(expected_horizon_frame_slice)
+
+        plan = self._active_plan
+
+        # Step 1: plan-local offset from the HEAD state (not body anchor).
+        current_plan_token = head_state.commit_idx - plan.anchor_commit_idx
+        if current_plan_token < 0:
+            # plan not yet active → no-traj
+            if expected_horizon_frame_slice is None:
+                raise ValueError(
+                    "inactive plan / no-traj fallback requires explicit "
+                    "expected_horizon_frame_slice (active-plan vs no-traj shape "
+                    "consistency)"
+                )
+            return self._return_no_traj(expected_horizon_frame_slice)
+
+        # Step 2a: output frame count H_frame (body-window space, shape only).
+        # ⚠ fallback uses token_range_to_frame_slice length (= 4*H for an
+        # arbitrary range), NOT num_frames_for_tokens (= 4N-3, prefix only).
+        if expected_horizon_frame_slice is not None:
+            H_frame = expected_horizon_frame_slice.stop - expected_horizon_frame_slice.start
+        else:
+            plan_range = token_range_to_frame_slice(
+                current_plan_token, horizon_tokens, plan.frames_per_token)
+            H_frame = plan_range.stop - plan_range.start
+
+        # Step 2b: plan-local slice (index into plan.waypoints_local_7d).
+        plan_frame_start = token_start_frame(current_plan_token, plan.frames_per_token)
+        plan_frame_slice = slice(plan_frame_start, plan_frame_start + H_frame)
+
+        # Step 3: slice + overflow hold-last (plan-local frame space).
+        traj_plan_local, traj_mask_frame = slice_plan_with_mask(
+            plan, frame_slice=plan_frame_slice, hold_last_on_overflow=True)
+
+        # Step 4: plan-anchor-local → world (plan's own anchor).
+        traj_world = uncanonicalize_7d(
+            traj_plan_local, plan.anchor_world_xz, plan.anchor_world_yaw)
+
+        # Step 5: world → body-window-local (body_anchor_state, NOT head_state).
+        traj_body_local = canonicalize_7d(
+            traj_world, body_anchor_state.world_xz, body_anchor_state.world_yaw)
+
+        return traj_body_local, traj_mask_frame
+
+    # ------------------------------------------------------------------
+    # public API (legacy xyz/feature streaming path)
     # ------------------------------------------------------------------
 
     def reset(self):
