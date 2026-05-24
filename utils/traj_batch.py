@@ -177,6 +177,15 @@ def encode_traj_batch(
             apply_horizon_mask_tokens(
                 mask_frame, horizon_active_end_token, horizon_tokens, frames_per_token,
             )
+        # B-P0-1: if the WHOLE batch's traj mask is zero (clear / no-traj, or a
+        # fully-truncated horizon), there is no valid trajectory → return None so
+        # the model's no-control path runs. Otherwise the encoder bias would emit
+        # a nonzero embedding (~0.2) that ControlNet treats as a constant control
+        # signal — mask=0 must equal no-control, not "constant control". (Mixed
+        # batches keep the per-token mask; per-sample tail truncation = Part B,
+        # see _get_traj_seq_lens TODO.)
+        if not bool(mask_frame[:, :tf].any()):
+            return None
         feats_frame = feats_frame * mask_frame[:, :tf].unsqueeze(-1).to(dtype=feats_frame.dtype)
 
     # --- frame → token grouping ---

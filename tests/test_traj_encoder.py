@@ -180,6 +180,44 @@ def test_encode_traj_batch_accepts_frame_level_7d():
     assert out.shape == (B, seq_len, 16)
 
 
+def test_all_zero_mask_returns_none_no_control():
+    """B-P0-1: a fully-masked traj batch → encode_traj_batch returns None so the
+    model runs its no-control path (the encoder bias would otherwise emit a
+    nonzero embedding that ControlNet treats as constant control)."""
+    import torch.nn as nn
+
+    B, seq_len, D = 2, 6, 7
+    T_frame = num_frames_for_tokens(seq_len)
+    x = {
+        "traj_features": torch.randn(B, T_frame, D),
+        "traj_cond_mask": torch.zeros(B, T_frame),   # everything masked
+    }
+    out = encode_traj_batch(x, seq_len, "cpu", nn.Identity(), nn.Identity())
+    assert out is None
+
+
+def test_horizon_fully_truncated_returns_none():
+    """horizon_tokens=0 zeros the whole mask → no valid traj → None."""
+    le, te = _encoders(7)
+    seq_len = 6
+    T_frame = num_frames_for_tokens(seq_len)
+    x = {"traj_features": torch.randn(1, T_frame, 7)}   # no base mask → all-ones
+    out = encode_traj_batch(x, seq_len, "cpu", le, te, horizon_tokens=0)
+    assert out is None
+
+
+def test_partial_mask_still_returns_embedding():
+    """A mask with SOME valid frames is still encoded (not None)."""
+    le, te = _encoders(7)
+    B, seq_len, D = 1, 6, 7
+    T_frame = num_frames_for_tokens(seq_len)
+    mask = torch.zeros(B, T_frame)
+    mask[:, :10] = 1.0
+    x = {"traj_features": torch.randn(B, T_frame, D), "traj_cond_mask": mask}
+    out = encode_traj_batch(x, seq_len, "cpu", le, te)
+    assert out is not None and out.shape == (B, seq_len, 16)
+
+
 def test_encode_traj_batch_rejects_token_level_input():
     """Token-level parallel path is disabled: shape[1]==seq_len (seq_len>1)
     means pre-tokenized data was mis-fed → raise."""
