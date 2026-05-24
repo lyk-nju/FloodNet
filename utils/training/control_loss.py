@@ -123,8 +123,9 @@ def compute_body_aux_loss(
         pred_latent = pred_list[i].to(device)
         t_tok = pred_latent.size(0)
         if chunk_size_tokens is not None and t_tok > chunk_size_tokens:
+            from utils.token_frame import token_start_frame
             start_tok = t_tok - chunk_size_tokens
-            start_f = 0 if start_tok == 0 else token_to_frame * start_tok - (token_to_frame - 1)
+            start_f = token_start_frame(start_tok, token_to_frame)   # P1-2: canonical helper
         else:
             start_f = 0
 
@@ -203,9 +204,10 @@ def compute_control_loss_xz(
         t_tok = pred_latent_full.size(0)
 
         if chunk_size_tokens is not None and t_tok > chunk_size_tokens:
+            from utils.token_frame import token_start_frame
             start_tok = t_tok - chunk_size_tokens
-            start_f = 0 if start_tok == 0 else 4 * start_tok - 3
-            end_f = t_tok * token_to_frame
+            start_f = token_start_frame(start_tok, token_to_frame)   # P1-2: canonical helper
+            end_f = t_tok * token_to_frame   # legacy: clamped to decoded length below
         else:
             start_tok = 0
             start_f = 0

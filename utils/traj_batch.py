@@ -156,9 +156,11 @@ def encode_traj_batch(
         tf = feats_frame.shape[1]
         mask_frame = tm.new_zeros(B_tm, tf)
         mask_frame[:, 0] = tm[:, 0]
+        from utils.token_frame import token_end_frame, token_start_frame
         for k in range(1, N_tm):
-            sf = 4 * k - 3
-            ef = min(4 * k + 1, tf)
+            # P1-4: use the canonical token↔frame helpers (was 4*k-3 / 4*k+1).
+            sf = token_start_frame(k)
+            ef = min(token_end_frame(k) + 1, tf)
             if sf < tf:
                 mask_frame[:, sf:ef] = tm[:, k:k + 1].expand(-1, ef - sf)
 

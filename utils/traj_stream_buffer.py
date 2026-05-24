@@ -400,6 +400,18 @@ class TrajStreamBuffer:
         return emb
 
     def _build_from_xyz(self, start_t, end_index, ctx_len, device):
+        # P1-5: the legacy xyz path is translate-only 4D path-heading, NOT B-full
+        # canonical / physical-yaw 7D. If the encoder is 7D, the 7D RootPlan path
+        # (get_body_traj_cond) is the intended route — warn so a stale legacy
+        # callsite doesn't silently feed 4D-style conditioning to a 7D model.
+        if getattr(self.traj_encoder, "in_dim", 4) == 7:
+            import warnings
+            warnings.warn(
+                "TrajStreamBuffer._build_from_xyz (legacy 4D translate-only path) "
+                "called with a 7D traj_encoder; use get_body_traj_cond (RootPlan "
+                "7D, B-full canonical) instead.",
+                RuntimeWarning, stacklevel=2,
+            )
         key = ("xyz", start_t, end_index, self._version)
         if self.use_emb_cache and key in self._emb_cache:
             return self._emb_cache[key]
