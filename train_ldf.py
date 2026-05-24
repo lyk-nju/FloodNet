@@ -135,7 +135,10 @@ class CustomLightningModule(BasicLightningModule):
                     key,
                     float(value),
                     on_step=True,
-                    prog_bar=False,
+                    # Surface the body aux terms (root_xz/root_y/heading/fwd_delta/
+                    # yaw_delta) on the tqdm bar too; other extra metrics stay
+                    # wandb-only to avoid cluttering the progress bar.
+                    prog_bar=key.startswith("body_aux/"),
                     batch_size=batch_size,
                 )
         for key, value in loss_dict.items():
