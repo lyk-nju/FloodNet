@@ -9,17 +9,41 @@ from pathlib import Path
 
 import yaml
 
-CFG_PATH = Path(__file__).resolve().parent.parent / "configs" / "root_refiner.yaml"
+_CFG_DIR = Path(__file__).resolve().parent.parent / "configs"
+CFG_PATH = _CFG_DIR / "root_refiner.yaml"
+TRAIN_CFG_PATH = _CFG_DIR / "root_refiner_train.yaml"
 
 
-def _load():
-    with CFG_PATH.open() as f:
+def _load(path=CFG_PATH):
+    with path.open() as f:
         return yaml.safe_load(f)
 
 
 def test_yaml_parses():
     cfg = _load()
     assert isinstance(cfg, dict)
+
+
+# ---------------------------------------------------------------------------
+# P2-2: lock the debug vs real config semantics
+# ---------------------------------------------------------------------------
+
+
+def test_debug_config_uses_stub():
+    cfg = _load(CFG_PATH)
+    assert cfg["text_encoder"]["debug_stub"] is True
+    assert cfg["data"]["normalize"] is False
+
+
+def test_train_config_is_real_precomputed_t5():
+    cfg = _load(TRAIN_CFG_PATH)
+    te = cfg["text_encoder"]
+    assert te["debug_stub"] is False
+    assert te["type"] == "precomputed_t5_pool"
+    assert "precomputed_text_emb_path" in te
+    assert te.get("pooling") in ("mean", "first")
+    assert cfg["model"]["text_emb_dim"] == 4096   # = T5 cache text_dim (P0-1)
+    assert cfg["data"]["normalize"] is True        # real training z-scores (P2-1)
 
 
 def test_model_block_required_keys_and_values():

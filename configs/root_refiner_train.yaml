@@ -1,0 +1,72 @@
+# RootRefiner REAL training config (T_A_09; P0-1 / P2-1).
+#
+# Differs from the debug config (configs/root_refiner.yaml) in the three ways
+# that make training real:
+#   - text_encoder.type: precomputed_t5_pool  (semantic T5, NOT the hashed stub)
+#   - model.text_emb_dim: 4096                (= LDF T5 cache text_dim)
+#   - data.normalize: true                    (z-score from stats_dir, must exist)
+#
+# Prereqs on the training box:
+#   1. tools/pretokenize_t5_text.py has produced the T5 cache at
+#      text_encoder.precomputed_text_emb_path.
+#   2. scripts/compute_5d_stats.py has populated data.stats_dir.
+#
+# Hard constraints (same as the debug config): canonicalization.mode=b_full +
+# anchor=first_effective_frame (§0.3 v1); full_plan_valid_history_frames=1;
+# loss_weights uses fwd_delta/yaw_delta (per-frame deltas, not m/s).
+
+model:
+  d_model: 256
+  n_layers: 6
+  n_heads: 8
+  ff_dim: 1024
+  dropout: 0.1
+  max_tokens: 49
+  min_tokens: 4
+  frames_per_token: 4
+  n_path: 64
+  n_hist: 20
+  text_emb_dim: 4096          # = precomputed T5 cache text_dim (P0-1)
+
+canonicalization:
+  mode: b_full
+  anchor: first_effective_frame
+  full_plan_valid_history_frames: 1
+
+training:
+  batch_size: 64
+  lr: 1.0e-4
+  optimizer: adamw
+  weight_decay: 0.01
+  total_steps: 100000
+  sampling_mode_full_ratio: 0.5
+  gradient_clip_val: 1.0
+
+loss:
+  heading_form: cosine
+
+loss_weights:
+  num_token: 1.0
+  xyz: 5.0
+  heading: 1.0
+  fwd_delta: 0.5
+  yaw_delta: 0.5
+  smoothness: 0.0             # enable (0.005~0.01) only for ablation / fine-tune
+
+text_encoder:
+  type: precomputed_t5_pool   # P0-1: reuse the LDF offline T5 cache, pooled
+  precomputed_text_emb_path: ${data.raw_data_dir}/HumanML3D/t5_text_embeddings.pt
+  pooling: mean               # mean | first
+  share_with: ldf
+  freeze: true
+  debug_stub: false           # REAL training — locked false (test_root_refiner_config)
+
+data:
+  raw_data_dir: /data1/yuankai/text2Motion/FloodDiffusion/raw_data
+  dataset: humanml3d
+  train_split_file: train.txt
+  val_split_file: val.txt
+  feature_path: new_joint_vecs
+  text_path: texts
+  normalize: true             # real training: z-score on (P2-1); stats_dir must exist
+  stats_dir: deps/refiner_stats

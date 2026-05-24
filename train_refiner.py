@@ -21,7 +21,6 @@ ldf-shared frozen text encoder via `text_encoder=`.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import logging
 import sys
 from pathlib import Path
@@ -38,6 +37,9 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from models.root_refiner import RootRefiner   # noqa: E402
+from utils.text_encoder_resolver import resolve_text_encoder  # noqa: E402
+# Re-exported for backward-compatible `from train_refiner import FrozenStubTextEncoder`.
+from utils.text_encoder_resolver import FrozenStubTextEncoder  # noqa: E402,F401
 
 log = logging.getLogger(__name__)
 
@@ -90,43 +92,8 @@ def second_order_diff_l2(values: Tensor, mask: Tensor) -> Tensor:
 # ---------------------------------------------------------------------------
 
 
-class FrozenStubTextEncoder(nn.Module):
-    """Deterministic per-text embedding via hashing + frozen embedding table.
-
-    Standalone placeholder so the training pipeline runs without the real
-    ldf text encoder. At integration time, pass a module with an `.encode(
-    texts: list[str]) -> [B, text_emb_dim]` method instead.
-    """
-
-    def __init__(self, emb_dim: int, vocab: int = 4096):
-        super().__init__()
-        self.emb_dim = emb_dim
-        self.vocab = vocab
-        self.table = nn.Embedding(vocab, emb_dim)
-        for p in self.parameters():
-            p.requires_grad_(False)
-
-    @staticmethod
-    def _stable_id(text: str, vocab: int) -> int:
-        """Process-stable hash of `text` → [0, vocab).
-
-        ⚠ Must NOT use builtin hash(): Python str hashing is salted per process
-        (PYTHONHASHSEED), so the same caption would map to different embedding
-        rows across runs / between training and benchmarking — silently
-        defeating any text conditioning when the encoder is reloaded. hashlib
-        is deterministic across processes.
-        """
-        digest = hashlib.md5(text.encode("utf-8")).digest()[:8]
-        return int.from_bytes(digest, "big") % vocab
-
-    @torch.no_grad()
-    def encode(self, texts: list[str], device=None) -> Tensor:
-        ids = torch.tensor(
-            [self._stable_id(t, self.vocab) for t in texts], dtype=torch.long,
-        )
-        if device is not None:
-            ids = ids.to(device)
-        return self.table(ids)
+# FrozenStubTextEncoder now lives in utils/text_encoder_resolver.py (shared with
+# the benchmark) and is re-exported above for backward-compatible imports.
 
 
 # ---------------------------------------------------------------------------
@@ -168,30 +135,11 @@ class RefinerLightningModule(pl.LightningModule):
 
     @staticmethod
     def _resolve_text_encoder(cfg: dict, text_encoder, text_emb_dim: int):
-        """Resolve the text encoder. Real training must NOT silently fall back
-        to the debug stub (hashed caption-id embeddings → no semantic
-        generalization). Resolution order:
-          1. explicit `text_encoder=` argument (e.g. the real LDF/T5 encoder);
-          2. cfg.text_encoder.debug_stub is true → FrozenStubTextEncoder + WARN;
-          3. otherwise → NotImplementedError telling the caller to wire a real
-             encoder or set debug_stub.
+        """Delegate to the shared resolver (utils/text_encoder_resolver) so train
+        and benchmark build the identical encoder. Supports an explicit encoder,
+        precomputed_t5_pool (real training), debug_stub (smoke/tests), else raise.
         """
-        if text_encoder is not None:
-            return text_encoder
-        te_cfg = cfg.get("text_encoder", {}) or {}
-        if te_cfg.get("debug_stub", False):
-            log.warning(
-                "RefinerLightningModule: using FrozenStubTextEncoder (DEBUG ONLY: "
-                "hashed caption-id embeddings, NOT LDF/T5). This is fine for "
-                "smoke/overfit tests but will NOT generalize — real training must "
-                "pass a real frozen encoder or wire text_encoder.share_with."
-            )
-            return FrozenStubTextEncoder(text_emb_dim)
-        raise NotImplementedError(
-            "No text encoder available: text_encoder.debug_stub is not set and the "
-            "real LDF/T5 encoder is not wired in this standalone script. Either set "
-            "text_encoder.debug_stub: true (smoke/tests only) or pass text_encoder=."
-        )
+        return resolve_text_encoder(cfg, text_encoder, text_emb_dim)
 
     # ------------------------------------------------------------------
 

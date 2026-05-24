@@ -1,4 +1,9 @@
-# RootRefiner training config (T_A_07).
+# RootRefiner DEBUG / SMOKE config (T_A_07).
+#
+# ⚠ This is the debug/smoke config (debug_stub: true, normalize: false). It runs
+# the pipeline WITHOUT semantic text (hashed caption-id stub) and WITHOUT z-score.
+# For REAL training use configs/root_refiner_train.yaml (precomputed_t5_pool +
+# normalize). Keep debug_stub: true here (locked by test_root_refiner_config).
 #
 # References:
 #   docs/design.md §9 — schema source of truth.
