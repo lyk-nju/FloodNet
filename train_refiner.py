@@ -208,8 +208,11 @@ class RefinerLightningModule(pl.LightningModule):
     def training_step(self, batch: dict, batch_idx: int):
         out = self(batch)
         losses = self._compute_loss(out, batch)
+        # Show every per-term loss (num_token/xyz/heading/fwd_delta/yaw_delta +
+        # total) on the tqdm bar, not just the total — so directional terms are
+        # watchable during training.
         for k, v in losses.items():
-            self.log(f"train/{k}", v, prog_bar=(k == "loss"), on_step=True, on_epoch=False)
+            self.log(f"train/{k}", v, prog_bar=True, on_step=True, on_epoch=False)
         return losses["loss"]
 
     def validation_step(self, batch: dict, batch_idx: int):
