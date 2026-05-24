@@ -58,6 +58,13 @@ def body_aux_loss_terms(pred_xyz, pred_yaw, gt_xyz, gt_yaw, active_mask,
     pred_xyz/gt_xyz: [B, T, 3]; pred_yaw/gt_yaw: [B, T] (physical yaw);
     active_mask: [B, T] (bool/float); sample_loss_mask: optional [B] (0 zeroes a
     whole invalid sample, e.g. T_B_05 padding anchor). Returns (total, per_term).
+
+    P1-3 (v1, intentional): fwd_delta / yaw_delta supervise the ACTIVE-WINDOW
+    INTERNAL dynamics — derived (derive_fwd_yaw_delta) from the sliced pred/gt,
+    NOT a direct per-frame loss vs the dataset 7D channels; the first active
+    frame's delta is 0 (no previous frame in the window). To strictly supervise
+    the 7D delta channels, include one pre-active frame when slicing — deferred
+    unless the body speed profile proves off.
     """
     mask = active_mask.to(pred_xyz.dtype)
     if sample_loss_mask is not None:

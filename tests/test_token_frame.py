@@ -5,16 +5,56 @@ Covers T01-T18 per docs/TODO.md §T_A_01b.
 
 from __future__ import annotations
 
+import torch
+
 from utils.token_frame import (
     FRAMES_PER_TOKEN_DEFAULT,
     frame_idx_to_token_idx,
     num_frames_for_tokens,
+    prefix_len_from_tail_invalid,
     token_active_window_left_frame,
     token_body_window_left_frame,
     token_end_frame,
     token_range_to_frame_slice,
     token_start_frame,
 )
+
+
+# ---------------------------------------------------------------------------
+# prefix_len_from_tail_invalid (B-P0-1 follow-up scaffold; not yet wired)
+# ---------------------------------------------------------------------------
+
+
+def test_prefix_len_tail_invalid_is_prefix_length():
+    # case A: pure tail-invalid → prefix length 4
+    m = torch.tensor([[1, 1, 1, 1, 0, 0, 0]])
+    assert prefix_len_from_tail_invalid(m).tolist() == [4]
+
+
+def test_prefix_len_middle_hole_returns_full_T():
+    # case B: a hole at index 2 followed by valid → cannot truncate → full T
+    m = torch.tensor([[1, 1, 0, 1, 1, 0, 0]])
+    assert prefix_len_from_tail_invalid(m).tolist() == [7]
+
+
+def test_prefix_len_all_invalid_is_zero():
+    m = torch.tensor([[0, 0, 0, 0]])
+    assert prefix_len_from_tail_invalid(m).tolist() == [0]
+
+
+def test_prefix_len_all_valid_is_T():
+    m = torch.tensor([[1, 1, 1, 1]])
+    assert prefix_len_from_tail_invalid(m).tolist() == [4]
+
+
+def test_prefix_len_batched_mixed():
+    m = torch.tensor([
+        [1, 1, 1, 1, 0, 0, 0],   # A → 4
+        [1, 1, 0, 1, 1, 0, 0],   # B (hole) → 7
+        [0, 0, 0, 0, 0, 0, 0],   # all invalid → 0
+        [1, 1, 1, 1, 1, 1, 1],   # all valid → 7
+    ])
+    assert prefix_len_from_tail_invalid(m).tolist() == [4, 7, 0, 7]
 
 
 # ---------------------------------------------------------------------------

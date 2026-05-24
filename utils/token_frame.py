@@ -162,6 +162,40 @@ def frames_to_token_mask(mask_frame, num_tokens: int,
     return out
 
 
+def prefix_len_from_tail_invalid(token_mask):
+    """Per-sample valid-token PREFIX length, but ONLY when the invalid region is
+    a pure suffix (B-P0-1 follow-up scaffold — NOT yet wired into the model).
+
+    `token_mask`: [B, T] (1 = valid). Returns LongTensor [B]:
+      - tail-invalid (e.g. [1,1,1,1,0,0,0]) → prefix length 4 (safe to truncate
+        traj_seq_lens, attention then ignores the out-of-horizon/overflow tail);
+      - middle hole (e.g. [1,1,0,1,1,0,0]) → full T (a hole is NOT expressible as
+        a single prefix length; truncating would wrongly drop later valid tokens —
+        these stay handled by the per-token embedding zeroing, not by seq_lens);
+      - all-invalid → 0; all-valid → T.
+
+    ⚠ This is the SEMANTICS for a future mask-aware _get_traj_seq_lens. Wiring it
+    into ControlNet attention needs a model-forward residual test (mask=0 tail
+    value-invariance) + a sparse-middle-hole non-regression check, so it is left
+    for the runtime box; do NOT route it through the main path blindly.
+    """
+    import torch
+
+    valid = token_mask > 0
+    B, T = valid.shape
+    out = torch.empty(B, dtype=torch.long, device=valid.device)
+    for b in range(B):
+        row = valid[b]
+        invalid = (~row).nonzero(as_tuple=True)[0]
+        if invalid.numel() == 0:
+            out[b] = T                      # all valid
+        elif not bool(row[int(invalid[0]):].any()):
+            out[b] = int(invalid[0])        # pure tail-invalid → prefix length
+        else:
+            out[b] = T                      # middle hole → not a prefix; don't truncate
+    return out
+
+
 __all__ = [
     "FRAMES_PER_TOKEN_DEFAULT",
     "token_start_frame",
@@ -172,4 +206,5 @@ __all__ = [
     "token_active_window_left_frame",
     "token_body_window_left_frame",
     "frames_to_token_mask",
+    "prefix_len_from_tail_invalid",
 ]

@@ -461,6 +461,14 @@ class DiffForcingWanModel(nn.Module):
         )
 
     def _get_traj_seq_lens(self, x, seq_len, device):
+        # B-P0-1 follow-up (NOT yet done): this returns the full token length, so
+        # ControlNet attention still attends to masked-but-zeroed tail tokens
+        # (their traj_type_embed leaks once trained). The fix is a mask-aware
+        # seq_lens via utils.token_frame.prefix_len_from_tail_invalid (truncate
+        # ONLY a pure-suffix invalid region; a middle hole must NOT truncate).
+        # Deferred to the runtime box: needs a ControlNet-residual model-forward
+        # test + a sparse-middle-hole non-regression check. Per-token embedding
+        # zeroing (encode_traj_batch) already removes the tail VALUE signal.
         # Prefer feature_length (= token_length) — exact, no rounding error.
         if "feature_length" in x and x["feature_length"] is not None:
             return (
