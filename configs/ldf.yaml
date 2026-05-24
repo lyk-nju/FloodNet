@@ -173,6 +173,15 @@ model:
 #   6 — active window, relative displacement, GT anchor    (loss = |pred_rel[t]-gt_rel[t]|², true disp error)
 control_loss_train_mode: 1
 
+# T_B_05: body-window canonicalize (design §2.3). Canonicalizes the 7D
+# world-frame traj_cond into the body-window-local frame (anchor = body window
+# leftmost / history0) to match inference's per-window re-anchoring. Only active
+# for the 7D traj path (traj_feat_dim/traj_encoder_in_dim = 7); a no-op for 4D.
+anchor_canonicalize:
+    enabled: true
+    source: gt_root      # anchor pose source (v1: read from traj_cond_7d itself)
+    mode: full           # full local-frame canonical (translate + rotate)
+
 # T_B_04: random horizon simulation (design.md §2.2.2/§2.2.3). Units are all
 # token-level. Truncates how many future tokens traj_cond exposes during
 # training, ramping toward the fixed inference horizon late in training.

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from utils.training.body_canonicalize import apply_body_window_canonicalize
 from utils.training.history_corruption import (
     apply_history_corruption,
     should_apply_corruption,
@@ -111,6 +112,10 @@ class SelfForcingTrainer:
         runtime_metrics["horizon_sim/horizon_tokens"] = getattr(
             self, "_last_horizon_tokens", -1.0
         )
+        # T_B_05: fraction of samples with a valid canonicalize anchor (loss-weighted).
+        _slm = getattr(self, "_last_sample_loss_mask", None)
+        if _slm is not None:
+            runtime_metrics["anchor_canonicalize/valid_frac"] = float(_slm.mean())
         if self._last_replace_diff is not None:
             runtime_metrics["self_forcing/replace_abs_diff"] = float(
                 self._last_replace_diff
@@ -275,6 +280,35 @@ class SelfForcingTrainer:
         all_text_context = model._prepare_text_context(model_batch, seq_len, device, text_dropped_flags)
         traj_dropped = model._decide_traj_dropout(device)
         plan = self.plan_rollout(feature_length, device, progress)
+
+        # T_B_05: canonicalize the 7D world-frame traj_cond into the body-window-
+        # local frame (anchor = body window leftmost = history0) so training
+        # matches inference's per-window re-anchoring. v1: single canonicalize for
+        # the K-step rollout using plan.start_end_indices; body_window_tokens =
+        # seq_len; the GT anchor pose is read from traj_features itself (its xyz =
+        # channels 0-2, heading = cos/sin in 3-4 ARE the unsmoothed GT root pose),
+        # valid_len = traj_length. Only fires for 7D traj. sample_loss_mask is
+        # produced here and consumed by the body aux loss (T_B_06).
+        self._last_sample_loss_mask = None
+        ac_cfg = self._module.cfg.get("anchor_canonicalize", {}) or {}
+        traj_feats = model_batch.get("traj_features")
+        if (ac_cfg.get("enabled", False)
+                and torch.is_tensor(traj_feats)
+                and traj_feats.shape[-1] == 7):
+            feats7 = traj_feats.to(device)
+            valid_len = model_batch.get("traj_length")
+            if valid_len is None:
+                valid_len = torch.full(
+                    (feats7.shape[0],), feats7.shape[1], device=device, dtype=torch.long
+                )
+            gt_xyz = feats7[..., :3]
+            gt_yaw = torch.atan2(feats7[..., 4], feats7[..., 3])
+            canon, sample_loss_mask = apply_body_window_canonicalize(
+                feats7, plan.start_end_indices, gt_xyz, gt_yaw, valid_len,
+                body_window_tokens=seq_len,
+            )
+            model_batch = {**model_batch, "traj_features": canon}
+            self._last_sample_loss_mask = sample_loss_mask
 
         # T_B_04: compute the horizon (token-level) here in the outer loop and
         # pass it down — the model never reads global_step. v1: active_end=0
