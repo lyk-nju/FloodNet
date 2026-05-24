@@ -7,6 +7,7 @@ from torch_ema import ExponentialMovingAverage
 
 from utils.initialize import check_state_dict, instantiate, load_config
 from utils.motion_process import StreamJointRecovery263
+from utils.training.ckpt_compat import expand_traj_input_4d_to_7d
 from utils.render_skeleton import get_humanml3d_chains, render_simple_skeleton_video
 from utils.visualize import render_single_video
 
@@ -53,8 +54,17 @@ def load_model_from_config():
     )
     checkpoint = torch.load(cfg.test_ckpt, map_location="cpu", weights_only=False)
 
-    model.load_state_dict(checkpoint["state_dict"], strict=True)
-    if "ema_state" in checkpoint:
+    # 4D→7D traj-encoder expansion when inferring a legacy 4D ckpt with a 7D
+    # model (mirrors train_ldf.on_load_checkpoint; this standalone path used to
+    # bypass it → shape mismatch). No-op when dims already match.
+    state_dict = checkpoint["state_dict"]
+    n_traj_exp = expand_traj_input_4d_to_7d(state_dict, getattr(model, "traj_in_dim", 4))
+    if n_traj_exp:
+        print(f"[ckpt] expanded {n_traj_exp} traj-encoder weights 4D->7D "
+              "(legacy 4D ckpt into a 7D model)")
+    model.load_state_dict(state_dict, strict=True)
+
+    if "ema_state" in checkpoint and n_traj_exp == 0:
         # Match the param subset that was tracked during training.
         # ControlNet training freezes the backbone so EMA only covers controlnet + traj_encoder.
         # Using model.parameters() (all params) would cause zip-misalignment in copy_to.
@@ -73,6 +83,12 @@ def load_model_from_config():
         ema.load_state_dict(checkpoint["ema_state"])
         ema.copy_to(ema_params)
         print(f"Loaded model from {cfg.test_ckpt} with EMA ({n_shadow} params)")
+    elif "ema_state" in checkpoint:
+        # n_traj_exp > 0: the EMA shadow_params are the 4D model's; their traj
+        # encoder shadows are [.,4] and cannot copy_to the expanded [.,7] params.
+        # Skip EMA and use the expanded loaded weights directly.
+        print("[ckpt] skipping EMA: shadow_params are from the 4D model and cannot "
+              "map onto the expanded 7D traj encoder; using expanded weights w/o EMA")
     else:
         print(f"Loaded model from {cfg.test_ckpt} w/o EMA")
 
