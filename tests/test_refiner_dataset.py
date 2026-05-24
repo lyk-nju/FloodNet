@@ -24,6 +24,23 @@ PI = math.pi
 # ---------------------------------------------------------------------------
 
 
+def test_P0_2_normalize_false_ignores_stats_dir():
+    """P0-2: with normalize=False the dataset must NOT touch stats_dir, even a
+    nonexistent one — the benchmark now passes stats_dir=None when normalize is
+    off (mirrors train_refiner), so constructing here must not raise."""
+    ds = RefinerDataset(
+        [_make_clip(T=50)], full_plan_ratio=1.0, seed=0,
+        normalize=False, stats_dir="/does/not/exist/refiner_stats",
+    )
+    _ = ds[0]   # __getitem__ works without loading any stats
+
+
+def test_P0_2_normalize_true_requires_stats_dir():
+    import pytest
+    with pytest.raises(ValueError):
+        RefinerDataset([_make_clip(T=50)], normalize=True, stats_dir=None)
+
+
 def _make_clip(T: int, *, text: str = "walk forward",
                 rot_vel_t0: float = 0.0,
                 local_vel_xz=(0.0, 0.1)) -> dict:

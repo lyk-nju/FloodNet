@@ -54,6 +54,16 @@ def _dummy_plan(num_tokens_pred: int = 5,
 # ---------------------------------------------------------------------------
 
 
+def test_P1_4_negative_current_plan_token_raises():
+    """P1-4: a negative (not-yet-active) plan token must raise, not silently
+    slice from frame 0 (token_start_frame clamps token_idx<=0 to 0)."""
+    import pytest
+
+    plan = _dummy_plan(num_tokens_pred=5)
+    with pytest.raises(ValueError):
+        slice_plan_with_mask(plan, current_plan_token=-1, horizon_tokens=5)
+
+
 def test_G18_slice_in_valid_region_returns_real_waypoints_and_mask_all_true():
     plan = _dummy_plan(num_tokens_pred=5)   # valid_frames = 4*5 - 3 = 17
     traj, mask = slice_plan_with_mask(plan, current_plan_token=0, horizon_tokens=5)

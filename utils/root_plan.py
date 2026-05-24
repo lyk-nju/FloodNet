@@ -101,6 +101,14 @@ def slice_plan_with_mask(plan: RootPlan,
                 "Either frame_slice or (current_plan_token, horizon_tokens) "
                 "must be provided"
             )
+        # P1-4: a negative current_plan_token means the plan has not taken effect
+        # yet; token_start_frame clamps token_idx<=0 to frame 0, which would
+        # SILENTLY slice a pending plan from the start. Reject it instead.
+        if current_plan_token < 0:
+            raise ValueError(
+                f"current_plan_token must be >= 0, got {current_plan_token} "
+                "(a pending / not-yet-active plan must not be sliced)"
+            )
         frame_slice = token_range_to_frame_slice(
             current_plan_token, horizon_tokens, plan.frames_per_token,
         )

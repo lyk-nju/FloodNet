@@ -288,13 +288,17 @@ def main(argv=None):
         text_path=data_cfg.get("text_path"),
     )
     model_cfg = cfg["model"]
+    # P0-2: follow data.normalize exactly (like train_refiner.py); do NOT force
+    # normalize just because a stats_dir is present in the config — that loaded
+    # stats even when normalize:false and crashed if the dir was missing.
+    normalize = bool(data_cfg.get("normalize", False))
     dataset = RefinerDataset(
         clips,
         n_hist=model_cfg["n_hist"], n_path=model_cfg["n_path"],
         max_tokens=model_cfg["max_tokens"], min_tokens=model_cfg["min_tokens"],
         frames_per_token=model_cfg["frames_per_token"],
-        normalize=data_cfg.get("stats_dir") is not None,
-        stats_dir=data_cfg.get("stats_dir"),
+        normalize=normalize,
+        stats_dir=data_cfg.get("stats_dir") if normalize else None,
         seed=0,
     )
 
