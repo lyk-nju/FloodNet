@@ -218,7 +218,9 @@ anchor_canonicalize:
 horizon_sim:
     enabled: true
     unit: token
-    inference_horizon_tokens: 20       # inference fixed value (= 80 frame)
+    inference_horizon_tokens: 20       # inference horizon (token-level); frame count
+                                       # comes from token_range_to_frame_slice (77 at
+                                       # start_token=0, 80 for an arbitrary range) — NOT a fixed 80
     early_min_horizon_tokens: 20       # early lower bound (>= inference)
     early_max_horizon_ratio: 1.0       # early upper = clip_tokens * ratio
     late_min_horizon_tokens: 10        # late short-horizon lower bound
