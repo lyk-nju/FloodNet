@@ -21,7 +21,7 @@ from utils.training.history_corruption import (
 from utils.training.horizon_sched import sample_random_horizon_tokens
 from lightning.pytorch.utilities import rank_zero_info
 
-from .control_loss import compute_control_loss_xz
+from .control_loss import compute_body_aux_loss, compute_control_loss_xz
 from .model_batch import prepare_model_input
 from .module_step import compute_step_semantics
 
@@ -116,6 +116,12 @@ class SelfForcingTrainer:
         _slm = getattr(self, "_last_sample_loss_mask", None)
         if _slm is not None:
             runtime_metrics["anchor_canonicalize/valid_frac"] = float(_slm.mean())
+        # T_B_06: per-term body aux loss breakdown (heading visible in fine-tune log).
+        _bat = getattr(self, "_last_body_aux_terms", None)
+        if _bat:
+            for _k, _v in _bat.items():
+                runtime_metrics[f"body_aux/{_k}"] = float(_v)
+            self._last_body_aux_terms = None
         if self._last_replace_diff is not None:
             runtime_metrics["self_forcing/replace_abs_diff"] = float(
                 self._last_replace_diff
@@ -429,7 +435,22 @@ class SelfForcingTrainer:
         control_weight = float(
             self._module.cfg.model.params.get("control_loss_weight", 1.0)
         )
-        if control_weight > 0.0 and "traj" in batch:
+        # T_B_06: in 7D mode with body_aux_loss enabled, the body aux loss (5
+        # terms incl. heading) replaces the legacy xz-only control loss. The 4D
+        # path keeps using compute_control_loss_xz (gate below).
+        ba_cfg = self._module.cfg.get("body_aux_loss", {}) or {}
+        use_body_aux = bool(ba_cfg.get("enabled", False)) and "traj_cond_7d" in batch
+        if control_weight > 0.0 and use_body_aux:
+            step_control_loss, self._last_body_aux_terms = _compute_body_aux_loss(
+                final_step_result["pred_x0_latent_list"],
+                batch,
+                self._module,
+                getattr(self, "_last_sample_loss_mask", None),
+                ba_cfg,
+            )
+            if step_control_loss is not None:
+                total_loss = total_loss + control_weight * step_control_loss
+        elif control_weight > 0.0 and "traj" in batch:
             step_control_loss = _compute_control_loss(
                 final_step_result["pred_x0_latent_list"],
                 batch,
@@ -456,6 +477,15 @@ class SelfForcingTrainer:
             raise NotImplementedError(
                 "self-forcing manual optimization does not yet support "
                 f"accumulate_grad_batches={accumulate_grad_batches}. Set it to 1."
+            )
+        # T_B_06: the new 7D traj heading channels MUST be supervised — refuse to
+        # train a 7D model without body_aux_loss (heading) enabled.
+        traj_in_dim = int(getattr(self._module.model, "traj_in_dim", 4))
+        ba_enabled = bool((self._module.cfg.get("body_aux_loss", {}) or {}).get("enabled", False))
+        if traj_in_dim == 7 and not ba_enabled:
+            raise ValueError(
+                "traj_encoder_in_dim=7 requires body_aux_loss.enabled=true "
+                "(the new 7D heading channels need supervision); see T_B_06."
             )
         self._preconditions_checked = True
 
@@ -501,6 +531,32 @@ class SelfForcingTrainer:
 # ------------------------------------------------------------------
 # Standalone helpers (called from main())
 # ------------------------------------------------------------------
+
+
+_DEFAULT_BODY_AUX_WEIGHTS = {
+    "root_xz": 1.0, "root_y": 0.3, "heading": 0.5, "fwd_delta": 0.1, "yaw_delta": 0.1,
+}
+
+
+def _compute_body_aux_loss(pred_list, batch, module, sample_loss_mask, ba_cfg):
+    """Resolve body-aux config then delegate to compute_body_aux_loss (T_B_06).
+
+    GT is the clip-local raw 7D traj_cond (batch[traj_cond_7d]); it is in the same
+    frame as the decoded pred (both clip-local recovery). Returns (loss, terms)."""
+    if pred_list is None or "traj_cond_7d" not in batch:
+        return None, {}
+    weights = {**_DEFAULT_BODY_AUX_WEIGHTS, **(ba_cfg.get("weights", {}) or {})}
+    return compute_body_aux_loss(
+        pred_list,
+        batch["traj_cond_7d"],
+        batch["traj_length"],
+        module.vae,
+        module.device,
+        weights,
+        chunk_size_tokens=getattr(module.model, "chunk_size", None),
+        heading_form=ba_cfg.get("heading_form", "cosine"),
+        sample_loss_mask=sample_loss_mask,
+    )
 
 
 def _compute_control_loss(pred_list, batch, module):

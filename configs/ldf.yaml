@@ -173,6 +173,21 @@ model:
 #   6 — active window, relative displacement, GT anchor    (loss = |pred_rel[t]-gt_rel[t]|², true disp error)
 control_loss_train_mode: 1
 
+# T_B_06: body aux loss (design §2.4). In 7D mode this replaces the legacy
+# xz-only control loss with 5 terms (root_xz/root_y/heading/fwd_delta/yaw_delta),
+# all served by ONE VAE decode. Mandatory in 7D (heading must be supervised):
+# traj_encoder_in_dim=7 with body_aux_loss.enabled=false raises (see T_B_06).
+# In 4D mode it is inert (gated on traj_cond_7d in the batch).
+body_aux_loss:
+    enabled: true
+    heading_form: cosine        # cosine | smooth_l1
+    weights:
+        root_xz: 1.0
+        root_y: 0.3
+        heading: 0.5            # do not disable — wastes the new 7D heading channel
+        fwd_delta: 0.1         # delta channels are noisy; conservative in v1
+        yaw_delta: 0.1
+
 # T_B_05: body-window canonicalize (design §2.3). Canonicalizes the 7D
 # world-frame traj_cond into the body-window-local frame (anchor = body window
 # leftmost / history0) to match inference's per-window re-anchoring. Only active
