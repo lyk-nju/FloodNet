@@ -460,33 +460,39 @@ class DiffForcingWanModel(nn.Module):
             horizon_active_end_token=horizon_active_end,
         )
 
-    def _get_traj_seq_lens(self, x, seq_len, device):
-        # B-P0-1 follow-up (NOT yet done): this returns the full token length, so
-        # ControlNet attention still attends to masked-but-zeroed tail tokens
-        # (their traj_type_embed leaks once trained). The fix is a mask-aware
-        # seq_lens via utils.token_frame.prefix_len_from_tail_invalid (truncate
-        # ONLY a pure-suffix invalid region; a middle hole must NOT truncate).
-        # Deferred to the runtime box: needs a ControlNet-residual model-forward
-        # test + a sparse-middle-hole non-regression check. Per-token embedding
-        # zeroing (encode_traj_batch) already removes the tail VALUE signal.
-        # Prefer feature_length (= token_length) — exact, no rounding error.
+    def _get_traj_seq_lens(self, x, seq_len, device, horizon_tokens=None,
+                           horizon_active_end=0):
+        # Base token length from feature_length / traj_length (exact).
+        base = None
         if "feature_length" in x and x["feature_length"] is not None:
-            return (
-                x["feature_length"]
-                .to(device=device, dtype=torch.long)
-                .clamp(min=0, max=seq_len)
-            )
-        if "traj_features_length" in x and x["traj_features_length"] is not None:
-            return (
-                x["traj_features_length"]
-                .to(device=device, dtype=torch.long)
-                .clamp(min=0, max=seq_len)
-            )
-        if "traj_length" in x and x["traj_length"] is not None:
-            # Fallback: match dataset formula token_end = (feature_length + 2) // 4
+            base = x["feature_length"].to(device=device, dtype=torch.long).clamp(min=0, max=seq_len)
+        elif "traj_features_length" in x and x["traj_features_length"] is not None:
+            base = x["traj_features_length"].to(device=device, dtype=torch.long).clamp(min=0, max=seq_len)
+        elif "traj_length" in x and x["traj_length"] is not None:
             tl = x["traj_length"].to(device=device, dtype=torch.long)
-            return ((tl + 2) // 4 + 1).clamp(min=0, max=seq_len)
-        return None
+            base = ((tl + 2) // 4 + 1).clamp(min=0, max=seq_len)
+        if base is None:
+            return None
+
+        # B-P0-1: mask-aware truncation so ControlNet attention ignores
+        # out-of-horizon / overflow tail tokens (their traj_type_embed would leak
+        # otherwise). Reuses the SAME token mask as encode_traj_batch
+        # (build_traj_token_mask — single source). prefix_len_from_tail_invalid
+        # truncates ONLY a pure-suffix invalid region; a middle hole returns
+        # seq_len so min() keeps base (sparse holes must NOT shorten attention —
+        # they are handled by per-token embedding zeroing). The end-to-end
+        # ControlNet-residual value-invariance check (real VAE-latent shapes) is
+        # run on the runtime box; the truncation logic is unit-tested here.
+        from utils.token_frame import prefix_len_from_tail_invalid
+        from utils.traj_batch import build_traj_token_mask
+        token_mask = build_traj_token_mask(
+            x, seq_len, device, horizon_tokens=horizon_tokens,
+            horizon_active_end_token=horizon_active_end,
+        )
+        if token_mask is None:
+            return base
+        prefix = prefix_len_from_tail_invalid(token_mask).to(device=device)
+        return torch.minimum(base, prefix)
 
     def _decide_text_dropout(self, batch_size: int, device) -> list:
         """Sample per-sample text-dropout flags, synced across DDP ranks."""
@@ -587,7 +593,10 @@ class DiffForcingWanModel(nn.Module):
                 x, seq_len, device, horizon_tokens=horizon_tokens,
                 horizon_active_end=horizon_active_end,
             )
-            traj_seq_lens = self._get_traj_seq_lens(x, seq_len, device)
+            traj_seq_lens = self._get_traj_seq_lens(
+                x, seq_len, device, horizon_tokens=horizon_tokens,
+                horizon_active_end=horizon_active_end,
+            )
 
         return traj_emb, traj_seq_lens, traj_dropped
 

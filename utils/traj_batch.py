@@ -105,6 +105,67 @@ def frames_to_tokens(feats_frame: torch.Tensor, seq_len: int) -> torch.Tensor:
     return tok0                                                         # (B, 1, 4, C)
 
 
+def _traj_source(x: dict):
+    """The traj tensor encode_traj_batch would use (source priority)."""
+    for key in ("traj_features", "traj_cond", "traj"):
+        if key in x and x[key] is not None:
+            return x[key]
+    return None
+
+
+def build_traj_frame_mask(x: dict, tf: int, device, *, frames_per_token: int = 4):
+    """Frame-level traj mask [B, tf] (1=valid) from traj_cond_mask/traj_mask, or a
+    token_mask expanded to frame level. Padded/truncated to `tf`. None if neither
+    is present. Single source for the frame-mask derivation (no second copy)."""
+    from utils.token_frame import token_end_frame, token_start_frame
+
+    _cond_mask = x.get("traj_cond_mask", x.get("traj_mask"))
+    if _cond_mask is not None:
+        mf = _cond_mask.to(device=device, dtype=torch.float32)
+    elif x.get("token_mask") is not None:
+        tm = x["token_mask"].to(device=device, dtype=torch.float32)
+        B_tm, N_tm = tm.shape
+        mf = tm.new_zeros(B_tm, tf)
+        mf[:, 0] = tm[:, 0]
+        for k in range(1, N_tm):
+            sf = token_start_frame(k, frames_per_token)
+            ef = min(token_end_frame(k, frames_per_token) + 1, tf)
+            if sf < tf:
+                mf[:, sf:ef] = tm[:, k:k + 1].expand(-1, ef - sf)
+    else:
+        return None
+    if mf.shape[1] < tf:
+        mf = torch.cat([mf, mf.new_zeros(mf.shape[0], tf - mf.shape[1])], dim=1)
+    return mf[:, :tf]
+
+
+def build_traj_token_mask(x: dict, seq_len: int, device, *,
+                          horizon_tokens: int | None = None,
+                          horizon_active_end_token=0,
+                          frames_per_token: int = 4):
+    """[B, seq_len] token mask (1=valid) = build_traj_frame_mask + optional horizon
+    truncation → frames_to_token_mask. SINGLE source reused by encode_traj_batch
+    (token-embedding zeroing) and _get_traj_seq_lens (attention truncation), so the
+    two never derive the mask differently. Returns None when there is neither a
+    traj mask nor a horizon."""
+    from utils.token_frame import frames_to_token_mask
+
+    src = _traj_source(x)
+    if src is None:
+        return None
+    tf = src.shape[1]
+    mask_frame = build_traj_frame_mask(x, tf, device, frames_per_token=frames_per_token)
+    if mask_frame is None and horizon_tokens is None:
+        return None
+    if mask_frame is None:
+        mask_frame = torch.ones(src.shape[0], tf, device=device, dtype=torch.float32)
+    if horizon_tokens is not None:
+        from utils.training.horizon_sched import apply_horizon_mask_tokens
+        apply_horizon_mask_tokens(
+            mask_frame, horizon_active_end_token, horizon_tokens, frames_per_token)
+    return frames_to_token_mask(mask_frame, seq_len, frames_per_token)
+
+
 def encode_traj_batch(
     x: dict,
     seq_len: int,
@@ -145,35 +206,16 @@ def encode_traj_batch(
     else:
         return None
 
-    # --- frame-level mask (traj_cond_mask preferred) ---
-    mask_frame = None
-    _cond_mask = x.get("traj_cond_mask", x.get("traj_mask"))
-    if _cond_mask is not None:
-        mask_frame = _cond_mask.to(device=device, dtype=torch.float32)
-    elif "token_mask" in x and x["token_mask"] is not None:
-        tm = x["token_mask"].to(device=device, dtype=torch.float32)
-        B_tm, N_tm = tm.shape
-        tf = feats_frame.shape[1]
-        mask_frame = tm.new_zeros(B_tm, tf)
-        mask_frame[:, 0] = tm[:, 0]
-        from utils.token_frame import token_end_frame, token_start_frame
-        for k in range(1, N_tm):
-            # P1-4: use the canonical token↔frame helpers (was 4*k-3 / 4*k+1).
-            sf = token_start_frame(k)
-            ef = min(token_end_frame(k) + 1, tf)
-            if sf < tf:
-                mask_frame[:, sf:ef] = tm[:, k:k + 1].expand(-1, ef - sf)
+    # --- frame-level mask (single source: build_traj_frame_mask) ---
+    tf = feats_frame.shape[1]
+    mask_frame = build_traj_frame_mask(x, tf, device, frames_per_token=frames_per_token)
 
     token_mask_from_frame = None
     if mask_frame is not None or horizon_tokens is not None:
-        tf = feats_frame.shape[1]
         if mask_frame is None:
             # No base traj mask, but horizon truncation requested → start from
             # all-visible and let the horizon cutoff zero the tail.
             mask_frame = feats_frame.new_ones(feats_frame.shape[0], tf)
-        elif mask_frame.shape[1] < tf:
-            pad = mask_frame.new_zeros(mask_frame.shape[0], tf - mask_frame.shape[1])
-            mask_frame = torch.cat([mask_frame, pad], dim=1)
         if horizon_tokens is not None:
             # T_B_04: frame-level horizon truncation (in place on mask_frame).
             from utils.training.horizon_sched import apply_horizon_mask_tokens
@@ -184,9 +226,7 @@ def encode_traj_batch(
         # fully-truncated horizon), there is no valid trajectory → return None so
         # the model's no-control path runs. Otherwise the encoder bias would emit
         # a nonzero embedding (~0.2) that ControlNet treats as a constant control
-        # signal — mask=0 must equal no-control, not "constant control". (Mixed
-        # batches keep the per-token mask; per-sample tail truncation = Part B,
-        # see _get_traj_seq_lens TODO.)
+        # signal — mask=0 must equal no-control, not "constant control".
         if not bool(mask_frame[:, :tf].any()):
             return None
         feats_frame = feats_frame * mask_frame[:, :tf].unsqueeze(-1).to(dtype=feats_frame.dtype)
