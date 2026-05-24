@@ -59,6 +59,7 @@ from utils.training import (
     resolve_sf_runtime,
     SelfForcingTrainer,
 )
+from utils.training.ckpt_compat import expand_traj_input_4d_to_7d
 
 # Set tokenizers parallelism to false to avoid warnings in multiprocessing
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -217,6 +218,16 @@ class CustomLightningModule(BasicLightningModule):
         ##############################
         # state_dict (strict vs loose for ControlNet)
         ##############################
+        # T_B_08: expand a 4D-era ckpt's traj-encoder weights to 7D when this
+        # model is 7D (safe x/z map + zero-init new channels). No-op for 4D.
+        n_traj_exp = expand_traj_input_4d_to_7d(
+            checkpoint["state_dict"], getattr(self.model, "traj_in_dim", 4)
+        )
+        if n_traj_exp:
+            rank_zero_info(
+                f"[ckpt] expanded {n_traj_exp} traj-encoder weights 4D->7D "
+                "(x/z carried, legacy heading dropped, new channels zero-init)"
+            )
         ckpt_keys = set(checkpoint["state_dict"].keys())
         controlnet_missing = not any(k.startswith("controlnet.") for k in ckpt_keys)
         strict = not controlnet_missing
