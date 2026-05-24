@@ -6,7 +6,7 @@ from torch.utils.data import ConcatDataset, Dataset
 from utils.initialize import instantiate
 
 _PAD_SEQUENCE_KEYS = {"feature", "token", "traj", "traj_cond", "traj_loss_gt",
-                      "traj_features"}
+                      "traj_features", "traj_cond_7d"}
 _PAD_MASK_KEYS = {"traj_mask", "traj_cond_mask", "traj_loss_mask", "token_mask"}
 _STACK_SCALAR_KEYS = {"feature_length", "token_length", "traj_length"}
 

@@ -75,6 +75,23 @@ def extract_root_xz_phi_features_263(feature_263: np.ndarray) -> np.ndarray:
     return features.squeeze(0).cpu().numpy()
 
 
+def extract_root_traj_feats_7d_263(feature_263: np.ndarray) -> np.ndarray:
+    """从 263 维 motion 提取 7D world-frame 轨迹特征 (T_B_09).
+
+    [x, y, z, cos(physical_yaw), sin(physical_yaw), fwd_delta, yaw_delta].
+    朝向用 root 物理 yaw (身体朝向), 与 4D path-heading 不同 (倒走时相反).
+
+    Args:
+        feature_263: (T, 263) numpy array, 263D motion features (crop 后, 未归一化)
+    Returns:
+        (T, 7) numpy array, world-frame 7D traj features (canonicalize 前).
+    """
+    feature_vec = torch.from_numpy(feature_263).float().unsqueeze(0)   # (1, T, 263)
+    r_rot_quat, r_pos = recover_root_rot_pos(feature_vec)              # (1,T,4),(1,T,3)
+    feats_7d = root_to_traj_feats_7d(r_rot_quat, r_pos)               # (1, T, 7)
+    return feats_7d.squeeze(0).cpu().numpy()
+
+
 def extract_root_trajectory_263_torch(feature_263: torch.Tensor) -> torch.Tensor:
     """
     从 263 维 motion 中提取根节点 3D 轨迹（PyTorch 版本，用于 control loss）。

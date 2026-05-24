@@ -10,7 +10,10 @@ from omegaconf import ListConfig, OmegaConf
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from utils.motion_process import extract_root_trajectory_263
+from utils.motion_process import (
+    extract_root_traj_feats_7d_263,
+    extract_root_trajectory_263,
+)
 from utils.traj_batch import root_to_traj_feats, smooth_root_xz
 
 
@@ -49,6 +52,9 @@ class BabelDataset(Dataset):
         self.text_path = cfg.data.get("text_path", None)
         self.feature_fps = float(cfg.data.get("feature_fps", 20))
         self.smooth_traj_sigma = float(cfg.data.get("smooth_traj_sigma", 0.0))
+        # T_B_09 flag-gated 7D migration: 4 = legacy (default); 7 = also emit
+        # world-frame traj_cond_7d for the 7D fine-tune path.
+        self.traj_feat_dim = int(cfg.data.get("traj_feat_dim", 4))
         self.dataset = self._load_file_list()
 
         rank_zero_info(f"Loaded {len(self.dataset)} samples from {split} dataset.")
@@ -254,6 +260,10 @@ class BabelDataset(Dataset):
             else:
                 traj_xyz_for_cond = traj_xyz
             output["traj_features"] = root_to_traj_feats(traj_xyz_for_cond)
+            # T_B_09: world-frame 7D traj cond (physical yaw), flag-gated;
+            # canonicalize (world→local) happens later in T_B_05.
+            if self.traj_feat_dim == 7:
+                output["traj_cond_7d"] = extract_root_traj_feats_7d_263(feature)
 
         ##############################
         # text
@@ -492,7 +502,7 @@ def collate_fn(batch):
 
     for key in keys:
         if key in ["feature", "token", "traj", "traj_cond", "traj_loss_gt",
-                   "traj_features"]:
+                   "traj_features", "traj_cond_7d"]:
             # Pad sequences
             items = [
                 torch.from_numpy(b[key]) if isinstance(b[key], np.ndarray) else b[key]
