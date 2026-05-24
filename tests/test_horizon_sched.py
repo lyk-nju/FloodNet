@@ -10,6 +10,7 @@ import random
 import torch
 
 from utils.token_frame import num_frames_for_tokens, token_start_frame
+from utils.traj_batch import encode_traj_batch
 from utils.training.horizon_sched import (
     apply_horizon_mask_tokens,
     sample_random_horizon_tokens,
@@ -132,20 +133,30 @@ def test_warmup_boundary_uses_late_branch_at_exactly_half():
 
 
 def test_encode_traj_batch_applies_horizon_truncation():
-    import torch.nn as nn
+    """horizon_tokens threaded into encode_traj_batch == manually zeroing the
+    traj frames at/after the cutoff (frame-level input, real encoders)."""
+    from models.tools.traj_encoder import LocalTrajEncoder, TrajEncoder
 
-    from utils.traj_batch import encode_traj_batch
+    B, seq_len, D = 1, 8, 4
+    T_frame = num_frames_for_tokens(seq_len)   # 29
+    torch.manual_seed(0)
+    le = LocalTrajEncoder(in_dim=D).eval()
+    torch.manual_seed(1)
+    te = TrajEncoder(in_dim=D, out_dim=16).eval()
 
-    B, seq_len, C = 2, 40, 4
-    x = {"traj_features": torch.ones(B, seq_len, C)}
-    ident = nn.Identity()
-    cutoff = token_start_frame(5)   # active_end=0, horizon=5 → 17
+    feats = torch.randn(B, T_frame, D)
+    H = 4
+    cutoff = token_start_frame(H)   # active_end=0, horizon=4 → 13
 
-    out = encode_traj_batch(x, seq_len, "cpu", ident, ident, horizon_tokens=5)
-    assert out.shape == (B, seq_len, C)
-    assert (out[:, :cutoff] == 1).all()    # visible before cutoff
-    assert (out[:, cutoff:] == 0).all()    # masked at/after cutoff
+    feats_manual = feats.clone()
+    feats_manual[:, cutoff:] = 0    # equivalent of the horizon frame mask
 
-    # horizon_tokens=None → original behavior (no truncation, all visible).
-    out_full = encode_traj_batch(x, seq_len, "cpu", ident, ident, horizon_tokens=None)
-    assert (out_full == 1).all()
+    with torch.no_grad():
+        o_h = encode_traj_batch({"traj_features": feats.clone()}, seq_len, "cpu",
+                                le, te, horizon_tokens=H)
+        o_m = encode_traj_batch({"traj_features": feats_manual}, seq_len, "cpu", le, te)
+        o_full = encode_traj_batch({"traj_features": feats.clone()}, seq_len, "cpu", le, te)
+
+    assert o_h.shape == (B, seq_len, 16)
+    assert torch.allclose(o_h, o_m, atol=1e-5)        # horizon == manual frame-zero
+    assert not torch.allclose(o_h, o_full, atol=1e-4)  # horizon actually masked

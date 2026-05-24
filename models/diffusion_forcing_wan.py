@@ -281,8 +281,9 @@ class DiffForcingWanModel(nn.Module):
         )
         self.controlnet.init_from_backbone(self.model)
 
-        # Local within-token encoder: compress masked 4-frame traj feats -> token-level 4D.
-        self.local_traj_encoder = LocalTrajEncoder(hidden_dim=32)
+        # Local within-token encoder: compress masked 4-frame traj feats -> token-level.
+        # in_dim flag-gated (traj_encoder_in_dim, default 4; 7 for the 7D migration).
+        self.local_traj_encoder = LocalTrajEncoder(in_dim=self.traj_in_dim, hidden_dim=32)
         self.traj_encoder = TrajEncoder(
             in_dim=self.traj_in_dim, hidden_dim=64, out_dim=self.traj_out_dim
         )

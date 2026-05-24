@@ -180,11 +180,19 @@ def encode_traj_batch(
         feats_frame = feats_frame * mask_frame[:, :tf].unsqueeze(-1).to(dtype=feats_frame.dtype)
 
     # --- frame → token grouping ---
-    if feats_frame.shape[1] == seq_len:
-        feats_tok = feats_frame                                        # already token-level
-    else:
-        feats_4 = frames_to_tokens(feats_frame, seq_len) # (B, seq_len, 4, C)
-        feats_tok = local_traj_encoder(feats_4)                        # (B, seq_len, C)
+    # T_B_07: frame-level is the only supported external entry. The old
+    # token-level passthrough (feeding pre-tokenized [B, seq_len, C] features and
+    # skipping the local encoder) is the disabled "parallel path": a genuine
+    # frame input has ~4x more frames than tokens, so shape[1] == seq_len with
+    # seq_len > 1 means token-level data was mis-fed → reject.
+    if feats_frame.shape[1] == seq_len and seq_len > 1:
+        raise ValueError(
+            "encode_traj_batch expects frame-level traj input [B, T_frame, C] "
+            f"(T_frame ~= 4*seq_len), got shape[1]={feats_frame.shape[1]} == "
+            f"seq_len={seq_len}; the token-level parallel path is disabled."
+        )
+    feats_4 = frames_to_tokens(feats_frame, seq_len)  # (B, seq_len, 4, C)
+    feats_tok = local_traj_encoder(feats_4)           # (B, seq_len, C)
 
     # --- token-level mask gate ---
     if "token_mask" in x and x["token_mask"] is not None:

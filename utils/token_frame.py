@@ -139,6 +139,29 @@ def token_body_window_left_frame(end_token_idx: int, body_window_tokens: int,
     return token_start_frame(left_token_idx, frames_per_token)
 
 
+def frames_to_token_mask(mask_frame, num_tokens: int,
+                         frames_per_token: int = FRAMES_PER_TOKEN_DEFAULT):
+    """Aggregate a frame-level mask to token level by OR (design §2.2.2).
+
+    A token is valid (1) iff ANY frame it covers is valid; token 0 covers the
+    single frame [0,0], token k≥1 covers [4k-3, 4k]. Tokens whose frame span
+    falls entirely beyond `mask_frame`'s length stay 0.
+
+    `mask_frame`: tensor [..., T_frame] (any leading dims). Returns
+    [..., num_tokens] in the same dtype/device.
+    """
+    T_frame = mask_frame.shape[-1]
+    lead = mask_frame.shape[:-1]
+    out = mask_frame.new_zeros(*lead, num_tokens)
+    for k in range(num_tokens):
+        s = token_start_frame(k, frames_per_token)
+        e = min(token_end_frame(k, frames_per_token) + 1, T_frame)  # inclusive→exclusive
+        if s >= T_frame or s >= e:
+            continue  # token beyond available frames → stays 0
+        out[..., k] = (mask_frame[..., s:e] > 0).any(dim=-1).to(mask_frame.dtype)
+    return out
+
+
 __all__ = [
     "FRAMES_PER_TOKEN_DEFAULT",
     "token_start_frame",
@@ -148,4 +171,5 @@ __all__ = [
     "token_range_to_frame_slice",
     "token_active_window_left_frame",
     "token_body_window_left_frame",
+    "frames_to_token_mask",
 ]
