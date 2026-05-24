@@ -316,22 +316,25 @@ class SelfForcingTrainer:
             model_batch = {**model_batch, "traj_features": canon}
             self._last_sample_loss_mask = sample_loss_mask
 
-        # T_B_04: compute the horizon (token-level) here in the outer loop and
-        # pass it down — the model never reads global_step. v1: active_end=0
-        # (horizon measured from clip start), so the traj_cond exposes only the
-        # first `horizon_tokens` tokens of the plan, matching inference's
-        # limited future view. None = full traj_cond.
+        # T_B_04 / B-P0-2: compute the horizon (token-level) in the outer loop and
+        # pass it down — the model never reads global_step. The horizon is
+        # truncated relative to the FINAL supervised step's active-window token
+        # position (NOT clip start): horizon_active_end = start_end + (K-1), per
+        # sample. Fixed across the K rollout steps so all steps see one consistent
+        # traj mask. None horizon_tokens = full traj_cond.
         horizon_tokens = None
+        horizon_active_end = 0
         hs_cfg = self._module.cfg.get("horizon_sim", {}) or {}
         if hs_cfg.get("enabled", False):
             horizon_tokens = sample_random_horizon_tokens(
                 progress, 1.0, seq_len, hs_cfg,
             )
+            horizon_active_end = (plan.start_end_indices + (plan.effective_k - 1)).to(device)
         self._last_horizon_tokens = float(horizon_tokens) if horizon_tokens is not None else -1.0
 
         traj_emb, traj_seq_lens, _ = model._prepare_traj_condition(
             model_batch, seq_len, device, traj_dropped_override=traj_dropped,
-            horizon_tokens=horizon_tokens,
+            horizon_tokens=horizon_tokens, horizon_active_end=horizon_active_end,
         )
 
         current_feature = feature.clone()

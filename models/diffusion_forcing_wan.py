@@ -450,12 +450,14 @@ class DiffForcingWanModel(nn.Module):
         x = x.permute(0, 2, 1, 3, 4).contiguous().view(x.size(0), x.size(2), -1)
         return x
 
-    def _build_traj_emb(self, x, seq_len, device, horizon_tokens=None):
+    def _build_traj_emb(self, x, seq_len, device, horizon_tokens=None,
+                        horizon_active_end=0):
         if self.traj_encoder is None:
             return None
         return encode_traj_batch(
             x, seq_len, device, self.local_traj_encoder, self.traj_encoder,
             horizon_tokens=horizon_tokens,
+            horizon_active_end_token=horizon_active_end,
         )
 
     def _get_traj_seq_lens(self, x, seq_len, device):
@@ -556,11 +558,15 @@ class DiffForcingWanModel(nn.Module):
         return traj_dropped
 
     def _prepare_traj_condition(
-        self, x, seq_len, device, traj_dropped_override=None, horizon_tokens=None
+        self, x, seq_len, device, traj_dropped_override=None, horizon_tokens=None,
+        horizon_active_end=0,
     ):
-        # T_B_04: horizon_tokens (token-level) is computed by the training outer
-        # loop (SelfForcingTrainer) and passed in — the model never reads
-        # global_step. None = no horizon truncation (full traj_cond).
+        # T_B_04 / B-P0-2: horizon_tokens (token-level) + horizon_active_end (the
+        # per-sample active-window token position, [B] tensor or int) are computed
+        # by the training outer loop (SelfForcingTrainer) and passed in — the model
+        # never reads global_step. horizon_active_end defaults to 0 (clip start)
+        # for non-SF callers; SF passes the supervised window position so horizon
+        # truncates relative to the current window, not the clip start.
         traj_emb = None
         traj_seq_lens = None
         if traj_dropped_override is None:
@@ -569,7 +575,10 @@ class DiffForcingWanModel(nn.Module):
             traj_dropped = bool(traj_dropped_override)
 
         if not traj_dropped:
-            traj_emb = self._build_traj_emb(x, seq_len, device, horizon_tokens=horizon_tokens)
+            traj_emb = self._build_traj_emb(
+                x, seq_len, device, horizon_tokens=horizon_tokens,
+                horizon_active_end=horizon_active_end,
+            )
             traj_seq_lens = self._get_traj_seq_lens(x, seq_len, device)
 
         return traj_emb, traj_seq_lens, traj_dropped

@@ -63,7 +63,7 @@ def sample_random_horizon_tokens(global_step: int,
 
 
 def apply_horizon_mask_tokens(traj_mask_frame,
-                              active_end_token: int,
+                              active_end_token,
                               horizon_tokens: int,
                               frames_per_token: int = 4):
     """Zero `traj_mask_frame` at/after the horizon cutoff frame, IN PLACE.
@@ -74,11 +74,23 @@ def apply_horizon_mask_tokens(traj_mask_frame,
     Using token_start_frame (not (E+H)*frames_per_token = token_end_frame) is
     what keeps the 77 vs 80 boundary correct (see §2.2.2). If the cutoff is at
     or beyond the mask length the mask is unchanged (e.g. horizon ≥ clip).
-    Returns the (mutated) mask for convenience.
+
+    `active_end_token` may be an int (one cutoff for the whole batch) OR a
+    per-sample tensor [B] (B-P0-2: each rollout sample's own active-window token
+    position, NOT a hardcoded 0 = clip start). Returns the (mutated) mask.
     """
-    cutoff_token = active_end_token + horizon_tokens
-    cutoff_frame = token_start_frame(cutoff_token, frames_per_token)
+    import torch
+
     T_frame = traj_mask_frame.shape[-1]
+    if torch.is_tensor(active_end_token) and active_end_token.dim() > 0:
+        # per-sample: traj_mask_frame must be [B, T_frame]
+        for b in range(active_end_token.shape[0]):
+            cutoff = token_start_frame(int(active_end_token[b]) + horizon_tokens,
+                                       frames_per_token)
+            if cutoff < T_frame:
+                traj_mask_frame[b, cutoff:] = 0
+        return traj_mask_frame
+    cutoff_frame = token_start_frame(int(active_end_token) + horizon_tokens, frames_per_token)
     if cutoff_frame < T_frame:
         traj_mask_frame[..., cutoff_frame:] = 0
     return traj_mask_frame

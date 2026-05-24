@@ -218,6 +218,26 @@ def test_partial_mask_still_returns_embedding():
     assert out is not None and out.shape == (B, seq_len, 16)
 
 
+def test_invalid_token_embeddings_zeroed_post_encoder():
+    """B-P0-1: tokens whose covered frames are ALL masked get a zero embedding
+    (not the encoder-bias nonzero), so masked/out-of-horizon tokens carry no
+    traj signal."""
+    from utils.token_frame import frames_to_token_mask
+
+    le, te = _encoders(7)
+    B, seq_len, D = 1, 8, 7
+    T_frame = num_frames_for_tokens(seq_len)
+    mask = torch.zeros(B, T_frame)
+    mask[:, :17] = 1.0   # frames [0,17) valid → tokens 0..4 valid, 5..7 invalid
+    x = {"traj_features": torch.randn(B, T_frame, D), "traj_cond_mask": mask}
+    out = encode_traj_batch(x, seq_len, "cpu", le, te)
+    tmask = frames_to_token_mask(mask, seq_len)[0]   # [seq_len]
+    invalid = tmask == 0
+    assert invalid.any()
+    assert torch.count_nonzero(out[0][invalid]) == 0       # masked tokens → exactly 0
+    assert torch.count_nonzero(out[0][~invalid]) > 0       # valid tokens → nonzero
+
+
 def test_encode_traj_batch_rejects_token_level_input():
     """Token-level parallel path is disabled: shape[1]==seq_len (seq_len>1)
     means pre-tokenized data was mis-fed → raise."""

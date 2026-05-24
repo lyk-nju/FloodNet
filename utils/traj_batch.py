@@ -162,6 +162,7 @@ def encode_traj_batch(
             if sf < tf:
                 mask_frame[:, sf:ef] = tm[:, k:k + 1].expand(-1, ef - sf)
 
+    token_mask_from_frame = None
     if mask_frame is not None or horizon_tokens is not None:
         tf = feats_frame.shape[1]
         if mask_frame is None:
@@ -187,6 +188,13 @@ def encode_traj_batch(
         if not bool(mask_frame[:, :tf].any()):
             return None
         feats_frame = feats_frame * mask_frame[:, :tf].unsqueeze(-1).to(dtype=feats_frame.dtype)
+        # B-P0-1: aggregate the (horizon-applied) frame mask to token level so we
+        # can zero invalid TOKEN embeddings after the encoder — zeroing the input
+        # frames is not enough because LocalTrajEncoder/TrajEncoder have bias and
+        # re-emit a nonzero embedding for an all-zero token.
+        from utils.token_frame import frames_to_token_mask
+        token_mask_from_frame = frames_to_token_mask(
+            mask_frame[:, :tf], seq_len, frames_per_token)
 
     # --- frame → token grouping ---
     # T_B_07: frame-level is the only supported external entry. The old
@@ -211,7 +219,12 @@ def encode_traj_batch(
             tm = torch.cat([tm, pad], dim=1)
         feats_tok = feats_tok * tm[:, :seq_len].unsqueeze(-1).to(dtype=feats_tok.dtype)
 
-    return traj_encoder(feats_tok)
+    traj_emb = traj_encoder(feats_tok)
+    # B-P0-1: zero invalid token embeddings (frame-derived token mask) so masked /
+    # out-of-horizon / overflow tokens carry no traj signal post-bias.
+    if token_mask_from_frame is not None:
+        traj_emb = traj_emb * token_mask_from_frame[..., None].to(traj_emb.dtype)
+    return traj_emb
 
 
 def build_traj_emb(

@@ -85,6 +85,16 @@ def test_mask_unchanged_when_cutoff_beyond_length():
     assert mask.all()   # cutoff_frame far beyond 50
 
 
+def test_per_sample_active_end_cutoffs():
+    """B-P0-2: a per-sample [B] active_end cuts each sample at its own
+    token_start_frame(active_end+horizon), not a shared clip-start cutoff."""
+    mask = torch.ones(2, 200)
+    active_end = torch.tensor([0, 5])    # → cutoffs token_start_frame(20)=77, (25)=97
+    apply_horizon_mask_tokens(mask, active_end, horizon_tokens=20)
+    assert mask[0, :77].all() and not mask[0, 77:].any()
+    assert mask[1, :97].all() and not mask[1, 97:].any()
+
+
 # ---------------------------------------------------------------------------
 # sample_random_horizon_tokens (T_B_04 #3 + bands)
 # ---------------------------------------------------------------------------
@@ -148,15 +158,19 @@ def test_encode_traj_batch_applies_horizon_truncation():
     H = 4
     cutoff = token_start_frame(H)   # active_end=0, horizon=4 → 13
 
-    feats_manual = feats.clone()
-    feats_manual[:, cutoff:] = 0    # equivalent of the horizon frame mask
+    # Equivalent of the horizon: a frame mask that zeros frames >= cutoff. This
+    # goes through the SAME frame-zero + token-embedding zeroing (B-P0-1) path as
+    # horizon_tokens, so the two must match.
+    manual_mask = torch.ones(B, T_frame)
+    manual_mask[:, cutoff:] = 0
 
     with torch.no_grad():
         o_h = encode_traj_batch({"traj_features": feats.clone()}, seq_len, "cpu",
                                 le, te, horizon_tokens=H)
-        o_m = encode_traj_batch({"traj_features": feats_manual}, seq_len, "cpu", le, te)
+        o_m = encode_traj_batch({"traj_features": feats.clone(), "traj_cond_mask": manual_mask},
+                                seq_len, "cpu", le, te)
         o_full = encode_traj_batch({"traj_features": feats.clone()}, seq_len, "cpu", le, te)
 
     assert o_h.shape == (B, seq_len, 16)
-    assert torch.allclose(o_h, o_m, atol=1e-5)        # horizon == manual frame-zero
+    assert torch.allclose(o_h, o_m, atol=1e-5)        # horizon == manual frame mask
     assert not torch.allclose(o_h, o_full, atol=1e-4)  # horizon actually masked

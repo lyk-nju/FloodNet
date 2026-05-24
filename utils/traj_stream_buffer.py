@@ -163,8 +163,12 @@ class TrajStreamBuffer:
             traj_plan_local, plan.anchor_world_xz, plan.anchor_world_yaw)
 
         # Step 5: world → body-window-local (body_anchor_state, NOT head_state).
-        traj_body_local = canonicalize_7d(
-            traj_world, body_anchor_state.world_xz, body_anchor_state.world_yaw)
+        # P1-1: defensively cast the anchor pose to the buffer device/dtype — the
+        # InferenceGlueState contract leaves casting to the caller, and a legacy
+        # buffer (no device/dtype passed) defaults to CPU → CUDA mismatch.
+        anchor_xz = body_anchor_state.world_xz.to(device=self._device, dtype=self._dtype)
+        anchor_yaw = body_anchor_state.world_yaw.to(device=self._device, dtype=self._dtype)
+        traj_body_local = canonicalize_7d(traj_world, anchor_xz, anchor_yaw)
 
         return traj_body_local, traj_mask_frame
 
