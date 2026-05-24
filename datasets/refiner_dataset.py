@@ -201,7 +201,21 @@ class RefinerDataset(Dataset):
                 raise ValueError("normalize=True requires stats_dir")
             self._load_stats(Path(stats_dir))
 
+        self._seed = seed
         self._rng = random_module.Random(seed) if seed is not None else random_module.Random()
+
+    def set_worker_seed(self) -> None:
+        """P1-3: reseed this worker's augmentation RNG to a per-worker-unique
+        value. Without this, fork()ed DataLoader workers inherit one identical
+        `random.Random` state (it's a Python RNG, NOT auto-seeded per worker like
+        torch's), so path-trim / sparse augmentation correlates across workers.
+        torch.initial_seed() is set distinctly per worker by the DataLoader, so we
+        derive from it (combined with the dataset's base seed when fixed).
+        """
+        base = int(torch.initial_seed()) % (2 ** 31)
+        if self._seed is not None:
+            base = (base + int(self._seed)) % (2 ** 31)
+        self._rng = random_module.Random(base)
 
     # ------------------------------------------------------------------
     # Public API
@@ -514,4 +528,12 @@ class RefinerDataset(Dataset):
         }
 
 
-__all__ = ["RefinerDataset"]
+def refiner_worker_init_fn(worker_id: int) -> None:
+    """DataLoader worker_init_fn: give each worker a distinct augmentation RNG
+    (P1-3). Pass to DataLoader(worker_init_fn=refiner_worker_init_fn)."""
+    info = torch.utils.data.get_worker_info()
+    if info is not None and hasattr(info.dataset, "set_worker_seed"):
+        info.dataset.set_worker_seed()
+
+
+__all__ = ["RefinerDataset", "refiner_worker_init_fn"]

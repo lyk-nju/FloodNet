@@ -240,6 +240,24 @@ def _load_cfg(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def path_aug_kwargs(cfg: dict) -> dict:
+    """Map cfg.path_aug → RefinerDataset path-augmentation kwargs (P1-2).
+
+    Absent keys are omitted so the dataset's own defaults apply.
+    """
+    aug = cfg.get("path_aug", {}) or {}
+    kwargs = {}
+    if "trim_prob" in aug:
+        kwargs["path_trim_prob"] = float(aug["trim_prob"])
+    if "trim_max_frames" in aug:
+        kwargs["path_trim_max_frames"] = int(aug["trim_max_frames"])
+    if "sparse_prob" in aug:
+        kwargs["path_sparse_prob"] = float(aug["sparse_prob"])
+    if "sparse_range" in aug:
+        kwargs["path_sparse_range"] = tuple(aug["sparse_range"])
+    return kwargs
+
+
 def _build_one_dataset(cfg: dict, split_file: str, *, seed: int | None = None):
     """Build a single RefinerDataset for a given split using the real loader."""
     from datasets.refiner_dataset import RefinerDataset
@@ -265,6 +283,9 @@ def _build_one_dataset(cfg: dict, split_file: str, *, seed: int | None = None):
         text_path=data_cfg.get("text_path"),
     )
     model_cfg = cfg["model"]
+    # P1-2: path-augmentation params from config (so R0-R4 ablations are
+    # reproducible). Fall back to the dataset defaults when absent.
+    aug_kwargs = path_aug_kwargs(cfg)
     return RefinerDataset(
         clips,
         n_hist=model_cfg["n_hist"],
@@ -276,6 +297,7 @@ def _build_one_dataset(cfg: dict, split_file: str, *, seed: int | None = None):
         normalize=normalize,
         stats_dir=stats_dir if normalize else None,
         seed=seed,
+        **aug_kwargs,
     )
 
 
@@ -323,6 +345,7 @@ def main(argv=None):
     max_steps = args.max_steps if args.max_steps is not None else train_cfg.get("total_steps", 100000)
 
     train_ds, val_ds = build_datasets(cfg)
+    from datasets.refiner_dataset import refiner_worker_init_fn
     train_loader = DataLoader(
         train_ds,
         batch_size=train_cfg.get("batch_size", 64),
@@ -330,6 +353,7 @@ def main(argv=None):
         num_workers=train_cfg.get("num_workers", 4),
         collate_fn=refiner_collate,
         drop_last=True,
+        worker_init_fn=refiner_worker_init_fn,   # P1-3: distinct aug RNG per worker
     )
     # Build a val loader when a val split is configured, so the module's
     # validation_step actually runs (review finding: previously only the train

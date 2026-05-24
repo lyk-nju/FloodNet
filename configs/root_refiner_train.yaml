@@ -70,3 +70,10 @@ data:
   text_path: texts
   normalize: true             # real training: z-score on (P2-1); stats_dir must exist
   stats_dir: deps/refiner_stats
+
+# P1-2: path-augmentation params (maps to RefinerDataset path_trim_*/path_sparse_*).
+path_aug:
+  trim_prob: 0.3
+  trim_max_frames: 10
+  sparse_prob: 0.5
+  sparse_range: [3, 8]

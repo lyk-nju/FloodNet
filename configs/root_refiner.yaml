@@ -88,3 +88,11 @@ data:
   # stats_dir; set true for real training. If true, stats_dir must exist.
   normalize: false
   stats_dir: deps/refiner_stats
+
+# P1-2: path-augmentation params (maps to RefinerDataset path_trim_*/path_sparse_*).
+# Exposed here so R0-R4 ablations are reproducible; absent keys use dataset defaults.
+path_aug:
+  trim_prob: 0.3
+  trim_max_frames: 10
+  sparse_prob: 0.5
+  sparse_range: [3, 8]

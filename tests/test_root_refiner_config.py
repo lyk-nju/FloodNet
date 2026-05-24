@@ -46,6 +46,14 @@ def test_train_config_is_real_precomputed_t5():
     assert cfg["data"]["normalize"] is True        # real training z-scores (P2-1)
 
 
+def test_path_aug_block_present_in_both_configs():
+    for path in (CFG_PATH, TRAIN_CFG_PATH):
+        cfg = _load(path)
+        aug = cfg["path_aug"]
+        for k in ("trim_prob", "trim_max_frames", "sparse_prob", "sparse_range"):
+            assert k in aug, f"{path.name} missing path_aug.{k}"
+
+
 def test_model_block_required_keys_and_values():
     cfg = _load()
     model = cfg["model"]
