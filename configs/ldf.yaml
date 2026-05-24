@@ -105,8 +105,16 @@ data:
     train_bs: 8
     val_bs: 32
     test_bs: 4
-    num_workers: 4 
+    num_workers: 4
     mask_ratio: 1.0
+
+    # T_B_10 7D-switch flag (must AGREE with model.params.traj_encoder_in_dim).
+    # 4 = legacy 4D path (default, unchanged). To run the 7D fine-tune set BOTH
+    # this and model.params.traj_encoder_in_dim to 7 (a mismatch raises at startup
+    # via utils.training.validate_traj_dim_consistency). When 7, the dataset emits
+    # world-frame traj_cond_7d and the SF rollout does body-window canonicalize
+    # (T_B_05) + body aux loss (T_B_06); old 4D ckpts load via the T_B_08 hook.
+    traj_feat_dim: 4
 
     train_meta_paths:
         # - ${dirs.raw_data}/HumanML3D/train.txt
@@ -143,7 +151,9 @@ model:
         noise_steps: 10
         freeze_backbone: true
 
-        # Trajectory condition encoder (used by ControlNet)
+        # Trajectory condition encoder (used by ControlNet).
+        # T_B_10 7D switch: 4 = legacy (default). Set to 7 (together with
+        # data.traj_feat_dim: 7) for the 7D fine-tune; the two MUST agree.
         traj_encoder_in_dim: 4
         traj_out_dim: 64
         traj_dropout: 0.1
