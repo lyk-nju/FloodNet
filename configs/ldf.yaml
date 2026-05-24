@@ -210,10 +210,11 @@ anchor_canonicalize:
 # T_B_04: random horizon simulation (design.md §2.2.2/§2.2.3). Units are all
 # token-level. Truncates how many future tokens traj_cond exposes during
 # training, ramping toward the fixed inference horizon late in training.
-# NOTE: the horizon-mask hook into the traj-conditioning path is not yet wired
-# (model lacks cfg/global_step access + traj_mask_frame is internal to
-# encode_traj_batch); the schedule/mask functions live in
-# utils/training/horizon_sched.py and are unit-tested. See TODO T_B_04 status.
+# WIRED (v1): SelfForcingTrainer._run_rollout computes the horizon in the outer
+# loop and passes it through _prepare_traj_condition → _build_traj_emb →
+# encode_traj_batch, which zeroes the frame-level traj mask past the cutoff.
+# v1 uses active_end_token=0 (horizon measured from clip start); per-sample
+# active end is a future refinement. Only active for the 7D traj path.
 horizon_sim:
     enabled: true
     unit: token
@@ -234,6 +235,10 @@ history_corruption:
     alpha_mask: 0.3             # fraction of focus tokens replaced by mask_emb
     alpha_noisy: 0.3            # fraction of focus tokens with additive N(0,(sigma·z_std)^2)
     noise_sigma_factor: 0.05    # noise sigma = noise_sigma_factor * z_std
+    # B-P0-1: dir with z_mean.npy / z_std.npy (scripts/compute_z_stats.py output).
+    # null → WanModel keeps z_std=1 (corruption noise uncalibrated). Set for the
+    # 7D fine-tune so the noisy branch uses the real cached-z per-channel sigma.
+    z_stats_dir: null
     curriculum:
         enabled: true
         early_prob: 0.2         # progress < 1/3

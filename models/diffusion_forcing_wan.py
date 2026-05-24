@@ -296,6 +296,13 @@ class DiffForcingWanModel(nn.Module):
                 p.requires_grad = True
             for p in self.traj_encoder.parameters():
                 p.requires_grad = True
+            for p in self.local_traj_encoder.parameters():
+                p.requires_grad = True
+            # B-P0-2: mask_emb is the LEARNABLE history-corruption replacement
+            # embedding (T_B_02/T_B_03); it lives inside self.model so the freeze
+            # loop above froze it. Keep it trainable for the 7D fine-tune.
+            if hasattr(self.model, "mask_emb"):
+                self.model.mask_emb.requires_grad_(True)
 
     def load_state_dict(self, state_dict, strict=True):
         """Backward-compatible load: when loading an older ckpt (strict=True)

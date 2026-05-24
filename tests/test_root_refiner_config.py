@@ -54,6 +54,21 @@ def test_path_aug_block_present_in_both_configs():
             assert k in aug, f"{path.name} missing path_aug.{k}"
 
 
+def test_A_P0_1_train_config_interpolation_resolves():
+    """A-P0-1: ${data.raw_data_dir} in root_refiner_train.yaml must resolve to a
+    real (no '${') path via resolve_cfg_interpolations (train uses yaml.safe_load
+    which would otherwise pass the literal to the text encoder)."""
+    from train_refiner import resolve_cfg_interpolations
+
+    raw = _load(TRAIN_CFG_PATH)
+    assert "${" in raw["text_encoder"]["precomputed_text_emb_path"]   # literal pre-resolve
+    resolved = resolve_cfg_interpolations(raw)
+    path = resolved["text_encoder"]["precomputed_text_emb_path"]
+    assert "${" not in path
+    assert path.startswith(resolved["data"]["raw_data_dir"])
+    assert path.endswith("HumanML3D/t5_text_embeddings.pt")
+
+
 def test_model_block_required_keys_and_values():
     cfg = _load()
     model = cfg["model"]

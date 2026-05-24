@@ -240,6 +240,17 @@ def _load_cfg(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def resolve_cfg_interpolations(cfg: dict) -> dict:
+    """Resolve OmegaConf-style ${...} interpolations in a plain config dict
+    (A-P0-1). yaml.safe_load leaves e.g. precomputed_text_emb_path as the literal
+    '${data.raw_data_dir}/...'; this substitutes against the cfg's own values.
+    Call AFTER any CLI overrides so the resolved paths use the final values.
+    """
+    from omegaconf import OmegaConf
+
+    return OmegaConf.to_container(OmegaConf.create(cfg), resolve=True)
+
+
 def path_aug_kwargs(cfg: dict) -> dict:
     """Map cfg.path_aug → RefinerDataset path-augmentation kwargs (P1-2).
 
@@ -341,6 +352,9 @@ def main(argv=None):
         cfg["data"]["stats_dir"] = args.stats_dir
     if args.normalize is not None:
         cfg["data"]["normalize"] = (args.normalize == "true")
+    # A-P0-1: resolve ${data.raw_data_dir} etc. AFTER overrides so e.g.
+    # text_encoder.precomputed_text_emb_path becomes a real path.
+    cfg = resolve_cfg_interpolations(cfg)
     train_cfg = cfg.get("training", {})
     max_steps = args.max_steps if args.max_steps is not None else train_cfg.get("total_steps", 100000)
 

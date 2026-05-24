@@ -273,8 +273,13 @@ def main(argv=None):
     from datasets.refiner_dataset import RefinerDataset
     from scripts.compute_5d_stats import load_clips_from_dir
 
+    from train_refiner import resolve_cfg_interpolations
+
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+    # A-P0-1: resolve ${data.raw_data_dir} etc. (the model cfg comes from the
+    # ckpt's saved hparams, which train_refiner already resolved).
+    cfg = resolve_cfg_interpolations(cfg)
 
     model, text_encoder = _load_model_from_ckpt(args.ckpt, args.device)
 

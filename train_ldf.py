@@ -89,6 +89,14 @@ class CustomLightningModule(BasicLightningModule):
         self._sf_trainer = (
             SelfForcingTrainer(self) if self_forcing_enabled else None
         )
+        # B-P0-1: load the cached-z latent stats into WanModel so history
+        # corruption's noisy branch uses the real per-channel sigma
+        # (noise_sigma = noise_sigma_factor * z_std), not the default z_std=1.
+        z_stats_dir = (cfg.get("history_corruption", {}) or {}).get("z_stats_dir")
+        inner = getattr(getattr(self, "model", None), "model", None)
+        if z_stats_dir and hasattr(inner, "load_z_stats"):
+            inner.load_z_stats(z_stats_dir)
+            rank_zero_info(f"[z_stats] loaded cached-z stats from {z_stats_dir}")
 
     def _log_step_metrics(
         self, loss_dict, optimizer, net_start_time, extra_metrics=None, lr_value=None

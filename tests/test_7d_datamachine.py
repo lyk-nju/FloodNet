@@ -20,44 +20,63 @@ fine-tune; see docs/TODO.md T_B_11):
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 _CFG_PATH = "configs/ldf.yaml"
 
 
-def _load_cfg_and_data_root():
-    """Return (cfg, first_train_meta_path) or (None, None) if unavailable."""
+def _resolve_raw_data_dir() -> str | None:
+    """B-P1-1: locate the HumanML3D data root. Priority:
+      1. $FLOODNET_RAW_DATA_DIR (override on any machine);
+      2. the config's resolved dirs.raw_data.
+    Returns None if neither yields an existing HumanML3D/train.txt.
+    """
+    candidates = []
+    env = os.environ.get("FLOODNET_RAW_DATA_DIR")
+    if env:
+        candidates.append(env)
     try:
         from utils.initialize import Config
 
-        cfg = Config(_CFG_PATH).config
-        meta = cfg.data.train_meta_paths[0]   # resolves ${dirs.raw_data}
-        return cfg, str(meta)
+        candidates.append(str(Config(_CFG_PATH).config.dirs.raw_data))
     except Exception:
-        return None, None
+        pass
+    for root in candidates:
+        if os.path.exists(os.path.join(root, "HumanML3D", "train.txt")):
+            return root
+    return None
 
 
-_CFG, _META = _load_cfg_and_data_root()
-
-
-def _data_present() -> bool:
-    import os
-    return _META is not None and os.path.exists(_META)
-
+_RAW_DIR = _resolve_raw_data_dir()
 
 pytestmark = pytest.mark.skipif(
-    not _data_present(), reason="HumanML3D data dir absent (run on the data machine)"
+    _RAW_DIR is None,
+    reason="HumanML3D data absent (set FLOODNET_RAW_DATA_DIR; run on data machine)",
 )
 
 
-def test_7d_dataset_emits_traj_cond_7d():
+def _make_cfg(traj_feat_dim: int):
+    """Build a resolved ldf cfg pinned to <raw_dir>/HumanML3D/{train,val}.txt
+    (NOT the config's train_difficult.txt, which may not exist on this host)."""
     from omegaconf import OmegaConf
 
+    from utils.initialize import Config
+
+    cfg = OmegaConf.create(OmegaConf.to_container(Config(_CFG_PATH).config, resolve=True))
+    hml = os.path.join(_RAW_DIR, "HumanML3D")
+    OmegaConf.update(cfg, "dirs.raw_data", _RAW_DIR)
+    OmegaConf.update(cfg, "data.train_meta_paths", [os.path.join(hml, "train.txt")])
+    OmegaConf.update(cfg, "data.val_meta_paths", [os.path.join(hml, "val.txt")])
+    OmegaConf.update(cfg, "data.traj_feat_dim", traj_feat_dim)
+    return cfg
+
+
+def test_7d_dataset_emits_traj_cond_7d():
     from datasets.humanml3d import HumanML3DDataset
 
-    cfg = OmegaConf.create(OmegaConf.to_container(_CFG, resolve=True))
-    OmegaConf.update(cfg, "data.traj_feat_dim", 7)
-    ds = HumanML3DDataset(cfg, split="train")
+    ds = HumanML3DDataset(_make_cfg(7), split="train")
     assert len(ds) > 0
     item = ds[0]
     assert "traj_cond_7d" in item, "7D dataset must emit traj_cond_7d"
@@ -69,13 +88,9 @@ def test_7d_dataset_emits_traj_cond_7d():
 
 
 def test_4d_default_dataset_has_no_traj_cond_7d():
-    from omegaconf import OmegaConf
-
     from datasets.humanml3d import HumanML3DDataset
 
-    cfg = OmegaConf.create(OmegaConf.to_container(_CFG, resolve=True))
-    OmegaConf.update(cfg, "data.traj_feat_dim", 4)   # legacy default
-    ds = HumanML3DDataset(cfg, split="train")
+    ds = HumanML3DDataset(_make_cfg(4), split="train")
     item = ds[0]
     assert "traj_cond_7d" not in item            # 4D path unchanged
     assert "traj_features" in item               # legacy 4D feature still emitted
