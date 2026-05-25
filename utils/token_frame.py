@@ -88,6 +88,20 @@ def frame_idx_to_token_idx(frame_idx: int, frames_per_token: int = FRAMES_PER_TO
     return (frame_idx - 1) // frames_per_token + 1
 
 
+def num_tokens_for_frame_len(frame_len: int, frames_per_token: int = FRAMES_PER_TOKEN_DEFAULT) -> int:
+    """Number of causal-VAE tokens whose PREFIX `[0, num_tokens)` covers a
+    `frame_len`-frame prefix — the inverse of `num_frames_for_tokens`.
+
+    `frame_len <= 0 → 0`; otherwise `frame_idx_to_token_idx(frame_len - 1) + 1`
+    (the token covering the last frame, plus one). Use this instead of hand-rolled
+    `(L + 2) // 4 + 1`-style formulas. The tensor path in
+    DiffForcingWanModel._get_traj_seq_lens mirrors this elementwise.
+    """
+    if frame_len <= 0:
+        return 0
+    return frame_idx_to_token_idx(frame_len - 1, frames_per_token) + 1
+
+
 def token_range_to_frame_slice(start_token_idx: int, num_tokens: int,
                                 frames_per_token: int = FRAMES_PER_TOKEN_DEFAULT) -> slice:
     """Map an arbitrary token range `[start, start+num_tokens)` → frame slice.
@@ -164,36 +178,39 @@ def frames_to_token_mask(mask_frame, num_tokens: int,
 
 def prefix_len_from_tail_invalid(token_mask):
     """Per-sample valid-token PREFIX length, but ONLY when the invalid region is
-    a pure suffix (B-P0-1 follow-up scaffold — NOT yet wired into the model).
+    a pure suffix. Wired into DiffForcingWanModel._get_traj_seq_lens (B-P0-1) to
+    truncate ControlNet attention past an out-of-horizon / overflow tail.
 
     `token_mask`: [B, T] (1 = valid). Returns LongTensor [B]:
       - tail-invalid (e.g. [1,1,1,1,0,0,0]) → prefix length 4 (safe to truncate
-        traj_seq_lens, attention then ignores the out-of-horizon/overflow tail);
+        traj_seq_lens; attention then ignores the out-of-horizon/overflow tail);
       - middle hole (e.g. [1,1,0,1,1,0,0]) → full T (a hole is NOT expressible as
         a single prefix length; truncating would wrongly drop later valid tokens —
         these stay handled by the per-token embedding zeroing, not by seq_lens);
       - all-invalid → 0; all-valid → T.
 
-    ⚠ This is the SEMANTICS for a future mask-aware _get_traj_seq_lens. Wiring it
-    into ControlNet attention needs a model-forward residual test (mask=0 tail
-    value-invariance) + a sparse-middle-hole non-regression check, so it is left
-    for the runtime box; do NOT route it through the main path blindly.
+    Fully vectorized (no per-sample Python loop / host sync): a row is a pure
+    valid-prefix iff its valid count equals the index of its first invalid token.
     """
     import torch
 
     valid = token_mask > 0
     B, T = valid.shape
-    out = torch.empty(B, dtype=torch.long, device=valid.device)
-    for b in range(B):
-        row = valid[b]
-        invalid = (~row).nonzero(as_tuple=True)[0]
-        if invalid.numel() == 0:
-            out[b] = T                      # all valid
-        elif not bool(row[int(invalid[0]):].any()):
-            out[b] = int(invalid[0])        # pure tail-invalid → prefix length
-        else:
-            out[b] = T                      # middle hole → not a prefix; don't truncate
-    return out
+    invalid = ~valid
+    has_invalid = invalid.any(dim=1)
+    # Index of the first invalid token (0 when the row is all-valid; the
+    # has_invalid mask below replaces those with T).
+    first_invalid = torch.argmax(invalid.to(torch.int8), dim=1)
+    prefix_len = torch.where(
+        has_invalid, first_invalid, torch.full_like(first_invalid, T)
+    )
+    num_valid = valid.sum(dim=1)
+    # Pure valid-prefix ⇔ every valid token is before the first invalid one
+    # (num_valid == first_invalid); a middle hole has num_valid > first_invalid.
+    pure_prefix = num_valid == prefix_len
+    return torch.where(
+        pure_prefix, prefix_len, torch.full_like(prefix_len, T)
+    ).to(torch.long)
 
 
 __all__ = [
@@ -201,6 +218,7 @@ __all__ = [
     "token_start_frame",
     "token_end_frame",
     "num_frames_for_tokens",
+    "num_tokens_for_frame_len",
     "frame_idx_to_token_idx",
     "token_range_to_frame_slice",
     "token_active_window_left_frame",

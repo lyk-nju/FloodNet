@@ -11,6 +11,7 @@ from utils.token_frame import (
     FRAMES_PER_TOKEN_DEFAULT,
     frame_idx_to_token_idx,
     num_frames_for_tokens,
+    num_tokens_for_frame_len,
     prefix_len_from_tail_invalid,
     token_active_window_left_frame,
     token_body_window_left_frame,
@@ -239,3 +240,43 @@ def test_body_window_left_frame_distinct_from_active_window():
 
 def test_default_frames_per_token_is_4():
     assert FRAMES_PER_TOKEN_DEFAULT == 4
+
+
+# ---------------------------------------------------------------------------
+# num_tokens_for_frame_len (L3: inverse of num_frames_for_tokens)
+# ---------------------------------------------------------------------------
+
+
+def test_num_tokens_for_frame_len_round_trips():
+    """Inverse of num_frames_for_tokens on every prefix length."""
+    for n in range(1, 50):
+        assert num_tokens_for_frame_len(num_frames_for_tokens(n)) == n
+
+
+def test_num_tokens_for_frame_len_edges():
+    assert num_tokens_for_frame_len(0) == 0
+    assert num_tokens_for_frame_len(-3) == 0
+    assert num_tokens_for_frame_len(1) == 1          # token 0 (1 frame)
+    assert num_tokens_for_frame_len(2) == 2          # spills into token 1
+    assert num_tokens_for_frame_len(5) == 2          # token 1 ends at frame 4
+    assert num_tokens_for_frame_len(6) == 3
+    assert num_tokens_for_frame_len(77) == 20
+
+
+def test_num_tokens_for_frame_len_matches_frame_idx():
+    """Definition lock-in: = frame_idx_to_token_idx(L-1)+1 for L>=1."""
+    for L in range(1, 200):
+        assert num_tokens_for_frame_len(L) == frame_idx_to_token_idx(L - 1) + 1
+
+
+def test_prefix_len_vectorized_semantics():
+    """L2: vectorized prefix_len_from_tail_invalid — tail-invalid truncates,
+    middle hole keeps full, all-invalid→0, all-valid→T."""
+    tm = torch.tensor(
+        [[1, 1, 1, 1, 0, 0, 0],   # pure tail → 4
+         [1, 1, 0, 1, 1, 0, 0],   # middle hole → full 7
+         [0, 0, 0, 0, 0, 0, 0],   # all invalid → 0
+         [1, 1, 1, 1, 1, 1, 1]],  # all valid → 7
+        dtype=torch.float32,
+    )
+    assert prefix_len_from_tail_invalid(tm).tolist() == [4, 7, 0, 7]

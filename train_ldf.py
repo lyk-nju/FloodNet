@@ -285,17 +285,23 @@ class CustomLightningModule(BasicLightningModule):
         # NOTE: Set to empty lists (not pop) so Lightning passes "key exists"
         # check but restores nothing, letting opt/sched follow current config.
         reset_optim_on_resume = bool(self.cfg.get("resume_reset_optimizer", False))
-        if has_new_cond_params or reset_optim_on_resume:
+        # n_traj_exp>0 means traj-encoder params were reshaped 4D→7D, so the
+        # saved Adam moments are 4D-shaped and would shape-mismatch the now-7D
+        # params on the first optimizer.step(). Reset the optimizer in that case
+        # too (mirrors the EMA guard above) — don't rely on resume_reset_optimizer.
+        if has_new_cond_params or reset_optim_on_resume or n_traj_exp > 0:
             checkpoint["optimizer_states"] = []
             checkpoint["lr_schedulers"] = []
-            if has_new_cond_params and reset_optim_on_resume:
-                rank_zero_info(
-                    "Skip restoring optimizer/scheduler (new cond params + resume_reset_optimizer)"
-                )
-            elif has_new_cond_params:
-                rank_zero_info("Skip restoring optimizer/scheduler (new cond params)")
-            else:
-                rank_zero_info("Skip restoring optimizer/scheduler (resume_reset_optimizer)")
+            reasons = []
+            if has_new_cond_params:
+                reasons.append("new cond params")
+            if n_traj_exp > 0:
+                reasons.append("traj 4D->7D expand")
+            if reset_optim_on_resume:
+                reasons.append("resume_reset_optimizer")
+            rank_zero_info(
+                f"Skip restoring optimizer/scheduler ({', '.join(reasons)})"
+            )
         check_state_dict(
             state_dict=self.model.state_dict(),
             named_parameters=self.model.named_parameters(),

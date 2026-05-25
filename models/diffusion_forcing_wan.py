@@ -470,7 +470,13 @@ class DiffForcingWanModel(nn.Module):
             base = x["traj_features_length"].to(device=device, dtype=torch.long).clamp(min=0, max=seq_len)
         elif "traj_length" in x and x["traj_length"] is not None:
             tl = x["traj_length"].to(device=device, dtype=torch.long)
-            base = ((tl + 2) // 4 + 1).clamp(min=0, max=seq_len)
+            # Vectorized mirror of token_frame.num_tokens_for_frame_len
+            # (= frame_idx_to_token_idx(tl-1)+1): 0 for tl<=0, 1 for tl==1,
+            # (tl-2)//4 + 2 for tl>=2. Replaces the old opaque (tl+2)//4+1.
+            tokens = torch.where(
+                tl <= 1, tl.clamp(min=0, max=1), (tl - 2) // 4 + 2,
+            )
+            base = tokens.clamp(min=0, max=seq_len)
         if base is None:
             return None
 
