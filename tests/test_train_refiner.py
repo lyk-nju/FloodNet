@@ -239,9 +239,8 @@ def test_num_token_soft_term_present_and_differentiable():
     losses = module._compute_loss(module(batch), batch)
     assert "num_token_soft" in losses and "num_token_soft_mae" in losses
     assert torch.isfinite(losses["num_token_soft"]).all()
-    assert "num_token_soft" in RefinerLightningModule.METRIC_KEYS or True  # it's a loss term
-    assert "num_token_soft" not in RefinerLightningModule.METRIC_KEYS      # weighted, not metric
-    assert "num_token_soft_mae" in RefinerLightningModule.METRIC_KEYS      # logged-only
+    assert "num_token_soft" not in RefinerLightningModule.METRIC_KEYS      # weighted loss term
+    assert "num_token_soft_mae" in RefinerLightningModule.METRIC_KEYS      # logged-only metric
     losses["num_token_soft"].backward()
     assert module.refiner.num_token_head.weight.grad is not None
 

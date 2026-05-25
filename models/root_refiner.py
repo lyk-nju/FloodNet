@@ -202,11 +202,20 @@ class RootRefiner(nn.Module):
         token_seq = torch.cat([chosen_tok, cond_hidden, plan_q], dim=1)
 
         ar = torch.arange(self.max_tokens, device=device)
-        token_query_pad = ~(ar.unsqueeze(0) < chosen_num_tokens.unsqueeze(1))    # [B,max_tokens]
+        token_valid = ar.unsqueeze(0) < chosen_num_tokens.unsqueeze(1)           # [B,max_tokens]
+        token_query_pad = ~token_valid
         chosen_pad = torch.zeros(B, 1, dtype=torch.bool, device=device)
         token_pad = torch.cat([chosen_pad, cond_pad, token_query_pad], dim=1)
         token_hidden = self.token_transformer(token_seq, src_key_padding_mask=token_pad)
         plan_token_hidden = token_hidden[:, -self.max_tokens:]                   # [B,max_tokens,D]
+
+        # Zero the hiddens of plan tokens PAST the chosen horizon. Attention only
+        # key-masks them (others can't read them) but the transformer still emits a
+        # (garbage, input-dependent) hidden for those query positions; the frame
+        # decoder's Conv1d(kernel=3) would then mix that tail into the boundary
+        # VALID waypoints. Zeroing here makes valid frames a clean function of the
+        # valid token hiddens + deterministic zero padding only.
+        plan_token_hidden = plan_token_hidden * token_valid.unsqueeze(-1).to(plan_token_hidden.dtype)
 
         # ---- Stage 3: token → frame decode + causal trim + heading norm ----
         dense = self.frame_decoder(plan_token_hidden)        # [B, max_tokens*fpt, 7]

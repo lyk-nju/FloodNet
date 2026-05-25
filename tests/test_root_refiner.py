@@ -82,6 +82,25 @@ def test_pred_num_tokens_in_range():
     assert int(pnt.max()) <= model.max_tokens
 
 
+def test_invalid_tail_token_hidden_zeroed_before_decoder():
+    """Plan tokens past chosen_num_tokens must be ZEROED before the Conv1d frame
+    decoder — otherwise the conv (kernel 3) mixes their garbage hiddens into the
+    boundary VALID waypoints (cross-token leak)."""
+    model = RootRefiner(d_model=64, n_layers=2, n_heads=4, ff_dim=128,
+                          max_tokens=8, min_tokens=2)
+    model.train()
+    captured = {}
+    model.frame_decoder.register_forward_pre_hook(
+        lambda mod, args: captured.__setitem__("x", args[0].detach().clone())
+    )
+    nt = torch.tensor([3, 5])   # chosen horizons
+    model(**_make_inputs(model, B=2), num_tokens=nt)
+    x = captured["x"]           # [2, max_tokens, D] = plan_token_hidden fed to decoder
+    for b, n in enumerate(nt.tolist()):
+        assert torch.count_nonzero(x[b, n:]) == 0, f"sample {b}: tail (>= {n}) not zeroed"
+        assert torch.count_nonzero(x[b, :n]) > 0, f"sample {b}: valid head wrongly zeroed"
+
+
 # ---------------------------------------------------------------------------
 # T03-T05: attention masking
 # ---------------------------------------------------------------------------
