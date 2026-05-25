@@ -50,10 +50,10 @@ validation:                   # val + checkpoint cadence (mirrors ldf.yaml.valid
                               # a positive value would be coerced to -1.
 
 model:
-  d_model: 256
-  n_layers: 6                 # legacy total; split below when *_cond/_token absent
-  n_layers_cond: 3            # Stage-1 condition-only num-token predictor depth
-  n_layers_token: 3           # Stage-2 token-level plan generator depth
+  d_model: 512                # bumped for the path_cond decoder (≈30M total)
+  n_layers: 8                 # legacy total; split below when *_cond/_token absent
+  n_layers_cond: 4            # Stage-1 condition-only num-token predictor depth
+  n_layers_token: 4           # Stage-2 token-level plan generator depth
   n_heads: 8
   ff_dim: 1024
   dropout: 0.1
@@ -63,6 +63,14 @@ model:
   n_path: 64
   n_hist: 20
   text_emb_dim: 4096          # = precomputed T5 cache text_dim (P0-1)
+  # Stage-3 path-conditioned decoder (≈11M at width 512; total model ≈30M).
+  decoder_type: path_cond     # path_cond | simple
+  decoder_width: 512          # PathCondFrameDecoder hidden width
+  decoder_path_cond_dim: 6    # [path_x, path_z, tan_x, tan_z, horizon_prog, grid_prog]
+  decoder_token_res_depth: 2  # token-grid ResBlocks
+  decoder_frame_res_depth: 4  # frame-grid dilated ResBlocks (repeated path cond)
+  decoder_dilation_growth_rate: 2
+  decoder_dropout: 0.0
 
 canonicalization:
   mode: b_full

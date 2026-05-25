@@ -41,7 +41,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from utils.token_frame import num_frames_for_tokens
+from utils.token_frame import frame_idx_to_token_idx, num_frames_for_tokens
 
 
 def _make_encoder(d_model: int, n_heads: int, ff_dim: int, dropout: float,
@@ -53,11 +53,28 @@ def _make_encoder(d_model: int, n_heads: int, ff_dim: int, dropout: float,
     return nn.TransformerEncoder(layer, num_layers=n_layers)
 
 
-class TokenToFrameDecoder(nn.Module):
-    """Upsample token-level plan hiddens [B, N, D] → frame-level [B, N*fpt, out_dim].
+class ResBlock1D(nn.Module):
+    """Dilated 1D residual block: Conv(dilated)→GELU→[Dropout]→Conv → + residual."""
 
-    Conv1d → GELU → nearest-Upsample(×fpt) → Conv1d → GELU → Conv1d. Simple and
-    stable; the caller applies the causal trim + heading normalization.
+    def __init__(self, width: int, dilation: int = 1, dropout: float = 0.0):
+        super().__init__()
+        self.conv1 = nn.Conv1d(width, width, 3, padding=dilation, dilation=dilation)
+        self.conv2 = nn.Conv1d(width, width, 3, padding=1)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+    def forward(self, x: Tensor) -> Tensor:              # [B, width, T]
+        h = self.act(self.conv1(x))
+        h = self.drop(h)
+        h = self.conv2(h)
+        return x + h
+
+
+class TokenToFrameDecoder(nn.Module):
+    """Simple decoder: Conv→GELU→nearest-Upsample(×fpt)→Conv→GELU→Conv, then the
+    causal trim to effective frames. Returns [B, num_frames_for_tokens(N), out_dim]
+    (= 4N-3 for fpt=4) so it is interchangeable with PathCondFrameDecoder. Ignores
+    the path-conditioning kwargs (kept for a uniform decoder signature).
     """
 
     def __init__(self, d_model: int, out_dim: int = 7, frames_per_token: int = 4):
@@ -69,13 +86,119 @@ class TokenToFrameDecoder(nn.Module):
         self.conv_out = nn.Conv1d(d_model, out_dim, 3, padding=1)
         self.act = nn.GELU()
 
-    def forward(self, token_hidden: Tensor) -> Tensor:   # [B, N, D]
+    def forward(self, token_hidden: Tensor, *, xz_path=None, path_mask=None,
+                chosen_num_tokens=None) -> Tensor:       # [B, N, D]
         h = token_hidden.transpose(1, 2)                 # [B, D, N]
         h = self.act(self.conv_in(h))
         h = self.up(h)                                   # [B, D, N*fpt]
         h = self.act(self.conv_mid(h))
         h = self.conv_out(h)                             # [B, out_dim, N*fpt]
-        return h.transpose(1, 2)                         # [B, N*fpt, out_dim]
+        dense = h.transpose(1, 2)                        # [B, N*fpt, out_dim]
+        fpt = self.frames_per_token
+        # Causal trim: token0=1 effective frame, token k≥1=fpt frames → 4N-3 frames.
+        return torch.cat([dense[:, :1], dense[:, fpt:]], dim=1)
+
+
+class PathCondFrameDecoder(nn.Module):
+    """Path-conditioned root-trajectory decoder (replaces the blind upsampler).
+
+    Builds the EFFECTIVE causal frame grid directly (token 0 → 1 frame, token k≥1
+    → fpt frames; no upsample-then-trim, so no off-by-one), injects a dense
+    frame-level path condition repeatedly (added before each dilated frame
+    ResBlock), and outputs [B, num_frames_for_tokens(max_tokens), out_dim].
+
+    path_cond[t] (per frame, dim 6) = [path_x, path_z, tangent_x, tangent_z,
+    horizon_progress, grid_progress], built by interpolating the (anchor-local,
+    arclength-resampled) xz_path at the per-frame horizon progress. For samples
+    whose path is degenerate (path_mask valid points < 2) the whole path_cond is
+    zeroed so the decoder falls back to the token-latent plan.
+    """
+
+    def __init__(self, d_model: int, max_tokens: int, *, frames_per_token: int = 4,
+                 n_path: int = 64, width: int = 512, path_cond_dim: int = 6,
+                 token_res_depth: int = 2, frame_res_depth: int = 4,
+                 dilation_growth_rate: int = 2, dropout: float = 0.0, out_dim: int = 7):
+        super().__init__()
+        self.frames_per_token = frames_per_token
+        self.max_tokens = max_tokens
+        self.n_path = n_path
+        self.max_frames = num_frames_for_tokens(max_tokens, frames_per_token)
+        self.path_cond_dim = path_cond_dim
+
+        # Constant causal frame→token expansion index (frame f pulls token f2t[f]).
+        f2t = [frame_idx_to_token_idx(f, frames_per_token) for f in range(self.max_frames)]
+        self.register_buffer("frame_to_token", torch.tensor(f2t, dtype=torch.long),
+                             persistent=False)
+
+        self.in_proj = nn.Conv1d(d_model, width, 3, padding=1)
+        self.token_blocks = nn.ModuleList(
+            [ResBlock1D(width, dilation=1, dropout=dropout) for _ in range(token_res_depth)]
+        )
+        self.path_proj = nn.Linear(path_cond_dim, width)
+        self.frame_blocks = nn.ModuleList(
+            [ResBlock1D(width, dilation=dilation_growth_rate ** i, dropout=dropout)
+             for i in range(frame_res_depth)]
+        )
+        self.out_conv1 = nn.Conv1d(width, width, 3, padding=1)
+        self.out_conv2 = nn.Conv1d(width, out_dim, 3, padding=1)
+        self.act = nn.GELU()
+
+    def _build_path_cond(self, xz_path: Tensor, path_mask: Tensor,
+                         chosen_num_tokens: Tensor) -> Tensor:
+        """Dense per-frame path condition [B, max_frames, path_cond_dim]. Fully
+        vectorized — no host sync / Python per-sample loop."""
+        B = xz_path.shape[0]
+        device, dtype = xz_path.device, xz_path.dtype
+        T, n_path, fpt = self.max_frames, self.n_path, self.frames_per_token
+
+        t = torch.arange(T, device=device, dtype=dtype)                       # [T]
+        # Effective-grid progress: valid frames = num_frames_for_tokens(chosen) =
+        # fpt*chosen - (fpt-1); last valid frame index = that - 1.
+        valid_eff = (fpt * chosen_num_tokens.to(dtype) - (fpt - 1))            # [B]
+        denom = (valid_eff - 1.0).clamp(min=1.0)                              # [B]
+        horizon = (t[None, :] / denom[:, None]).clamp(0.0, 1.0)              # [B, T]
+        grid = (t / float(max(T - 1, 1)))[None, :].expand(B, T)              # [B, T] absolute pos
+
+        # Linear interp along xz_path at horizon progress (gather-based lerp).
+        path_pos = horizon * (n_path - 1)                                     # [B, T]
+        idx0 = path_pos.floor().long().clamp(0, n_path - 1)                   # [B, T]
+        idx1 = (idx0 + 1).clamp(max=n_path - 1)
+        alpha = (path_pos - idx0.to(dtype))[..., None]                        # [B, T, 1]
+        idx0e = idx0[..., None].expand(-1, -1, 2)
+        idx1e = idx1[..., None].expand(-1, -1, 2)
+        p0 = torch.gather(xz_path, 1, idx0e)                                  # [B, T, 2]
+        p1 = torch.gather(xz_path, 1, idx1e)
+        path_xy = (1.0 - alpha) * p0 + alpha * p1                            # [B, T, 2]
+
+        # Tangent (path direction); pad last with previous; eps-safe normalize.
+        diff = path_xy[:, 1:] - path_xy[:, :-1]                              # [B, T-1, 2]
+        tangent = torch.cat([diff, diff[:, -1:]], dim=1)                     # [B, T, 2]
+        tangent = F.normalize(tangent, dim=-1, eps=1e-6)
+
+        cond = torch.cat(
+            [path_xy, tangent, horizon[..., None], grid[..., None]], dim=-1,  # [B, T, 6]
+        )
+        # Degenerate path (valid points < 2) → zero the whole sample's condition.
+        path_valid = (path_mask > 0).sum(dim=1) >= 2                          # [B] bool
+        return cond * path_valid[:, None, None].to(dtype)
+
+    def forward(self, token_hidden: Tensor, *, xz_path: Tensor, path_mask: Tensor,
+                chosen_num_tokens: Tensor) -> Tensor:
+        # Token stage (token grid).
+        h = self.act(self.in_proj(token_hidden.transpose(1, 2)))             # [B, width, max_tokens]
+        for blk in self.token_blocks:
+            h = blk(h)
+        # Causal expand to the effective frame grid (no upsample/trim → no offset).
+        h = h.index_select(2, self.frame_to_token)                           # [B, width, max_frames]
+        # Repeated additive path conditioning before each dilated frame block.
+        cond = self._build_path_cond(xz_path, path_mask, chosen_num_tokens)  # [B, max_frames, 6]
+        path_emb = self.path_proj(cond).transpose(1, 2)                      # [B, width, max_frames]
+        for blk in self.frame_blocks:
+            h = h + path_emb
+            h = blk(h)
+        h = self.act(self.out_conv1(h))
+        h = self.out_conv2(h)                                                # [B, out_dim, max_frames]
+        return h.transpose(1, 2)                                             # [B, max_frames, out_dim]
 
 
 class RootRefiner(nn.Module):
@@ -98,6 +221,13 @@ class RootRefiner(nn.Module):
         norm_first: bool = True,
         n_layers_cond: int | None = None,
         n_layers_token: int | None = None,
+        decoder_type: str = "path_cond",
+        decoder_width: int | None = None,
+        decoder_path_cond_dim: int = 6,
+        decoder_token_res_depth: int = 2,
+        decoder_frame_res_depth: int = 4,
+        decoder_dilation_growth_rate: int = 2,
+        decoder_dropout: float = 0.0,
     ):
         super().__init__()
         if max_tokens < min_tokens:
@@ -151,9 +281,25 @@ class RootRefiner(nn.Module):
         self.token_transformer = _make_encoder(
             d_model, n_heads, ff_dim, dropout, n_layers_token, norm_first)
 
-        # Stage 3: token → frame decoder.
-        self.frame_decoder = TokenToFrameDecoder(
-            d_model=d_model, out_dim=7, frames_per_token=frames_per_token)
+        # Stage 3: token → frame decoder (both return effective [B, max_frames, 7]).
+        self.decoder_type = decoder_type
+        if decoder_type == "path_cond":
+            width = decoder_width if decoder_width is not None else d_model
+            self.frame_decoder = PathCondFrameDecoder(
+                d_model=d_model, max_tokens=max_tokens, frames_per_token=frames_per_token,
+                n_path=n_path, width=width, path_cond_dim=decoder_path_cond_dim,
+                token_res_depth=decoder_token_res_depth,
+                frame_res_depth=decoder_frame_res_depth,
+                dilation_growth_rate=decoder_dilation_growth_rate,
+                dropout=decoder_dropout, out_dim=7,
+            )
+        elif decoder_type == "simple":
+            self.frame_decoder = TokenToFrameDecoder(
+                d_model=d_model, out_dim=7, frames_per_token=frames_per_token)
+        else:
+            raise ValueError(
+                f"decoder_type must be 'path_cond' or 'simple', got {decoder_type!r}"
+            )
 
         # CLS + text + path_stats are the 3 never-masked "special" condition tokens.
         self._n_specials = 3
@@ -225,11 +371,13 @@ class RootRefiner(nn.Module):
         # valid token hiddens + deterministic zero padding only.
         plan_token_hidden = plan_token_hidden * token_valid.unsqueeze(-1).to(plan_token_hidden.dtype)
 
-        # ---- Stage 3: token → frame decode + causal trim + heading norm ----
-        dense = self.frame_decoder(plan_token_hidden)        # [B, max_tokens*fpt, 7]
-        waypoints = torch.cat(
-            [dense[:, :1], dense[:, self.frames_per_token:]], dim=1,
-        )                                                    # [B, 4N-3, 7]
+        # ---- Stage 3: token → frame decode (decoder returns EFFECTIVE frames
+        # [B, num_frames_for_tokens(max_tokens), 7] directly; path_cond decoder also
+        # fuses the frame-level path condition) + heading norm. ----
+        waypoints = self.frame_decoder(
+            plan_token_hidden, xz_path=xz_path, path_mask=path_mask,
+            chosen_num_tokens=chosen_num_tokens,
+        )                                                    # [B, max_frames, 7]
         assert waypoints.shape[1] == self.max_frames, (      # int compare, no host sync
             f"decoded frames {waypoints.shape[1]} != max_frames {self.max_frames}"
         )
@@ -249,4 +397,4 @@ class RootRefiner(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
-__all__ = ["RootRefiner", "TokenToFrameDecoder"]
+__all__ = ["RootRefiner", "TokenToFrameDecoder", "PathCondFrameDecoder", "ResBlock1D"]

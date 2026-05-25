@@ -67,6 +67,14 @@ model:
   n_path: 64                  # arclength-resampled user path length
   n_hist: 20                  # history window length (current_motion)
   text_emb_dim: 512
+  # Stage-3 decoder (debug: light path_cond, decoder_width defaults to d_model).
+  decoder_type: path_cond     # path_cond | simple
+  decoder_width: 256          # PathCondFrameDecoder hidden width
+  decoder_path_cond_dim: 6    # [path_x, path_z, tan_x, tan_z, horizon_prog, grid_prog]
+  decoder_token_res_depth: 2
+  decoder_frame_res_depth: 4
+  decoder_dilation_growth_rate: 2
+  decoder_dropout: 0.0
 
 canonicalization:
   mode: b_full                # Anchor Convention v1
