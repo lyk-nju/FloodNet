@@ -151,6 +151,56 @@ def root_to_traj_feats_7d(root_quat: torch.Tensor, root_xyz: torch.Tensor) -> to
     return append_traj_deltas_5d_to_7d(traj_5d, physical_yaw=physical_yaw)
 
 
+def unnormalize_waypoints_5d(
+    wp5: torch.Tensor,
+    wp_mean: torch.Tensor | None,
+    wp_std: torch.Tensor | None,
+    wp_norm_idx: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Inverse z-score for the xyz channels (0, 1, 2) of a 5D waypoint tensor.
+
+    cos / sin (channels 3, 4) are unit-vector invariant and intentionally NOT
+    z-scored at the dataset (rule 7 in datasets/refiner_dataset.py), so they
+    pass through unchanged. If `wp_mean` or `wp_std` is None (normalize=False),
+    returns `wp5` unchanged.
+
+    `wp_norm_idx` is the dataset's per-channel z-score index list (subset of
+    [0, 1, 2, 5, 6]); only indices < 5 are honored here (the 5D output cannot
+    speak for the 7D delta channels).
+    """
+    if wp_mean is None or wp_std is None:
+        return wp5
+    out = wp5.clone()
+    mean = wp_mean.to(device=wp5.device, dtype=wp5.dtype)
+    std = wp_std.to(device=wp5.device, dtype=wp5.dtype)
+    if wp_norm_idx is not None:
+        idxs = [int(i) for i in wp_norm_idx.tolist() if int(i) < 5]
+    else:
+        idxs = [0, 1, 2]
+    for c in idxs:
+        out[..., c] = wp5[..., c] * std[c] + mean[c]
+    return out
+
+
+def build_physical_7d_from_normalized_5d(
+    wp5: torch.Tensor,
+    wp_mean: torch.Tensor | None,
+    wp_std: torch.Tensor | None,
+    wp_norm_idx: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Boundary assembly: normalized 5D `[x, y, z, cos, sin]` → physical 7D.
+
+    Order is load-bearing: unnormalize xyz FIRST, then derive fwd_delta /
+    yaw_delta in the physical space (deltas are only meaningful there). cos /
+    sin are re-L2-normalized before derivation so a slight model drift does
+    not bias the fwd_dir.
+    """
+    wp5_phys = unnormalize_waypoints_5d(wp5, wp_mean, wp_std, wp_norm_idx)
+    head = F.normalize(wp5_phys[..., 3:5], dim=-1, eps=1e-6)
+    wp5_phys = torch.cat([wp5_phys[..., :3], head], dim=-1)
+    return append_traj_deltas_5d_to_7d(wp5_phys)
+
+
 def append_traj_deltas_5d_to_7d(traj_5d: torch.Tensor,
                                 *, physical_yaw: torch.Tensor | None = None) -> torch.Tensor:
     """[..., T, 5] = [x, y, z, cos(yaw), sin(yaw)] → [..., T, 7] by appending the

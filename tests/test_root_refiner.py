@@ -41,7 +41,7 @@ def test_T01_forward_shape_num_token_logits_and_waypoints():
     out = model(**_make_inputs(model, B=B))
     K = model.max_tokens - model.min_tokens + 1
     assert out["num_token_logits"].shape == (B, K)
-    assert out["waypoints"].shape == (B, num_frames_for_tokens(model.max_tokens), 7)
+    assert out["waypoints"].shape == (B, num_frames_for_tokens(model.max_tokens), 5)
 
 
 def test_T02_max_frames_equals_num_frames_for_tokens_max():
@@ -63,12 +63,12 @@ def test_forward_with_and_without_num_tokens():
     nt = torch.tensor([2, 5, 8])
     out = model(**inputs, num_tokens=nt)
     assert out["num_token_logits"].shape == (3, K)
-    assert out["waypoints"].shape == (3, Fm, 7)
+    assert out["waypoints"].shape == (3, Fm, 5)
     assert torch.equal(out["chosen_num_tokens"], nt)   # teacher-forced horizon
 
     model.eval()
     out2 = model(**inputs)                              # no num_tokens → use pred
-    assert out2["waypoints"].shape == (3, Fm, 7)
+    assert out2["waypoints"].shape == (3, Fm, 5)
     assert torch.equal(out2["chosen_num_tokens"], out2["pred_num_tokens"])
 
     # Teacher-forcing is gated on num_tokens PRESENCE, not train/eval mode: passing
@@ -88,13 +88,13 @@ def test_pred_num_tokens_in_range():
 
 
 def test_both_decoder_types_build_and_output_effective_frames():
-    """simple and path_cond decoders both return effective [B, num_frames_for_tokens, 7]."""
+    """simple and path_cond decoders both return effective [B, num_frames_for_tokens, 5]."""
     for dt in ("simple", "path_cond"):
         model = RootRefiner(d_model=64, n_layers=2, n_heads=4, ff_dim=128,
                              max_tokens=8, min_tokens=2, n_hist=8, n_path=16,
                              text_emb_dim=16, decoder_type=dt, decoder_width=48)
         out = model(**_make_inputs(model, B=2))
-        assert out["waypoints"].shape == (2, num_frames_for_tokens(8), 7), dt
+        assert out["waypoints"].shape == (2, num_frames_for_tokens(8), 5), dt
         # heading unit-norm holds for both.
         norms = out["waypoints"][..., 3:5].pow(2).sum(-1)
         assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5), dt
@@ -145,23 +145,48 @@ def test_path_cond_decoder_no_leak_from_post_horizon():
     )
 
 
-def test_output_7d_deltas_derived_from_xz_heading():
-    """The model predicts 5D and DERIVES fwd_delta/yaw_delta (ch 5,6) from xz +
-    heading, so re-deriving from channels [:5] reproduces the full 7D exactly.
-    This locks the no-independent-delta-head invariant and the LDF 7D contract."""
-    from utils.motion_process import append_traj_deltas_5d_to_7d
+def test_output_is_5d_and_boundary_assembles_physical_7d():
+    """Model emits NORMALIZED 5D = [x,y,z,cos,sin]; the 7D physical contract is
+    assembled at the boundary by `build_physical_7d_from_normalized_5d`
+    (unnormalize xyz → unit heading → derive deltas IN PHYSICAL SPACE).
+
+    Locks: (a) model output is 5D; (b) heading channels are unit-norm;
+    (c) the boundary helper produces a 7D where re-deriving deltas from its
+    own [:5] reproduces the full 7D (i.e. deltas are an exact function of
+    the physical xz + heading); (d) the boundary helper unnormalizes xyz
+    when wp_mean/std are provided (no-op when None)."""
+    from utils.motion_process import (
+        append_traj_deltas_5d_to_7d,
+        build_physical_7d_from_normalized_5d,
+    )
     model = RootRefiner(d_model=64, n_layers=2, n_heads=4, ff_dim=128,
                         max_tokens=8, min_tokens=2)
     model.eval()
     with torch.no_grad():
         wp = model(**_make_inputs(model, B=2), num_tokens=torch.tensor([3, 5]))["waypoints"]
-    assert wp.shape[-1] == 7                                   # contract preserved
-    rederived = append_traj_deltas_5d_to_7d(wp[..., :5])
-    assert torch.allclose(rederived, wp, atol=1e-6)           # deltas are derived, not free
-    # heading unit-norm; anchor (frame 0) deltas exactly zero.
-    assert torch.allclose(wp[..., 3:5].norm(dim=-1),
-                          torch.ones_like(wp[..., 0]), atol=1e-5)
-    assert torch.count_nonzero(wp[:, 0, 5:7]) == 0
+    # (a) 5D contract.
+    assert wp.shape[-1] == 5
+    # (b) heading unit-norm.
+    norms = wp[..., 3:5].pow(2).sum(-1)
+    assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
+
+    # (c) boundary helper: physical-7D [:5] re-derived gives back the full 7D,
+    #     i.e. deltas are an exact function of physical xz + heading.
+    phys7 = build_physical_7d_from_normalized_5d(wp, None, None)
+    assert phys7.shape[-1] == 7
+    rederived = append_traj_deltas_5d_to_7d(phys7[..., :5])
+    assert torch.allclose(rederived, phys7, atol=1e-6)
+    # frame-0 deltas exactly zero (no preceding frame).
+    assert torch.count_nonzero(phys7[:, 0, 5:7]) == 0
+
+    # (d) unnormalize path: xyz get *std + mean, cos/sin pass through.
+    wp_mean = torch.tensor([10.0, 0.5, -3.0, 0.0, 0.0, 0.0, 0.0])
+    wp_std = torch.tensor([2.0, 0.5, 4.0, 1.0, 1.0, 1.0, 1.0])
+    norm_idx = torch.tensor([0, 1, 2])
+    phys = build_physical_7d_from_normalized_5d(wp, wp_mean, wp_std, norm_idx)
+    expected_xyz = wp[..., :3] * wp_std[:3] + wp_mean[:3]
+    assert torch.allclose(phys[..., :3], expected_xyz, atol=1e-6)
+    assert torch.allclose(phys[..., 3:5], wp[..., 3:5], atol=1e-6)  # cos/sin untouched
 
 
 def test_path_cond_tangent_is_unit_or_zero():
@@ -367,16 +392,16 @@ def test_T08_tiny_batch_overfit():
     current_motion = torch.randn(B, model.n_hist, 5, generator=g)
     history_mask = torch.ones(B, model.n_hist, dtype=torch.bool)
 
-    # Random but fixed targets.
+    # Random but fixed targets — built as 5D (same as model output) so the
+    # overfit loss is exactly what `train_refiner._compute_loss` does in
+    # same-space derivation mode.
     target_num_tokens_class = torch.randint(0, K, (B,), generator=g)
     target_num_tokens = target_num_tokens_class + model.min_tokens   # teacher-forced horizon
-    # Build valid 7D waypoints: cos/sin on unit circle.
     target_yaw = torch.randn(B, F_max, generator=g) * 0.5
-    target_waypoints = torch.zeros(B, F_max, 7)
+    target_waypoints = torch.zeros(B, F_max, 5)
     target_waypoints[..., :3] = torch.randn(B, F_max, 3, generator=g) * 0.3
     target_waypoints[..., 3] = torch.cos(target_yaw)
     target_waypoints[..., 4] = torch.sin(target_yaw)
-    target_waypoints[..., 5:7] = torch.randn(B, F_max, 2, generator=g) * 0.2
     # (target_mask is intentionally all-True so we skip mask gating in this
     # overfit test; the dataset-level test_T06 already locks the strict
     # target_mask.sum() == num_frames_for_tokens(num_tokens) relationship.)
@@ -393,15 +418,20 @@ def test_T08_tiny_batch_overfit():
             path_stats=path_stats, current_motion=current_motion,
             history_mask=history_mask, num_tokens=target_num_tokens,
         )
-        # Loss: num_token CE + xyz SmoothL1 + heading cosine + fwd_delta + yaw_delta
+        # Loss: num_token CE + xyz SmoothL1 + heading cosine + same-space
+        # derived fwd_delta / yaw_delta (channels 5, 6 of the 7D produced by
+        # `append_traj_deltas_5d_to_7d` from the same-space 5D).
+        from utils.motion_process import append_traj_deltas_5d_to_7d
         l_num = F.cross_entropy(out["num_token_logits"], target_num_tokens_class)
         l_xyz = F.smooth_l1_loss(
             out["waypoints"][..., :3], target_waypoints[..., :3],
         )
         cos_term = (out["waypoints"][..., 3:5] * target_waypoints[..., 3:5]).sum(-1)
         l_heading = (1.0 - cos_term).mean()
-        l_fwd = F.smooth_l1_loss(out["waypoints"][..., 5], target_waypoints[..., 5])
-        l_yaw = F.smooth_l1_loss(out["waypoints"][..., 6], target_waypoints[..., 6])
+        pred7 = append_traj_deltas_5d_to_7d(out["waypoints"])
+        gt7 = append_traj_deltas_5d_to_7d(target_waypoints)
+        l_fwd = F.smooth_l1_loss(pred7[..., 5], gt7[..., 5])
+        l_yaw = F.smooth_l1_loss(pred7[..., 6], gt7[..., 6])
         loss = l_num + 5.0 * l_xyz + 1.0 * l_heading + 0.5 * l_fwd + 0.5 * l_yaw
 
         optimizer.zero_grad()

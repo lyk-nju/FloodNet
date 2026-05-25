@@ -20,16 +20,20 @@ Architecture (redesigned — duration-first / trajectory-second):
       plan_token_hidden = token_hidden[:, -max_tokens:]
     Plan queries past `chosen_num_tokens` are key-masked (token_query_pad).
 
-  Stage 3 — token→frame decoder (predict 5D, derive the 7D contract):
-      raw5 = frame_decoder(plan_token_hidden)          # [B, max_frames, 5] = [x,y,z,cos,sin]
-      heading channels [3:5] L2-normalized, then fwd_delta / yaw_delta are
-      DERIVED from xz + heading (append_traj_deltas_5d_to_7d) → [B, max_frames, 7].
-    The 7D output (LDF traj-cond contract) is unchanged, but it is now internally
-    consistent BY CONSTRUCTION: the deltas are exact functions of the predicted
-    xz + heading, so the model cannot emit a facing/displacement that disagrees
-    with its own velocity channels (which would be out-of-distribution for the
-    LDF, trained on GT-consistent traj cond). The decoder only spends capacity on
-    the 3 planar DOF (+y); deltas carry no independent regression head.
+  Stage 3 — token→frame decoder (predict 5D — model output is the minimal
+  representation, no internal append):
+      waypoints5 = frame_decoder(plan_token_hidden)    # [B, max_frames, 5] = [x,y,z,cos,sin]
+      heading channels [3:5] L2-normalized.
+    Why 5D output (not internal-7D append): the dataset z-scores xyz channels
+    (rule 7 in datasets/refiner_dataset.py) but cos/sin stay raw unit vectors.
+    Appending fwd_delta / yaw_delta inside the model — i.e. inside the
+    normalized space — would emit deltas in NORMALIZED-xz units, while the
+    GT delta channels are PHYSICAL-then-z-scored: scales and offsets do not
+    match, both at training-loss time and at inference. So the 7D contract is
+    enforced at the boundary instead: callers unnormalize the 5D and call
+    `build_physical_7d_from_normalized_5d` (utils.motion_process) to get the
+    LDF-compatible physical 7D. This kills the over-parameterization (deltas
+    carry no independent head) AND preserves the LDF traj-cond contract.
 
 Causal-VAE frame convention: num_frames_for_tokens(N) = 4N - 3 (fpt=4). The
 decoder emits max_tokens*fpt frames; the causal trim keeps token 0 as ONE
@@ -47,7 +51,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from utils.motion_process import append_traj_deltas_5d_to_7d
 from utils.token_frame import frame_idx_to_token_idx, num_frames_for_tokens
 
 
@@ -407,11 +410,14 @@ class RootRefiner(nn.Module):
         # valid token hiddens + deterministic zero padding only.
         plan_token_hidden = plan_token_hidden * token_valid.unsqueeze(-1).to(plan_token_hidden.dtype)
 
-        # ---- Stage 3: token → frame decode. The decoder returns EFFECTIVE frames
-        # [B, max_frames, 5] = [x, y, z, cos, sin] (path_cond decoder also fuses the
-        # frame-level path condition). Heading is L2-normalized, then fwd_delta /
-        # yaw_delta are DERIVED from xz + heading so the emitted 7D is internally
-        # consistent by construction (LDF traj-cond contract unchanged). ----
+        # ---- Stage 3: token → frame decode. Returns the MINIMAL representation
+        # [B, max_frames, 5] = [x, y, z, cos, sin] in NORMALIZED space (whatever
+        # space the dataset feeds the loss in). Heading is L2-normalized in place.
+        # Physical-7D assembly (unnormalize xyz → keep unit heading → append
+        # fwd_delta / yaw_delta) is done at the inference / RootPlan boundary by
+        # `utils.motion_process.build_physical_7d_from_normalized_5d`; doing it
+        # inside the model would emit deltas in normalized-xz units which do not
+        # match the dataset's physical-then-z-scored target delta channels. ----
         raw5 = self.frame_decoder(
             plan_token_hidden, xz_path=xz_path, path_mask=path_mask,
             chosen_num_tokens=chosen_num_tokens,
@@ -420,8 +426,7 @@ class RootRefiner(nn.Module):
             f"decoded frames {raw5.shape[1]} != max_frames {self.max_frames}"
         )
         head = F.normalize(raw5[..., 3:5], dim=-1, eps=1e-6)
-        waypoints5 = torch.cat([raw5[..., :3], head], dim=-1)         # [B, max_frames, 5]
-        waypoints = append_traj_deltas_5d_to_7d(waypoints5)          # [B, max_frames, 7]
+        waypoints = torch.cat([raw5[..., :3], head], dim=-1)          # [B, max_frames, 5]
 
         return {
             "num_token_logits": num_token_logits,

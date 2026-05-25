@@ -192,8 +192,24 @@ def run_benchmark(model, dataset, text_encoder, device="cpu",
             num_tokens=oracle_nt,
         )
         logits = out["num_token_logits"][0]                  # [K]
-        pred_wp = out["waypoints"][0].cpu()                  # [max_frames, 7]
-        gt_wp = sample["target_waypoints"]
+        # Model emits NORMALIZED 5D. Assemble physical 7D at the boundary
+        # (unnormalize xyz → unit heading → append fwd_delta / yaw_delta) so
+        # metrics are computed in physical space. GT `target_waypoints` is
+        # PHYSICAL-then-z-scored, so unnormalize its xyz the same way and
+        # re-derive its deltas (do NOT trust target_wp[..., 5:7] — those are
+        # z-scored physical deltas that would mismatch the freshly-derived
+        # physical pred deltas in scale and offset).
+        from utils.motion_process import build_physical_7d_from_normalized_5d
+        wp_mean = getattr(dataset, "_wp_mean", None)
+        wp_std = getattr(dataset, "_wp_std", None)
+        wp_norm_idx = getattr(dataset, "_wp_norm_idx", None)
+        pred_wp = build_physical_7d_from_normalized_5d(
+            out["waypoints"][0].cpu(), wp_mean, wp_std, wp_norm_idx,
+        )                                                    # [max_frames, 7] physical
+        gt5_norm = sample["target_waypoints"][..., :5]
+        gt_wp = build_physical_7d_from_normalized_5d(
+            gt5_norm, wp_mean, wp_std, wp_norm_idx,
+        )                                                    # [max_frames, 7] physical
         mask = sample["target_mask"]
 
         # num_token metrics.
