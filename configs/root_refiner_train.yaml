@@ -38,9 +38,9 @@ logger:
 
 trainer:                      # Lightning Trainer kwargs (mirrors ldf.yaml.trainer)
   accelerator: auto           # ldf uses gpu; auto stays host-portable
-  devices: 1
+  devices: 1                  # int or list ([0,1,...]); >1 → DDP(find_unused_parameters=True)
   log_every_n_steps: 100
-  precision: bf16-mixed       # matches ldf; refiner is tiny so fp32 is fine too
+  precision: bf16-mixed       # matches ldf; auto-downgraded to 32-true on CPU hosts
 
 validation:                   # val + checkpoint cadence (mirrors ldf.yaml.validation)
   validation_steps: 5000      # step-based val cadence (Trainer val_check_interval)

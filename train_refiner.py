@@ -454,6 +454,35 @@ def build_checkpoint_callback(cfg: dict, output_dir: str):
     )
 
 
+def _num_devices(devices) -> int:
+    """Device count used to decide whether DDP is needed. `devices` may be an int
+    (>=0), -1 (= all), a list of indices, or "auto"/str (→ visible CUDA count)."""
+    if isinstance(devices, (list, tuple)):
+        return len(devices)
+    if isinstance(devices, int) and devices >= 0:
+        return devices
+    try:
+        return torch.cuda.device_count()
+    except Exception:   # noqa: BLE001 — defensive; assume single device
+        return 1
+
+
+def safe_precision(accelerator: str, precision, *, cuda_available: bool):
+    """Downgrade a mixed/low precision to 32-true when the run will land on CPU
+    (accelerator='cpu', or 'auto' with no CUDA visible) so a GPU-tuned config
+    (e.g. bf16-mixed) stays host-portable instead of erroring / crawling on CPU.
+    Returns precision unchanged on GPU, or None when none was requested."""
+    if precision is None:
+        return None
+    on_cpu = accelerator == "cpu" or (accelerator == "auto" and not cuda_available)
+    fp32 = {"32", "32-true", "64", "64-true", 32, 64}
+    if on_cpu and precision not in fp32:
+        log.warning("precision=%s requested but the run resolves to CPU; "
+                    "using 32-true instead.", precision)
+        return "32-true"
+    return precision
+
+
 def _build_one_dataset(cfg: dict, split_file: str, *, seed: int | None = None):
     """Build a single RefinerDataset for a given split using the real loader."""
     from datasets.refiner_dataset import RefinerDataset
@@ -616,11 +645,19 @@ def main(argv=None):
         log.info("resuming from checkpoint: %s", resume_ckpt)
 
     # Trainer kwargs from the `trainer` block (LDF style), with CLI/defaults.
+    accelerator = trainer_cfg.get("accelerator", "auto")
     devices = args.devices if args.devices is not None else trainer_cfg.get("devices", 1)
+    # Multi-device → DDP with find_unused_parameters=True (mirrors train_ldf; the
+    # frozen text encoder otherwise risks DDP unused-parameter errors).
+    strategy = "auto"
+    if _num_devices(devices) > 1:
+        from lightning.pytorch.strategies import DDPStrategy
+        strategy = DDPStrategy(find_unused_parameters=True)
     trainer_kwargs = dict(
         max_steps=max_steps,
         devices=devices,
-        accelerator=trainer_cfg.get("accelerator", "auto"),
+        accelerator=accelerator,
+        strategy=strategy,
         gradient_clip_val=trainer_cfg.get(
             "gradient_clip_val", train_cfg.get("gradient_clip_val", 1.0)),
         default_root_dir=output_dir,
@@ -628,8 +665,11 @@ def main(argv=None):
         logger=logger if logger is not None else True,
         callbacks=callbacks,
     )
-    if trainer_cfg.get("precision") is not None:
-        trainer_kwargs["precision"] = trainer_cfg["precision"]
+    # Host-portable precision: a GPU-tuned bf16-mixed config downgrades to fp32 on CPU.
+    precision = safe_precision(accelerator, trainer_cfg.get("precision"),
+                               cuda_available=torch.cuda.is_available())
+    if precision is not None:
+        trainer_kwargs["precision"] = precision
     # Step-based validation cadence when configured (LDF style); else epoch.
     # validation_steps counts GLOBAL train steps, so check_val_every_n_epoch must
     # be None — otherwise Lightning reads val_check_interval as a within-epoch

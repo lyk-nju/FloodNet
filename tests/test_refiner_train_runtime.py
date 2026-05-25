@@ -164,6 +164,25 @@ def test_resolve_seed_tolerates_null_training_block():
     assert tr.resolve_seed({"training": None}) == 1234
 
 
+def test_num_devices_int_list_auto():
+    assert tr._num_devices(1) == 1
+    assert tr._num_devices(4) == 4
+    assert tr._num_devices([0, 1, 2]) == 3
+    assert isinstance(tr._num_devices("auto"), int)   # → visible CUDA count (0 on CPU box)
+    assert isinstance(tr._num_devices(-1), int)
+
+
+def test_safe_precision_downgrades_on_cpu():
+    """Review #6: bf16-mixed must downgrade to 32-true when the run lands on CPU."""
+    assert tr.safe_precision("auto", "bf16-mixed", cuda_available=False) == "32-true"
+    assert tr.safe_precision("cpu", "16-mixed", cuda_available=True) == "32-true"
+    # fp32 / GPU paths unchanged; None stays None.
+    assert tr.safe_precision("auto", "bf16-mixed", cuda_available=True) == "bf16-mixed"
+    assert tr.safe_precision("gpu", "bf16-mixed", cuda_available=True) == "bf16-mixed"
+    assert tr.safe_precision("auto", "32-true", cuda_available=False) == "32-true"
+    assert tr.safe_precision("cpu", None, cuda_available=False) is None
+
+
 def test_checkpoint_monitor_and_save_last_from_validation_block():
     """Review #4/#7: monitor / save_last are honored from the validation block
     (configs were migrated checkpoint:→validation:)."""
