@@ -200,12 +200,19 @@ class RefinerLightningModule(pl.LightningModule):
         else:
             L_head = smooth_l1_masked(pred_h, gt_h, target_mask)
 
-        # per-frame fwd_delta / yaw_delta SmoothL1 (channels 5, 6).
+        # per-frame fwd_delta / yaw_delta SmoothL1 (channels 5, 6). The model now
+        # DERIVES these from xz + heading (root_refiner Stage 3), so frame 0's delta
+        # is structurally 0 (no preceding frame) and the LDF traj-cond uses 0 at its
+        # window start. GT, however, carries the real *incoming* anchor delta in
+        # sliding mode (motion[anchor]-motion[anchor-1]) — which the plan can't and
+        # shouldn't predict — so exclude frame 0 from the delta supervision.
+        delta_mask = target_mask.clone()
+        delta_mask[:, 0] = False
         L_fwd_delta = smooth_l1_masked(
-            out["waypoints"][..., 5:6], target_wp[..., 5:6], target_mask,
+            out["waypoints"][..., 5:6], target_wp[..., 5:6], delta_mask,
         )
         L_yaw_delta = smooth_l1_masked(
-            out["waypoints"][..., 6:7], target_wp[..., 6:7], target_mask,
+            out["waypoints"][..., 6:7], target_wp[..., 6:7], delta_mask,
         )
 
         # smoothness L2 on 2nd-order diff of [fwd_delta, yaw_delta].

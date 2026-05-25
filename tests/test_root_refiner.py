@@ -145,6 +145,25 @@ def test_path_cond_decoder_no_leak_from_post_horizon():
     )
 
 
+def test_output_7d_deltas_derived_from_xz_heading():
+    """The model predicts 5D and DERIVES fwd_delta/yaw_delta (ch 5,6) from xz +
+    heading, so re-deriving from channels [:5] reproduces the full 7D exactly.
+    This locks the no-independent-delta-head invariant and the LDF 7D contract."""
+    from utils.motion_process import append_traj_deltas_5d_to_7d
+    model = RootRefiner(d_model=64, n_layers=2, n_heads=4, ff_dim=128,
+                        max_tokens=8, min_tokens=2)
+    model.eval()
+    with torch.no_grad():
+        wp = model(**_make_inputs(model, B=2), num_tokens=torch.tensor([3, 5]))["waypoints"]
+    assert wp.shape[-1] == 7                                   # contract preserved
+    rederived = append_traj_deltas_5d_to_7d(wp[..., :5])
+    assert torch.allclose(rederived, wp, atol=1e-6)           # deltas are derived, not free
+    # heading unit-norm; anchor (frame 0) deltas exactly zero.
+    assert torch.allclose(wp[..., 3:5].norm(dim=-1),
+                          torch.ones_like(wp[..., 0]), atol=1e-5)
+    assert torch.count_nonzero(wp[:, 0, 5:7]) == 0
+
+
 def test_path_cond_tangent_is_unit_or_zero():
     """Tangent channels [2:4] are eps-safe unit vectors on valid frames (never NaN)."""
     dec = PathCondFrameDecoder(d_model=32, max_tokens=8, n_path=16, width=48,

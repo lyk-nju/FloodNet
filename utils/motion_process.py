@@ -139,31 +139,53 @@ def root_to_traj_feats_7d(root_quat: torch.Tensor, root_xyz: torch.Tensor) -> to
     Note: do NOT confuse with legacy `utils.traj_batch.root_to_traj_feats`
     (which returns path-direction unit vectors, NOT physical yaw cos/sin).
     """
-    from utils.local_frame import (
-        heading_dir_xz,
-        root_quat_to_physical_yaw,
-        wrap_angle,
-    )
+    from utils.local_frame import root_quat_to_physical_yaw
 
     physical_yaw = root_quat_to_physical_yaw(root_quat)
     cos_h = torch.cos(physical_yaw)
     sin_h = torch.sin(physical_yaw)
+    traj_5d = torch.cat([root_xyz, cos_h[..., None], sin_h[..., None]], dim=-1)
+    # Single source for the delta derivation (shared with the RootRefiner, which
+    # predicts the 5D and derives the same deltas). Pass the exact physical_yaw so
+    # this stays bit-identical to the quaternion-derived 7D (no atan2 round-trip).
+    return append_traj_deltas_5d_to_7d(traj_5d, physical_yaw=physical_yaw)
 
-    # Per-frame xz delta (forward difference); first frame zero (no preceding).
-    delta_xz = torch.zeros_like(root_xyz[..., :, [0, 2]])
-    delta_xz[..., 1:, :] = root_xyz[..., 1:, [0, 2]] - root_xyz[..., :-1, [0, 2]]
 
-    # Project xz delta onto heading direction to get signed forward delta.
-    fwd_dir = heading_dir_xz(physical_yaw)                            # [..., T, 2]
+def append_traj_deltas_5d_to_7d(traj_5d: torch.Tensor,
+                                *, physical_yaw: torch.Tensor | None = None) -> torch.Tensor:
+    """[..., T, 5] = [x, y, z, cos(yaw), sin(yaw)] → [..., T, 7] by appending the
+    fwd_delta / yaw_delta channels *derived* from the xz + heading channels, so
+    the 7D is internally consistent by construction:
+
+        fwd_delta[t] = ⟨xz[t] - xz[t-1], heading_dir_xz(yaw[t])⟩,
+                       heading_dir_xz(yaw) = [sin(yaw), cos(yaw)] = [sin_h, cos_h]
+        yaw_delta[t] = wrap_angle(yaw[t] - yaw[t-1]),  yaw = atan2(sin_h, cos_h)
+        fwd_delta[0] = yaw_delta[0] = 0   (no preceding frame)
+
+    Differentiable (gradients flow into the 5D), so the RootRefiner can predict a
+    minimal 5D and emit a consistent 7D for the LDF traj-cond contract. Matches
+    `root_to_traj_feats_7d` exactly; pass `physical_yaw` (the unwrapped/canonical
+    angle) on the GT path to skip the atan2 and stay bit-identical.
+    """
+    from utils.local_frame import wrap_angle
+
+    xyz = traj_5d[..., :3]
+    cos_h = traj_5d[..., 3]
+    sin_h = traj_5d[..., 4]
+    if physical_yaw is None:
+        physical_yaw = torch.atan2(sin_h, cos_h)
+
+    xz = traj_5d[..., [0, 2]]
+    delta_xz = torch.zeros_like(xz)
+    delta_xz[..., 1:, :] = xz[..., 1:, :] - xz[..., :-1, :]
+    fwd_dir = torch.stack([sin_h, cos_h], dim=-1)                     # heading_dir_xz(yaw)
     fwd_delta = (delta_xz * fwd_dir).sum(-1, keepdim=True)            # [..., T, 1]
-    # fwd_delta[..., 0, :] == 0  (because delta_xz[..., 0, :] == 0).
 
     yaw_delta = torch.zeros_like(physical_yaw)
     yaw_delta[..., 1:] = wrap_angle(physical_yaw[..., 1:] - physical_yaw[..., :-1])
-    # yaw_delta[..., 0] == 0.
 
     return torch.cat(
-        [root_xyz, cos_h[..., None], sin_h[..., None], fwd_delta, yaw_delta[..., None]],
+        [xyz, cos_h[..., None], sin_h[..., None], fwd_delta, yaw_delta[..., None]],
         dim=-1,
     )
 

@@ -20,10 +20,16 @@ Architecture (redesigned — duration-first / trajectory-second):
       plan_token_hidden = token_hidden[:, -max_tokens:]
     Plan queries past `chosen_num_tokens` are key-masked (token_query_pad).
 
-  Stage 3 — token→frame decoder:
-      dense = frame_decoder(plan_token_hidden)         # [B, max_tokens*fpt, 7]
-      waypoints = causal_trim(dense)                   # [B, num_frames_for_tokens(max_tokens), 7]
-      heading channels [3:5] L2-normalized.
+  Stage 3 — token→frame decoder (predict 5D, derive the 7D contract):
+      raw5 = frame_decoder(plan_token_hidden)          # [B, max_frames, 5] = [x,y,z,cos,sin]
+      heading channels [3:5] L2-normalized, then fwd_delta / yaw_delta are
+      DERIVED from xz + heading (append_traj_deltas_5d_to_7d) → [B, max_frames, 7].
+    The 7D output (LDF traj-cond contract) is unchanged, but it is now internally
+    consistent BY CONSTRUCTION: the deltas are exact functions of the predicted
+    xz + heading, so the model cannot emit a facing/displacement that disagrees
+    with its own velocity channels (which would be out-of-distribution for the
+    LDF, trained on GT-consistent traj cond). The decoder only spends capacity on
+    the 3 planar DOF (+y); deltas carry no independent regression head.
 
 Causal-VAE frame convention: num_frames_for_tokens(N) = 4N - 3 (fpt=4). The
 decoder emits max_tokens*fpt frames; the causal trim keeps token 0 as ONE
@@ -41,6 +47,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from utils.motion_process import append_traj_deltas_5d_to_7d
 from utils.token_frame import frame_idx_to_token_idx, num_frames_for_tokens
 
 
@@ -77,7 +84,7 @@ class TokenToFrameDecoder(nn.Module):
     the path-conditioning kwargs (kept for a uniform decoder signature).
     """
 
-    def __init__(self, d_model: int, out_dim: int = 7, frames_per_token: int = 4):
+    def __init__(self, d_model: int, out_dim: int = 5, frames_per_token: int = 4):
         super().__init__()
         self.frames_per_token = frames_per_token
         self.conv_in = nn.Conv1d(d_model, d_model, 3, padding=1)
@@ -117,7 +124,7 @@ class PathCondFrameDecoder(nn.Module):
     def __init__(self, d_model: int, max_tokens: int, *, frames_per_token: int = 4,
                  n_path: int = 64, width: int = 512, path_cond_dim: int = 6,
                  token_res_depth: int = 2, frame_res_depth: int = 4,
-                 dilation_growth_rate: int = 2, dropout: float = 0.0, out_dim: int = 7):
+                 dilation_growth_rate: int = 2, dropout: float = 0.0, out_dim: int = 5):
         super().__init__()
         # _build_path_cond emits a fixed 6-D condition [x, z, tan_x, tan_z,
         # horizon_progress, grid_progress]; the param exists for config symmetry
@@ -307,6 +314,9 @@ class RootRefiner(nn.Module):
             d_model, n_heads, ff_dim, dropout, n_layers_token, norm_first)
 
         # Stage 3: token → frame decoder (both return effective [B, max_frames, 7]).
+        # Decoder predicts the minimal 5D = [x, y, z, cos, sin]; forward() derives
+        # the consistent 7D (fwd_delta / yaw_delta) for the downstream contract.
+        self.decoder_pred_dim = 5
         self.decoder_type = decoder_type
         if decoder_type == "path_cond":
             width = decoder_width if decoder_width is not None else d_model
@@ -316,11 +326,12 @@ class RootRefiner(nn.Module):
                 token_res_depth=decoder_token_res_depth,
                 frame_res_depth=decoder_frame_res_depth,
                 dilation_growth_rate=decoder_dilation_growth_rate,
-                dropout=decoder_dropout, out_dim=7,
+                dropout=decoder_dropout, out_dim=self.decoder_pred_dim,
             )
         elif decoder_type == "simple":
             self.frame_decoder = TokenToFrameDecoder(
-                d_model=d_model, out_dim=7, frames_per_token=frames_per_token)
+                d_model=d_model, out_dim=self.decoder_pred_dim,
+                frames_per_token=frames_per_token)
         else:
             raise ValueError(
                 f"decoder_type must be 'path_cond' or 'simple', got {decoder_type!r}"
@@ -396,18 +407,21 @@ class RootRefiner(nn.Module):
         # valid token hiddens + deterministic zero padding only.
         plan_token_hidden = plan_token_hidden * token_valid.unsqueeze(-1).to(plan_token_hidden.dtype)
 
-        # ---- Stage 3: token → frame decode (decoder returns EFFECTIVE frames
-        # [B, num_frames_for_tokens(max_tokens), 7] directly; path_cond decoder also
-        # fuses the frame-level path condition) + heading norm. ----
-        waypoints = self.frame_decoder(
+        # ---- Stage 3: token → frame decode. The decoder returns EFFECTIVE frames
+        # [B, max_frames, 5] = [x, y, z, cos, sin] (path_cond decoder also fuses the
+        # frame-level path condition). Heading is L2-normalized, then fwd_delta /
+        # yaw_delta are DERIVED from xz + heading so the emitted 7D is internally
+        # consistent by construction (LDF traj-cond contract unchanged). ----
+        raw5 = self.frame_decoder(
             plan_token_hidden, xz_path=xz_path, path_mask=path_mask,
             chosen_num_tokens=chosen_num_tokens,
-        )                                                    # [B, max_frames, 7]
-        assert waypoints.shape[1] == self.max_frames, (      # int compare, no host sync
-            f"decoded frames {waypoints.shape[1]} != max_frames {self.max_frames}"
+        )                                                    # [B, max_frames, 5]
+        assert raw5.shape[1] == self.max_frames, (           # int compare, no host sync
+            f"decoded frames {raw5.shape[1]} != max_frames {self.max_frames}"
         )
-        head = F.normalize(waypoints[..., 3:5], dim=-1, eps=1e-6)
-        waypoints = torch.cat([waypoints[..., :3], head, waypoints[..., 5:7]], dim=-1)
+        head = F.normalize(raw5[..., 3:5], dim=-1, eps=1e-6)
+        waypoints5 = torch.cat([raw5[..., :3], head], dim=-1)         # [B, max_frames, 5]
+        waypoints = append_traj_deltas_5d_to_7d(waypoints5)          # [B, max_frames, 7]
 
         return {
             "num_token_logits": num_token_logits,

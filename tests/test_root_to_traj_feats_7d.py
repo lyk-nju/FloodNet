@@ -16,12 +16,42 @@ from utils.local_frame import (
     root_quat_to_physical_yaw,
 )
 from utils.motion_process import (
+    append_traj_deltas_5d_to_7d,
     recover_root_rot_pos,
     root_to_traj_feats_7d,
 )
 
 ATOL = 1e-5
 PI = math.pi
+
+
+# ---------------------------------------------------------------------------
+# append_traj_deltas_5d_to_7d: shared single-source derivation
+# ---------------------------------------------------------------------------
+
+
+def test_append_deltas_matches_root_to_traj_feats_7d():
+    """Deriving deltas from the 5D [x,y,z,cos,sin] must reproduce the full 7D that
+    root_to_traj_feats_7d builds from the quaternion (single-source guarantee)."""
+    torch.manual_seed(0)
+    quat = torch.randn(2, 7, 4)
+    quat = quat / quat.norm(dim=-1, keepdim=True)
+    xyz = torch.randn(2, 7, 3)
+    full = root_to_traj_feats_7d(quat, xyz)               # [2,7,7]
+    derived = append_traj_deltas_5d_to_7d(full[..., :5])  # re-derive from [x,y,z,cos,sin]
+    assert torch.allclose(derived, full, atol=1e-6)
+
+
+def test_append_deltas_first_frame_zero_and_differentiable():
+    x = torch.randn(1, 5, 5, requires_grad=True)
+    # normalize the heading channels so atan2/derivation is well-defined
+    h = torch.nn.functional.normalize(x[..., 3:5], dim=-1)
+    traj5 = torch.cat([x[..., :3], h], dim=-1)
+    out = append_traj_deltas_5d_to_7d(traj5)
+    assert out.shape == (1, 5, 7)
+    assert torch.count_nonzero(out[:, 0, 5:7]) == 0      # frame-0 deltas are 0
+    out.sum().backward()                                 # gradient flows into the 5D
+    assert x.grad is not None and torch.isfinite(x.grad).all()
 
 
 def _make_263d(rot_vel_t0: float, local_vel_xz_per_frame, n_frames: int = 6):
