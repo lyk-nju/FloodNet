@@ -280,6 +280,22 @@ class TrajStreamBuffer:
             return self._build_from_xyz(start_t, end_index, ctx_len, device)
         return None
 
+    def get_traj_token_mask(
+        self, end_index: int, seq_len: int, device
+    ) -> torch.Tensor | None:
+        """Return the token-level traj mask (B, ctx_len) for the same window as
+        ``build_traj_emb``. Used to gate the traj_in_proj output in
+        ControlNet (mask-after-proj contract). Returns None when no mask is
+        tracked, matching the no-mask semantics of ``get_traj_valid_lens``.
+        """
+        if self._mask_buf is None:
+            return None
+        ctx_len = min(end_index, seq_len)
+        start_t = max(0, end_index - seq_len)
+        mask_slice = self._mask_buf[:, start_t:end_index].to(device)
+        mask_slice = self._pad_mask_to_ctx(mask_slice, ctx_len, device)
+        return (mask_slice > 0).to(dtype=torch.float32)
+
     def get_traj_valid_lens(
         self, end_index: int, seq_len: int, device
     ) -> torch.Tensor | None:
@@ -394,6 +410,22 @@ class TrajStreamBuffer:
         if mask is not None:
             feats = feats * mask.unsqueeze(-1).to(dtype=feats.dtype)
 
+        # Streaming buffer stores token-level features. The new 7D encoder
+        # expects per-token output of LocalTrajEncoder (in_dim=128, see
+        # models/tools/traj_encoder.py). If the buffer holds raw 7D frame-level
+        # features, the streaming caller needs to be updated to store them
+        # frame-level so we can run frames_to_tokens + LocalTrajEncoder.
+        traj_in_dim = getattr(self.traj_encoder, "in_dim", None)
+        if traj_in_dim is not None and feats.size(-1) != traj_in_dim:
+            raise ValueError(
+                "TrajStreamBuffer._feat_buf last-dim "
+                f"{feats.size(-1)} doesn't match traj_encoder.in_dim={traj_in_dim}. "
+                "After the 7D traj-encoder rewrite the streaming buffer must "
+                "either store post-LocalTrajEncoder embeddings (in_dim=128) or "
+                "be reworked to stream frame-level features through "
+                "LocalTrajEncoder. Until that landing, route streaming traj "
+                "through the training-time encode_traj_batch path."
+            )
         emb = self.traj_encoder(feats)
         if self.use_emb_cache:
             self._emb_cache[key] = emb

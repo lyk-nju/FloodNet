@@ -119,8 +119,8 @@ class DiffForcingWanModel(nn.Module):
         cfg_scale_traj=0.0,
         prediction_type="vel",  # "vel", "x0", "noise"
         causal=False,
-        traj_out_dim=64,
-        traj_in_dim=4,
+        traj_out_dim=128,
+        traj_in_dim=7,
         traj_encoder_in_dim=None,
         traj_dropout=0.1,
         use_traj_emb_cache=False,
@@ -281,12 +281,10 @@ class DiffForcingWanModel(nn.Module):
         )
         self.controlnet.init_from_backbone(self.model)
 
-        # Local within-token encoder: compress masked 4-frame traj feats -> token-level.
-        # in_dim flag-gated (traj_encoder_in_dim, default 4; 7 for the 7D migration).
-        self.local_traj_encoder = LocalTrajEncoder(in_dim=self.traj_in_dim, hidden_dim=32)
-        self.traj_encoder = TrajEncoder(
-            in_dim=self.traj_in_dim, hidden_dim=64, out_dim=self.traj_out_dim
-        )
+        # Local within-token Conv1d encoder over the 4 frames of a token, then
+        # a token-level LayerNorm + MLP. 7D-only — see models/tools/traj_encoder.py.
+        self.local_traj_encoder = LocalTrajEncoder(in_dim=self.traj_in_dim)
+        self.traj_encoder = TrajEncoder(out_dim=self.traj_out_dim)
         self.param_dtype = torch.float32
 
         if self.freeze_backbone:
@@ -331,6 +329,7 @@ class DiffForcingWanModel(nn.Module):
         seq_len,
         traj_emb,
         traj_seq_lens,
+        traj_token_mask=None,
     ):
         return self.controlnet(
             noisy_input,
@@ -340,6 +339,7 @@ class DiffForcingWanModel(nn.Module):
             y=None,
             traj_emb=traj_emb,
             traj_seq_lens=traj_seq_lens,
+            traj_token_mask=traj_token_mask,
         )
 
     def _concat_text_for_cfg(
@@ -451,13 +451,14 @@ class DiffForcingWanModel(nn.Module):
         return x
 
     def _build_traj_emb(self, x, seq_len, device, horizon_tokens=None,
-                        horizon_active_end=0):
+                        horizon_active_end=0, return_token_mask=False):
         if self.traj_encoder is None:
-            return None
+            return (None, None) if return_token_mask else None
         return encode_traj_batch(
             x, seq_len, device, self.local_traj_encoder, self.traj_encoder,
             horizon_tokens=horizon_tokens,
             horizon_active_end_token=horizon_active_end,
+            return_token_mask=return_token_mask,
         )
 
     def _get_traj_seq_lens(self, x, seq_len, device, horizon_tokens=None,
@@ -589,22 +590,24 @@ class DiffForcingWanModel(nn.Module):
         # truncates relative to the current window, not the clip start.
         traj_emb = None
         traj_seq_lens = None
+        traj_token_mask = None
         if traj_dropped_override is None:
             traj_dropped = self._decide_traj_dropout(device)
         else:
             traj_dropped = bool(traj_dropped_override)
 
         if not traj_dropped:
-            traj_emb = self._build_traj_emb(
+            traj_emb, traj_token_mask = self._build_traj_emb(
                 x, seq_len, device, horizon_tokens=horizon_tokens,
                 horizon_active_end=horizon_active_end,
+                return_token_mask=True,
             )
             traj_seq_lens = self._get_traj_seq_lens(
                 x, seq_len, device, horizon_tokens=horizon_tokens,
                 horizon_active_end=horizon_active_end,
             )
 
-        return traj_emb, traj_seq_lens, traj_dropped
+        return traj_emb, traj_seq_lens, traj_dropped, traj_token_mask
 
     def _slice_diffusion_window(self, clean_feature, feature_length, time_steps):
         batch_size, seq_len, _ = clean_feature.shape
@@ -642,6 +645,7 @@ class DiffForcingWanModel(nn.Module):
         traj_seq_lens,
         traj_dropped,
         enable_scheduled_sampling=True,
+        traj_token_mask=None,
     ):
         feature_length = x["feature_length"]
         batch_size, seq_len, _ = clean_feature.shape
@@ -670,6 +674,7 @@ class DiffForcingWanModel(nn.Module):
             seq_len,
             traj_emb,
             traj_seq_lens,
+            traj_token_mask=traj_token_mask,
         )
         predicted_result = self.model(
             noisy_feature_input,
@@ -821,7 +826,7 @@ class DiffForcingWanModel(nn.Module):
             time_steps = torch.tensor(time_steps, device=device)  # (B,)
         text_dropped_flags = self._decide_text_dropout(batch_size, device)
         all_text_context = self._prepare_text_context(x, seq_len, device, text_dropped_flags)
-        traj_emb, traj_seq_lens, traj_dropped = self._prepare_traj_condition(
+        traj_emb, traj_seq_lens, traj_dropped, traj_token_mask = self._prepare_traj_condition(
             x, seq_len, device
         )
 
@@ -834,6 +839,7 @@ class DiffForcingWanModel(nn.Module):
             traj_seq_lens,
             traj_dropped,
             enable_scheduled_sampling=True,
+            traj_token_mask=traj_token_mask,
         )
 
         loss_dict = {"total": single_result["loss"], "mse": single_result["loss"]}
@@ -853,6 +859,7 @@ class DiffForcingWanModel(nn.Module):
         traj_seq_lens,
         seq_len: int,
         batch_size: int,
+        traj_token_mask=None,
     ) -> list:
         """Unified CFG denoising step shared by generate / stream_generate / stream_generate_step.
 
@@ -910,8 +917,14 @@ class DiffForcingWanModel(nn.Module):
                 if traj_seq_lens is not None
                 else None
             )
+            traj_mask_double = (
+                torch.cat([traj_token_mask, traj_token_mask], dim=0)
+                if traj_token_mask is not None
+                else None
+            )
             residuals = self._controlnet_forward(
-                noisy_double, t_double, ctx_double, seq_len, traj_double, traj_sl_double
+                noisy_double, t_double, ctx_double, seq_len, traj_double, traj_sl_double,
+                traj_token_mask=traj_mask_double,
             )
             if self.cfg_scale_traj > 0.0:
                 # Separated CFG — batch all 3 passes into a single 3B backbone forward.
@@ -956,7 +969,8 @@ class DiffForcingWanModel(nn.Module):
                 ]
         else:
             residuals = self._controlnet_forward(
-                noisy_input, t_scaled, text_cond_ctx, seq_len, traj_emb, traj_seq_lens
+                noisy_input, t_scaled, text_cond_ctx, seq_len, traj_emb, traj_seq_lens,
+                traj_token_mask=traj_token_mask,
             )
             pred = self.model(
                 noisy_input, t_scaled, text_cond_ctx, seq_len,
@@ -967,7 +981,8 @@ class DiffForcingWanModel(nn.Module):
                 # truly unconditioned (Bug fix: reusing cond residuals made CFG uncond
                 # branch not truly null).
                 residuals_null = self._controlnet_forward(
-                    noisy_input, t_scaled, text_null_ctx, seq_len, traj_emb, traj_seq_lens
+                    noisy_input, t_scaled, text_null_ctx, seq_len, traj_emb, traj_seq_lens,
+                    traj_token_mask=traj_token_mask,
                 )
                 pred_null = self.model(
                     noisy_input, t_scaled, text_null_ctx, seq_len,
@@ -1080,7 +1095,9 @@ class DiffForcingWanModel(nn.Module):
         text_null_context = [u.to(self.param_dtype) for u in text_null_context]
 
         gen_seq_len = seq_len + self.chunk_size
-        traj_emb = self._build_traj_emb(x, gen_seq_len, device)
+        traj_emb, traj_token_mask = self._build_traj_emb(
+            x, gen_seq_len, device, return_token_mask=True,
+        )
         traj_seq_lens = self._get_traj_seq_lens(x, gen_seq_len, device)
 
         # Progressively advance from t=0 to t=max_t
@@ -1107,6 +1124,7 @@ class DiffForcingWanModel(nn.Module):
                 noisy_input, t_scaled,
                 all_text_context, text_null_context,
                 traj_emb, traj_seq_lens, gen_sl, batch_size,
+                traj_token_mask=traj_token_mask,
             )
 
             for i in range(batch_size):
@@ -1257,7 +1275,10 @@ class DiffForcingWanModel(nn.Module):
         gen_seq_len = seq_len + self.chunk_size
         traj_emb = None
         traj_seq_lens = None
-        traj_emb = self._build_traj_emb(x, gen_seq_len, device)
+        traj_token_mask = None
+        traj_emb, traj_token_mask = self._build_traj_emb(
+            x, gen_seq_len, device, return_token_mask=True,
+        )
         traj_seq_lens = self._get_traj_seq_lens(x, gen_seq_len, device)
 
         commit_index = 0
@@ -1285,6 +1306,7 @@ class DiffForcingWanModel(nn.Module):
                 noisy_input, t_scaled,
                 all_text_context, text_null_context,
                 traj_emb, traj_seq_lens, gen_sl, batch_size,
+                traj_token_mask=traj_token_mask,
             )
 
             for i in range(batch_size):
@@ -1456,14 +1478,19 @@ class DiffForcingWanModel(nn.Module):
                         dtype=torch.long,
                     )
                 )
+                traj_token_mask = self._traj_buf.get_traj_token_mask(
+                    end_index, self.seq_len, device
+                )
             else:
                 traj_seq_lens = None
+                traj_token_mask = None
             model_sl = min(end_index, self.seq_len)
             t_scaled = noise_level * self.time_embedding_scale
             predicted_result = self._denoise_with_cfg(
                 noisy_input, t_scaled,
                 text_condition, text_null_context,
                 traj_emb, traj_seq_lens, model_sl, self.batch_size,
+                traj_token_mask=traj_token_mask,
             )
 
             for i in range(self.batch_size):

@@ -7,7 +7,7 @@ from torch_ema import ExponentialMovingAverage
 
 from utils.initialize import check_state_dict, instantiate, load_config
 from utils.motion_process import StreamJointRecovery263
-from utils.training.ckpt_compat import expand_traj_input_4d_to_7d
+from utils.training.ckpt_compat import strip_legacy_traj_encoder_weights
 from utils.render_skeleton import get_humanml3d_chains, render_simple_skeleton_video
 from utils.visualize import render_single_video
 
@@ -54,15 +54,15 @@ def load_model_from_config():
     )
     checkpoint = torch.load(cfg.test_ckpt, map_location="cpu", weights_only=False)
 
-    # 4D→7D traj-encoder expansion when inferring a legacy 4D ckpt with a 7D
-    # model (mirrors train_ldf.on_load_checkpoint; this standalone path used to
-    # bypass it → shape mismatch). No-op when dims already match.
+    # Strip legacy traj-encoder weights from a pre-rewrite ckpt (mirrors
+    # train_ldf.on_load_checkpoint). The new 7D traj encoder + traj_in_proj will
+    # then load with strict=False and stay at init values for inference.
     state_dict = checkpoint["state_dict"]
-    n_traj_exp = expand_traj_input_4d_to_7d(state_dict, getattr(model, "traj_in_dim", 4))
+    n_traj_exp = strip_legacy_traj_encoder_weights(state_dict, model.state_dict())
     if n_traj_exp:
-        print(f"[ckpt] expanded {n_traj_exp} traj-encoder weights 4D->7D "
-              "(legacy 4D ckpt into a 7D model)")
-    model.load_state_dict(state_dict, strict=True)
+        print(f"[ckpt] stripped {n_traj_exp} legacy traj-encoder weights "
+              "(7D encoder rewrite — new traj encoder uses init weights)")
+    model.load_state_dict(state_dict, strict=(n_traj_exp == 0))
 
     if "ema_state" in checkpoint and n_traj_exp == 0:
         # Match the param subset that was tracked during training.

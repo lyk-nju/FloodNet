@@ -176,18 +176,25 @@ def encode_traj_batch(
     horizon_tokens: int | None = None,
     horizon_active_end_token: int = 0,
     frames_per_token: int = 4,
-) -> torch.Tensor | None:
+    return_token_mask: bool = False,
+):
     """Build trajectory embedding (B, seq_len, traj_out_dim) from a training batch dict.
 
     Pipeline:
-      traj_features (B,T,4) or traj xyz (B,T,3)
+      traj_features (B,T,7) or traj xyz (B,T,3)
         → frame-level mask gate (+ optional T_B_04 horizon truncation)
-        → frames_to_tokens  [skipped if already token-level]
-        → local_traj_encoder
+        → frames_to_tokens
+        → LocalTrajEncoder(masked-mean over 4 frames)
         → token-level mask gate
-        → traj_encoder
+        → TrajEncoder
 
-    Returns None if x contains no trajectory fields.
+    Returns:
+      - traj_emb (B, seq_len, traj_out_dim) by default, or None if x has no
+        trajectory fields (or the entire batch's traj mask is zero).
+      - When `return_token_mask=True`, returns (traj_emb, token_mask) where
+        `token_mask` is (B, seq_len) in {0, 1} and is None when there is no
+        traj/horizon mask. The tuple is also returned (with traj_emb=None,
+        token_mask=None) on the no-traj path so callers can unpack uniformly.
 
     Horizon simulation (T_B_04): when `horizon_tokens` is not None, the
     frame-level traj mask is additionally zeroed at/after the cutoff frame
@@ -204,7 +211,7 @@ def encode_traj_batch(
     elif "traj" in x and x["traj"] is not None:
         feats_frame = root_to_traj_feats(x["traj"].to(device))
     else:
-        return None
+        return (None, None) if return_token_mask else None
 
     # --- frame-level mask (single source: build_traj_frame_mask) ---
     tf = feats_frame.shape[1]
@@ -217,55 +224,62 @@ def encode_traj_batch(
             # all-visible and let the horizon cutoff zero the tail.
             mask_frame = feats_frame.new_ones(feats_frame.shape[0], tf)
         if horizon_tokens is not None:
-            # T_B_04: frame-level horizon truncation (in place on mask_frame).
             from utils.training.horizon_sched import apply_horizon_mask_tokens
             apply_horizon_mask_tokens(
                 mask_frame, horizon_active_end_token, horizon_tokens, frames_per_token,
             )
-        # B-P0-1: if the WHOLE batch's traj mask is zero (clear / no-traj, or a
-        # fully-truncated horizon), there is no valid trajectory → return None so
-        # the model's no-control path runs. Otherwise the encoder bias would emit
-        # a nonzero embedding (~0.2) that ControlNet treats as a constant control
-        # signal — mask=0 must equal no-control, not "constant control".
+        # If the WHOLE batch's traj mask is zero (clear / no-traj, or a fully-
+        # truncated horizon), there is no valid trajectory → return None so the
+        # model's no-control path runs.
         if not bool(mask_frame[:, :tf].any()):
-            return None
+            return (None, None) if return_token_mask else None
         feats_frame = feats_frame * mask_frame[:, :tf].unsqueeze(-1).to(dtype=feats_frame.dtype)
-        # B-P0-1: aggregate the (horizon-applied) frame mask to token level so we
-        # can zero invalid TOKEN embeddings after the encoder — zeroing the input
-        # frames is not enough because LocalTrajEncoder/TrajEncoder have bias and
-        # re-emit a nonzero embedding for an all-zero token.
         from utils.token_frame import frames_to_token_mask
         token_mask_from_frame = frames_to_token_mask(
             mask_frame[:, :tf], seq_len, frames_per_token)
 
     # --- frame → token grouping ---
-    # T_B_07: frame-level is the only supported external entry. The old
-    # token-level passthrough (feeding pre-tokenized [B, seq_len, C] features and
-    # skipping the local encoder) is the disabled "parallel path": a genuine
-    # frame input has ~4x more frames than tokens, so shape[1] == seq_len with
-    # seq_len > 1 means token-level data was mis-fed → reject.
     if feats_frame.shape[1] == seq_len and seq_len > 1:
         raise ValueError(
             "encode_traj_batch expects frame-level traj input [B, T_frame, C] "
             f"(T_frame ~= 4*seq_len), got shape[1]={feats_frame.shape[1]} == "
             f"seq_len={seq_len}; the token-level parallel path is disabled."
         )
-    feats_4 = frames_to_tokens(feats_frame, seq_len)  # (B, seq_len, 4, C)
-    feats_tok = local_traj_encoder(feats_4)           # (B, seq_len, C)
+    feats_4 = frames_to_tokens(feats_frame, seq_len)            # (B, seq_len, 4, C)
+    # Build a 4-frame mask (B, seq_len, 4) so LocalTrajEncoder can do masked-mean
+    # pool — otherwise zero-padded frames in a partial token dilute the mean by
+    # 1/valid_count.
+    if mask_frame is not None:
+        mf_grouped = frames_to_tokens(
+            mask_frame[:, :tf].unsqueeze(-1).to(feats_frame.dtype), seq_len
+        )
+        frame_mask_4 = mf_grouped.squeeze(-1)                    # (B, seq_len, 4)
+    else:
+        frame_mask_4 = None
+    feats_tok = local_traj_encoder(feats_4, frame_mask=frame_mask_4)
 
     # --- token-level mask gate ---
+    # `token_mask` (when present) gates fully-invalid tokens; combine with the
+    # frame-derived token mask so downstream callers see a single token-level
+    # validity signal.
+    combined_token_mask = token_mask_from_frame
     if "token_mask" in x and x["token_mask"] is not None:
         tm = x["token_mask"].to(device=device, dtype=torch.float32)
         if tm.shape[1] < seq_len:
             pad = tm.new_zeros(tm.shape[0], seq_len - tm.shape[1])
             tm = torch.cat([tm, pad], dim=1)
-        feats_tok = feats_tok * tm[:, :seq_len].unsqueeze(-1).to(dtype=feats_tok.dtype)
+        tm = tm[:, :seq_len]
+        feats_tok = feats_tok * tm.unsqueeze(-1).to(dtype=feats_tok.dtype)
+        combined_token_mask = (
+            tm if combined_token_mask is None else (combined_token_mask * tm)
+        )
 
     traj_emb = traj_encoder(feats_tok)
-    # B-P0-1: zero invalid token embeddings (frame-derived token mask) so masked /
-    # out-of-horizon / overflow tokens carry no traj signal post-bias.
     if token_mask_from_frame is not None:
         traj_emb = traj_emb * token_mask_from_frame[..., None].to(traj_emb.dtype)
+
+    if return_token_mask:
+        return traj_emb, combined_token_mask
     return traj_emb
 
 

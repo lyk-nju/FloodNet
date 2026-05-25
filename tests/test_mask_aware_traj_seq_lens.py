@@ -110,7 +110,7 @@ def test_seq_lens_no_horizon_no_mask_is_base(model):
 def test_prepare_traj_condition_returns_truncated_seq_lens(model):
     """Wiring: _prepare_traj_condition threads horizon into _get_traj_seq_lens."""
     seq_len = 6
-    _, traj_seq_lens, dropped = model._prepare_traj_condition(
+    _, traj_seq_lens, dropped, _tmask = model._prepare_traj_condition(
         _x(seq_len), seq_len, "cpu", traj_dropped_override=False,
         horizon_tokens=4, horizon_active_end=0,
     )

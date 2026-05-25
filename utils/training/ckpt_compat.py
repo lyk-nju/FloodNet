@@ -1,82 +1,110 @@
-"""Checkpoint compatibility shims for the flag-gated 4D→7D traj migration (T_B_08).
+"""Checkpoint compatibility shims for the 7D traj-encoder rewrite.
 
-`expand_traj_input_4d_to_7d` lets an old 4D-era checkpoint load into a 7D-encoder
-model. It is a no-op unless the target model is 7D (`target_in_dim == 7`), so the
-4D path is unaffected.
+The old 4D-era encoder (Conv1d 4→32→4 + per-token MLP 4→64→64) and the new 7D
+encoder (Conv1d 7→64→128 + LayerNorm + MLP 128→128→128, traj_out_dim=128) have
+incompatible shapes throughout. We do **not** try to migrate weights — the old
+traj encoder is dropped entirely and the new one trains from scratch.
 
-Trajectory encoder shape changes (in_dim 4 → 7):
-  local_traj_encoder.net.0.weight : Conv1d in-channels  4→7  (RAW traj feature)
-  local_traj_encoder.net.2.weight : Conv1d out-channels 4→7  (internal feature)
-  local_traj_encoder.net.2.bias   : 4→7                       (internal feature)
-  traj_encoder.mlp.0.weight       : Linear in-features  4→7  (internal feature)
+`strip_legacy_traj_encoder_weights` removes any incoming key whose shape no
+longer matches the model:
+  * local_traj_encoder.*
+  * traj_encoder.*
+  * controlnet.traj_in_proj.* (input dim changed 64 → 128)
 
-Two different expansion rules, by what the axis MEANS:
-
-* RAW-feature input axis (net.0 in-channels): the channels ARE the trajectory
-  feature layout. Old 4D `[x, z, legacy_h0, legacy_h1]` → new 7D
-  `[x, y, z, cos, sin, fwd, yaw]`. Only x/z are carried (old 0→new 0, old 1→new 2);
-  the legacy heading channels are DROPPED (NOT mapped onto the new physical-yaw
-  heading — different semantics, see T_A_01 legacy-heading analysis), and
-  y/cos/sin/fwd/yaw zero-init.
-
-* INTERNAL feature axis (net.2 out-channels and mlp.0 in-features — these are the
-  local encoder's *learned* compressed channels, not raw x/z): keep the old 4
-  channels in place and append 3 zero channels. This preserves the old
-  computation EXACTLY, so a 7D input `[x, 0, z, 0, 0, 0, 0]` reproduces the old
-  4D forward on `[x, z, 0, 0]` (Done-criterion #3), while the new channels start
-  at zero and become learnable during fine-tune.
+The backbone, ControlNet attention layers, time/text embeddings, and the
+T_B_02 optional fields (mask_emb / z_mean / z_std) all keep loading as before —
+only the trajectory-conditioning weights are dropped on a legacy ckpt.
 """
 
 from __future__ import annotations
 
 import torch
 
-# RAW-feature semantic map: old 4D [x, z, lh0, lh1] -> new 7D [x, y, z, ...]
-_RAW_SRC = [0, 1]   # old channels x, z
-_RAW_DST = [0, 2]   # new positions x, z (old 2,3 dropped; new 1,3,4,5,6 zero)
+# Key prefixes whose owning submodules were rewritten and have new shapes /
+# layouts. Any key whose suffix-tail matches one of these is a candidate for
+# stripping (we additionally check shape mismatch before dropping, so a fresh
+# 7D ckpt round-trips cleanly).
+_LEGACY_TRAJ_PREFIXES = (
+    "local_traj_encoder.",
+    "traj_encoder.",
+    "controlnet.traj_in_proj.",
+    "model.traj_in_proj.",
+)
 
 
-def expand_traj_input_4d_to_7d(state_dict, target_in_dim: int) -> int:
-    """In-place expand 4D traj-encoder weights to 7D in `state_dict`.
+def _key_matches_legacy_traj(key: str) -> bool:
+    for p in _LEGACY_TRAJ_PREFIXES:
+        # Match either "<module>.<key>" or "<prefix>.<module>.<key>".
+        if key.startswith(p) or f".{p}" in key:
+            return True
+    return False
 
-    No-op unless `target_in_dim == 7`. Returns the number of tensors expanded.
-    Matches keys by suffix so it works with or without a module prefix.
+
+def strip_legacy_traj_encoder_weights(state_dict: dict, own_state: dict) -> int:
+    """Drop incoming traj-encoder/traj_in_proj keys that don't match the rewritten
+    7D model. Returns the number of keys stripped.
+
+    A legacy ckpt's traj submodules were entirely rewritten — even keys whose
+    raw shape happens to match (e.g. ``traj_in_proj.bias`` is still ``(dim,)``)
+    carry stale 4D-era statistics, so the safe rule for the traj prefixes is
+    "strip unconditionally": any incoming traj-prefix key whose tensor or shape
+    doesn't match the live model's same-key tensor is removed, AND if any key
+    under a given traj-prefix is being stripped, all sibling keys for that
+    prefix are stripped too — otherwise a surviving bias would silently
+    re-introduce non-zero init into the supposedly zero-init projection.
+
+    Modifies `state_dict` in place. Caller is expected to load with strict=False.
     """
-    if target_in_dim != 7:
+    legacy_keys = [k for k in state_dict.keys() if _key_matches_legacy_traj(k)]
+    if not legacy_keys:
         return 0
+
+    # Phase 1: shape-mismatch check, grouped by prefix so a partial-mismatch
+    # group strips its siblings too.
+    by_prefix: dict[str, list[str]] = {}
+    for key in legacy_keys:
+        for p in _LEGACY_TRAJ_PREFIXES:
+            if key.startswith(p) or f".{p}" in key:
+                # Use the full prefix path (including any LightningModule "model." outer).
+                idx = key.find(p)
+                full_prefix = key[: idx + len(p)]
+                by_prefix.setdefault(full_prefix, []).append(key)
+                break
+
     n = 0
-    for key in list(state_dict.keys()):
-        w = state_dict[key]
-        if not torch.is_tensor(w):
-            continue
-
-        # RAW input axis (Conv1d in-channels) → semantic x/z map.
-        if key.endswith("local_traj_encoder.net.0.weight") and w.dim() == 3 and w.shape[1] == 4:
-            nw = w.new_zeros(w.shape[0], 7, w.shape[2])
-            nw[:, _RAW_DST, :] = w[:, _RAW_SRC, :]
-            state_dict[key] = nw
-            n += 1
-
-        # INTERNAL output axis (Conv1d out-channels) → in-place + zero pad.
-        elif key.endswith("local_traj_encoder.net.2.weight") and w.dim() == 3 and w.shape[0] == 4:
-            nw = w.new_zeros(7, w.shape[1], w.shape[2])
-            nw[:4] = w
-            state_dict[key] = nw
-            n += 1
-        elif key.endswith("local_traj_encoder.net.2.bias") and w.dim() == 1 and w.shape[0] == 4:
-            nb = w.new_zeros(7)
-            nb[:4] = w
-            state_dict[key] = nb
-            n += 1
-
-        # INTERNAL input axis (Linear in-features = local encoder output) → in-place + zero pad.
-        elif key.endswith("traj_encoder.mlp.0.weight") and w.dim() == 2 and w.shape[1] == 4:
-            nw = w.new_zeros(w.shape[0], 7)
-            nw[:, :4] = w
-            state_dict[key] = nw
-            n += 1
-
+    for full_prefix, keys in by_prefix.items():
+        # Mismatched if ANY sibling has no own-state counterpart or shape mismatch.
+        mismatched = False
+        for key in keys:
+            v = state_dict[key]
+            if not torch.is_tensor(v):
+                continue
+            own = own_state.get(key)
+            if own is None or tuple(v.shape) != tuple(own.shape):
+                mismatched = True
+                break
+        if mismatched:
+            for key in keys:
+                if key in state_dict:
+                    del state_dict[key]
+                    n += 1
     return n
 
 
-__all__ = ["expand_traj_input_4d_to_7d"]
+# --- Legacy 4D→7D expansion is gone. Keep a stub so existing callers (train_ldf,
+# generate_ldf, tests) keep importing without crash; it now strips legacy weights
+# instead of reshaping them. ---
+def expand_traj_input_4d_to_7d(state_dict: dict, target_in_dim: int) -> int:
+    """Backward-compat shim: legacy 4D ckpts no longer reshape into the new 7D
+    encoder (architecture changed too much). This function is now a no-op and
+    returns 0 — call `strip_legacy_traj_encoder_weights` against the live
+    model's state dict instead.
+    """
+    del state_dict, target_in_dim
+    return 0
+
+
+__all__ = [
+    "strip_legacy_traj_encoder_weights",
+    "expand_traj_input_4d_to_7d",
+]

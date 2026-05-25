@@ -147,12 +147,12 @@ def test_encode_traj_batch_applies_horizon_truncation():
     traj frames at/after the cutoff (frame-level input, real encoders)."""
     from models.tools.traj_encoder import LocalTrajEncoder, TrajEncoder
 
-    B, seq_len, D = 1, 8, 4
+    B, seq_len, D = 1, 8, 7
     T_frame = num_frames_for_tokens(seq_len)   # 29
     torch.manual_seed(0)
-    le = LocalTrajEncoder(in_dim=D).eval()
+    le = LocalTrajEncoder().eval()                          # 7 → 128
     torch.manual_seed(1)
-    te = TrajEncoder(in_dim=D, out_dim=16).eval()
+    te = TrajEncoder(out_dim=16).eval()                     # 128 → 16
 
     feats = torch.randn(B, T_frame, D)
     H = 4

@@ -180,6 +180,7 @@ class WanControlNet(nn.Module):
         y: Optional[List[torch.Tensor]] = None,
         traj_emb: Optional[torch.Tensor] = None,
         traj_seq_lens: Optional[torch.Tensor] = None,
+        traj_token_mask: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         if self.model_type == "i2v":
             assert y is not None
@@ -211,6 +212,22 @@ class WanControlNet(nn.Module):
         if self.traj_in_proj is not None and traj_emb is not None:
             traj_t = self.traj_in_proj(traj_emb.to(dtype=x.dtype, device=x.device))
             traj_t = traj_t + self.traj_type_embed
+            # Mask AFTER traj_in_proj + traj_type_embed: zero-init bias of
+            # traj_type_embed (and traj_in_proj.bias) would otherwise leak into
+            # invalid tokens once those parameters move off zero in training.
+            if traj_token_mask is not None:
+                tm = traj_token_mask.to(device=x.device, dtype=traj_t.dtype)
+                if tm.dim() == 2:
+                    tm = tm[..., None]
+                tm_len = tm.shape[1]
+                proj_len = traj_t.shape[1]
+                if tm_len < proj_len:
+                    tm = torch.cat(
+                        [tm, tm.new_zeros(tm.shape[0], proj_len - tm_len, 1)], dim=1
+                    )
+                elif tm_len > proj_len:
+                    tm = tm[:, :proj_len, :]
+                traj_t = traj_t * tm
             bt, tlen, _ = traj_t.shape
             if tlen < seq_len:
                 traj_t = torch.cat(

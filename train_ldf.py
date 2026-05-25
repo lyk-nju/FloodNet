@@ -59,7 +59,7 @@ from utils.training import (
     resolve_sf_runtime,
     SelfForcingTrainer,
 )
-from utils.training.ckpt_compat import expand_traj_input_4d_to_7d
+from utils.training.ckpt_compat import strip_legacy_traj_encoder_weights
 from utils.training.config_validate import (
     validate_7d_requires_self_forcing,
     validate_traj_dim_consistency,
@@ -238,15 +238,16 @@ class CustomLightningModule(BasicLightningModule):
         ##############################
         # state_dict (strict vs loose for ControlNet)
         ##############################
-        # T_B_08: expand a 4D-era ckpt's traj-encoder weights to 7D when this
-        # model is 7D (safe x/z map + zero-init new channels). No-op for 4D.
-        n_traj_exp = expand_traj_input_4d_to_7d(
-            checkpoint["state_dict"], getattr(self.model, "traj_in_dim", 4)
+        # 7D traj-encoder rewrite: strip legacy traj-encoder weights from the
+        # incoming ckpt when their shapes no longer match the model. The new
+        # traj encoder + traj_in_proj will train from scratch.
+        n_traj_exp = strip_legacy_traj_encoder_weights(
+            checkpoint["state_dict"], self.model.state_dict()
         )
         if n_traj_exp:
             rank_zero_info(
-                f"[ckpt] expanded {n_traj_exp} traj-encoder weights 4D->7D "
-                "(x/z carried, legacy heading dropped, new channels zero-init)"
+                f"[ckpt] stripped {n_traj_exp} legacy traj-encoder weights "
+                "(7D encoder rewrite — new traj encoder trains from scratch)"
             )
         ckpt_keys = set(checkpoint["state_dict"].keys())
         controlnet_missing = not any(k.startswith("controlnet.") for k in ckpt_keys)
@@ -302,7 +303,7 @@ class CustomLightningModule(BasicLightningModule):
             if has_new_cond_params:
                 reasons.append("new cond params")
             if n_traj_exp > 0:
-                reasons.append("traj 4D->7D expand")
+                reasons.append("traj encoder stripped (legacy)")
             if reset_optim_on_resume:
                 reasons.append("resume_reset_optimizer")
             rank_zero_info(
