@@ -154,6 +154,12 @@ def run_benchmark(model, dataset, text_encoder, device="cpu",
     model = model.to(device).eval()
     min_tokens = model.min_tokens
 
+    # Reproducibility: get_sample advances the dataset RNG every call (mode/anchor/
+    # num_tokens dice), so reset it to the base seed → repeat runs (and oracle vs
+    # normal) see the identical sample sequence.
+    if hasattr(dataset, "reset_rng"):
+        dataset.reset_rng()
+
     n = len(dataset) if max_samples < 0 else min(max_samples, len(dataset))
 
     per_sample = []

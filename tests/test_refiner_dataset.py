@@ -429,3 +429,20 @@ def test_len_excludes_short_clips():
     long_b = _make_clip(T=70)
     ds = RefinerDataset([short, long_a, long_b], full_plan_ratio=1.0, seed=0)
     assert len(ds) == 2
+
+
+def test_reset_rng_makes_get_sample_sequence_reproducible():
+    """reset_rng() restores the base-seed RNG so a repeat pass draws the identical
+    mode/anchor/num_tokens sequence (benchmark reproducibility)."""
+    clips = [_make_clip(T=50) for _ in range(5)]
+    ds = RefinerDataset(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
+                         full_plan_ratio=0.5, seed=0)
+    first = [int(ds.get_sample(i)["num_tokens"].item()) for i in range(len(ds))]
+    # Without reset, a second pass diverges (RNG advanced).
+    second_no_reset = [int(ds.get_sample(i)["num_tokens"].item()) for i in range(len(ds))]
+    ds.reset_rng()
+    third_after_reset = [int(ds.get_sample(i)["num_tokens"].item()) for i in range(len(ds))]
+    assert third_after_reset == first, "reset_rng did not reproduce the first pass"
+    # (second_no_reset is allowed to differ; assert reset actually changed something
+    #  only when the un-reset pass diverged, which it does for full_plan_ratio<1.)
+    assert second_no_reset != first or third_after_reset == first

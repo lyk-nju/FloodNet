@@ -153,15 +153,13 @@ def test_run_benchmark_oracle_duration_mode():
                          text_emb_dim=16, dropout=0.0)
     text_encoder = FrozenStubTextEncoder(emb_dim=16)
 
-    # Fresh seeded dataset per call: get_sample still randomizes mode/anchor/
-    # num_tokens via the dataset RNG (force_no_path_aug only kills PATH aug), so a
-    # shared ds would advance the RNG and feed the two runs DIFFERENT samples.
-    def _ds():
-        return RefinerDataset(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
-                              full_plan_ratio=1.0, seed=0)
-
-    normal = run_benchmark(model, _ds(), text_encoder, device="cpu")["summary"]
-    oracle = run_benchmark(model, _ds(), text_encoder, device="cpu",
+    # A SINGLE shared dataset: run_benchmark calls dataset.reset_rng() at the start
+    # so both passes see the identical sample sequence (this also exercises
+    # reset_rng — otherwise the RNG would advance and the two runs would diverge).
+    ds = RefinerDataset(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
+                         full_plan_ratio=1.0, seed=0)
+    normal = run_benchmark(model, ds, text_encoder, device="cpu")["summary"]
+    oracle = run_benchmark(model, ds, text_encoder, device="cpu",
                             oracle_duration=True)["summary"]
 
     assert normal["oracle_duration"] is False

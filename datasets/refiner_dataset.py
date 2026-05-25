@@ -217,6 +217,16 @@ class RefinerDataset(Dataset):
             base = (base + int(self._seed)) % (2 ** 31)
         self._rng = random_module.Random(base)
 
+    def reset_rng(self) -> None:
+        """Reset the sampling/augmentation RNG to the dataset's base `seed` so a
+        repeat single-process pass (e.g. a benchmark run) draws the IDENTICAL
+        mode / anchor / num_tokens / path-aug sequence. `get_sample` advances the
+        RNG every call (force_no_path_aug only disables PATH aug, not the
+        mode/anchor/num_tokens dice), so without this two passes over the same
+        dataset object diverge. Reproducible only when constructed with a fixed
+        `seed` (seed=None → reseeds from OS entropy, matching construction)."""
+        self._rng = random_module.Random(self._seed)
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
