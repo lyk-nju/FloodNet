@@ -179,6 +179,19 @@ class RefinerLightningModule(pl.LightningModule):
         )
         L_num = F.cross_entropy(out["num_token_logits"], target_class)
 
+        # Ordinal-aware auxiliary term: SmoothL1/Huber between the soft-argmax
+        # EXPECTED class (sum_k p_k * k, fully differentiable through softmax) and
+        # the target class. CE alone treats off-by-1 the same as off-by-40; this
+        # distance-aware term gives the head a gradient proportional to how far
+        # the predicted distribution's mean is from the true token count, which is
+        # what we want for an ordinal horizon. Weighted by loss_weights.num_token_soft.
+        probs = out["num_token_logits"].softmax(dim=-1)                  # [B, K]
+        class_idx = torch.arange(
+            n_classes, device=probs.device, dtype=probs.dtype,
+        )
+        expected_class = (probs * class_idx).sum(dim=-1)                 # [B], differentiable
+        L_num_soft = F.smooth_l1_loss(expected_class, target_class.to(probs.dtype))
+
         # xyz SmoothL1 (valid only).
         L_xyz = smooth_l1_masked(out["waypoints"][..., 0:3], target_wp[..., 0:3], target_mask)
 
@@ -205,6 +218,7 @@ class RefinerLightningModule(pl.LightningModule):
         w = self.loss_weights
         loss = (
             w.get("num_token", 1.0) * L_num
+            + w.get("num_token_soft", 0.1) * L_num_soft
             + w.get("xyz", 5.0) * L_xyz
             + w.get("heading", 1.0) * L_head
             + w.get("fwd_delta", 0.5) * L_fwd_delta
@@ -212,14 +226,17 @@ class RefinerLightningModule(pl.LightningModule):
             + w.get("smoothness", 0.0) * L_smooth
         )
         # num_token diagnostics (NOT part of the weighted loss): exact / ±1 / ±2
-        # argmax accuracy + mean absolute token error. argmax is non-differentiable
-        # so these carry no gradient — they are logged only.
+        # argmax accuracy, discrete (argmax) MAE, and continuous (soft-argmax)
+        # expected-token MAE. argmax is non-differentiable so the argmax-based
+        # ones carry no gradient; all are logged only.
         with torch.no_grad():
             pred_class = out["num_token_logits"].argmax(dim=-1)
             err = (pred_class - target_class).abs().float()
+            soft_err = (expected_class - target_class.to(expected_class.dtype)).abs()
         out_losses = {
             "loss": loss,
             "num_token": L_num,
+            "num_token_soft": L_num_soft,
             "xyz": L_xyz,
             "heading": L_head,
             "fwd_delta": L_fwd_delta,
@@ -229,12 +246,16 @@ class RefinerLightningModule(pl.LightningModule):
             "num_token_acc_pm1": (err <= 1).float().mean(),
             "num_token_acc_pm2": (err <= 2).float().mean(),
             "num_token_mae": err.mean(),
+            "num_token_soft_mae": soft_err.mean(),
         }
         return out_losses
 
-    # Loss-term keys that feed the weighted total (everything else in the dict is
-    # a logged-only diagnostic metric).
-    METRIC_KEYS = ("num_token_acc", "num_token_acc_pm1", "num_token_acc_pm2", "num_token_mae")
+    # Logged-only diagnostic keys (everything else returned by _compute_loss is a
+    # weighted loss term with a matching loss_weights entry).
+    METRIC_KEYS = (
+        "num_token_acc", "num_token_acc_pm1", "num_token_acc_pm2",
+        "num_token_mae", "num_token_soft_mae",
+    )
 
     def training_step(self, batch: dict, batch_idx: int):
         out = self(batch)

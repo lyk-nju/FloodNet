@@ -185,7 +185,7 @@ def _tiny_cfg():
         "training": {"lr": 1e-3, "weight_decay": 0.01},
         "loss": {"heading_form": "cosine"},
         "loss_weights": {
-            "num_token": 1.0, "xyz": 5.0, "heading": 1.0,
+            "num_token": 1.0, "num_token_soft": 0.1, "xyz": 5.0, "heading": 1.0,
             "fwd_delta": 0.5, "yaw_delta": 0.5, "smoothness": 0.0,
         },
         # tests opt into the debug stub explicitly (real training must wire LDF).
@@ -220,7 +220,8 @@ def test_loss_dict_keys_match_config_weights_and_no_speed():
     out = module(batch)
     losses = module._compute_loss(out, batch)
     # Loss-term keys + the logged-only num_token diagnostic metrics.
-    expected = {"loss", "num_token", "xyz", "heading", "fwd_delta", "yaw_delta", "smoothness"}
+    expected = {"loss", "num_token", "num_token_soft", "xyz", "heading",
+                "fwd_delta", "yaw_delta", "smoothness"}
     expected |= set(RefinerLightningModule.METRIC_KEYS)
     assert set(losses.keys()) == expected
     # Round 6 P1-6: no legacy "speed" key.
@@ -228,6 +229,37 @@ def test_loss_dict_keys_match_config_weights_and_no_speed():
     # all finite
     for k, v in losses.items():
         assert torch.isfinite(v).all(), f"{k} not finite"
+
+
+def test_num_token_soft_term_present_and_differentiable():
+    """The soft-argmax expected-token aux term is a weighted loss term, finite,
+    and its gradient reaches num_token_head (so it actually shapes the logits)."""
+    module = RefinerLightningModule(_tiny_cfg())
+    batch = _make_batch(module)
+    losses = module._compute_loss(module(batch), batch)
+    assert "num_token_soft" in losses and "num_token_soft_mae" in losses
+    assert torch.isfinite(losses["num_token_soft"]).all()
+    assert "num_token_soft" in RefinerLightningModule.METRIC_KEYS or True  # it's a loss term
+    assert "num_token_soft" not in RefinerLightningModule.METRIC_KEYS      # weighted, not metric
+    assert "num_token_soft_mae" in RefinerLightningModule.METRIC_KEYS      # logged-only
+    losses["num_token_soft"].backward()
+    assert module.refiner.num_token_head.weight.grad is not None
+
+
+def test_soft_argmax_expected_value_is_distance_aware():
+    """Soft-argmax expected class = sum_k p_k * k tracks the logit peak (so the
+    Huber aux penalizes by token distance, not 0/1 like CE)."""
+    K = 7
+    logits = torch.full((1, K), -10.0)
+    logits[0, 3] = 10.0
+    probs = logits.softmax(dim=-1)
+    expected = (probs * torch.arange(K, dtype=probs.dtype)).sum(-1)
+    assert abs(expected.item() - 3.0) < 1e-2
+    # SmoothL1 to a far target is larger than to a near target (distance-aware).
+    import torch.nn.functional as F
+    near = F.smooth_l1_loss(expected, torch.tensor([3.0]))
+    far = F.smooth_l1_loss(expected, torch.tensor([0.0]))
+    assert far > near
 
 
 def test_loss_weights_keys_align_with_compute_loss_keys():
