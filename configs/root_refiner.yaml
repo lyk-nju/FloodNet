@@ -22,6 +22,15 @@
 #     first real training run (round 6 P1-5). Enable only for ablation / fine-tune
 #     once turn / stop / U-turn behavior is verified to not be smoothed out.
 
+# Run control (parity with train_ldf.py). All optional; absent → defaults.
+# Debug config keeps wandb off and no periodic checkpointing (smoke runs).
+seed: 1234                    # torch + dataset-aug RNG seed (pl.seed_everything)
+exp_name: root_refiner_debug
+resume_ckpt:                  # empty = fresh run
+logger:
+  wandb:
+    enabled: false
+
 model:
   d_model: 256
   n_layers: 6

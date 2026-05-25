@@ -15,6 +15,26 @@
 # anchor=first_effective_frame (§0.3 v1); full_plan_valid_history_frames=1;
 # loss_weights uses fwd_delta/yaw_delta (per-frame deltas, not m/s).
 
+# Run control (parity with train_ldf.py). All optional; absent → defaults.
+seed: 1234                    # torch + dataset-aug RNG seed (pl.seed_everything)
+exp_name: root_refiner        # used in the wandb run name
+deterministic: false          # set true for bit-reproducible runs (slower)
+resume_ckpt:                  # path to resume from; empty = fresh run
+
+logger:
+  wandb:
+    enabled: false            # set true for real runs; key from paths_default.yaml
+    # project / entity / wandb_key fall back to configs/paths_default.yaml
+    # wandb_info.{project,entity,key} (same source as train_ldf) when blank.
+    project:
+    entity:
+    wandb_key:
+
+checkpoint:
+  save_every_n_steps: 5000    # periodic ckpt cadence (ModelCheckpoint)
+  save_top_k: -1              # -1 = keep every periodic ckpt
+  save_last: true
+
 model:
   d_model: 256
   n_layers: 6

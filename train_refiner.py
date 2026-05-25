@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import argparse
 import logging
-import sys
+import os
+import time
 from pathlib import Path
+import sys
 
 import lightning.pytorch as pl
 import torch
@@ -272,6 +274,124 @@ def path_aug_kwargs(cfg: dict) -> dict:
     return kwargs
 
 
+# ---------------------------------------------------------------------------
+# Run config: seed / resume / wandb / checkpoint (parity with train_ldf.py)
+# ---------------------------------------------------------------------------
+
+
+def resolve_seed(cfg: dict, cli_seed: int | None = None) -> int:
+    """Seed precedence: CLI --seed > top-level cfg.seed (LDF style) >
+    cfg.training.seed > 1234 default. Used for pl.seed_everything + dataset RNG.
+    """
+    if cli_seed is not None:
+        return int(cli_seed)
+    if cfg.get("seed") is not None:
+        return int(cfg["seed"])
+    return int(cfg.get("training", {}).get("seed", 1234))
+
+
+def resolve_resume_ckpt(cfg: dict, cli_ckpt: str | None = None) -> str | None:
+    """Resume precedence: CLI --ckpt_path > cfg.resume_ckpt (LDF style) > None.
+    Empty string in either place means "no resume"."""
+    if cli_ckpt:
+        return cli_ckpt
+    rc = cfg.get("resume_ckpt")
+    return rc or None
+
+
+def _read_wandb_info_from_paths_default() -> dict:
+    """Best-effort read of `wandb_info` from configs/paths_default.yaml (the same
+    source train_ldf.py resolves `${wandb_info.*}` against). Returns {} if absent.
+    """
+    import yaml
+
+    p = _REPO_ROOT / "configs" / "paths_default.yaml"
+    if not p.is_file():
+        return {}
+    try:
+        with p.open() as f:
+            d = yaml.safe_load(f) or {}
+        return d.get("wandb_info", {}) or {}
+    except Exception:   # noqa: BLE001 — credentials are optional, never fatal
+        return {}
+
+
+def _literal_or_none(v):
+    """Return v only if it's a usable literal string (non-empty, not an
+    unresolved ${...} interpolation); else None so a fallback kicks in."""
+    if isinstance(v, str) and v.strip() and not v.startswith("${"):
+        return v
+    return None
+
+
+def build_wandb_logger(cfg: dict, run_name: str, save_dir: str):
+    """Build a WandbLogger when cfg.logger.wandb.enabled is true and an API key
+    is resolvable; else return None (so the Trainer keeps its default logger).
+
+    Credential precedence per field: explicit cfg.logger.wandb value >
+    configs/paths_default.yaml wandb_info > env WANDB_API_KEY (key only).
+    Mirrors train_ldf.py's behavior so both scripts log to the same project.
+    """
+    wb = (cfg.get("logger") or {}).get("wandb") or {}
+    if not wb.get("enabled", False):
+        return None
+    info = _read_wandb_info_from_paths_default()
+    key = (
+        _literal_or_none(wb.get("wandb_key"))
+        or info.get("key")
+        or os.environ.get("WANDB_API_KEY")
+    )
+    project = _literal_or_none(wb.get("project")) or info.get("project")
+    entity = _literal_or_none(wb.get("entity")) or info.get("entity")
+    if not key:
+        log.warning("logger.wandb.enabled is true but no API key found "
+                    "(cfg / paths_default.yaml / $WANDB_API_KEY) — skipping wandb.")
+        return None
+    os.environ["WANDB_API_KEY"] = key
+    from lightning.pytorch.loggers import WandbLogger
+
+    return WandbLogger(
+        project=project, entity=entity, name=run_name, save_dir=save_dir,
+        config=cfg,
+    )
+
+
+def build_checkpoint_callback(cfg: dict, output_dir: str):
+    """Build a periodic ModelCheckpoint from cfg.checkpoint (or LDF-style
+    cfg.validation.save_every_n_steps). Returns None when no cadence is set, so
+    the Trainer falls back to Lightning's default end-of-run save.
+    """
+    ck = cfg.get("checkpoint") or {}
+    val = cfg.get("validation") or {}
+    every = ck.get("save_every_n_steps", val.get("save_every_n_steps"))
+    if not every:
+        return None
+    from lightning.pytorch.callbacks import ModelCheckpoint
+
+    # monitor=None means "periodic keep-all"; Lightning forbids a positive
+    # finite save_top_k without a monitored metric, so coerce it to -1 (keep
+    # every periodic ckpt). Set checkpoint.monitor (+ mode) to keep top-k by a
+    # logged metric instead (e.g. "val/loss").
+    monitor = ck.get("monitor")
+    save_top_k = int(ck.get("save_top_k", val.get("save_top_k", -1)))
+    if monitor is None and save_top_k not in (-1, 0):
+        log.warning("checkpoint.save_top_k=%d needs checkpoint.monitor; "
+                    "keeping all periodic ckpts (save_top_k=-1) instead.", save_top_k)
+        save_top_k = -1
+
+    return ModelCheckpoint(
+        dirpath=ck.get("dirpath", output_dir),
+        filename=ck.get("filename", "refiner_step_{step:06d}"),
+        every_n_train_steps=int(every),
+        save_top_k=save_top_k,
+        monitor=monitor,
+        mode=ck.get("mode", "min"),
+        save_last=bool(ck.get("save_last", True)),
+        auto_insert_metric_name=False,
+        save_on_train_epoch_end=False,
+    )
+
+
 def _build_one_dataset(cfg: dict, split_file: str, *, seed: int | None = None):
     """Build a single RefinerDataset for a given split using the real loader."""
     from datasets.refiner_dataset import RefinerDataset
@@ -315,14 +435,19 @@ def _build_one_dataset(cfg: dict, split_file: str, *, seed: int | None = None):
     )
 
 
-def build_datasets(cfg: dict):
+def build_datasets(cfg: dict, seed: int | None = None):
     """Build (train_ds, val_ds) RefinerDatasets from cfg.data via the real
     HumanML3D/BABEL loader. val_ds is None if no val_split_file is configured.
+
+    `seed` is threaded into the train dataset's augmentation RNG for
+    reproducibility (matters with num_workers=0; with workers each gets a
+    distinct RNG via refiner_worker_init_fn). val uses a fixed seed so the
+    val set is identical across runs.
     """
     data_cfg = cfg.get("data", {})
     train_split = data_cfg.get("train_split_file", "train.txt")
     val_split = data_cfg.get("val_split_file")
-    train_ds = _build_one_dataset(cfg, train_split)
+    train_ds = _build_one_dataset(cfg, train_split, seed=seed)
     val_ds = _build_one_dataset(cfg, val_split, seed=0) if val_split else None
     return train_ds, val_ds
 
@@ -334,7 +459,9 @@ def main(argv=None):
                          help="Override training.total_steps (smoke runs).")
     parser.add_argument("--devices", type=int, default=1)
     parser.add_argument("--ckpt_path", type=str, default=None,
-                         help="Resume-from-checkpoint path.")
+                         help="Resume-from-checkpoint path (overrides cfg.resume_ckpt).")
+    parser.add_argument("--seed", type=int, default=None,
+                         help="Override cfg.seed (RNG seed for torch + dataset aug).")
     parser.add_argument("--output_dir", type=str, default="outputs/root_refiner")
     parser.add_argument("--raw_data_dir", type=str, default=None,
                          help="Override data.raw_data_dir (e.g. on a host where the "
@@ -361,7 +488,16 @@ def main(argv=None):
     train_cfg = cfg.get("training", {})
     max_steps = args.max_steps if args.max_steps is not None else train_cfg.get("total_steps", 100000)
 
-    train_ds, val_ds = build_datasets(cfg)
+    # Reproducibility: seed torch/numpy/python (+ Lightning workers) and thread
+    # the same seed into the dataset augmentation RNG.
+    seed = resolve_seed(cfg, args.seed)
+    pl.seed_everything(seed, workers=True)
+    if bool(cfg.get("deterministic", False)):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+    log.info("seed=%d deterministic=%s", seed, bool(cfg.get("deterministic", False)))
+
+    train_ds, val_ds = build_datasets(cfg, seed=seed)
     from datasets.refiner_dataset import refiner_worker_init_fn
     train_loader = DataLoader(
         train_ds,
@@ -388,6 +524,20 @@ def main(argv=None):
 
     module = RefinerLightningModule(cfg)
 
+    # Logger (wandb, parity with train_ldf) + periodic checkpointing + resume.
+    run_name = f"{cfg.get('exp_name', 'root_refiner')}_{time.strftime('%Y%m%d_%H%M%S')}"
+    logger = build_wandb_logger(cfg, run_name=run_name, save_dir=args.output_dir)
+    callbacks = []
+    ckpt_cb = build_checkpoint_callback(cfg, args.output_dir)
+    if ckpt_cb is not None:
+        callbacks.append(ckpt_cb)
+    resume_ckpt = resolve_resume_ckpt(cfg, args.ckpt_path)
+    if resume_ckpt:
+        log.info("resuming from checkpoint: %s", resume_ckpt)
+
+    # Step-based validation cadence when configured (LDF style); else epoch.
+    val_check_interval = (cfg.get("validation") or {}).get("validation_steps")
+
     trainer = pl.Trainer(
         max_steps=max_steps,
         devices=args.devices,
@@ -395,8 +545,11 @@ def main(argv=None):
         gradient_clip_val=train_cfg.get("gradient_clip_val", 1.0),
         default_root_dir=args.output_dir,
         log_every_n_steps=10,
+        logger=logger if logger is not None else True,
+        callbacks=callbacks,
+        val_check_interval=val_check_interval if (val_loader is not None and val_check_interval) else None,
     )
-    trainer.fit(module, train_loader, val_dataloaders=val_loader, ckpt_path=args.ckpt_path)
+    trainer.fit(module, train_loader, val_dataloaders=val_loader, ckpt_path=resume_ckpt)
 
 
 if __name__ == "__main__":
