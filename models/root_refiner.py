@@ -181,13 +181,12 @@ class RootRefiner(nn.Module):
             [spec_pad, not_path, not_hist, query_pad], dim=1,
         )                                                                          # [B, L]
 
-        # Defensive: degenerate all-True padding row would cause NaN attention
-        # (no valid keys). We can't mathematically guard upstream — flag here.
-        # In normal operation `cls_tok` row is always non-masked so this is OK.
-        assert not src_key_padding_mask.all(dim=1).any().item(), (
-            "src_key_padding_mask has at least one row fully True; "
-            "attention would NaN. CLS/text/stats/queries should always be unmasked."
-        )
+        # No all-True row is possible: spec_pad (CLS/text/stats, 3 cols) and
+        # query_pad (max_frames cols) are always False, so every row keeps
+        # >= _n_specials + max_frames valid keys → attention never NaNs. We
+        # therefore skip the old `.all(dim=1).any().item()` assertion, which
+        # forced a GPU→CPU sync on every forward to check an invariant that
+        # holds by construction.
 
         hidden = self.transformer(seq, src_key_padding_mask=src_key_padding_mask)
 
