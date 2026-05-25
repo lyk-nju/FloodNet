@@ -4,21 +4,15 @@ debug: false
 train: true
 
 dirs:
-    deps: /data/home/shengqiuProf_user_yuankai/FloodDiffusion/deps
+    deps: /data1/yuankai/text2Motion/FloodDiffusion/deps
     outputs: ./outputs
-    raw_data: /data/home/shengqiuProf_user_yuankai/FloodDiffusion/raw_data
+    raw_data: /data1/yuankai/text2Motion/FloodDiffusion/raw_data
 
 save_dir: ./outputs
-resume_ckpt: /data/home/shengqiuProf_user_yuankai/FloodNet/outputs/20260508_001434_ldf/step_396000.ckpt
-test_ckpt: /data/home/shengqiuProf_user_yuankai/FloodNet/outputs/20260508_001434_ldf/step_396000.ckpt
+resume_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt
+test_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt
 
-# resume_ckpt: /data/home/shengqiuProf_user_yuankai/FloodNet/outputs/20260428_004404_ldf/step_step=300000.ckpt
-# test_ckpt: /data/home/shengqiuProf_user_yuankai/FloodNet/outputs/20260428_004404_ldf/step_step=300000.ckpt
-
-# resume_ckpt: /data/home/shengqiuProf_user_yuankai/FloodDiffusion/step_step=240000.ckpt
-# test_ckpt: /data/home/shengqiuProf_user_yuankai/FloodDiffusion/step_step=240000.ckpt
-
-test_vae_ckpt: /data/home/shengqiuProf_user_yuankai/FloodDiffusion/vae_1d_z4_step=300000.ckpt
+test_vae_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/vae_1d_z4_step=300000.ckpt
 test_vae:
     target: models.vae_wan_1d.VAEWanModel
     ema_decay: 0.99
@@ -45,11 +39,10 @@ logger:
 trainer: # lightning trainer
     max_steps: 500000
     accelerator: gpu
-    devices: [0,1,2,3,4,5,6,7]
+    devices: [0,1,2,3,4]
     log_every_n_steps: 100
     precision: bf16-mixed
 # Set to true to run T2M FID/R-Precision on val_meta_paths during eval.
-# Can also be enabled via --t2m_metric CLI flag.
 t2m_metric: true
 
 validation:
@@ -107,18 +100,11 @@ data:
     test_bs: 4
     num_workers: 4
     mask_ratio: 1.0
-
-    # T_B_10 7D-switch flag (must AGREE with model.params.traj_encoder_in_dim).
-    # 4 = legacy 4D path (default, unchanged). To run the 7D fine-tune set BOTH
-    # this and model.params.traj_encoder_in_dim to 7 (a mismatch raises at startup
-    # via utils.training.validate_traj_dim_consistency). When 7, the dataset emits
-    # world-frame traj_cond_7d and the SF rollout does body-window canonicalize
-    # (T_B_05) + body aux loss (T_B_06); old 4D ckpts load via the T_B_08 hook.
-    traj_feat_dim: 4
+    traj_feat_dim: 7
 
     train_meta_paths:
         # - ${dirs.raw_data}/HumanML3D/train.txt
-        - ${dirs.raw_data}/HumanML3D/train_difficult.txt
+        - ${dirs.raw_data}/HumanML3D/train.txt
         # - ${dirs.raw_data}/HumanML3D/test_min.txt
         # - ${dirs.raw_data}/HumanML3D/val.txt
     val_meta_paths:
@@ -151,11 +137,8 @@ model:
         noise_steps: 10
         freeze_backbone: true
 
-        # Trajectory condition encoder (used by ControlNet).
-        # T_B_10 7D switch: 4 = legacy (default). Set to 7 (together with
-        # data.traj_feat_dim: 7) for the 7D fine-tune; the two MUST agree.
-        traj_encoder_in_dim: 4
-        traj_out_dim: 64
+        traj_encoder_in_dim: 7
+        traj_out_dim: 128
         traj_dropout: 0.1
         text_dropout: 0.2
         use_traj_emb_cache: true
@@ -183,44 +166,28 @@ model:
 #   6 — active window, relative displacement, GT anchor    (loss = |pred_rel[t]-gt_rel[t]|², true disp error)
 control_loss_train_mode: 1
 
-# T_B_06: body aux loss (design §2.4). In 7D mode this replaces the legacy
-# xz-only control loss with 5 terms (root_xz/root_y/heading/fwd_delta/yaw_delta),
-# all served by ONE VAE decode. Mandatory in 7D (heading must be supervised):
-# traj_encoder_in_dim=7 with body_aux_loss.enabled=false raises (see T_B_06).
-# In 4D mode it is inert (gated on traj_cond_7d in the batch).
+
 body_aux_loss:
     enabled: true
     heading_form: cosine        # cosine | smooth_l1
     weights:
         root_xz: 1.0
-        root_y: 0.3
+        root_y: 0.1
         heading: 0.5            # do not disable — wastes the new 7D heading channel
         fwd_delta: 0.1         # delta channels are noisy; conservative in v1
         yaw_delta: 0.1
 
-# T_B_05: body-window canonicalize (design §2.3). Canonicalizes the 7D
-# world-frame traj_cond into the body-window-local frame (anchor = body window
-# leftmost / history0) to match inference's per-window re-anchoring. Only active
-# for the 7D traj path (traj_feat_dim/traj_encoder_in_dim = 7); a no-op for 4D.
+
 anchor_canonicalize:
     enabled: true
     source: gt_root      # anchor pose source (v1: read from traj_cond_7d itself)
     mode: full           # full local-frame canonical (translate + rotate)
 
-# T_B_04: random horizon simulation (design.md §2.2.2/§2.2.3). Units are all
-# token-level. Truncates how many future tokens traj_cond exposes during
-# training, ramping toward the fixed inference horizon late in training.
-# WIRED (v1): SelfForcingTrainer._run_rollout computes the horizon in the outer
-# loop and passes it through _prepare_traj_condition → _build_traj_emb →
-# encode_traj_batch, which zeroes the frame-level traj mask past the cutoff.
-# v1 uses active_end_token=0 (horizon measured from clip start); per-sample
-# active end is a future refinement. Only active for the 7D traj path.
+
 horizon_sim:
     enabled: true
     unit: token
     inference_horizon_tokens: 20       # inference horizon (token-level); frame count
-                                       # comes from token_range_to_frame_slice (77 at
-                                       # start_token=0, 80 for an arbitrary range) — NOT a fixed 80
     early_min_horizon_tokens: 20       # early lower bound (>= inference)
     early_max_horizon_ratio: 1.0       # early upper = clip_tokens * ratio
     late_min_horizon_tokens: 10        # late short-horizon lower bound
@@ -228,19 +195,15 @@ horizon_sim:
     p_exact_inference_horizon: 0.5     # late: 50% exact = 20, else U[10,20]
     warmup_ratio: 0.5                  # first 50% of steps = early phase
 
-# T_B_03: history-token corruption for streaming body training (design.md §2.1.3/§2.1.4).
-# Replaces the removed scheduled_sampling (T_B_01). Applied once at SF rollout
-# start to the history region (left of the active window), fixed across K steps.
+
 history_corruption:
     enabled: true
     apply_prob: null            # null = use curriculum below; a float skips curriculum
     alpha_mask: 0.3             # fraction of focus tokens replaced by mask_emb
     alpha_noisy: 0.3            # fraction of focus tokens with additive N(0,(sigma·z_std)^2)
     noise_sigma_factor: 0.05    # noise sigma = noise_sigma_factor * z_std
-    # B-P0-1: dir with z_mean.npy / z_std.npy (scripts/compute_z_stats.py output).
-    # null → WanModel keeps z_std=1 (corruption noise uncalibrated). Set for the
-    # 7D fine-tune so the noisy branch uses the real cached-z per-channel sigma.
-    z_stats_dir: null
+
+    z_stats_dir: deps/body_stats
     curriculum:
         enabled: true
         early_prob: 0.2         # progress < 1/3
@@ -251,7 +214,7 @@ resume_reset_optimizer: true
 optimizer:
     target: AdamW
     params:
-        lr: 5e-5
+        lr: 1e-4
         betas: [0.9, 0.999]
         weight_decay: 0.0
         eps: 1e-8
@@ -262,3 +225,4 @@ lr_scheduler:
     params:
         num_warmup_steps: 1000
         num_training_steps: ${trainer.max_steps}
+

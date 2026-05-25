@@ -251,7 +251,11 @@ class CustomLightningModule(BasicLightningModule):
             )
         ckpt_keys = set(checkpoint["state_dict"].keys())
         controlnet_missing = not any(k.startswith("controlnet.") for k in ckpt_keys)
-        strict = not controlnet_missing
+        # strict=False when EITHER (a) the ckpt has no ControlNet (base pretrain
+        # warm-start path) OR (b) we just stripped legacy traj-encoder weights —
+        # in both cases the live model has keys the ckpt doesn't carry, so a
+        # strict load would raise on missing keys.
+        strict = not controlnet_missing and n_traj_exp == 0
         result = self.model.load_state_dict(checkpoint["state_dict"], strict=strict)
         has_new_cond_params = controlnet_missing and bool(result.missing_keys)
         if not strict and result.missing_keys:

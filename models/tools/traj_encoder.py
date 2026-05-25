@@ -75,6 +75,17 @@ class LocalTrajEncoder(nn.Module):
                 f"expected (B,T,{_FRAMES_PER_TOKEN},{self.in_dim}), got {tuple(x.shape)}"
             )
         b, t, n_frames, c = x.shape
+        if frame_mask is not None and frame_mask.shape != (b, t, n_frames):
+            raise ValueError(
+                f"frame_mask shape {tuple(frame_mask.shape)} != (B,T,{n_frames}) "
+                f"= ({b},{t},{n_frames})"
+            )
+        # Defense-in-depth: zero invalid frames BEFORE the conv. Otherwise any
+        # caller that passes frame_mask without pre-zeroing the frames would
+        # leak invalid-frame values into neighbors via the kernel-size-3 conv,
+        # and only the masked-mean pool below would see the mask.
+        if frame_mask is not None:
+            x = x * frame_mask.to(dtype=x.dtype).unsqueeze(-1)
         # (B,T,L,C) -> (B*T,C,L)
         y = x.reshape(b * t, n_frames, c).transpose(1, 2).contiguous()
         y = self.act(self.conv1(y))
@@ -82,11 +93,6 @@ class LocalTrajEncoder(nn.Module):
         if frame_mask is None:
             y = y.mean(dim=-1)                   # plain mean
         else:
-            if frame_mask.shape != (b, t, n_frames):
-                raise ValueError(
-                    f"frame_mask shape {tuple(frame_mask.shape)} != (B,T,{n_frames}) "
-                    f"= ({b},{t},{n_frames})"
-                )
             mflat = frame_mask.reshape(b * t, n_frames)
             y = _masked_mean(y, mflat)
         return y.reshape(b, t, self.out_dim)

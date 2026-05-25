@@ -70,6 +70,24 @@ def test_traj_encoder_rejects_dim_mismatch():
         enc(torch.randn(2, 5, 7))                        # last dim != 128
 
 
+def test_local_encoder_zeros_invalid_frames_before_conv():
+    """LocalTrajEncoder must zero invalid frames internally — values on
+    masked frames must not bleed into neighbors via the kernel-size-3 conv.
+    """
+    enc = LocalTrajEncoder().eval()
+    base = torch.randn(1, 2, 4, 7)
+    mask = torch.ones(1, 2, 4)
+    mask[:, :, 1] = 0.0   # frame 1 invalid in every token
+
+    perturbed = base.clone()
+    perturbed[:, :, 1] = 1e3   # huge value on the masked frame
+
+    with torch.no_grad():
+        o_clean = enc(base, frame_mask=mask)
+        o_perturbed = enc(perturbed, frame_mask=mask)
+    assert torch.allclose(o_clean, o_perturbed, atol=1e-5)
+
+
 # ---------------------------------------------------------------------------
 # Mask effectiveness through the full encode_traj_batch pipeline
 # ---------------------------------------------------------------------------

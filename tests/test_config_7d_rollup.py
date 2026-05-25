@@ -41,15 +41,15 @@ def test_all_new_sections_present_and_readable():
     assert cfg.body_aux_loss.heading_form in ("cosine", "smooth_l1")
     for k in ("root_xz", "root_y", "heading", "fwd_delta", "yaw_delta"):
         assert k in cfg.body_aux_loss.weights
-    # T_B_07 / T_B_09 flags (default 4D)
-    assert cfg.data.traj_feat_dim == 4
-    assert cfg.model.params.traj_encoder_in_dim == 4
+    # T_B_07 / T_B_09 flags — shipped ldf.yaml is now on the 7D path.
+    assert cfg.data.traj_feat_dim == 7
+    assert cfg.model.params.traj_encoder_in_dim == 7
 
 
-def test_default_config_is_4d_and_consistent():
-    """Shipped ldf.yaml stays on the legacy 4D path (conservative default)."""
+def test_default_config_is_7d_and_consistent():
+    """Shipped ldf.yaml is on the 7D path (post-rewrite default)."""
     cfg = OmegaConf.load(_LDF)
-    assert validate_traj_dim_consistency(cfg) == 4
+    assert validate_traj_dim_consistency(cfg) == 7
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +124,6 @@ def test_4d_without_self_forcing_ok():
 
 
 def test_shipped_ldf_passes_sf_guard():
-    """Shipped ldf.yaml is 4D, so the SF guard is a no-op."""
+    """Shipped ldf.yaml is 7D with self_forcing_enabled=true, so the guard passes."""
     cfg = OmegaConf.load(_LDF)
     validate_7d_requires_self_forcing(cfg)   # no raise
