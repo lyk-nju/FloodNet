@@ -55,7 +55,9 @@ validation:                   # val + checkpoint cadence (mirrors ldf.yaml.valid
 
 model:
   d_model: 256
-  n_layers: 6
+  n_layers: 6                 # legacy total; split below when *_cond/_token absent
+  n_layers_cond: 3            # Stage-1 condition-only num-token predictor depth
+  n_layers_token: 3           # Stage-2 token-level plan generator depth
   n_heads: 8
   ff_dim: 1024
   dropout: 0.1

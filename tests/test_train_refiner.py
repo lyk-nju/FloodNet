@@ -219,7 +219,9 @@ def test_loss_dict_keys_match_config_weights_and_no_speed():
     batch = _make_batch(module)
     out = module(batch)
     losses = module._compute_loss(out, batch)
+    # Loss-term keys + the logged-only num_token diagnostic metrics.
     expected = {"loss", "num_token", "xyz", "heading", "fwd_delta", "yaw_delta", "smoothness"}
+    expected |= set(RefinerLightningModule.METRIC_KEYS)
     assert set(losses.keys()) == expected
     # Round 6 P1-6: no legacy "speed" key.
     assert "speed" not in losses
@@ -236,7 +238,8 @@ def test_loss_weights_keys_align_with_compute_loss_keys():
     batch = _make_batch(module)
     losses = module._compute_loss(module(batch), batch)
     weight_keys = set(cfg["loss_weights"].keys())
-    loss_keys = set(losses.keys()) - {"loss"}
+    # Exclude "loss" (the total) and the logged-only diagnostic metric keys.
+    loss_keys = set(losses.keys()) - {"loss"} - set(RefinerLightningModule.METRIC_KEYS)
     assert weight_keys == loss_keys, (
         f"weight keys {weight_keys} != loss term keys {loss_keys}"
     )

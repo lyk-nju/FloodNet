@@ -50,6 +50,38 @@ def test_T02_max_frames_equals_num_frames_for_tokens_max():
     assert model.max_frames == 193
 
 
+def test_forward_with_and_without_num_tokens():
+    """Duration-first/trajectory-second: forward must work both with a GT
+    num_tokens (teacher-forced horizon) and without (argmax-driven inference)."""
+    model = RootRefiner(d_model=64, n_layers=2, n_heads=4, ff_dim=128,
+                          max_tokens=8, min_tokens=2)
+    inputs = _make_inputs(model, B=3)
+    K = model.num_token_logits_dim
+    Fm = model.max_frames
+
+    model.train()
+    nt = torch.tensor([2, 5, 8])
+    out = model(**inputs, num_tokens=nt)
+    assert out["num_token_logits"].shape == (3, K)
+    assert out["waypoints"].shape == (3, Fm, 7)
+    assert torch.equal(out["chosen_num_tokens"], nt)   # teacher-forced horizon
+
+    model.eval()
+    out2 = model(**inputs)                              # no num_tokens → use pred
+    assert out2["waypoints"].shape == (3, Fm, 7)
+    assert torch.equal(out2["chosen_num_tokens"], out2["pred_num_tokens"])
+
+
+def test_pred_num_tokens_in_range():
+    model = RootRefiner(d_model=64, n_layers=2, n_heads=4, ff_dim=128,
+                          max_tokens=8, min_tokens=2)
+    model.eval()
+    out = model(**_make_inputs(model, B=4))
+    pnt = out["pred_num_tokens"]
+    assert int(pnt.min()) >= model.min_tokens
+    assert int(pnt.max()) <= model.max_tokens
+
+
 # ---------------------------------------------------------------------------
 # T03-T05: attention masking
 # ---------------------------------------------------------------------------
@@ -214,6 +246,7 @@ def test_T08_tiny_batch_overfit():
 
     # Random but fixed targets.
     target_num_tokens_class = torch.randint(0, K, (B,), generator=g)
+    target_num_tokens = target_num_tokens_class + model.min_tokens   # teacher-forced horizon
     # Build valid 7D waypoints: cos/sin on unit circle.
     target_yaw = torch.randn(B, F_max, generator=g) * 0.5
     target_waypoints = torch.zeros(B, F_max, 7)
@@ -235,7 +268,7 @@ def test_T08_tiny_batch_overfit():
         out = model(
             text_emb=text_emb, xz_path=xz_path, path_mask=path_mask,
             path_stats=path_stats, current_motion=current_motion,
-            history_mask=history_mask,
+            history_mask=history_mask, num_tokens=target_num_tokens,
         )
         # Loss: num_token CE + xyz SmoothL1 + heading cosine + fwd_delta + yaw_delta
         l_num = F.cross_entropy(out["num_token_logits"], target_num_tokens_class)

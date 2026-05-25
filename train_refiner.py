@@ -155,15 +155,28 @@ class RefinerLightningModule(pl.LightningModule):
             path_stats=batch["path_stats"],
             current_motion=batch["current_motion"],
             history_mask=batch["history_mask"],
+            # Teacher-force the horizon with GT num_tokens during training; the
+            # model falls back to its own argmax at eval / when absent.
+            num_tokens=batch.get("num_tokens"),
         )
 
     def _compute_loss(self, out: dict, batch: dict) -> dict:
         target_wp = batch["target_waypoints"]
         target_mask = batch["target_mask"]
 
-        # num_token CE: target class = num_tokens - min_tokens (clamped to logits range).
+        # num_token CE: target class = num_tokens - min_tokens. Validate the range
+        # explicitly (the dataset shares min/max_tokens with the model, so a stray
+        # out-of-range value means a config/data mismatch we want to fail loudly on)
+        # instead of silently clamping it into a wrong class.
         n_classes = out["num_token_logits"].shape[-1]
-        target_class = (batch["num_tokens"] - self.min_tokens).clamp(0, n_classes - 1)
+        target_class = batch["num_tokens"] - self.min_tokens
+        assert int(target_class.min()) >= 0, (
+            f"num_tokens below min_tokens: min target_class={int(target_class.min())}"
+        )
+        assert int(target_class.max()) < n_classes, (
+            f"num_tokens above max_tokens: max target_class={int(target_class.max())} "
+            f">= n_classes={n_classes}"
+        )
         L_num = F.cross_entropy(out["num_token_logits"], target_class)
 
         # xyz SmoothL1 (valid only).
@@ -198,7 +211,13 @@ class RefinerLightningModule(pl.LightningModule):
             + w.get("yaw_delta", 0.5) * L_yaw_delta
             + w.get("smoothness", 0.0) * L_smooth
         )
-        return {
+        # num_token diagnostics (NOT part of the weighted loss): exact / ±1 / ±2
+        # argmax accuracy + mean absolute token error. argmax is non-differentiable
+        # so these carry no gradient — they are logged only.
+        with torch.no_grad():
+            pred_class = out["num_token_logits"].argmax(dim=-1)
+            err = (pred_class - target_class).abs().float()
+        out_losses = {
             "loss": loss,
             "num_token": L_num,
             "xyz": L_xyz,
@@ -206,7 +225,16 @@ class RefinerLightningModule(pl.LightningModule):
             "fwd_delta": L_fwd_delta,
             "yaw_delta": L_yaw_delta,
             "smoothness": L_smooth,
+            "num_token_acc": (err == 0).float().mean(),
+            "num_token_acc_pm1": (err <= 1).float().mean(),
+            "num_token_acc_pm2": (err <= 2).float().mean(),
+            "num_token_mae": err.mean(),
         }
+        return out_losses
+
+    # Loss-term keys that feed the weighted total (everything else in the dict is
+    # a logged-only diagnostic metric).
+    METRIC_KEYS = ("num_token_acc", "num_token_acc_pm1", "num_token_acc_pm2", "num_token_mae")
 
     def training_step(self, batch: dict, batch_idx: int):
         out = self(batch)
