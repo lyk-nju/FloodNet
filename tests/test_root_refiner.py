@@ -115,6 +115,36 @@ def test_path_cond_zeroed_for_degenerate_path():
     assert float(cond[1].abs().max()) > 0.0            # valid → nonzero
 
 
+def test_path_cond_decoder_no_leak_from_post_horizon():
+    """Valid-horizon waypoints must be INVARIANT to the post-horizon path
+    condition. frame_valid masking + per-block re-mask stop the dilated frame
+    convs (kernel/bias) from leaking the future path condition into boundary
+    valid frames."""
+    torch.manual_seed(0)
+    model = RootRefiner(d_model=64, n_layers=2, n_heads=4, ff_dim=128,
+                         max_tokens=8, min_tokens=2, decoder_type="path_cond",
+                         decoder_width=48)
+    model.eval()
+    inputs = _make_inputs(model, B=1)
+    N = 3
+    veff = num_frames_for_tokens(N)
+    dec = model.frame_decoder
+    orig = dec._build_path_cond
+
+    def perturbed(xz, pm, cnt):
+        c = orig(xz, pm, cnt).clone()
+        c[:, veff:] = c[:, veff:] + torch.randn_like(c[:, veff:]) * 50.0   # garbage past horizon
+        return c
+
+    with torch.no_grad():
+        out1 = model(**inputs, num_tokens=torch.tensor([N]))["waypoints"]
+        dec._build_path_cond = perturbed
+        out2 = model(**inputs, num_tokens=torch.tensor([N]))["waypoints"]
+    assert torch.allclose(out1[:, :veff], out2[:, :veff], atol=1e-6), (
+        "post-horizon path condition leaked into valid frames"
+    )
+
+
 def test_path_cond_tangent_is_unit_or_zero():
     """Tangent channels [2:4] are eps-safe unit vectors on valid frames (never NaN)."""
     dec = PathCondFrameDecoder(d_model=32, max_tokens=8, n_path=16, width=48,

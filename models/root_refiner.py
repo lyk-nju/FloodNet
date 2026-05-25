@@ -119,6 +119,14 @@ class PathCondFrameDecoder(nn.Module):
                  token_res_depth: int = 2, frame_res_depth: int = 4,
                  dilation_growth_rate: int = 2, dropout: float = 0.0, out_dim: int = 7):
         super().__init__()
+        # _build_path_cond emits a fixed 6-D condition [x, z, tan_x, tan_z,
+        # horizon_progress, grid_progress]; the param exists for config symmetry
+        # only — anything else would shape-mismatch path_proj. Fail at construction.
+        if path_cond_dim != 6:
+            raise ValueError(
+                f"PathCondFrameDecoder builds a 6-D path condition; "
+                f"path_cond_dim must be 6, got {path_cond_dim}"
+            )
         self.frames_per_token = frames_per_token
         self.max_tokens = max_tokens
         self.n_path = n_path
@@ -184,19 +192,36 @@ class PathCondFrameDecoder(nn.Module):
 
     def forward(self, token_hidden: Tensor, *, xz_path: Tensor, path_mask: Tensor,
                 chosen_num_tokens: Tensor) -> Tensor:
+        device, dtype = token_hidden.device, token_hidden.dtype
+        fpt = self.frames_per_token
+        # Validity masks: tokens / frames past the chosen horizon are zeroed and
+        # RE-MASKED after EVERY block. Conv1d/ResBlock have a bias and a kernel that
+        # reads neighbors, so an unmasked invalid region re-grows nonzero features
+        # each layer and the dilated frame convs leak them back into the boundary
+        # VALID frames (incl. the past-horizon path condition). Re-masking keeps a
+        # valid frame's conv inputs (its invalid neighbors) at a deterministic 0.
+        tok_ar = torch.arange(self.max_tokens, device=device)
+        token_valid = (tok_ar[None, :] < chosen_num_tokens[:, None]).to(dtype)        # [B, max_tokens]
+        valid_eff = fpt * chosen_num_tokens - (fpt - 1)                               # [B]
+        fr_ar = torch.arange(self.max_frames, device=device)
+        frame_valid = (fr_ar[None, :] < valid_eff[:, None]).to(dtype)                 # [B, max_frames]
+        tok_m = token_valid[:, None, :]                                               # [B, 1, max_tokens]
+        fr_m = frame_valid[:, None, :]                                                # [B, 1, max_frames]
+
         # Token stage (token grid).
-        h = self.act(self.in_proj(token_hidden.transpose(1, 2)))             # [B, width, max_tokens]
+        h = self.act(self.in_proj(token_hidden.transpose(1, 2))) * tok_m              # [B, width, max_tokens]
         for blk in self.token_blocks:
-            h = blk(h)
+            h = blk(h) * tok_m
         # Causal expand to the effective frame grid (no upsample/trim → no offset).
-        h = h.index_select(2, self.frame_to_token)                           # [B, width, max_frames]
-        # Repeated additive path conditioning before each dilated frame block.
+        h = h.index_select(2, self.frame_to_token) * fr_m                            # [B, width, max_frames]
+        # Repeated additive path conditioning before each dilated frame block. Mask
+        # path_emb on invalid frames too — path_proj has a bias, so path_proj(cond=0)
+        # is NOT zero; only post-projection masking kills the past-horizon path leak.
         cond = self._build_path_cond(xz_path, path_mask, chosen_num_tokens)  # [B, max_frames, 6]
-        path_emb = self.path_proj(cond).transpose(1, 2)                      # [B, width, max_frames]
+        path_emb = (self.path_proj(cond).transpose(1, 2)) * fr_m                      # [B, width, max_frames]
         for blk in self.frame_blocks:
-            h = h + path_emb
-            h = blk(h)
-        h = self.act(self.out_conv1(h))
+            h = blk(h + path_emb) * fr_m
+        h = self.act(self.out_conv1(h)) * fr_m
         h = self.out_conv2(h)                                                # [B, out_dim, max_frames]
         return h.transpose(1, 2)                                             # [B, max_frames, out_dim]
 
