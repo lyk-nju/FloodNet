@@ -28,14 +28,13 @@ resume_ckpt:                  # path to resume from; empty = fresh run
 
 logger:
   wandb:
-    # Left blank → resolved at runtime from configs/paths_default.yaml: key +
-    # entity from wandb_info, project from refiner_wandb_info ("RootRefiner") so
-    # refiner runs log to a SEPARATE project from FloodNet/LDF. Put a literal
-    # here to override. (Unlike ldf.yaml we do NOT use ${wandb_info.*} so the
-    # API key is never resolved into — or logged with — the run config.)
-    wandb_key:
-    project:
-    entity:
+    # ${...} resolved against configs/paths_default.yaml (same as ldf.yaml). key +
+    # entity are shared with FloodNet; project comes from refiner_wandb_info so
+    # refiner runs log to a SEPARATE project ("RootRefiner"). The resolved key is
+    # scrubbed from cfg before checkpoint/wandb logging (see train_refiner.main).
+    wandb_key: "${wandb_info.key}"
+    project: "${refiner_wandb_info.project}"
+    entity: "${wandb_info.entity}"
 
 trainer:                      # Lightning Trainer kwargs (mirrors ldf.yaml.trainer)
   accelerator: auto           # ldf uses gpu; auto stays host-portable

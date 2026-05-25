@@ -35,12 +35,12 @@ resume_ckpt:                  # path to resume from; empty = fresh run
 
 logger:
   wandb:
-    # Inert while debug=true. When debug=false, blank values resolve from
-    # configs/paths_default.yaml (key+entity from wandb_info, project from
-    # refiner_wandb_info "RootRefiner"). Put a literal here to override.
-    wandb_key:
-    project:
-    entity:
+    # ${...} resolved against configs/paths_default.yaml (same as ldf.yaml).
+    # Inert while debug=true. project → refiner_wandb_info ("RootRefiner"), so
+    # refiner logs to a SEPARATE project from FloodNet; key+entity shared.
+    wandb_key: "${wandb_info.key}"
+    project: "${refiner_wandb_info.project}"
+    entity: "${wandb_info.entity}"
 
 trainer:                      # Lightning Trainer kwargs (mirrors ldf.yaml.trainer)
   accelerator: auto

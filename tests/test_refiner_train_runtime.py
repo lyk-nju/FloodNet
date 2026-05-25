@@ -11,7 +11,11 @@ These cover the pure config-resolution helpers (no Trainer, no live wandb):
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import train_refiner as tr
+
+_CFG_DIR = Path(__file__).resolve().parent.parent / "configs"
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +109,28 @@ def test_literal_or_none_ignores_unresolved_interpolation():
     assert tr._literal_or_none("") is None
     assert tr._literal_or_none(None) is None
     assert tr._literal_or_none("real-key") == "real-key"
+
+
+def test_wandb_interpolation_resolves_against_paths_default():
+    """${wandb_info.*} / ${refiner_wandb_info.project} in the config must resolve
+    (like ldf.yaml), and the injected paths_default blocks must be stripped."""
+    raw = tr._load_cfg(str(_CFG_DIR / "root_refiner_train.yaml"))
+    assert raw["logger"]["wandb"]["wandb_key"] == "${wandb_info.key}"   # literal pre-resolve
+    assert raw["logger"]["wandb"]["project"] == "${refiner_wandb_info.project}"
+
+    resolved = tr.resolve_cfg_interpolations(raw)
+    wb = resolved["logger"]["wandb"]
+    assert "${" not in str(wb["wandb_key"]) and wb["wandb_key"]   # real key
+    assert wb["project"] == "RootRefiner"                          # separate project
+    assert "${" not in str(wb["entity"]) and wb["entity"]
+    # interpolation-source blocks are not leaked into the returned cfg
+    assert "wandb_info" not in resolved and "refiner_wandb_info" not in resolved
+
+
+def test_resolve_does_not_break_configs_without_interpolation_sources():
+    """A cfg with no ${...} refs still resolves cleanly (injected blocks stripped)."""
+    resolved = tr.resolve_cfg_interpolations({"a": 1, "b": {"c": 2}})
+    assert resolved == {"a": 1, "b": {"c": 2}}
 
 
 # ---------------------------------------------------------------------------

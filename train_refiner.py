@@ -246,15 +246,42 @@ def _load_cfg(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def _load_paths_default() -> dict:
+    """Read configs/paths_default.yaml (dirs / wandb_info / refiner_wandb_info).
+    Returns {} if absent/unreadable. This is the same file train_ldf merges for
+    its ${...} interpolation sources."""
+    import yaml
+
+    p = _REPO_ROOT / "configs" / "paths_default.yaml"
+    if not p.is_file():
+        return {}
+    try:
+        with p.open() as f:
+            return yaml.safe_load(f) or {}
+    except Exception:   # noqa: BLE001 — interpolation sources are best-effort
+        return {}
+
+
 def resolve_cfg_interpolations(cfg: dict) -> dict:
     """Resolve OmegaConf-style ${...} interpolations in a plain config dict
-    (A-P0-1). yaml.safe_load leaves e.g. precomputed_text_emb_path as the literal
-    '${data.raw_data_dir}/...'; this substitutes against the cfg's own values.
-    Call AFTER any CLI overrides so the resolved paths use the final values.
+    (A-P0-1). yaml.safe_load leaves e.g. precomputed_text_emb_path and
+    logger.wandb.* as literals like '${data.raw_data_dir}/...' / '${wandb_info.key}';
+    this substitutes them against the cfg's own values PLUS the interpolation
+    sources from configs/paths_default.yaml (wandb_info / refiner_wandb_info /
+    dirs) — exactly like train_ldf merges paths_default. Call AFTER CLI overrides.
+
+    The injected paths_default blocks are stripped from the result, so the
+    returned cfg keeps its original top-level shape (now with resolved values).
     """
     from omegaconf import OmegaConf
 
-    return OmegaConf.to_container(OmegaConf.create(cfg), resolve=True)
+    extras = _load_paths_default()
+    injected = [k for k in extras if k not in cfg]   # only add what cfg lacks
+    merged = {**{k: extras[k] for k in injected}, **cfg}
+    resolved = OmegaConf.to_container(OmegaConf.create(merged), resolve=True)
+    for k in injected:
+        resolved.pop(k, None)
+    return resolved
 
 
 def path_aug_kwargs(cfg: dict) -> dict:
@@ -331,15 +358,16 @@ def _literal_or_none(v):
     return None
 
 
-def build_wandb_logger(cfg: dict, run_name: str, save_dir: str):
+def build_wandb_logger(cfg: dict, run_name: str, save_dir: str, api_key: str | None = None):
     """Build a WandbLogger, mirroring train_ldf.py's gating: OFF when cfg.debug
     is true (smoke), else ON when a cfg.logger.wandb block exists and an API key
     is resolvable. `logger.wandb.enabled: false` is an explicit override. Returns
     None (Trainer keeps its default logger) when disabled or no key is found.
 
-    Credential precedence per field: explicit cfg.logger.wandb literal >
-    configs/paths_default.yaml (key+entity from wandb_info, project from
-    refiner_wandb_info) > env WANDB_API_KEY (key only).
+    With the ${wandb_info.*} interpolation style, project/entity arrive already
+    resolved in cfg.logger.wandb; `api_key` carries the resolved key separately
+    (main() scrubs it out of cfg so it is never saved to ckpt hparams / wandb
+    config). Falls back to configs/paths_default.yaml + env WANDB_API_KEY.
     """
     if cfg.get("debug", False):
         return None
@@ -348,7 +376,8 @@ def build_wandb_logger(cfg: dict, run_name: str, save_dir: str):
         return None
     info = _read_wandb_info_from_paths_default()
     key = (
-        _literal_or_none(wb.get("wandb_key"))
+        api_key
+        or _literal_or_none(wb.get("wandb_key"))
         or info.get("key")
         or os.environ.get("WANDB_API_KEY")
     )
@@ -503,9 +532,17 @@ def main(argv=None):
         cfg["data"]["stats_dir"] = args.stats_dir
     if args.normalize is not None:
         cfg["data"]["normalize"] = (args.normalize == "true")
-    # A-P0-1: resolve ${data.raw_data_dir} etc. AFTER overrides so e.g.
-    # text_encoder.precomputed_text_emb_path becomes a real path.
+    # A-P0-1: resolve ${data.raw_data_dir}, ${wandb_info.*} etc. AFTER overrides so
+    # e.g. text_encoder.precomputed_text_emb_path and logger.wandb become real values.
     cfg = resolve_cfg_interpolations(cfg)
+    # Scrub the resolved WandB API key out of cfg (it came from ${wandb_info.key})
+    # BEFORE it can be captured by RefinerLightningModule.save_hyperparameters or
+    # logged into the wandb run config. Keep it only in a local for the logger.
+    wandb_api_key = None
+    _wb = (cfg.get("logger") or {}).get("wandb")
+    if isinstance(_wb, dict):
+        wandb_api_key = _literal_or_none(_wb.get("wandb_key"))
+        _wb["wandb_key"] = None
     train_cfg = cfg.get("training", {})
     trainer_cfg = cfg.get("trainer", {}) or {}
     # max_steps precedence: CLI > trainer.max_steps > training.total_steps.
@@ -553,7 +590,8 @@ def main(argv=None):
 
     # Logger (wandb, parity with train_ldf) + periodic checkpointing + resume.
     run_name = f"{cfg.get('exp_name', 'root_refiner')}_{time.strftime('%Y%m%d_%H%M%S')}"
-    logger = build_wandb_logger(cfg, run_name=run_name, save_dir=output_dir)
+    logger = build_wandb_logger(cfg, run_name=run_name, save_dir=output_dir,
+                                api_key=wandb_api_key)
     callbacks = []
     ckpt_cb = build_checkpoint_callback(cfg, output_dir)
     if ckpt_cb is not None:
