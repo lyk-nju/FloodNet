@@ -159,3 +159,29 @@ def test_data_block_has_required_paths():
     data = cfg["data"]
     assert "raw_data_dir" in data
     assert "stats_dir" in data
+
+
+# ---------------------------------------------------------------------------
+# Run-control blocks (parity with configs/ldf.yaml): both configs must carry
+# the same logger / trainer / validation structure so the two stay consistent.
+# ---------------------------------------------------------------------------
+
+
+def test_run_control_blocks_present_in_both_configs():
+    for path in (CFG_PATH, TRAIN_CFG_PATH):
+        cfg = _load(path)
+        for k in ("exp_name", "seed", "debug", "train", "save_dir", "resume_ckpt"):
+            assert k in cfg, f"{path.name} missing top-level {k}"
+        assert "wandb" in cfg["logger"]
+        for k in ("wandb_key", "project", "entity"):
+            assert k in cfg["logger"]["wandb"], f"{path.name} logger.wandb missing {k}"
+        for k in ("accelerator", "devices", "log_every_n_steps", "precision"):
+            assert k in cfg["trainer"], f"{path.name} trainer missing {k}"
+        for k in ("validation_steps", "save_every_n_steps", "save_top_k"):
+            assert k in cfg["validation"], f"{path.name} validation missing {k}"
+
+
+def test_debug_config_has_wandb_off_via_debug_flag():
+    """Debug/smoke config must keep wandb off (debug=true); real config debug=false."""
+    assert _load(CFG_PATH)["debug"] is True
+    assert _load(TRAIN_CFG_PATH)["debug"] is False

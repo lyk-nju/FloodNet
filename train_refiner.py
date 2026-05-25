@@ -21,6 +21,7 @@ ldf-shared frozen text encoder via `text_encoder=`.
 from __future__ import annotations
 
 import argparse
+import copy
 import logging
 import os
 import time
@@ -331,15 +332,19 @@ def _literal_or_none(v):
 
 
 def build_wandb_logger(cfg: dict, run_name: str, save_dir: str):
-    """Build a WandbLogger when cfg.logger.wandb.enabled is true and an API key
-    is resolvable; else return None (so the Trainer keeps its default logger).
+    """Build a WandbLogger, mirroring train_ldf.py's gating: OFF when cfg.debug
+    is true (smoke), else ON when a cfg.logger.wandb block exists and an API key
+    is resolvable. `logger.wandb.enabled: false` is an explicit override. Returns
+    None (Trainer keeps its default logger) when disabled or no key is found.
 
-    Credential precedence per field: explicit cfg.logger.wandb value >
-    configs/paths_default.yaml wandb_info > env WANDB_API_KEY (key only).
-    Mirrors train_ldf.py's behavior so both scripts log to the same project.
+    Credential precedence per field: explicit cfg.logger.wandb literal >
+    configs/paths_default.yaml (key+entity from wandb_info, project from
+    refiner_wandb_info) > env WANDB_API_KEY (key only).
     """
-    wb = (cfg.get("logger") or {}).get("wandb") or {}
-    if not wb.get("enabled", False):
+    if cfg.get("debug", False):
+        return None
+    wb = (cfg.get("logger") or {}).get("wandb")
+    if wb is None or wb.get("enabled") is False:
         return None
     info = _read_wandb_info_from_paths_default()
     key = (
@@ -350,15 +355,22 @@ def build_wandb_logger(cfg: dict, run_name: str, save_dir: str):
     project = _literal_or_none(wb.get("project")) or info.get("project")
     entity = _literal_or_none(wb.get("entity")) or info.get("entity")
     if not key:
-        log.warning("logger.wandb.enabled is true but no API key found "
-                    "(cfg / paths_default.yaml / $WANDB_API_KEY) — skipping wandb.")
+        log.warning("wandb requested (debug=false, logger.wandb present) but no "
+                    "API key found (cfg / paths_default.yaml / $WANDB_API_KEY) — "
+                    "skipping wandb.")
         return None
     os.environ["WANDB_API_KEY"] = key
     from lightning.pytorch.loggers import WandbLogger
 
+    # Don't leak the API key into the logged run config.
+    safe_cfg = copy.deepcopy(cfg)
+    try:
+        safe_cfg["logger"]["wandb"].pop("wandb_key", None)
+    except (KeyError, TypeError, AttributeError):
+        pass
     return WandbLogger(
         project=project, entity=entity, name=run_name, save_dir=save_dir,
-        config=cfg,
+        config=safe_cfg,
     )
 
 
@@ -462,13 +474,16 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=str, default="configs/root_refiner.yaml")
     parser.add_argument("--max_steps", type=int, default=None,
-                         help="Override training.total_steps (smoke runs).")
-    parser.add_argument("--devices", type=int, default=1)
+                         help="Override trainer.max_steps / training.total_steps (smoke runs).")
+    parser.add_argument("--devices", type=int, default=None,
+                         help="Override trainer.devices.")
     parser.add_argument("--ckpt_path", type=str, default=None,
                          help="Resume-from-checkpoint path (overrides cfg.resume_ckpt).")
     parser.add_argument("--seed", type=int, default=None,
                          help="Override cfg.seed (RNG seed for torch + dataset aug).")
-    parser.add_argument("--output_dir", type=str, default="outputs/root_refiner")
+    parser.add_argument("--output_dir", type=str, default=None,
+                         help="Checkpoint/log dir (overrides cfg.save_dir; "
+                              "default outputs/root_refiner).")
     parser.add_argument("--raw_data_dir", type=str, default=None,
                          help="Override data.raw_data_dir (e.g. on a host where the "
                               "config's training-box path doesn't exist).")
@@ -492,7 +507,13 @@ def main(argv=None):
     # text_encoder.precomputed_text_emb_path becomes a real path.
     cfg = resolve_cfg_interpolations(cfg)
     train_cfg = cfg.get("training", {})
-    max_steps = args.max_steps if args.max_steps is not None else train_cfg.get("total_steps", 100000)
+    trainer_cfg = cfg.get("trainer", {}) or {}
+    # max_steps precedence: CLI > trainer.max_steps > training.total_steps.
+    max_steps = (
+        args.max_steps if args.max_steps is not None
+        else trainer_cfg.get("max_steps", train_cfg.get("total_steps", 100000))
+    )
+    output_dir = args.output_dir or cfg.get("save_dir") or "outputs/root_refiner"
 
     # Reproducibility: seed torch/numpy/python (+ Lightning workers) and thread
     # the same seed into the dataset augmentation RNG.
@@ -532,29 +553,36 @@ def main(argv=None):
 
     # Logger (wandb, parity with train_ldf) + periodic checkpointing + resume.
     run_name = f"{cfg.get('exp_name', 'root_refiner')}_{time.strftime('%Y%m%d_%H%M%S')}"
-    logger = build_wandb_logger(cfg, run_name=run_name, save_dir=args.output_dir)
+    logger = build_wandb_logger(cfg, run_name=run_name, save_dir=output_dir)
     callbacks = []
-    ckpt_cb = build_checkpoint_callback(cfg, args.output_dir)
+    ckpt_cb = build_checkpoint_callback(cfg, output_dir)
     if ckpt_cb is not None:
         callbacks.append(ckpt_cb)
     resume_ckpt = resolve_resume_ckpt(cfg, args.ckpt_path)
     if resume_ckpt:
         log.info("resuming from checkpoint: %s", resume_ckpt)
 
-    # Step-based validation cadence when configured (LDF style); else epoch.
-    val_check_interval = (cfg.get("validation") or {}).get("validation_steps")
-
-    trainer = pl.Trainer(
+    # Trainer kwargs from the `trainer` block (LDF style), with CLI/defaults.
+    devices = args.devices if args.devices is not None else trainer_cfg.get("devices", 1)
+    trainer_kwargs = dict(
         max_steps=max_steps,
-        devices=args.devices,
-        accelerator="auto",
-        gradient_clip_val=train_cfg.get("gradient_clip_val", 1.0),
-        default_root_dir=args.output_dir,
-        log_every_n_steps=10,
+        devices=devices,
+        accelerator=trainer_cfg.get("accelerator", "auto"),
+        gradient_clip_val=trainer_cfg.get(
+            "gradient_clip_val", train_cfg.get("gradient_clip_val", 1.0)),
+        default_root_dir=output_dir,
+        log_every_n_steps=trainer_cfg.get("log_every_n_steps", 10),
         logger=logger if logger is not None else True,
         callbacks=callbacks,
-        val_check_interval=val_check_interval if (val_loader is not None and val_check_interval) else None,
     )
+    if trainer_cfg.get("precision") is not None:
+        trainer_kwargs["precision"] = trainer_cfg["precision"]
+    # Step-based validation cadence when configured (LDF style); else epoch.
+    val_check_interval = (cfg.get("validation") or {}).get("validation_steps")
+    if val_loader is not None and val_check_interval:
+        trainer_kwargs["val_check_interval"] = val_check_interval
+
+    trainer = pl.Trainer(**trainer_kwargs)
     trainer.fit(module, train_loader, val_dataloaders=val_loader, ckpt_path=resume_ckpt)
 
 

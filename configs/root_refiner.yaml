@@ -22,14 +22,36 @@
 #     first real training run (round 6 P1-5). Enable only for ablation / fine-tune
 #     once turn / stop / U-turn behavior is verified to not be smoothed out.
 
-# Run control (parity with train_ldf.py). All optional; absent → defaults.
-# Debug config keeps wandb off and no periodic checkpointing (smoke runs).
-seed: 1234                    # torch + dataset-aug RNG seed (pl.seed_everything)
+# ── Run control (structure mirrors configs/ldf.yaml) ──────────────────────
+# Debug/smoke: debug=true keeps wandb OFF. All keys optional; absent → defaults.
+# max_steps comes from training.total_steps below.
 exp_name: root_refiner_debug
-resume_ckpt:                  # empty = fresh run
+seed: 1234                    # torch + dataset-aug RNG seed (pl.seed_everything)
+debug: true                   # true → wandb OFF (smoke); set false for real wandb
+train: true
+deterministic: false          # true = bit-reproducible (slower)
+save_dir: ./outputs/root_refiner
+resume_ckpt:                  # path to resume from; empty = fresh run
+
 logger:
   wandb:
-    enabled: false
+    # Inert while debug=true. When debug=false, blank values resolve from
+    # configs/paths_default.yaml (key+entity from wandb_info, project from
+    # refiner_wandb_info "RootRefiner"). Put a literal here to override.
+    wandb_key:
+    project:
+    entity:
+
+trainer:                      # Lightning Trainer kwargs (mirrors ldf.yaml.trainer)
+  accelerator: auto
+  devices: 1
+  log_every_n_steps: 10
+  precision: 32-true          # smoke runs on CPU; keep fp32
+
+validation:                   # val + checkpoint cadence (mirrors ldf.yaml.validation)
+  validation_steps: 1000
+  save_every_n_steps: 1000
+  save_top_k: -1
 
 model:
   d_model: 256

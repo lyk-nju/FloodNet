@@ -63,6 +63,22 @@ def test_wandb_disabled_returns_none():
     assert tr.build_wandb_logger({"logger": {"wandb": {"enabled": False}}}, "run", "/tmp") is None
 
 
+def test_wandb_debug_gate_short_circuits():
+    """debug=true → None even when a logger.wandb block + a resolvable key exist
+    (LDF parity: `if not cfg.debug`)."""
+    cfg = {"debug": True, "logger": {"wandb": {}}}
+    assert tr.build_wandb_logger(cfg, "run", "/tmp") is None
+
+
+def test_wandb_block_without_enabled_proceeds(monkeypatch):
+    """A logger.wandb block with no `enabled` key (ldf style) is treated as ON
+    when debug=false; here no key is resolvable so it returns None (not crash)."""
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    monkeypatch.setattr(tr, "_read_wandb_info_from_paths_default", lambda: {})
+    cfg = {"debug": False, "logger": {"wandb": {}}}
+    assert tr.build_wandb_logger(cfg, "run", "/tmp") is None
+
+
 def test_wandb_enabled_no_key_returns_none(monkeypatch):
     """enabled but no key anywhere (cfg blank, no paths_default key, no env) → None,
     not a crash."""
