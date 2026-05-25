@@ -16,6 +16,7 @@ import numpy as np
 import torch
 
 from utils.motion_process import extract_root_trajectory_263_torch, recover_joint_positions_263
+from utils.training.model_batch import prepare_model_input
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -71,20 +72,15 @@ def _slice_single_sample_batch(batch: Dict, sample_idx: int) -> Dict:
     return sample_batch
 
 
-def _copy_traj_fields(batch: Dict, model_batch: Dict):
-    for key in ("traj", "traj_length", "traj_mask", "token_mask", "traj_features"):
-        if key in batch:
-            model_batch[key] = batch[key]
-
-
 def _build_model_batch(batch: Dict, device: torch.device) -> Dict:
-    mb = batch.copy()
-    mb["feature"] = batch["token"]
-    mb["feature_length"] = batch["token_length"]
-    if "token_text_end" in batch:
-        mb["feature_text_end"] = batch["token_text_end"]
-    _copy_traj_fields(batch, mb)
-    return _to_device(mb, device)
+    """Build the model_batch consumed by `model.__call__` / forward-control-loss
+    eval. Reuses `prepare_model_input` so the eval path shares the EXACT field
+    routing of training — in particular the 7D `traj_cond_7d` → `traj_features`
+    mapping. Hand-rolled `_copy_traj_fields` previously dropped `traj_cond_7d`,
+    causing `_build_model_batch` to feed the 4D legacy `traj_features` into the
+    7D-only encoder ("expected (B,T,4,7), got (B,T,4,4)").
+    """
+    return _to_device(prepare_model_input(batch), device)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

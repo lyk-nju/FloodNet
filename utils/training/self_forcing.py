@@ -332,7 +332,7 @@ class SelfForcingTrainer:
             horizon_active_end = (plan.start_end_indices + (plan.effective_k - 1)).to(device)
         self._last_horizon_tokens = float(horizon_tokens) if horizon_tokens is not None else -1.0
 
-        traj_emb, traj_seq_lens, _ = model._prepare_traj_condition(
+        traj_emb, traj_seq_lens, _, traj_token_mask = model._prepare_traj_condition(
             model_batch, seq_len, device, traj_dropped_override=traj_dropped,
             horizon_tokens=horizon_tokens, horizon_active_end=horizon_active_end,
         )
@@ -378,6 +378,7 @@ class SelfForcingTrainer:
                     traj_seq_lens,
                     traj_dropped,
                     enable_scheduled_sampling=False,
+                    traj_token_mask=traj_token_mask,
                 )
                 break
 
@@ -391,6 +392,7 @@ class SelfForcingTrainer:
                     traj_seq_lens,
                     traj_dropped,
                     enable_scheduled_sampling=False,
+                    traj_token_mask=traj_token_mask,
                 )
 
             disable_replace = bool(

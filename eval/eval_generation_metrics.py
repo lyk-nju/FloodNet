@@ -57,6 +57,7 @@ from metrics.traj import (
 from utils.initialize import get_function, instantiate, load_config
 from utils.motion_process import extract_root_trajectory_263_torch
 from utils.traj_batch import root_to_traj_feats
+from utils.training.ckpt_compat import strip_legacy_traj_encoder_weights
 from utils.visualize import make_composite_compare_videos, render_video
 
 
@@ -147,9 +148,20 @@ def _infer_meta_tag(meta_paths) -> str:
 
 
 def _remove_traj_fields(batch: Dict) -> Dict:
-    """Return a shallow copy with all traj conditioning fields removed (for ablation)."""
-    traj_keys = {"traj", "traj_length", "traj_mask", "traj_features",
-                 "traj_features_length", "token_mask"}
+    """Return a shallow copy with ALL traj conditioning fields removed.
+
+    Must include both legacy 4D keys (traj / traj_features / traj_mask) and the
+    7D pipeline keys (traj_cond / traj_cond_7d / traj_cond_mask /
+    traj_loss_mask) — otherwise prepare_model_input would still route the 7D
+    cond into model_batch and the ablation wouldn't actually disable
+    ControlNet.
+    """
+    traj_keys = {
+        "traj", "traj_length", "traj_mask", "traj_features",
+        "traj_features_length", "token_mask",
+        # 7D pipeline keys consumed by utils.training.model_batch:
+        "traj_cond", "traj_cond_7d", "traj_cond_mask", "traj_loss_mask",
+    }
     return {k: v for k, v in batch.items() if k not in traj_keys}
 
 
@@ -157,9 +169,23 @@ def _load_model(cfg, ckpt_path: str, device: torch.device, use_ema: bool):
     model = instantiate(target=cfg.model.target, cfg=None, hfstyle=False, **cfg.model.params)
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
+    # 7D traj-encoder rewrite (matches train_ldf.py:244): legacy 4D ckpts must
+    # have their traj-encoder / traj_in_proj weights stripped before load_state_dict
+    # — otherwise either (a) shape mismatch on local_traj_encoder.conv1
+    # (4-channel→7-channel input), or (b) `traj_in_proj.bias` shape happens
+    # to match (1024,) and gets restored, breaking the zero-init contract.
+    n_traj_exp = strip_legacy_traj_encoder_weights(
+        checkpoint["state_dict"], model.state_dict()
+    )
+    if n_traj_exp:
+        print(f"[load] stripped {n_traj_exp} legacy traj-encoder weights "
+              "(7D encoder rewrite — eval will use new traj encoder from scratch)")
+
     ckpt_keys = set(checkpoint["state_dict"].keys())
     has_controlnet = any(k.startswith("controlnet.") for k in ckpt_keys)
-    strict = has_controlnet  # base FloodDiffusion ckpt has no controlnet.* keys → strict=False
+    # strict=False when EITHER (a) the ckpt has no ControlNet (base pretrain
+    # warm-start path) OR (b) we just stripped legacy traj-encoder weights.
+    strict = has_controlnet and n_traj_exp == 0
     load_result = model.load_state_dict(checkpoint["state_dict"], strict=strict)
 
     if not strict:
@@ -169,11 +195,14 @@ def _load_model(cfg, ckpt_path: str, device: torch.device, use_ema: bool):
             print(f"[load] strict=False  unexpected keys ignored: {len(load_result.unexpected_keys)}")
         if (getattr(model, "controlnet", None) is not None
                 and bool(getattr(model, "controlnet_init_from_backbone", True))
-                and load_result.missing_keys):
+                and load_result.missing_keys
+                and any("controlnet." in k for k in load_result.missing_keys)):
             model.controlnet.init_from_backbone(model.model)
             print("[load] Re-initialized ControlNet from loaded backbone weights.")
 
-    if use_ema and "ema_state" in checkpoint:
+    # EMA: with stripped traj weights or fresh ControlNet, the saved EMA shadow
+    # has wrong param count / shape — skip rather than crash.
+    if use_ema and "ema_state" in checkpoint and n_traj_exp == 0:
         ema = ExponentialMovingAverage(
             [p for p in model.parameters() if p.requires_grad],
             decay=cfg.model.ema_decay,
@@ -182,8 +211,11 @@ def _load_model(cfg, ckpt_path: str, device: torch.device, use_ema: bool):
             ema.load_state_dict(checkpoint["ema_state"])
             ema.copy_to([p for p in model.parameters() if p.requires_grad])
             print("[load] Applied EMA weights.")
-        except ValueError as e:
+        except (ValueError, RuntimeError) as e:
             print(f"[load] EMA incompatible, skip. Detail: {e}")
+    elif use_ema and n_traj_exp > 0:
+        print("[load] Skipping EMA: traj-encoder weights stripped (legacy 4D), "
+              "saved EMA shadow has wrong param count for new 7D traj params.")
 
     model.to(device).eval()
     return model
