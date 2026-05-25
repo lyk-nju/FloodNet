@@ -136,11 +136,18 @@ def compute_sample_metrics(pred_wp: Tensor, gt_wp: Tensor, mask: Tensor) -> dict
 
 @torch.no_grad()
 def run_benchmark(model, dataset, text_encoder, device="cpu",
-                   max_samples: int = -1) -> dict:
+                   max_samples: int = -1, oracle_duration: bool = False) -> dict:
     """Run inference over `dataset` and aggregate the metric suite.
 
     `model` is a RootRefiner (eval mode). `text_encoder` must have
     `.encode(list[str], device=...) -> [B, text_emb_dim]`.
+
+    `oracle_duration`: if True, feed the GT num_tokens to the model so the
+    trajectory metrics (xyz_ADE/FDE, heading, ...) measure the WAYPOINT DECODER
+    ALONE under the correct horizon, isolating it from num_token-head prediction
+    error. Default False = real inference (model picks its own argmax horizon, so
+    trajectory metrics conflate duration + waypoint quality). num_token_* metrics
+    are always reported against the head's argmax regardless of this flag.
 
     Returns dict with `summary` (aggregate metrics) and `per_sample` (list).
     """
@@ -163,6 +170,12 @@ def run_benchmark(model, dataset, text_encoder, device="cpu",
         else:
             sample = dataset[idx]
         text_emb = text_encoder.encode([sample["text"]], device=device)
+        # oracle_duration: teacher-force the GT horizon so the trajectory metrics
+        # isolate the waypoint decoder (the model honors num_tokens when given,
+        # regardless of eval mode — see RootRefiner.forward gate).
+        oracle_nt = (
+            sample["num_tokens"].reshape(1).to(device) if oracle_duration else None
+        )
         out = model(
             text_emb=text_emb,
             xz_path=sample["xz_path"].unsqueeze(0).to(device),
@@ -170,6 +183,7 @@ def run_benchmark(model, dataset, text_encoder, device="cpu",
             path_stats=sample["path_stats"].unsqueeze(0).to(device),
             current_motion=sample["current_motion"].unsqueeze(0).to(device),
             history_mask=sample["history_mask"].unsqueeze(0).to(device),
+            num_tokens=oracle_nt,
         )
         logits = out["num_token_logits"][0]                  # [K]
         pred_wp = out["waypoints"][0].cpu()                  # [max_frames, 7]
@@ -207,6 +221,7 @@ def run_benchmark(model, dataset, text_encoder, device="cpu",
 
     summary = {
         "n_samples": n,
+        "oracle_duration": oracle_duration,
         "num_token_top1_accuracy": num_top1 / n if n else float("nan"),
         "num_token_top3_accuracy": num_top3 / n if n else float("nan"),
         "num_token_MAE": num_mae_sum / n if n else float("nan"),

@@ -144,6 +144,35 @@ def test_run_benchmark_smoke_finite_metrics_and_report(tmp_path):
     assert loaded["n_samples"] == 6
 
 
+def test_run_benchmark_oracle_duration_mode():
+    """oracle_duration=True feeds GT num_tokens (teacher-force) so trajectory
+    metrics isolate the waypoint decoder; num_token metrics (argmax) are unchanged."""
+    clips = [_make_clip(50) for _ in range(6)]
+    model = RootRefiner(d_model=32, n_layers=2, n_heads=4, ff_dim=64,
+                         max_tokens=8, min_tokens=2, n_hist=8, n_path=16,
+                         text_emb_dim=16, dropout=0.0)
+    text_encoder = FrozenStubTextEncoder(emb_dim=16)
+
+    # Fresh seeded dataset per call: get_sample still randomizes mode/anchor/
+    # num_tokens via the dataset RNG (force_no_path_aug only kills PATH aug), so a
+    # shared ds would advance the RNG and feed the two runs DIFFERENT samples.
+    def _ds():
+        return RefinerDataset(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
+                              full_plan_ratio=1.0, seed=0)
+
+    normal = run_benchmark(model, _ds(), text_encoder, device="cpu")["summary"]
+    oracle = run_benchmark(model, _ds(), text_encoder, device="cpu",
+                            oracle_duration=True)["summary"]
+
+    assert normal["oracle_duration"] is False
+    assert oracle["oracle_duration"] is True
+    # num_token head metrics are argmax-based → independent of the oracle horizon.
+    assert normal["num_token_top1_accuracy"] == oracle["num_token_top1_accuracy"]
+    assert normal["num_token_MAE"] == oracle["num_token_MAE"]
+    # trajectory metrics finite under the oracle (GT) horizon.
+    assert math.isfinite(oracle["xyz_ADE"]) and oracle["xyz_ADE"] >= 0.0
+
+
 def test_run_benchmark_max_samples_limit(tmp_path):
     clips = [_make_clip(50) for _ in range(10)]
     ds = RefinerDataset(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,

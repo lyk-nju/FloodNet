@@ -71,6 +71,11 @@ def test_forward_with_and_without_num_tokens():
     assert out2["waypoints"].shape == (3, Fm, 7)
     assert torch.equal(out2["chosen_num_tokens"], out2["pred_num_tokens"])
 
+    # Teacher-forcing is gated on num_tokens PRESENCE, not train/eval mode: passing
+    # num_tokens in eval() must still teacher-force (needed for val + oracle eval).
+    out3 = model(**inputs, num_tokens=nt)
+    assert torch.equal(out3["chosen_num_tokens"], nt)
+
 
 def test_pred_num_tokens_in_range():
     model = RootRefiner(d_model=64, n_layers=2, n_heads=4, ff_dim=128,

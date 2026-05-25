@@ -164,19 +164,15 @@ class RefinerLightningModule(pl.LightningModule):
         target_wp = batch["target_waypoints"]
         target_mask = batch["target_mask"]
 
-        # num_token CE: target class = num_tokens - min_tokens. Validate the range
-        # explicitly (the dataset shares min/max_tokens with the model, so a stray
-        # out-of-range value means a config/data mismatch we want to fail loudly on)
-        # instead of silently clamping it into a wrong class.
+        # num_token CE: target class = num_tokens - min_tokens (NO silent clamp).
+        # An out-of-range target means a config/data mismatch; F.cross_entropy
+        # already validates target ∈ [0, C) and fails loudly (device-side assert on
+        # CUDA), so we don't add explicit min()/max() asserts here — those force a
+        # GPU→CPU host sync every step, crash on an empty batch, and vanish under
+        # `python -O`. The dataset shares min/max_tokens with the model, so in the
+        # normal path the range always holds.
         n_classes = out["num_token_logits"].shape[-1]
         target_class = batch["num_tokens"] - self.min_tokens
-        assert int(target_class.min()) >= 0, (
-            f"num_tokens below min_tokens: min target_class={int(target_class.min())}"
-        )
-        assert int(target_class.max()) < n_classes, (
-            f"num_tokens above max_tokens: max target_class={int(target_class.max())} "
-            f">= n_classes={n_classes}"
-        )
         L_num = F.cross_entropy(out["num_token_logits"], target_class)
 
         # Ordinal-aware auxiliary term: SmoothL1/Huber between the soft-argmax

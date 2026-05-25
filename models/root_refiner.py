@@ -11,8 +11,10 @@ Architecture (redesigned — duration-first / trajectory-second):
     is not diluted and waypoint-regression gradients do not dominate it.
 
   Stage 2 — token-level plan-latent generator (conditioned on the chosen horizon):
-      chosen_class = (training & num_tokens given) ? num_tokens - min_tokens
-                                                   : argmax(num_token_logits)
+      chosen_class = (num_tokens given) ? num_tokens - min_tokens   # teacher-force
+                                        : argmax(num_token_logits)   # inference
+      (gated on num_tokens presence, NOT on train/eval mode → val + oracle eval
+       can teacher-force the GT horizon)
       token_seq = [num_token_emb(chosen_class), cond_hidden, plan_queries × max_tokens]
       token_hidden = token_transformer(token_seq, token_pad)
       plan_token_hidden = token_hidden[:, -max_tokens:]
@@ -166,7 +168,7 @@ class RootRefiner(nn.Module):
         path_stats: Tensor,          # [B, path_stats_dim]
         current_motion: Tensor,      # [B, n_hist, 5]
         history_mask: Tensor,        # [B, n_hist] bool (True = valid)
-        num_tokens: Tensor | None = None,   # [B] long GT horizon (training teacher-forcing)
+        num_tokens: Tensor | None = None,   # [B] long GT horizon → teacher-force when given (train/val/oracle); argmax when None
     ) -> dict[str, Tensor]:
         B = text_emb.shape[0]
         device = text_emb.device
@@ -187,7 +189,13 @@ class RootRefiner(nn.Module):
         num_token_logits = self.num_token_head(cond_hidden[:, 0])                # [B, K]
 
         pred_class = num_token_logits.argmax(dim=-1)                             # [B] in [0,K-1]
-        if self.training and num_tokens is not None:
+        # Teacher-force the horizon whenever a num_tokens is PROVIDED — training,
+        # validation, AND oracle-duration eval — and fall back to the model's own
+        # argmax when it is absent (real inference / normal benchmark). Gated on
+        # `num_tokens is not None`, NOT on self.training, so val/oracle can
+        # teacher-force in eval() mode (else val waypoint loss would be scored
+        # against a possibly-wrong predicted horizon).
+        if num_tokens is not None:
             chosen_class = (num_tokens.to(device=device, dtype=torch.long) - self.min_tokens)
             chosen_class = chosen_class.clamp(0, self.num_token_logits_dim - 1)  # no host sync
         else:
