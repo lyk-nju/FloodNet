@@ -3,7 +3,15 @@ dirs:
     outputs: outputs
     raw_data: /home/yuankai/Text2Motion/FloodDiffusion/raw_data
 
+# FloodNet / LDF training (train_ldf.py resolves ${wandb_info.*}).
 wandb_info:
     key: "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"  # Your WandB API key
     project: "FloodNet"
     entity: "laiyuankia-nanjing-university"
+
+# Root Refiner training (train_refiner.py). Shares the same API key + entity as
+# wandb_info, but logs to a SEPARATE project so refiner runs don't mix with the
+# LDF/FloodNet runs. Only `project` is overridden here; key/entity are inherited
+# from wandb_info above.
+refiner_wandb_info:
+    project: "RootRefiner"

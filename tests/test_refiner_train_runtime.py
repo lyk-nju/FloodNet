@@ -72,6 +72,18 @@ def test_wandb_enabled_no_key_returns_none(monkeypatch):
     assert tr.build_wandb_logger(cfg, "run", "/tmp") is None
 
 
+def test_refiner_wandb_info_separate_project_shared_key():
+    """paths_default.yaml: refiner uses its own project but inherits key/entity
+    from wandb_info (so FloodNet and Root Refiner don't share a project name)."""
+    info = tr._read_wandb_info_from_paths_default()
+    # Repo ships both blocks; if paths_default is customized away this may be {}.
+    if not info:
+        return
+    assert info.get("project") == "RootRefiner"     # refiner override
+    assert info.get("key")                          # inherited shared key
+    assert "FloodNet" not in (info.get("project") or "")
+
+
 def test_literal_or_none_ignores_unresolved_interpolation():
     assert tr._literal_or_none("${wandb_info.key}") is None
     assert tr._literal_or_none("") is None

@@ -24,8 +24,9 @@ resume_ckpt:                  # path to resume from; empty = fresh run
 logger:
   wandb:
     enabled: false            # set true for real runs; key from paths_default.yaml
-    # project / entity / wandb_key fall back to configs/paths_default.yaml
-    # wandb_info.{project,entity,key} (same source as train_ldf) when blank.
+    # When blank, these fall back to configs/paths_default.yaml: key + entity
+    # from wandb_info, project from refiner_wandb_info ("RootRefiner") so refiner
+    # runs log to a SEPARATE project from FloodNet/LDF. Set here to override.
     project:
     entity:
     wandb_key:

@@ -300,8 +300,12 @@ def resolve_resume_ckpt(cfg: dict, cli_ckpt: str | None = None) -> str | None:
 
 
 def _read_wandb_info_from_paths_default() -> dict:
-    """Best-effort read of `wandb_info` from configs/paths_default.yaml (the same
-    source train_ldf.py resolves `${wandb_info.*}` against). Returns {} if absent.
+    """Best-effort wandb credentials from configs/paths_default.yaml.
+
+    Base = `wandb_info` (the same block train_ldf.py resolves `${wandb_info.*}`
+    against → project "FloodNet"). `refiner_wandb_info` is then merged ON TOP so
+    the Refiner shares the key/entity but logs to its own project. Returns {} if
+    the file is absent/unreadable.
     """
     import yaml
 
@@ -311,7 +315,9 @@ def _read_wandb_info_from_paths_default() -> dict:
     try:
         with p.open() as f:
             d = yaml.safe_load(f) or {}
-        return d.get("wandb_info", {}) or {}
+        base = d.get("wandb_info", {}) or {}
+        refiner = d.get("refiner_wandb_info", {}) or {}
+        return {**base, **refiner}   # refiner overrides (project); inherits key/entity
     except Exception:   # noqa: BLE001 — credentials are optional, never fatal
         return {}
 
