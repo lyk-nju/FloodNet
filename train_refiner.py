@@ -616,9 +616,13 @@ def main(argv=None):
     if trainer_cfg.get("precision") is not None:
         trainer_kwargs["precision"] = trainer_cfg["precision"]
     # Step-based validation cadence when configured (LDF style); else epoch.
+    # validation_steps counts GLOBAL train steps, so check_val_every_n_epoch must
+    # be None — otherwise Lightning reads val_check_interval as a within-epoch
+    # batch index and raises when it exceeds the (often smaller) epoch length.
     val_check_interval = (cfg.get("validation") or {}).get("validation_steps")
     if val_loader is not None and val_check_interval:
         trainer_kwargs["val_check_interval"] = val_check_interval
+        trainer_kwargs["check_val_every_n_epoch"] = None
 
     trainer = pl.Trainer(**trainer_kwargs)
     trainer.fit(module, train_loader, val_dataloaders=val_loader, ckpt_path=resume_ckpt)
