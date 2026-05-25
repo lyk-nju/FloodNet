@@ -7,7 +7,10 @@ from pathlib import Path
 import pytest
 from omegaconf import OmegaConf
 
-from utils.training.config_validate import validate_traj_dim_consistency
+from utils.training.config_validate import (
+    validate_7d_requires_self_forcing,
+    validate_traj_dim_consistency,
+)
 
 _LDF = Path(__file__).resolve().parent.parent / "configs" / "ldf.yaml"
 
@@ -91,3 +94,36 @@ def test_flip_to_7d_overlay_is_consistent():
     OmegaConf.update(cfg, "data.traj_feat_dim", 7)
     OmegaConf.update(cfg, "model.params.traj_encoder_in_dim", 7)
     assert validate_traj_dim_consistency(cfg) == 7
+
+
+# ---------------------------------------------------------------------------
+# 7D => self-forcing guard (heading supervision + canonicalize are SF-only)
+# ---------------------------------------------------------------------------
+
+
+def _cfg_sf(model_dim, sf):
+    return OmegaConf.create(
+        {"model": {"params": {"traj_encoder_in_dim": model_dim,
+                              "self_forcing_enabled": sf}}}
+    )
+
+
+def test_7d_without_self_forcing_raises():
+    with pytest.raises(ValueError, match="self_forcing_enabled"):
+        validate_7d_requires_self_forcing(_cfg_sf(7, False))
+
+
+def test_7d_with_self_forcing_ok():
+    validate_7d_requires_self_forcing(_cfg_sf(7, True))   # no raise
+
+
+def test_4d_without_self_forcing_ok():
+    """4D is unaffected by the SF guard regardless of the self_forcing flag."""
+    validate_7d_requires_self_forcing(_cfg_sf(4, False))
+    validate_7d_requires_self_forcing(OmegaConf.create({}))   # defaults: 4D, no SF
+
+
+def test_shipped_ldf_passes_sf_guard():
+    """Shipped ldf.yaml is 4D, so the SF guard is a no-op."""
+    cfg = OmegaConf.load(_LDF)
+    validate_7d_requires_self_forcing(cfg)   # no raise

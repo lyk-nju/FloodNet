@@ -60,7 +60,10 @@ from utils.training import (
     SelfForcingTrainer,
 )
 from utils.training.ckpt_compat import expand_traj_input_4d_to_7d
-from utils.training.config_validate import validate_traj_dim_consistency
+from utils.training.config_validate import (
+    validate_7d_requires_self_forcing,
+    validate_traj_dim_consistency,
+)
 
 # Set tokenizers parallelism to false to avoid warnings in multiprocessing
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -74,8 +77,11 @@ class CustomLightningModule(BasicLightningModule):
     generation eval, and T2M metric computation.
     """
     def __init__(self, cfg):
-        # T_B_10: fail fast if the two 4D/7D traj-dim flags disagree.
+        # T_B_10: fail fast if the two 4D/7D traj-dim flags disagree, and if a 7D
+        # run lacks self-forcing (the only path that supervises the 7D heading
+        # channels and canonicalizes the traj cond — see validate_7d_requires_*).
         validate_traj_dim_consistency(cfg)
+        validate_7d_requires_self_forcing(cfg)
         self._inline_eval_dedup = {}
         self._resume_step_offset = 0
         super().__init__(cfg)

@@ -11,6 +11,7 @@ logs*/
 log_*
 slurm*
 *.bin
+*.ckpt
 
 # cache
 .ruff_cache/
@@ -54,3 +55,8 @@ eval/result
 *.md
 !TODO.md
 !eval/babel_todo.md
+
+
+# coding plan
+docs/
+motionbricks/

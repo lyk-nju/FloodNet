@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
+import pytest
 import torch
 
 from datasets.refiner_dataset import RefinerDataset
@@ -347,6 +348,26 @@ def test_T13_cos_sin_invariant_under_selective_zscore(tmp_path):
     assert torch.equal(s_raw["target_waypoints"][..., 4], s_norm["target_waypoints"][..., 4])
     # xyz channels of current_motion DIFFER after normalize.
     assert not torch.equal(s_raw["current_motion"][..., 0], s_norm["current_motion"][..., 0])
+
+
+def test_waypoint_norm_indices_with_heading_channel_raises(tmp_path):
+    """A stats file that lists heading channel 3 or 4 in waypoint_norm_indices
+    must fail loudly at load (z-scoring cos/sin would break the unit-norm GT the
+    cosine heading loss assumes)."""
+    cm_mean = np.zeros(5, dtype=np.float32)
+    cm_std = np.ones(5, dtype=np.float32)
+    cm_idx = np.array([0, 1, 2], dtype=np.int64)
+    wp_mean = np.zeros(7, dtype=np.float32)
+    wp_std = np.ones(7, dtype=np.float32)
+    wp_idx = np.array([0, 1, 2, 3, 5, 6], dtype=np.int64)   # ⚠ includes heading ch 3
+    np.save(tmp_path / "current_motion_mean.npy", cm_mean)
+    np.save(tmp_path / "current_motion_std.npy", cm_std)
+    np.save(tmp_path / "current_motion_norm_indices.npy", cm_idx)
+    np.save(tmp_path / "waypoint_mean.npy", wp_mean)
+    np.save(tmp_path / "waypoint_std.npy", wp_std)
+    np.save(tmp_path / "waypoint_norm_indices.npy", wp_idx)
+    with pytest.raises(ValueError, match="heading channels 3/4"):
+        RefinerDataset([_make_clip(T=50)], normalize=True, stats_dir=tmp_path)
 
 
 # ---------------------------------------------------------------------------
