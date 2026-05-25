@@ -133,6 +133,50 @@ def test_resolve_does_not_break_configs_without_interpolation_sources():
     assert resolved == {"a": 1, "b": {"c": 2}}
 
 
+def test_resolve_graceful_when_paths_default_missing(monkeypatch):
+    """Review #1: a missing/empty paths_default must NOT crash resolution —
+    ${wandb_info.*} resolves to '' (wandb skipped) instead of InterpolationKeyError."""
+    monkeypatch.setattr(tr, "_load_paths_default", lambda: {})
+    cfg = {"debug": True, "logger": {"wandb": {
+        "wandb_key": "${wandb_info.key}",
+        "project": "${refiner_wandb_info.project}",
+        "entity": "${wandb_info.entity}"}}}
+    resolved = tr.resolve_cfg_interpolations(cfg)   # must not raise
+    wb = resolved["logger"]["wandb"]
+    assert wb == {"wandb_key": "", "project": "", "entity": ""}
+    assert "wandb_info" not in resolved and "refiner_wandb_info" not in resolved
+
+
+def test_resolve_strips_cfg_defined_wandb_info(monkeypatch):
+    """Review #3: a cfg that defines its own wandb_info (raw key) must be stripped
+    from the result so the secret cannot reach ckpt hparams / wandb config."""
+    monkeypatch.setattr(tr, "_load_paths_default", lambda: {})
+    cfg = {"wandb_info": {"key": "SECRET", "project": "P", "entity": "E"},
+           "logger": {"wandb": {"wandb_key": "${wandb_info.key}"}}}
+    resolved = tr.resolve_cfg_interpolations(cfg)
+    assert "wandb_info" not in resolved                       # raw-key block stripped
+    assert resolved["logger"]["wandb"]["wandb_key"] == "SECRET"  # still resolved for the logger
+    # ...and main() then scrubs logger.wandb.wandb_key before module construction.
+
+
+def test_resolve_seed_tolerates_null_training_block():
+    """Review #2: a present-but-null `training:` block must not crash resolve_seed."""
+    assert tr.resolve_seed({"training": None}) == 1234
+
+
+def test_checkpoint_monitor_and_save_last_from_validation_block():
+    """Review #4/#7: monitor / save_last are honored from the validation block
+    (configs were migrated checkpoint:→validation:)."""
+    cb = tr.build_checkpoint_callback(
+        {"validation": {"save_every_n_steps": 1000, "save_top_k": 3,
+                        "monitor": "val/loss", "save_last": False}}, "/out",
+    )
+    assert cb is not None
+    assert cb.save_top_k == 3            # honored because validation.monitor exists
+    assert cb.monitor == "val/loss"
+    assert cb.save_last is False         # honored from validation block
+
+
 # ---------------------------------------------------------------------------
 # checkpoint callback
 # ---------------------------------------------------------------------------

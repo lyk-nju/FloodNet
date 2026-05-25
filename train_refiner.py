@@ -276,10 +276,23 @@ def resolve_cfg_interpolations(cfg: dict) -> dict:
     from omegaconf import OmegaConf
 
     extras = _load_paths_default()
+    # Guarantee the wandb interpolation sources exist so a missing/customized
+    # paths_default.yaml degrades gracefully — ${wandb_info.*}/${refiner_wandb_info.*}
+    # resolve to "" (→ wandb simply skipped) instead of raising InterpolationKeyError
+    # and aborting the run (incl. the debug/smoke config, which must run standalone).
+    extras.setdefault("wandb_info", {})
+    for _k in ("key", "project", "entity"):
+        extras["wandb_info"].setdefault(_k, "")
+    extras.setdefault("refiner_wandb_info", {})
+    extras["refiner_wandb_info"].setdefault("project", "")
+
     injected = [k for k in extras if k not in cfg]   # only add what cfg lacks
     merged = {**{k: extras[k] for k in injected}, **cfg}
     resolved = OmegaConf.to_container(OmegaConf.create(merged), resolve=True)
-    for k in injected:
+    # Strip interpolation-source blocks: the ones we injected PLUS the credential
+    # blocks even when the cfg itself defined them — they carry the raw API key and
+    # must never survive into ckpt hparams or the wandb run config.
+    for k in set(injected) | {"wandb_info", "refiner_wandb_info"}:
         resolved.pop(k, None)
     return resolved
 
@@ -315,7 +328,7 @@ def resolve_seed(cfg: dict, cli_seed: int | None = None) -> int:
         return int(cli_seed)
     if cfg.get("seed") is not None:
         return int(cfg["seed"])
-    return int(cfg.get("training", {}).get("seed", 1234))
+    return int((cfg.get("training") or {}).get("seed", 1234))
 
 
 def resolve_resume_ckpt(cfg: dict, cli_ckpt: str | None = None) -> str | None:
@@ -419,10 +432,12 @@ def build_checkpoint_callback(cfg: dict, output_dir: str):
     # finite save_top_k without a monitored metric, so coerce it to -1 (keep
     # every periodic ckpt). Set checkpoint.monitor (+ mode) to keep top-k by a
     # logged metric instead (e.g. "val/loss").
-    monitor = ck.get("monitor")
+    # Keys may live in either the `checkpoint` block or the LDF-style `validation`
+    # block (the shipped configs use the latter), so read both with checkpoint first.
+    monitor = ck.get("monitor", val.get("monitor"))
     save_top_k = int(ck.get("save_top_k", val.get("save_top_k", -1)))
     if monitor is None and save_top_k not in (-1, 0):
-        log.warning("checkpoint.save_top_k=%d needs checkpoint.monitor; "
+        log.warning("save_top_k=%d needs a monitor (checkpoint/validation.monitor); "
                     "keeping all periodic ckpts (save_top_k=-1) instead.", save_top_k)
         save_top_k = -1
 
@@ -432,8 +447,8 @@ def build_checkpoint_callback(cfg: dict, output_dir: str):
         every_n_train_steps=int(every),
         save_top_k=save_top_k,
         monitor=monitor,
-        mode=ck.get("mode", "min"),
-        save_last=bool(ck.get("save_last", True)),
+        mode=ck.get("mode", val.get("mode", "min")),
+        save_last=bool(ck.get("save_last", val.get("save_last", True))),
         auto_insert_metric_name=False,
         save_on_train_epoch_end=False,
     )
@@ -543,8 +558,8 @@ def main(argv=None):
     if isinstance(_wb, dict):
         wandb_api_key = _literal_or_none(_wb.get("wandb_key"))
         _wb["wandb_key"] = None
-    train_cfg = cfg.get("training", {})
-    trainer_cfg = cfg.get("trainer", {}) or {}
+    train_cfg = cfg.get("training") or {}
+    trainer_cfg = cfg.get("trainer") or {}
     # max_steps precedence: CLI > trainer.max_steps > training.total_steps.
     max_steps = (
         args.max_steps if args.max_steps is not None
