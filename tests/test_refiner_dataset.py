@@ -370,6 +370,26 @@ def test_waypoint_norm_indices_with_heading_channel_raises(tmp_path):
         RefinerDataset([_make_clip(T=50)], normalize=True, stats_dir=tmp_path)
 
 
+def test_current_motion_norm_indices_with_heading_channel_raises(tmp_path):
+    """Symmetric to the waypoint check: a stats file that lists heading channel
+    3 or 4 in current_motion_norm_indices must also fail loudly at load (cos/sin
+    yaw are unit-vector invariant; rule 7)."""
+    cm_mean = np.zeros(5, dtype=np.float32)
+    cm_std = np.ones(5, dtype=np.float32)
+    cm_idx = np.array([0, 1, 2, 4], dtype=np.int64)   # ⚠ includes heading ch 4
+    wp_mean = np.zeros(7, dtype=np.float32)
+    wp_std = np.ones(7, dtype=np.float32)
+    wp_idx = np.array([0, 1, 2, 5, 6], dtype=np.int64)
+    np.save(tmp_path / "current_motion_mean.npy", cm_mean)
+    np.save(tmp_path / "current_motion_std.npy", cm_std)
+    np.save(tmp_path / "current_motion_norm_indices.npy", cm_idx)
+    np.save(tmp_path / "waypoint_mean.npy", wp_mean)
+    np.save(tmp_path / "waypoint_std.npy", wp_std)
+    np.save(tmp_path / "waypoint_norm_indices.npy", wp_idx)
+    with pytest.raises(ValueError, match="heading channels 3/4"):
+        RefinerDataset([_make_clip(T=50)], normalize=True, stats_dir=tmp_path)
+
+
 # ---------------------------------------------------------------------------
 # T15: rigid-invariant fwd_delta / yaw_delta channels
 # ---------------------------------------------------------------------------

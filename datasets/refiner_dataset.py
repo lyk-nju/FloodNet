@@ -311,6 +311,17 @@ class RefinerDataset(Dataset):
         if self._cm_norm_idx.numel() and int(self._cm_norm_idx.max()) >= 5:
             raise ValueError(f"current_motion_norm_indices out of range for dim 5: "
                              f"{self._cm_norm_idx.tolist()}")
+        # Heading channels 3/4 (cos/sin yaw) are unit-vector invariant and MUST
+        # NOT be z-scored (rule 7) — same invariant as the waypoint check below.
+        # current_motion is only a model input (hist_proj), so a z-scored heading
+        # wouldn't break a loss, but it silently diverges from the design's
+        # unit-heading convention; fail loudly on a stale/hand-edited stats file.
+        if set(self._cm_norm_idx.tolist()) & {3, 4}:
+            raise ValueError(
+                "current_motion_norm_indices must NOT include heading channels 3/4 "
+                "(cos/sin yaw are unit-vector invariant; rule 7): "
+                f"{self._cm_norm_idx.tolist()}"
+            )
         if self._wp_norm_idx.numel() and int(self._wp_norm_idx.max()) >= 7:
             raise ValueError(f"waypoint_norm_indices out of range for dim 7: "
                              f"{self._wp_norm_idx.tolist()}")
