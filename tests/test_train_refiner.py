@@ -294,6 +294,37 @@ def test_training_step_produces_finite_loss_and_grads():
     assert n_bad == 0
 
 
+def test_training_step_skips_batch_on_nonfinite_loss(monkeypatch):
+    """A non-finite loss must NOT propagate to the optimizer step: training_step
+    returns None (Lightning's skip-batch signal) so a single bad batch cannot
+    poison every parameter with NaN."""
+    module = RefinerLightningModule(_tiny_cfg())
+    batch = _make_batch(module)
+
+    def _nan_loss(out, b):
+        losses = RefinerLightningModule._compute_loss(module, out, b)
+        losses["loss"] = losses["loss"] * float("nan")
+        return losses
+
+    monkeypatch.setattr(module, "_compute_loss", _nan_loss)
+    monkeypatch.setattr(module, "log", lambda *a, **k: None)   # no Trainer attached
+    assert module.training_step(batch, 0) is None
+
+
+def test_training_step_returns_finite_loss_on_good_batch():
+    """The guard must not regress the normal path: a finite loss is returned."""
+    module = RefinerLightningModule(_tiny_cfg())
+    batch = _make_batch(module)
+    import types
+
+    logged = {}
+    module.log = types.MethodType(
+        lambda self, k, v, **kw: logged.__setitem__(k, v), module)
+    loss = module.training_step(batch, 0)
+    assert loss is not None and torch.isfinite(loss).all()
+    assert "train/loss" in logged and "train/nonfinite_skip" not in logged
+
+
 def test_configure_optimizers_returns_adamw():
     module = RefinerLightningModule(_tiny_cfg())
     opt = module.configure_optimizers()

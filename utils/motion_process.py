@@ -223,7 +223,28 @@ def append_traj_deltas_5d_to_7d(traj_5d: torch.Tensor,
     cos_h = traj_5d[..., 3]
     sin_h = traj_5d[..., 4]
     if physical_yaw is None:
-        physical_yaw = torch.atan2(sin_h, cos_h)
+        # Gradient-safe atan2. atan2(y, x) back-props ∝ 1/(x²+y²), so as the
+        # heading vector collapses toward zero norm the gradient explodes (→1e9
+        # for a 1e-9 heading), which can diverge training into eventual Inf/NaN
+        # (every parameter then reads NaN). The caller normalizes cos/sin with
+        # F.normalize(eps=1e-6), but that divides by max(‖v‖, eps): a pre-norm
+        # magnitude < eps stays sub-unit (or exactly zero), so the unit-vector
+        # guarantee we rely on here does not hold. Hard-normalize to a unit
+        # direction (atan2 grad denom = 1 → bounded) and fall back to yaw=0
+        # ([cos,sin]=[1,0]) below the floor so a fully-collapsed heading gets a
+        # bounded gradient instead of 1/‖v‖². For a valid unit heading this is
+        # bit-identical to atan2(sin, cos) (dividing a unit vector by its ~1.0
+        # norm is a no-op).
+        # Clamp the SQUARED norm before the sqrt: sqrt(0) back-props inf, and
+        # clamping the sqrt *result* instead would zero that path (0·inf = NaN).
+        # Flooring the radicand keeps the sqrt input > 0 so its gradient stays
+        # finite, and the floored norm (≥1e-6) makes the division safe too.
+        sq = cos_h * cos_h + sin_h * sin_h
+        norm = torch.sqrt(sq.clamp_min(1e-12))
+        ok = sq > 1e-12
+        cos_u = torch.where(ok, cos_h / norm, torch.ones_like(cos_h))
+        sin_u = torch.where(ok, sin_h / norm, torch.zeros_like(sin_h))
+        physical_yaw = torch.atan2(sin_u, cos_u)
 
     xz = traj_5d[..., [0, 2]]
     delta_xz = torch.zeros_like(xz)

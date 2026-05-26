@@ -271,12 +271,30 @@ class RefinerLightningModule(pl.LightningModule):
     def training_step(self, batch: dict, batch_idx: int):
         out = self(batch)
         losses = self._compute_loss(out, batch)
+        loss = losses["loss"]
+        # NaN/Inf guard. A single non-finite loss back-props non-finite grads, and
+        # the AdamW step then poisons EVERY parameter — from there on every loss
+        # term reads NaN (gradient clipping does not help: clipping NaN grads
+        # stays NaN). Returning None makes Lightning skip the optimizer step for
+        # this batch instead of corrupting the weights. Costs one scalar host-sync
+        # per step, which is an acceptable price for the safety. (Single-device
+        # assumption: under DDP a None return on only some ranks desyncs the
+        # backward all-reduce — run detect_anomaly to locate the source instead.)
+        if not torch.isfinite(loss):
+            log.warning(
+                "non-finite train loss (%s) at global_step=%d batch_idx=%d; "
+                "skipping optimizer step for this batch.",
+                loss.detach().item(), self.global_step, batch_idx,
+            )
+            self.log("train/nonfinite_skip", 1.0, prog_bar=False,
+                     on_step=True, on_epoch=False)
+            return None
         # Show every per-term loss (num_token/xyz/heading/fwd_delta/yaw_delta +
         # total) on the tqdm bar, not just the total — so directional terms are
         # watchable during training.
         for k, v in losses.items():
             self.log(f"train/{k}", v, prog_bar=True, on_step=True, on_epoch=False)
-        return losses["loss"]
+        return loss
 
     def validation_step(self, batch: dict, batch_idx: int):
         out = self(batch)

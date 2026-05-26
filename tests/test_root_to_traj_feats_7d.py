@@ -54,6 +54,37 @@ def test_append_deltas_first_frame_zero_and_differentiable():
     assert x.grad is not None and torch.isfinite(x.grad).all()
 
 
+def test_append_deltas_grad_finite_with_exactly_zero_heading():
+    """A *collapsed* heading (cos=sin=0) must back-prop finite gradients (the
+    direction is undefined, so the fix falls back to yaw=0 with a bounded grad)."""
+    base = torch.zeros(1, 4, 5)
+    base[0, :, 0] = torch.arange(4, dtype=torch.float32)   # moving x
+    base[0, :, 3] = 1.0                                    # cos=1 (yaw 0) elsewhere
+    base[0, 2, 3] = 0.0                                    # frame 2 heading = (0,0)
+    base = base.detach().requires_grad_(True)
+    out = append_traj_deltas_5d_to_7d(base)
+    assert torch.isfinite(out).all()
+    out.sum().backward()
+    assert base.grad is not None and torch.isfinite(base.grad).all()
+
+
+def test_append_deltas_grad_bounded_with_subunit_heading():
+    """Regression: a sub-unit heading — what F.normalize(eps) yields for a pre-norm
+    magnitude < eps — must NOT produce an explosive atan2 gradient. The plain
+    atan2(sin, cos) gradient is ∝ 1/‖v‖² (≈1e8 at a 1e-4 heading, ≈1e8+ below),
+    which diverges training; the gradient-safe form floors it to O(1)."""
+    base = torch.zeros(1, 3, 5)
+    base[0, :, 0] = torch.tensor([0.0, 1.0, 2.0])
+    base[0, :, 3] = 1e-8                                   # collapsed heading (sub-floor)
+    base = base.detach().requires_grad_(True)
+    out = append_traj_deltas_5d_to_7d(base)
+    assert torch.isfinite(out).all()
+    out.sum().backward()
+    assert base.grad is not None and torch.isfinite(base.grad).all()
+    # Plain atan2 here back-props ~1e8; the fix keeps it bounded (O(1)).
+    assert base.grad.abs().max() < 1e3, base.grad.abs().max()
+
+
 def _make_263d(rot_vel_t0: float, local_vel_xz_per_frame, n_frames: int = 6):
     """Minimal 263D motion fixture (see tests/test_local_frame helpers)."""
     data = torch.zeros(1, n_frames, 263, dtype=torch.float32)
