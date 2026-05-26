@@ -229,7 +229,8 @@ class TrajStreamBuffer:
                     self._feat_buf[:, commit_index:commit_index + k] = tf[:, :k]
                     wrote = True
                 self._mask_buf = self._write_mask(
-                    x.get("token_mask"), commit_index, k, device, dtype=tf.dtype
+                    x.get("token_mask"), commit_index, k, device, dtype=tf.dtype,
+                    fill_ones_if_absent=(k > 0),
                 )
 
         elif "traj" in x and x["traj"] is not None:

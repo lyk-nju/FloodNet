@@ -16,11 +16,11 @@ from utils.training.config_validate import validate_traj_dim_consistency
 _LDF = Path(__file__).resolve().parent.parent / "configs" / "ldf.yaml"
 _NAMES = {
     "all_on", "no_corruption", "no_horizon_sim",
-    "no_anchor_canonical", "no_heading_loss", "no_7d",
+    "no_anchor_canonical", "no_heading_loss",
 }
 
 
-def test_six_named_ablations():
+def test_named_ablations():
     assert set(body_ablation_overrides()) == _NAMES
 
 
@@ -30,9 +30,9 @@ def _applied(name):
 
 
 def test_every_ablation_is_traj_dim_consistent():
-    # no_7d → 4D; the other five → 7D. All must pass the consistency guard.
-    assert validate_traj_dim_consistency(_applied("no_7d")) == 4
-    for name in _NAMES - {"no_7d"}:
+    # All ablations are 7D (the 4D `no_7d` baseline was removed with the
+    # 4D encoder); each must pass the consistency guard.
+    for name in _NAMES:
         assert validate_traj_dim_consistency(_applied(name)) == 7
 
 
@@ -65,12 +65,6 @@ def test_no_heading_loss_zeroes_heading_but_keeps_aux_enabled():
     assert c.body_aux_loss.enabled is True
     assert float(c.body_aux_loss.weights.heading) == 0.0
     assert float(c.body_aux_loss.weights.root_xz) > 0   # other terms intact
-
-
-def test_no_7d_flips_both_traj_flags_to_4():
-    c = _applied("no_7d")
-    assert c.data.traj_feat_dim == 4
-    assert c.model.params.traj_encoder_in_dim == 4
 
 
 def test_overrides_to_cli_formats_bools_lowercase():

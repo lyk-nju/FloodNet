@@ -193,9 +193,16 @@ def _load_model(cfg, ckpt_path: str, device: torch.device, use_ema: bool):
             print(f"[load] strict=False  missing keys (new modules): {len(load_result.missing_keys)}")
         if load_result.unexpected_keys:
             print(f"[load] strict=False  unexpected keys ignored: {len(load_result.unexpected_keys)}")
+        # Re-init ControlNet from backbone ONLY when the ckpt had no ControlNet
+        # at all (base pretrain warm-start). Gating on "any controlnet.* key is
+        # missing" is WRONG: stripping legacy traj weights puts
+        # controlnet.traj_in_proj.* into missing_keys even for a fully-trained
+        # ControlNet, which would clobber it with a raw backbone copy. Mirror
+        # train_ldf.py's `controlnet_missing` gate.
+        controlnet_missing = not has_controlnet
         if (getattr(model, "controlnet", None) is not None
                 and bool(getattr(model, "controlnet_init_from_backbone", True))
-                and load_result.missing_keys
+                and controlnet_missing
                 and any("controlnet." in k for k in load_result.missing_keys)):
             model.controlnet.init_from_backbone(model.model)
             print("[load] Re-initialized ControlNet from loaded backbone weights.")

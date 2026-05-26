@@ -29,6 +29,11 @@ _LEGACY_TRAJ_PREFIXES = (
     "traj_encoder.",
     "controlnet.traj_in_proj.",
     "model.traj_in_proj.",
+    # traj_type_embed is a leaf Parameter (no ".weight"); its shape (1,1,dim) is
+    # UNCHANGED across 4D→7D, but a legacy ckpt's drifted value is added to every
+    # token (`traj_t = traj_in_proj(emb) + traj_type_embed`), re-introducing
+    # non-zero init into the otherwise zero-init traj projection. Strip it too.
+    "controlnet.traj_type_embed",
 )
 
 
@@ -44,14 +49,16 @@ def strip_legacy_traj_encoder_weights(state_dict: dict, own_state: dict) -> int:
     """Drop incoming traj-encoder/traj_in_proj keys that don't match the rewritten
     7D model. Returns the number of keys stripped.
 
-    A legacy ckpt's traj submodules were entirely rewritten — even keys whose
-    raw shape happens to match (e.g. ``traj_in_proj.bias`` is still ``(dim,)``)
-    carry stale 4D-era statistics, so the safe rule for the traj prefixes is
-    "strip unconditionally": any incoming traj-prefix key whose tensor or shape
-    doesn't match the live model's same-key tensor is removed, AND if any key
-    under a given traj-prefix is being stripped, all sibling keys for that
-    prefix are stripped too — otherwise a surviving bias would silently
-    re-introduce non-zero init into the supposedly zero-init projection.
+    The traj-conditioning submodules (local_traj_encoder + traj_encoder +
+    traj_in_proj + traj_type_embed) are ONE logical unit. On a legacy 4D ckpt the
+    encoders / traj_in_proj.weight changed shape; ``traj_in_proj.bias`` and
+    ``traj_type_embed`` keep the same shape but carry stale 4D-era values that
+    would re-introduce non-zero init into the supposedly zero-init projection.
+
+    Rule: if ANY legacy-prefix key is shape-mismatched or absent from the live
+    model, the subsystem was rewritten → strip ALL legacy-prefix keys (including
+    the shape-matching ones). A fresh 7D ckpt matches everywhere → nothing is
+    stripped and it round-trips cleanly.
 
     Modifies `state_dict` in place. Caller is expected to load with strict=False.
     """
@@ -59,35 +66,25 @@ def strip_legacy_traj_encoder_weights(state_dict: dict, own_state: dict) -> int:
     if not legacy_keys:
         return 0
 
-    # Phase 1: shape-mismatch check, grouped by prefix so a partial-mismatch
-    # group strips its siblings too.
-    by_prefix: dict[str, list[str]] = {}
+    # Decide once for the whole subsystem: any shape mismatch / missing own
+    # counterpart means a legacy (pre-rewrite) ckpt → strip everything.
+    any_mismatch = False
     for key in legacy_keys:
-        for p in _LEGACY_TRAJ_PREFIXES:
-            if key.startswith(p) or f".{p}" in key:
-                # Use the full prefix path (including any LightningModule "model." outer).
-                idx = key.find(p)
-                full_prefix = key[: idx + len(p)]
-                by_prefix.setdefault(full_prefix, []).append(key)
-                break
+        v = state_dict[key]
+        if not torch.is_tensor(v):
+            continue
+        own = own_state.get(key)
+        if own is None or tuple(v.shape) != tuple(own.shape):
+            any_mismatch = True
+            break
+    if not any_mismatch:
+        return 0
 
     n = 0
-    for full_prefix, keys in by_prefix.items():
-        # Mismatched if ANY sibling has no own-state counterpart or shape mismatch.
-        mismatched = False
-        for key in keys:
-            v = state_dict[key]
-            if not torch.is_tensor(v):
-                continue
-            own = own_state.get(key)
-            if own is None or tuple(v.shape) != tuple(own.shape):
-                mismatched = True
-                break
-        if mismatched:
-            for key in keys:
-                if key in state_dict:
-                    del state_dict[key]
-                    n += 1
+    for key in legacy_keys:
+        if key in state_dict:
+            del state_dict[key]
+            n += 1
     return n
 
 

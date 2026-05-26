@@ -9,7 +9,9 @@ isolate each gap-closure subitem:
     no_horizon_sim       horizon simulation off (T_B_04 / §2.2)
     no_anchor_canonical  body-window canonicalize off → absolute world xyz (T_B_05 / §2.3)
     no_heading_loss      heading term zeroed in body aux loss (T_B_06 / §2.4)
-    no_7d (4D legacy)    back to the 4D traj path (≈ old ckpt baseline)
+
+(The former `no_7d` 4D-legacy baseline was removed: the traj encoder is now 7D
+only — LocalTrajEncoder rejects in_dim=4 — so a 4D ablation can't be built.)
 
 Bools are emitted lowercase so utils/initialize._convert_value parses them.
 
@@ -37,8 +39,6 @@ def body_ablation_overrides() -> dict[str, dict]:
         # supervision — _check_preconditions raises); ablate by zeroing the
         # heading weight while keeping the other four terms.
         "no_heading_loss": {**base, "body_aux_loss.weights.heading": 0.0},
-        # 4D legacy: flip BOTH traj flags back to 4; the 7D subitems go inert.
-        "no_7d": {"model.params.traj_encoder_in_dim": 4, "data.traj_feat_dim": 4},
     }
 
 

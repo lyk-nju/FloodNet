@@ -13,20 +13,25 @@ from omegaconf import OmegaConf
 
 
 def validate_traj_dim_consistency(cfg) -> int:
-    """Check the two traj-dim flags agree and are 4 or 7. Returns the dim.
+    """Check the two traj-dim flags agree and equal 7. Returns the dim (7).
 
-    Raises ValueError on mismatch or an unsupported value.
+    The 4D legacy encoder was removed (LocalTrajEncoder is 7D-only), so a 4D
+    config now crashes at model construction — fail fast here with a clear
+    message. Defaults are 7 (matching the model's `traj_in_dim=7` default).
+
+    Raises ValueError on mismatch or any non-7 value.
     """
-    data_dim = int(OmegaConf.select(cfg, "data.traj_feat_dim", default=4))
-    model_dim = int(OmegaConf.select(cfg, "model.params.traj_encoder_in_dim", default=4))
+    data_dim = int(OmegaConf.select(cfg, "data.traj_feat_dim", default=7))
+    model_dim = int(OmegaConf.select(cfg, "model.params.traj_encoder_in_dim", default=7))
     if data_dim != model_dim:
         raise ValueError(
             f"traj dim mismatch: data.traj_feat_dim={data_dim} != "
-            f"model.params.traj_encoder_in_dim={model_dim}. They must agree "
-            "(both 4 = legacy, both 7 = 7D fine-tune). See T_B_10."
+            f"model.params.traj_encoder_in_dim={model_dim}. They must agree."
         )
-    if data_dim not in (4, 7):
-        raise ValueError(f"traj dim must be 4 or 7, got {data_dim}.")
+    if data_dim != 7:
+        raise ValueError(
+            f"traj dim must be 7 (the 4D legacy encoder was removed), got {data_dim}."
+        )
     return data_dim
 
 
@@ -46,7 +51,7 @@ def validate_7d_requires_self_forcing(cfg) -> None:
     in-SF "traj_encoder_in_dim=7 requires body_aux_loss" guard never runs when SF
     is off, so enforce 7D => self_forcing here (at module construction).
     """
-    dim = int(OmegaConf.select(cfg, "model.params.traj_encoder_in_dim", default=4))
+    dim = int(OmegaConf.select(cfg, "model.params.traj_encoder_in_dim", default=7))
     if dim != 7:
         return
     sf = bool(OmegaConf.select(cfg, "model.params.self_forcing_enabled", default=False))

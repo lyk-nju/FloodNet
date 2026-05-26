@@ -19,6 +19,7 @@ from utils.training.ckpt_compat import (
 _LOCAL_PREFIX = "local_traj_encoder."
 _TRAJ_PREFIX = "traj_encoder."
 _CN_TRAJ_IN_PROJ = "controlnet.traj_in_proj."
+_CN_TRAJ_TYPE = "controlnet.traj_type_embed"
 
 
 def _own_state_for_new_model() -> dict:
@@ -32,6 +33,7 @@ def _own_state_for_new_model() -> dict:
         own[_TRAJ_PREFIX + k] = v
     own[_CN_TRAJ_IN_PROJ + "weight"] = torch.zeros(1024, 128)
     own[_CN_TRAJ_IN_PROJ + "bias"] = torch.zeros(1024)
+    own[_CN_TRAJ_TYPE] = torch.zeros(1, 1, 1024)
     return own
 
 
@@ -83,6 +85,22 @@ def test_strip_keeps_already_7d_keys():
     n = strip_legacy_traj_encoder_weights(sd, own)
     assert n == 0
     assert set(sd.keys()) == set(own.keys())
+    # The shape-matching traj_type_embed is a valid 7D value → kept.
+    assert _CN_TRAJ_TYPE in sd
+
+
+def test_strip_drops_traj_type_embed_when_subsystem_rewritten():
+    """traj_type_embed keeps the SAME shape across 4D→7D, but a legacy ckpt's
+    drifted value is added to every token; it must be stripped alongside the
+    rewritten encoder so it can't re-introduce non-zero init."""
+    own = _own_state_for_new_model()
+    sd = _legacy_4d_state()
+    # Shape matches own; only the (stale) value differs.
+    sd[_CN_TRAJ_TYPE] = torch.randn(1, 1, 1024)
+    n = strip_legacy_traj_encoder_weights(sd, own)
+    assert _CN_TRAJ_TYPE not in sd            # stripped despite shape match
+    assert n == 11                            # 10 encoder/proj keys + type_embed
+    assert "model.blocks.0.self_attn.q.weight" in sd  # backbone untouched
 
 
 def test_strip_handles_lightning_module_prefix():

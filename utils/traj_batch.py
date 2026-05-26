@@ -275,8 +275,12 @@ def encode_traj_batch(
         )
 
     traj_emb = traj_encoder(feats_tok)
-    if token_mask_from_frame is not None:
-        traj_emb = traj_emb * token_mask_from_frame[..., None].to(traj_emb.dtype)
+    # Re-zero by the COMBINED token mask (frame-derived ∧ x["token_mask"]), not
+    # just token_mask_from_frame: TrajEncoder's LayerNorm+bias maps a zeroed-input
+    # token to a NON-zero embedding, so a token invalid only via x["token_mask"]
+    # (when a separate frame cond_mask marks it valid) would otherwise leak.
+    if combined_token_mask is not None:
+        traj_emb = traj_emb * combined_token_mask[..., None].to(traj_emb.dtype)
 
     if return_token_mask:
         return traj_emb, combined_token_mask

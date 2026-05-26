@@ -2355,7 +2355,11 @@ def main():
         # 2. Patch _build_traj_emb so generate() uses the buffer's emb,
         #    then call generate() which is known not to OOM.
         _orig_build = model._build_traj_emb
-        def _patched_build(x, sl, dev):
+        def _patched_build(x, sl, dev, return_token_mask=False):
+            # generate() now calls with return_token_mask=True and unpacks a
+            # 2-tuple; this diagnostic doesn't gate tokens, so return a None mask.
+            if return_token_mask:
+                return _buf_emb, None
             return _buf_emb
         model._build_traj_emb = _patched_build
 
