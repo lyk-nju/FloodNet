@@ -171,8 +171,10 @@ def run_benchmark(model, dataset, text_encoder, device="cpu",
         # ⚠ Use get_sample(force_no_path_aug=True) so the benchmark measures
         # CLEAN inference: dataset[idx] would apply random trim/sparse path
         # augmentation, making metrics non-deterministic and inflating errors.
+        # force_text_idx=0 pins the canonical first caption (training randomizes
+        # over all captions for augmentation; eval must stay comparable).
         if hasattr(dataset, "get_sample"):
-            sample = dataset.get_sample(idx, force_no_path_aug=True)
+            sample = dataset.get_sample(idx, force_no_path_aug=True, force_text_idx=0)
         else:
             sample = dataset[idx]
         text_emb = text_encoder.encode([sample["text"]], device=device)

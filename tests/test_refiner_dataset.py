@@ -487,3 +487,55 @@ def test_reset_rng_makes_get_sample_sequence_reproducible():
     # (second_no_reset is allowed to differ; assert reset actually changed something
     #  only when the un-reset pass diverged, which it does for full_plan_ratio<1.)
     assert second_no_reset != first or third_after_reset == first
+
+
+# ---------------------------------------------------------------------------
+# Multi-caption text augmentation (clip carries a `texts` list)
+# ---------------------------------------------------------------------------
+
+
+def _make_multicap_clip(T: int, texts: list[str]) -> dict:
+    """A clip carrying multiple captions in `texts` (load_clips_from_dir schema)."""
+    clip = _make_clip(T=T, text=texts[0])
+    clip["texts"] = list(texts)
+    return clip
+
+
+def test_random_caption_selection_uses_all_captions():
+    """With a `texts` list, repeated sampling must surface more than one caption
+    (text augmentation), and every drawn caption must come from the list."""
+    texts = ["walk forward", "stroll ahead", "march onward", "step forward"]
+    ds = RefinerDataset([_make_multicap_clip(T=60, texts=texts)],
+                         full_plan_ratio=1.0, seed=0)
+    drawn = {ds.get_sample(0)["text"] for _ in range(40)}
+    assert drawn.issubset(set(texts))
+    assert len(drawn) > 1, f"expected caption diversity, only saw {drawn}"
+
+
+def test_force_text_idx_pins_specific_caption():
+    texts = ["walk forward", "stroll ahead", "march onward"]
+    ds = RefinerDataset([_make_multicap_clip(T=60, texts=texts)],
+                         full_plan_ratio=1.0, seed=0)
+    for i, cap in enumerate(texts):
+        s = ds.get_sample(0, force_text_idx=i)
+        assert s["text"] == cap
+
+
+def test_clip_without_texts_falls_back_to_single_text():
+    """Legacy clips (only `text`, no `texts`) keep working: the single caption is
+    returned, and the fallback path does NOT call self._rng.choice — so two fresh
+    identical legacy datasets draw an identical mode/num_tokens sequence (the
+    existing T01/T02/reset_rng tests separately lock in that the legacy draw order
+    is unperturbed by the multi-caption change)."""
+    def fresh():
+        return RefinerDataset([_make_clip(T=60, text="walk forward")],
+                              full_plan_ratio=0.5, seed=0)
+
+    ds_a = fresh()
+    assert ds_a.get_sample(0)["text"] == "walk forward"   # single-caption fallback
+
+    seq_a = [int(fresh().get_sample(0, force_no_path_aug=True)["num_tokens"])
+             for _ in range(5)]
+    seq_b = [int(fresh().get_sample(0, force_no_path_aug=True)["num_tokens"])
+             for _ in range(5)]
+    assert seq_a == seq_b   # deterministic; fallback consumes no caption RNG

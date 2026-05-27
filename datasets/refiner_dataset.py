@@ -251,17 +251,36 @@ class RefinerDataset(Dataset):
             m = m.float()
         return m
 
+    def _choose_caption(self, clip: dict, force_text_idx: int | None) -> str:
+        """Pick the caption for this sample. A clip may carry `texts` (all
+        distinct captions, from load_clips_from_dir); HumanML3D gives 3-5 per
+        clip. Selecting one at random each draw turns paraphrases into text
+        augmentation — the frozen T5 cache holds every caption so the encoder
+        lookup always hits. `force_text_idx` pins a specific caption (tests).
+        Falls back to the single `text` key when `texts` is absent/empty
+        (synthetic test clips), so the legacy schema keeps working unchanged.
+        """
+        texts = clip.get("texts")
+        if texts:
+            if force_text_idx is not None:
+                return texts[int(force_text_idx) % len(texts)]
+            return self._rng.choice(texts)
+        return clip.get("text", "")
+
     def get_sample(self, idx_in_valid: int, *,
                     force_mode: str | None = None,
                     force_num_tokens: int | None = None,
                     force_anchor_frame: int | None = None,
-                    force_no_path_aug: bool = False) -> dict[str, Any]:
+                    force_no_path_aug: bool = False,
+                    force_text_idx: int | None = None) -> dict[str, Any]:
         """Debug / unit-test entry point: bypasses random by forcing decisions.
 
         `force_mode`: "full" | "sliding" | None (use full_plan_ratio dice).
         `force_num_tokens`: override num_tokens; must be in [min_tokens, max_tokens].
         `force_anchor_frame`: override anchor_frame.
         `force_no_path_aug`: skip trim / sparse augmentation (deterministic path).
+        `force_text_idx`: pick `clip["texts"][i]` instead of a random caption
+            (no-op when the clip has no `texts` list).
         """
         clip_idx = self.valid_indices[idx_in_valid]
         return self._make_sample(
@@ -270,6 +289,7 @@ class RefinerDataset(Dataset):
             force_num_tokens=force_num_tokens,
             force_anchor_frame=force_anchor_frame,
             force_no_path_aug=force_no_path_aug,
+            force_text_idx=force_text_idx,
         )
 
     # ------------------------------------------------------------------
@@ -362,11 +382,12 @@ class RefinerDataset(Dataset):
                       force_mode: str | None = None,
                       force_num_tokens: int | None = None,
                       force_anchor_frame: int | None = None,
-                      force_no_path_aug: bool = False) -> dict[str, Any]:
+                      force_no_path_aug: bool = False,
+                      force_text_idx: int | None = None) -> dict[str, Any]:
         clip = self._clips[clip_idx]
         motion_263 = self._motion_of(clip).unsqueeze(0)            # [1, T, 263]
         T = motion_263.shape[1]
-        text = clip["text"]
+        text = self._choose_caption(clip, force_text_idx)
 
         # Step 1: 263D recovery → (root_quat, root_xyz, root_yaw)
         root_quat, root_xyz = recover_root_rot_pos(motion_263)

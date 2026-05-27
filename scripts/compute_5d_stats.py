@@ -196,22 +196,36 @@ def resolve_dataset_dir(raw_data_dir: str | Path, dataset: str) -> Path:
     return root
 
 
-def _read_first_caption(text_file: Path) -> str:
-    """First non-empty caption from a HumanML3D/BABEL text file.
+def _read_all_captions(text_file: Path) -> list[str]:
+    """All distinct non-empty captions from a HumanML3D/BABEL text file.
 
     Text files are `#`-delimited: `caption#tokens#f_tag#to_tag` (see
-    datasets/humanml3d.py:load_text). v1 takes the **first non-empty line** and
-    keeps the part before the first `#`. If the file has no `#` (plain caption
-    format), the whole line is used. Missing file → empty string.
+    datasets/humanml3d.py:load_text). Each line contributes the part before the
+    first `#` (or the whole line if no `#`). Duplicates are dropped while
+    preserving first-seen order, so `result[0]` equals `_read_first_caption`.
+    Missing/empty file → empty list.
     """
     if not text_file.is_file():
-        return ""
+        return []
+    seen: set[str] = set()
+    caps: list[str] = []
     with text_file.open() as f:
         for line in f:
             line = line.strip()
-            if line:
-                return line.split("#", 1)[0].strip()
-    return ""
+            if not line:
+                continue
+            cap = line.split("#", 1)[0].strip()
+            if cap and cap not in seen:
+                seen.add(cap)
+                caps.append(cap)
+    return caps
+
+
+def _read_first_caption(text_file: Path) -> str:
+    """First non-empty caption (part before the first `#`); "" if none.
+    Kept for callers that only need a single caption."""
+    caps = _read_all_captions(text_file)
+    return caps[0] if caps else ""
 
 
 def load_clips_from_dir(raw_data_dir: str | Path,
@@ -223,7 +237,11 @@ def load_clips_from_dir(raw_data_dir: str | Path,
                          max_samples: int = -1) -> list[dict]:
     """Load clips from the real HumanML3D / BABEL layout.
 
-    Returns a list of `{"motion_263": Tensor[T, 263], "text": str}`.
+    Returns a list of `{"motion_263": Tensor[T, 263], "text": str, "texts": list[str]}`.
+    `text` is the first caption (backward compatible); `texts` holds every
+    distinct caption so RefinerDataset can randomly pick one per epoch (text
+    augmentation). The precomputed T5 cache contains all captions (see
+    tools/pretokenize_t5_text.py), so the encoder lookup always hits.
 
     Layout (per dataset):
         <dataset_dir>/<split_file>            one sample id per line
@@ -275,8 +293,12 @@ def load_clips_from_dir(raw_data_dir: str | Path,
             log.warning("clip %s has unexpected shape %s (expected [T, 263]), skipping",
                         name, motion.shape)
             continue
-        text = _read_first_caption(text_dir / f"{name}.txt")
-        clips.append({"motion_263": torch.from_numpy(motion), "text": text})
+        texts = _read_all_captions(text_dir / f"{name}.txt")
+        clips.append({
+            "motion_263": torch.from_numpy(motion),
+            "text": texts[0] if texts else "",   # first caption (backward compat)
+            "texts": texts,                       # all captions (RefinerDataset random pick)
+        })
 
     if not clips:
         log.warning(

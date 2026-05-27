@@ -10,7 +10,9 @@ from scripts.compute_5d_stats import (
     CURRENT_MOTION_NORM_INDICES,
     WAYPOINT_NORM_INDICES,
     WelfordAccumulator,
+    _read_all_captions,
     compute_stats,
+    load_clips_from_dir,
     save_stats,
 )
 
@@ -194,3 +196,56 @@ def test_norm_indices_constants_match_spec():
     """Hard lock-in on the norm_indices constants per docs/TODO.md §T_A_06."""
     np.testing.assert_array_equal(CURRENT_MOTION_NORM_INDICES, np.array([0, 1, 2]))
     np.testing.assert_array_equal(WAYPOINT_NORM_INDICES, np.array([0, 1, 2, 5, 6]))
+
+
+# ---------------------------------------------------------------------------
+# Multi-caption loading (text augmentation enabler)
+# ---------------------------------------------------------------------------
+
+
+def _write_fake_humanml3d(root, names, captions_by_name):
+    """Minimal HumanML3D layout: new_joint_vecs/<id>.npy + texts/<id>.txt."""
+    ds = root / "HumanML3D"
+    (ds / "new_joint_vecs").mkdir(parents=True)
+    (ds / "texts").mkdir(parents=True)
+    (ds / "train.txt").write_text("\n".join(names) + "\n")
+    for n in names:
+        arr = np.zeros((40, 263), dtype=np.float32)
+        arr[:, 2] = 0.05      # small forward velocity
+        arr[:, 3] = 1.0       # constant root y
+        np.save(ds / "new_joint_vecs" / f"{n}.npy", arr)
+        # '#'-delimited HumanML3D caption lines.
+        lines = [f"{c}#tok#0.0#0.0" for c in captions_by_name[n]]
+        (ds / "texts" / f"{n}.txt").write_text("\n".join(lines) + "\n")
+    return ds
+
+
+def test_read_all_captions_dedups_and_keeps_order(tmp_path):
+    f = tmp_path / "cap.txt"
+    f.write_text(
+        "a person walks#x#0#0\n"
+        "someone strolls forward#x#0#0\n"
+        "a person walks#x#0#0\n"   # duplicate of line 1
+        "\n"                        # blank line ignored
+    )
+    caps = _read_all_captions(f)
+    assert caps == ["a person walks", "someone strolls forward"]
+
+
+def test_load_clips_populates_texts_list_and_first_caption(tmp_path):
+    """load_clips_from_dir must expose every distinct caption in `texts`, with
+    `text` == the first one (backward compatible)."""
+    caps = {
+        "c1": ["a person walks forward", "someone strides ahead", "walking"],
+        "c2": ["a man jumps"],
+    }
+    _write_fake_humanml3d(tmp_path, ["c1", "c2"], caps)
+    clips = load_clips_from_dir(str(tmp_path), dataset="humanml3d",
+                                split_file="train.txt",
+                                feature_path="new_joint_vecs", text_path="texts")
+    by_first = {c["text"]: c for c in clips}
+    assert "a person walks forward" in by_first
+    assert "a man jumps" in by_first
+    c1 = by_first["a person walks forward"]
+    assert c1["texts"] == caps["c1"]          # all captions, in order
+    assert c1["text"] == caps["c1"][0]        # first caption mirrored into `text`
