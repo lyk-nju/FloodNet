@@ -521,6 +521,30 @@ def test_force_text_idx_pins_specific_caption():
         assert s["text"] == cap
 
 
+def test_randomize_caption_false_pins_first_and_consumes_no_rng():
+    """randomize_caption=False (val / benchmark) must always return texts[0] AND
+    consume no caption RNG, so the mode/num_tokens draw order is identical to a
+    single-caption clip — keeping val/loss comparable across epochs."""
+    texts = ["walk forward", "stroll ahead", "march onward", "step forward"]
+    ds_fixed = RefinerDataset([_make_multicap_clip(T=60, texts=texts)],
+                               full_plan_ratio=0.5, seed=0, randomize_caption=False)
+    # Always the first caption, never a random one.
+    assert {ds_fixed.get_sample(0)["text"] for _ in range(20)} == {"walk forward"}
+
+    # No caption RNG consumed: the num_tokens sequence matches a clip that has
+    # only `text` (the legacy, no-`texts` path) under the same seed.
+    multicap_seq = [int(RefinerDataset([_make_multicap_clip(T=60, texts=texts)],
+                                       full_plan_ratio=0.5, seed=0,
+                                       randomize_caption=False)
+                        .get_sample(0, force_no_path_aug=True)["num_tokens"])
+                    for _ in range(5)]
+    legacy_seq = [int(RefinerDataset([_make_clip(T=60, text="walk forward")],
+                                     full_plan_ratio=0.5, seed=0)
+                      .get_sample(0, force_no_path_aug=True)["num_tokens"])
+                  for _ in range(5)]
+    assert multicap_seq == legacy_seq
+
+
 def test_clip_without_texts_falls_back_to_single_text():
     """Legacy clips (only `text`, no `texts`) keep working: the single caption is
     returned, and the fallback path does NOT call self._rng.choice — so two fresh

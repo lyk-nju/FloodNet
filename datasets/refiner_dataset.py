@@ -158,6 +158,7 @@ class RefinerDataset(Dataset):
         normalize: bool = False,
         stats_dir: str | os.PathLike | None = None,
         seed: int | None = None,
+        randomize_caption: bool = True,
     ):
         self._clips = clips
         self.n_hist = n_hist
@@ -171,6 +172,10 @@ class RefinerDataset(Dataset):
         self.path_sparse_prob = path_sparse_prob
         self.path_sparse_range = path_sparse_range
         self.normalize = normalize
+        # When False (e.g. validation / benchmark), always use the first caption
+        # so the metric is comparable across epochs; when True (training), draw a
+        # random caption per sample for text augmentation. See _choose_caption.
+        self.randomize_caption = randomize_caption
 
         # Pre-compute clip lengths.
         self._clip_lengths = [int(self._motion_of(c).shape[0]) for c in clips]
@@ -254,17 +259,23 @@ class RefinerDataset(Dataset):
     def _choose_caption(self, clip: dict, force_text_idx: int | None) -> str:
         """Pick the caption for this sample. A clip may carry `texts` (all
         distinct captions, from load_clips_from_dir); HumanML3D gives 3-5 per
-        clip. Selecting one at random each draw turns paraphrases into text
-        augmentation — the frozen T5 cache holds every caption so the encoder
-        lookup always hits. `force_text_idx` pins a specific caption (tests).
-        Falls back to the single `text` key when `texts` is absent/empty
-        (synthetic test clips), so the legacy schema keeps working unchanged.
+        clip. With `randomize_caption` (training default) a random caption is
+        drawn each sample — paraphrases become text augmentation, and the frozen
+        T5 cache holds every caption so the encoder lookup always hits. With it
+        off (val / benchmark) the first caption is used so the metric stays
+        comparable across epochs; that path consumes NO RNG, so the mode/anchor/
+        num_tokens draw order matches the legacy single-caption behavior.
+        `force_text_idx` pins a specific caption (benchmark / tests) and takes
+        precedence. Falls back to the single `text` key when `texts` is
+        absent/empty (synthetic test clips), keeping the legacy schema working.
         """
         texts = clip.get("texts")
         if texts:
             if force_text_idx is not None:
                 return texts[int(force_text_idx) % len(texts)]
-            return self._rng.choice(texts)
+            if self.randomize_caption:
+                return self._rng.choice(texts)
+            return texts[0]
         return clip.get("text", "")
 
     def get_sample(self, idx_in_valid: int, *,

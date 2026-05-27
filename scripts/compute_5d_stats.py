@@ -202,7 +202,7 @@ def _read_all_captions(text_file: Path) -> list[str]:
     Text files are `#`-delimited: `caption#tokens#f_tag#to_tag` (see
     datasets/humanml3d.py:load_text). Each line contributes the part before the
     first `#` (or the whole line if no `#`). Duplicates are dropped while
-    preserving first-seen order, so `result[0]` equals `_read_first_caption`.
+    preserving first-seen order, so `result[0]` is the first distinct caption.
     Missing/empty file → empty list.
     """
     if not text_file.is_file():
@@ -219,13 +219,6 @@ def _read_all_captions(text_file: Path) -> list[str]:
                 seen.add(cap)
                 caps.append(cap)
     return caps
-
-
-def _read_first_caption(text_file: Path) -> str:
-    """First non-empty caption (part before the first `#`); "" if none.
-    Kept for callers that only need a single caption."""
-    caps = _read_all_captions(text_file)
-    return caps[0] if caps else ""
 
 
 def load_clips_from_dir(raw_data_dir: str | Path,

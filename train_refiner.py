@@ -561,7 +561,8 @@ def safe_precision(accelerator: str, precision, *, cuda_available: bool):
     return precision
 
 
-def _build_one_dataset(cfg: dict, split_file: str, *, seed: int | None = None):
+def _build_one_dataset(cfg: dict, split_file: str, *, seed: int | None = None,
+                       randomize_caption: bool = True):
     """Build a single RefinerDataset for a given split using the real loader."""
     from datasets.refiner_dataset import RefinerDataset
     from scripts.compute_5d_stats import load_clips_from_dir
@@ -600,6 +601,7 @@ def _build_one_dataset(cfg: dict, split_file: str, *, seed: int | None = None):
         normalize=normalize,
         stats_dir=stats_dir if normalize else None,
         seed=seed,
+        randomize_caption=randomize_caption,
         **aug_kwargs,
     )
 
@@ -612,12 +614,17 @@ def build_datasets(cfg: dict, seed: int | None = None):
     reproducibility (matters with num_workers=0; with workers each gets a
     distinct RNG via refiner_worker_init_fn). val uses a fixed seed so the
     val set is identical across runs.
+
+    Train randomizes the caption per sample (text augmentation); val pins the
+    first caption (randomize_caption=False) so val/loss stays comparable across
+    epochs instead of wobbling with caption choice.
     """
     data_cfg = cfg.get("data", {})
     train_split = data_cfg.get("train_split_file", "train.txt")
     val_split = data_cfg.get("val_split_file")
     train_ds = _build_one_dataset(cfg, train_split, seed=seed)
-    val_ds = _build_one_dataset(cfg, val_split, seed=0) if val_split else None
+    val_ds = (_build_one_dataset(cfg, val_split, seed=0, randomize_caption=False)
+              if val_split else None)
     return train_ds, val_ds
 
 
