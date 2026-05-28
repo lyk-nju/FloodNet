@@ -1,0 +1,19 @@
+# Large-dataset RootRefiner diagnostic:
+# - train on the real dataset
+# - disable random num_tokens by taking the maximum valid horizon per anchor
+# - evaluate on a fixed clean validation cache so val curves are comparable
+#
+# Suggested launch:
+#   python train_refiner.py --config configs/root_refiner_train_fixed_val_no_random_token.yaml
+
+base_config: root_refiner_train.yaml
+
+exp_name: root_refiner_fixed_val_no_random_token
+save_dir: ./outputs/root_refiner_fixed_val_no_random_token
+resume_ckpt:
+
+data:
+  num_token_policy: max
+
+fixed_overfit:
+  enabled: false

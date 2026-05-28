@@ -155,6 +155,7 @@ class RefinerDataset(Dataset):
         path_trim_max_frames: int = 10,
         path_sparse_prob: float = 0.5,
         path_sparse_range: tuple[int, int] = (3, 8),
+        num_token_policy: str = "random",
         normalize: bool = False,
         stats_dir: str | os.PathLike | None = None,
         seed: int | None = None,
@@ -171,6 +172,7 @@ class RefinerDataset(Dataset):
         self.path_trim_max_frames = path_trim_max_frames
         self.path_sparse_prob = path_sparse_prob
         self.path_sparse_range = path_sparse_range
+        self.num_token_policy = str(num_token_policy)
         self.normalize = normalize
         # When False (e.g. validation / benchmark), always use the first caption
         # so the metric is comparable across epochs; when True (training), draw a
@@ -478,8 +480,15 @@ class RefinerDataset(Dataset):
 
         if force_num_tokens is not None:
             num_tokens = int(force_num_tokens)
-        else:
+        elif self.num_token_policy == "max":
+            num_tokens = max_valid_tokens
+        elif self.num_token_policy == "random":
             num_tokens = self._rng.randint(self.min_tokens, max_valid_tokens)
+        else:
+            raise ValueError(
+                "num_token_policy must be 'random' or 'max', "
+                f"got {self.num_token_policy!r}"
+            )
         num_tokens = max(self.min_tokens, min(num_tokens, max_valid_tokens))
         target_frame_count = num_frames_for_tokens(num_tokens, self.frames_per_token)
         assert anchor_frame + target_frame_count <= T, (

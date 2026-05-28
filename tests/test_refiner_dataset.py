@@ -172,6 +172,26 @@ def test_T05_target_frame_count_equals_num_frames_for_tokens():
         )
 
 
+def test_num_token_policy_max_disables_random_token_sampling():
+    """Diagnostic training can disable random num_tokens by taking the maximum
+    valid horizon for the selected anchor."""
+    clip = _make_clip(T=80)
+    ds = RefinerDataset(
+        [clip],
+        full_plan_ratio=1.0,
+        max_tokens=49,
+        min_tokens=4,
+        seed=0,
+        num_token_policy="max",
+    )
+    s0 = ds.get_sample(0, force_mode="full", force_no_path_aug=True)
+    s1 = ds.get_sample(0, force_mode="full", force_no_path_aug=True)
+
+    assert s0["num_tokens"].item() == 20
+    assert s1["num_tokens"].item() == 20
+    assert int(s0["target_mask"].sum().item()) == num_frames_for_tokens(20)
+
+
 def test_T06_target_mask_sum_equals_num_frames_for_tokens_strict():
     """Strict equality (round 8 P0-1 lock-in): target_mask.sum() must equal
     num_frames_for_tokens(num_tokens), NOT just <=.

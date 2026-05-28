@@ -46,6 +46,12 @@ def test_train_config_is_real_precomputed_t5():
     assert cfg["data"]["normalize"] is True        # real training z-scores (P2-1)
 
 
+def test_train_config_has_no_fixed_validation_knob():
+    """Fixed validation is train_refiner's default construction, not a config knob."""
+    cfg = _load(TRAIN_CFG_PATH)
+    assert "fixed_validation" not in cfg
+
+
 def test_path_aug_block_present_in_both_configs():
     for path in (CFG_PATH, TRAIN_CFG_PATH):
         cfg = _load(path)

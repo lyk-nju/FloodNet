@@ -618,6 +618,7 @@ def _build_one_dataset(cfg: dict, split_file: str, *, seed: int | None = None,
         min_tokens=model_cfg["min_tokens"],
         frames_per_token=model_cfg["frames_per_token"],
         full_plan_ratio=cfg.get("training", {}).get("sampling_mode_full_ratio", 0.5),
+        num_token_policy=data_cfg.get("num_token_policy", "random"),
         normalize=normalize,
         stats_dir=stats_dir if normalize else None,
         seed=seed,
@@ -685,6 +686,37 @@ def apply_fixed_overfit_datasets(train_ds, val_ds, cfg: dict):
     return fixed_train, fixed_val
 
 
+def apply_default_fixed_validation_dataset(train_ds, val_ds):
+    """Replace validation with one deterministic sample per val item.
+
+    Train remains stochastic. Validation is always a fixed clean cache built
+    from val.txt so val/loss is comparable across epochs. If no val split is
+    configured, leave validation absent.
+    """
+    if val_ds is None:
+        return train_ds, val_ds
+    from datasets.refiner_fixed import (
+        FixedRefinerSampleDataset,
+        build_fixed_refiner_samples,
+    )
+    if isinstance(val_ds, FixedRefinerSampleDataset):
+        return train_ds, val_ds
+
+    val_samples = build_fixed_refiner_samples(
+        val_ds,
+        num_samples=len(val_ds),
+        mode_policy="random",
+        force_no_path_aug=True,
+        force_text_idx=0,
+    )
+    fixed_val = FixedRefinerSampleDataset(val_samples)
+    log.info(
+        "default fixed validation: samples=%d mode_policy=random force_no_path_aug=True",
+        len(fixed_val),
+    )
+    return train_ds, fixed_val
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=str, default="configs/root_refiner.yaml")
@@ -749,6 +781,7 @@ def main(argv=None):
 
     train_ds, val_ds = build_datasets(cfg, seed=seed)
     train_ds, val_ds = apply_fixed_overfit_datasets(train_ds, val_ds, cfg)
+    train_ds, val_ds = apply_default_fixed_validation_dataset(train_ds, val_ds)
     from datasets.refiner_dataset import refiner_worker_init_fn
     train_loader = DataLoader(
         train_ds,
