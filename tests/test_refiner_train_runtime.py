@@ -13,9 +13,75 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import torch
+
+from datasets.refiner_dataset import RefinerDataset
+from datasets.refiner_fixed import FixedRefinerSampleDataset
 import train_refiner as tr
 
 _CFG_DIR = Path(__file__).resolve().parent.parent / "configs"
+
+
+def _clip(T=80):
+    motion = torch.zeros(T, 263, dtype=torch.float32)
+    motion[:, 2] = 0.1
+    motion[:, 3] = 1.0
+    return {"motion_263": motion, "text": "walk"}
+
+
+# ---------------------------------------------------------------------------
+# config overlays
+# ---------------------------------------------------------------------------
+
+
+def test_load_cfg_supports_base_config_overlay(tmp_path):
+    base = tmp_path / "base.yaml"
+    base.write_text(
+        "trainer:\n"
+        "  devices: 4\n"
+        "  precision: bf16-mixed\n"
+        "training:\n"
+        "  batch_size: 64\n"
+        "model:\n"
+        "  d_model: 512\n"
+    )
+    overlay = tmp_path / "overlay.yaml"
+    overlay.write_text(
+        "base_config: base.yaml\n"
+        "trainer:\n"
+        "  devices: 1\n"
+        "training:\n"
+        "  batch_size: 16\n"
+    )
+
+    cfg = tr._load_cfg(str(overlay))
+
+    assert cfg["trainer"]["devices"] == 1
+    assert cfg["trainer"]["precision"] == "bf16-mixed"
+    assert cfg["training"]["batch_size"] == 16
+    assert cfg["model"]["d_model"] == 512
+    assert "base_config" not in cfg
+
+
+def test_apply_fixed_overfit_replaces_train_and_val_with_cached_samples():
+    source = RefinerDataset([_clip(), _clip(T=90)], seed=0)
+    cfg = {
+        "fixed_overfit": {
+            "enabled": True,
+            "num_samples": 3,
+            "mode_policy": "full",
+            "force_no_path_aug": True,
+            "val_on_train": True,
+        }
+    }
+
+    train_ds, val_ds = tr.apply_fixed_overfit_datasets(source, None, cfg)
+
+    assert isinstance(train_ds, FixedRefinerSampleDataset)
+    assert isinstance(val_ds, FixedRefinerSampleDataset)
+    assert len(train_ds) == 3
+    assert len(val_ds) == 3
+    assert torch.equal(train_ds[0]["xz_path"], train_ds[0]["xz_path"])
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,11 @@
+# A: easiest diagnostic. Full-plan samples, no path augmentation.
+# Tests whether the model can fit clip-start root plans with fixed horizons.
+
+base_config: base.yaml
+
+exp_name: root_refiner_overfit_a_full_clean
+save_dir: ./outputs/root_refiner_overfit/a_full_clean
+
+fixed_overfit:
+  mode_policy: full
+  force_no_path_aug: true

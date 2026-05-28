@@ -320,8 +320,28 @@ class RefinerLightningModule(pl.LightningModule):
 
 def _load_cfg(config_path: str) -> dict:
     import yaml
-    with open(config_path) as f:
-        return yaml.safe_load(f)
+
+    path = Path(config_path)
+    with path.open() as f:
+        cfg = yaml.safe_load(f) or {}
+    base_config = cfg.pop("base_config", None)
+    if not base_config:
+        return cfg
+    base_path = Path(base_config)
+    if not base_path.is_absolute():
+        base_path = path.parent / base_path
+    base = _load_cfg(str(base_path))
+    return _deep_merge_dicts(base, cfg)
+
+
+def _deep_merge_dicts(base: dict, override: dict) -> dict:
+    out = copy.deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge_dicts(out[key], value)
+        else:
+            out[key] = copy.deepcopy(value)
+    return out
 
 
 def _load_paths_default() -> dict:
@@ -628,6 +648,43 @@ def build_datasets(cfg: dict, seed: int | None = None):
     return train_ds, val_ds
 
 
+def apply_fixed_overfit_datasets(train_ds, val_ds, cfg: dict):
+    """Replace train/val datasets with pre-sampled deterministic diagnostics."""
+    fixed_cfg = cfg.get("fixed_overfit") or {}
+    if not fixed_cfg.get("enabled", False):
+        return train_ds, val_ds
+
+    from datasets.refiner_fixed import (
+        FixedRefinerSampleDataset,
+        build_fixed_refiner_samples,
+    )
+
+    kwargs = {
+        "num_samples": int(fixed_cfg.get("num_samples", 64)),
+        "mode_policy": fixed_cfg.get("mode_policy", "mixed"),
+        "force_no_path_aug": bool(fixed_cfg.get("force_no_path_aug", True)),
+        "force_text_idx": fixed_cfg.get("force_text_idx", 0),
+    }
+    train_samples = build_fixed_refiner_samples(train_ds, **kwargs)
+    fixed_train = FixedRefinerSampleDataset(train_samples)
+
+    if bool(fixed_cfg.get("val_on_train", True)) or val_ds is None:
+        fixed_val = FixedRefinerSampleDataset(train_samples)
+    else:
+        val_samples = build_fixed_refiner_samples(val_ds, **kwargs)
+        fixed_val = FixedRefinerSampleDataset(val_samples)
+
+    log.info(
+        "fixed_overfit enabled: samples=%d mode_policy=%s force_no_path_aug=%s "
+        "val_on_train=%s",
+        len(fixed_train),
+        kwargs["mode_policy"],
+        kwargs["force_no_path_aug"],
+        bool(fixed_cfg.get("val_on_train", True)),
+    )
+    return fixed_train, fixed_val
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=str, default="configs/root_refiner.yaml")
@@ -691,6 +748,7 @@ def main(argv=None):
     log.info("seed=%d deterministic=%s", seed, bool(cfg.get("deterministic", False)))
 
     train_ds, val_ds = build_datasets(cfg, seed=seed)
+    train_ds, val_ds = apply_fixed_overfit_datasets(train_ds, val_ds, cfg)
     from datasets.refiner_dataset import refiner_worker_init_fn
     train_loader = DataLoader(
         train_ds,

@@ -23,8 +23,8 @@ seed: 1234                    # torch + dataset-aug RNG seed (pl.seed_everything
 debug: false                  # false → wandb ON (real run); true → wandb OFF (smoke)
 train: true
 deterministic: false          # true = bit-reproducible (slower)
-save_dir: ./outputs/root_refiner
-resume_ckpt:                  # path to resume from; empty = fresh run
+save_dir: ./outputs/root_refiner_new
+resume_ckpt:               # path to resume from; empty = fresh run
 
 logger:
   wandb:
@@ -38,7 +38,7 @@ logger:
 
 trainer:                      # Lightning Trainer kwargs (mirrors ldf.yaml.trainer)
   accelerator: auto           # ldf uses gpu; auto stays host-portable
-  devices: 1                  # int or list ([0,1,...]); >1 → DDP(find_unused_parameters=True)
+  devices: [0,1,2,3]                 # int or list ([0,1,...]); >1 → DDP(find_unused_parameters=True)
   log_every_n_steps: 100
   precision: bf16-mixed       # matches ldf; auto-downgraded to 32-true on CPU hosts
 
@@ -51,12 +51,12 @@ validation:                   # val + checkpoint cadence (mirrors ldf.yaml.valid
 
 model:
   d_model: 512                # bumped for the path_cond decoder (≈30M total)
-  n_layers: 8                 # legacy total; split below when *_cond/_token absent
-  n_layers_cond: 4            # Stage-1 condition-only num-token predictor depth
-  n_layers_token: 4           # Stage-2 token-level plan generator depth
+  n_layers: 6                 # legacy total; split below when *_cond/_token absent
+  n_layers_cond: 3           # Stage-1 condition-only num-token predictor depth
+  n_layers_token: 3          # Stage-2 token-level plan generator depth
   n_heads: 8
   ff_dim: 1024
-  dropout: 0.1
+  dropout: 0.2
   max_tokens: 49
   min_tokens: 4
   frames_per_token: 4
@@ -70,7 +70,7 @@ model:
   decoder_token_res_depth: 2  # token-grid ResBlocks
   decoder_frame_res_depth: 4  # frame-grid dilated ResBlocks (repeated path cond)
   decoder_dilation_growth_rate: 2
-  decoder_dropout: 0.0
+  decoder_dropout: 0.15
 
 canonicalization:
   mode: b_full
@@ -82,7 +82,7 @@ training:
   lr: 1.0e-4
   optimizer: adamw
   weight_decay: 0.01
-  total_steps: 100000
+  total_steps: 2000000
   sampling_mode_full_ratio: 0.5
   gradient_clip_val: 1.0
 
@@ -96,7 +96,7 @@ loss_weights:
   heading: 1.0
   fwd_delta: 0.5
   yaw_delta: 0.5
-  smoothness: 0.0             # enable (0.005~0.01) only for ablation / fine-tune
+  smoothness: 0.005             # enable (0.005~0.01) only for ablation / fine-tune
 
 text_encoder:
   type: precomputed_t5_pool   # P0-1: reuse the LDF offline T5 cache, pooled
@@ -122,3 +122,4 @@ path_aug:
   trim_max_frames: 10
   sparse_prob: 0.5
   sparse_range: [3, 8]
+

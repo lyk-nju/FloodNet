@@ -1,0 +1,11 @@
+# D: full + sliding with path augmentation sampled once and then cached.
+# Tests robustness to sparse/trimmed inputs without per-epoch target drift.
+
+base_config: base.yaml
+
+exp_name: root_refiner_overfit_d_mixed_cached_aug
+save_dir: ./outputs/root_refiner_overfit/d_mixed_cached_aug
+
+fixed_overfit:
+  mode_policy: mixed
+  force_no_path_aug: false
