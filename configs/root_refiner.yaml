@@ -94,10 +94,11 @@ training:
 
 loss:
   heading_form: cosine                # cosine | smooth_l1
+  ordinal_sigma: 1.0                  # R2.6 duration soft-label bandwidth (token units)
 
 loss_weights:
-  num_token: 1.0
-  num_token_soft: 0.1                 # ordinal-aware soft-argmax expected-token Huber aux
+  num_token: 1.0                      # R2.6: now weights ordinal soft-label CE (was hard CE)
+  num_token_soft: 0.1                 # R2.6: soft-argmax expected-token Huber aux
   xyz: 5.0
   heading: 1.0
   fwd_delta: 0.5                      # per-frame forward delta (NOT m/s)

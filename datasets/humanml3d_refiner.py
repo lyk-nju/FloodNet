@@ -37,6 +37,7 @@ class HumanML3DRefinerDataset(_BaseHumanML3DRefinerDataset):
         offset_start_max_frames: int = 40,
         offset_start_apply_to: tuple[str, ...] | list[str] = ("dense_path", "sparse_path"),
         sparse_path_point_range: tuple[int, int] = (3, 8),
+        path_feature_stats_dir: str | None = None,
         **kwargs,
     ):
         if horizon_policy is not None and "num_token_policy" not in kwargs:
@@ -53,6 +54,39 @@ class HumanML3DRefinerDataset(_BaseHumanML3DRefinerDataset):
         self.offset_start_apply_to = tuple(offset_start_apply_to)
         self.sparse_path_point_range = tuple(int(v) for v in sparse_path_point_range)
         self.max_frames = self.max_frames if hasattr(self, "max_frames") else None
+        # R2.5: optional PHYSICAL path-feature normalization stats (own mean/std,
+        # NOT the waypoint stats). When normalize=True and a stats dir is given,
+        # path_features are z-scored by these; otherwise they stay raw-physical.
+        self._pf_mean = None
+        self._pf_std = None
+        if path_feature_stats_dir is not None:
+            from utils.refiner.path_feature_stats import load_path_feature_stats
+
+            stats = load_path_feature_stats(path_feature_stats_dir)
+            self._pf_mean = stats.mean
+            self._pf_std = stats.std
+
+    def _zscore_path_xz(self, path_xz: torch.Tensor) -> torch.Tensor:
+        """Z-score path geometry [N, 2] with the WAYPOINT x/z stats (indices 0,2),
+        mirroring the base dataset's xz_path normalization so path tokens match
+        the z-scored waypoints used by the control loss."""
+        wp_mean, wp_std = self._wp_mean, self._wp_std
+        wp_idx = self._wp_norm_idx
+        if wp_mean is None or wp_std is None or wp_idx is None:
+            return path_xz
+        out = path_xz.clone()
+        idx_set = set(wp_idx.tolist())
+        if 0 in idx_set:
+            out[..., 0] = (out[..., 0] - wp_mean[0]) / wp_std[0]
+        if 2 in idx_set:
+            out[..., 1] = (out[..., 1] - wp_mean[2]) / wp_std[2]
+        return out
+
+    def _normalize_path_features(self, features: torch.Tensor) -> torch.Tensor:
+        """Z-score physical path_features by their OWN stats, if loaded."""
+        if self._pf_mean is None or self._pf_std is None:
+            return features
+        return (features - self._pf_mean) / self._pf_std
 
     @property
     def max_frames(self) -> int:
@@ -101,7 +135,29 @@ class HumanML3DRefinerDataset(_BaseHumanML3DRefinerDataset):
         waypoints = sample["target_waypoints"][..., :5]
         waypoints_mask = sample["target_mask"]
         valid_frame_count = int(waypoints_mask.sum().item())
-        future_xz = waypoints[:valid_frame_count, [0, 2]]
+        # R2.5: build the path condition (and its physical path_features) from the
+        # PHYSICAL pre-z-score waypoints, not the z-scored `target_waypoints`.
+        # Reading z-scored xz here made compute_path_features run in anisotropic
+        # z-units → non-physical path_length and the duration-head overfit. The
+        # geometry `path` tokens are re-z-scored below to stay in the waypoint
+        # space the control loss compares against; only path_features stay physical.
+        if "target_waypoints_physical" in sample:
+            physical_wp = sample["target_waypoints_physical"]
+        elif getattr(self, "normalize", False):
+            # When normalizing, the base MUST hand us the pre-z-score waypoints.
+            # Silently falling back to the z-scored `target_waypoints` would
+            # rebuild path_features in z-score space — the exact R2.5 overfit
+            # bug — so fail loudly (e.g. a sample cache built before R2.5).
+            raise KeyError(
+                "target_waypoints_physical missing while normalize=True; the "
+                "base dataset must emit pre-z-score waypoints. Rebuild any stale "
+                "sample cache — a z-scored fallback would silently reintroduce "
+                "the R2.5 path-feature-space bug."
+            )
+        else:
+            # normalize=False: target_waypoints is already physical (never z-scored).
+            physical_wp = sample["target_waypoints"]
+        future_xz = physical_wp[:valid_frame_count, [0, 2]]
         path_mode = force_path_mode or self._sample_path_mode()
         offset_start_frames = 0
         if (
@@ -125,12 +181,21 @@ class HumanML3DRefinerDataset(_BaseHumanML3DRefinerDataset):
         )
 
         out = dict(sample)
+        # R2.5: path was built in physical space. Re-apply the waypoint xz z-score
+        # to the GEOMETRY tokens (only) so they live in the same space as the
+        # z-scored `waypoints` the dense/sparse control loss compares them against.
+        # path_features stay PHYSICAL (optionally normalized by their OWN stats).
+        path_tokens = condition.path
+        path_features = condition.path_features_raw
+        if getattr(self, "normalize", False):
+            path_tokens = self._zscore_path_xz(path_tokens)
+            path_features = self._normalize_path_features(path_features)
         out.update(
             {
-                "path": condition.path,
+                "path": path_tokens,
                 "path_valid_mask": condition.path_valid_mask,
                 "path_control_mask": condition.path_control_mask,
-                "path_features": condition.path_features_raw,
+                "path_features": path_features,
                 "path_mode": condition.path_mode,
                 "history_motion": sample["current_motion"],
                 "waypoints": waypoints,

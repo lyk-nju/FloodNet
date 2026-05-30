@@ -45,6 +45,7 @@ from utils.refiner.losses import (  # noqa: E402
     dense_path_control_loss,
     goal_point_control_loss,
     masked_mean,
+    ordinal_duration_loss,
     second_order_diff_l2,
     smooth_l1_masked,
     sparse_path_control_loss,
@@ -83,6 +84,9 @@ class RefinerLightningModule(pl.LightningModule):
         self.text_encoder = self._resolve_text_encoder(cfg, text_encoder, text_emb_dim)
         self.loss_weights = dict(cfg.get("loss_weights", {}))
         self.heading_form = cfg.get("loss", {}).get("heading_form", "cosine")
+        # Ordinal duration loss bandwidth (Gaussian soft-label sigma, in token
+        # units). Wider = softer neighbour credit; 1.0 ≈ ±1-token tolerance.
+        self.ordinal_sigma = float(cfg.get("loss", {}).get("ordinal_sigma", 1.0))
         # Don't pickle the (possibly large) text encoder into hparams.
         self.save_hyperparameters(ignore=["text_encoder"])
 
@@ -127,29 +131,29 @@ class RefinerLightningModule(pl.LightningModule):
             target_wp = batch["target_waypoints"][..., :5]
         target_mask = batch.get("waypoints_mask", batch.get("target_mask"))
 
-        # num_token CE: target class = num_tokens - min_tokens (NO silent clamp).
-        # An out-of-range target means a config/data mismatch; F.cross_entropy
-        # already validates target ∈ [0, C) and fails loudly (device-side assert on
-        # CUDA), so we don't add explicit min()/max() asserts here — those force a
-        # GPU→CPU host sync every step, crash on an empty batch, and vanish under
-        # `python -O`. The dataset shares min/max_tokens with the model, so in the
-        # normal path the range always holds.
-        n_classes = out["num_token_logits"].shape[-1]
+        # Ordinal duration loss (R2.6). The old design used hard F.cross_entropy
+        # (off-by-1 penalised the same as off-by-40 → confident-wrong overfit:
+        # val/num_token CE climbed ABOVE the random-guess line ln(K)). We now
+        # split it into two distance-aware terms computed by ordinal_duration_loss:
+        #   ordinal_ce  — CE against Gaussian soft labels (neighbouring token
+        #                 counts get partial credit; bandwidth = ordinal_sigma).
+        #   expected    — SmoothL1/Huber between the soft-argmax EXPECTED token
+        #                 count (sum_k p_k*k, differentiable) and the target.
+        # ordinal_ce keeps the `num_token` weight slot; expected keeps the
+        # `num_token_soft` slot, so loss_weights / METRIC_KEYS stay aligned and no
+        # config key is renamed. target validation: ordinal_duration_loss subtracts
+        # min_tokens internally and raises ValueError if num_tokens falls outside
+        # [min_tokens, max_tokens] (model/dataset disagreement) — keeping the loud
+        # failure the old hard F.cross_entropy gave on an out-of-range target.
         target_class = batch["num_tokens"] - self.min_tokens
-        L_num = F.cross_entropy(out["num_token_logits"], target_class)
-
-        # Ordinal-aware auxiliary term: SmoothL1/Huber between the soft-argmax
-        # EXPECTED class (sum_k p_k * k, fully differentiable through softmax) and
-        # the target class. CE alone treats off-by-1 the same as off-by-40; this
-        # distance-aware term gives the head a gradient proportional to how far
-        # the predicted distribution's mean is from the true token count, which is
-        # what we want for an ordinal horizon. Weighted by loss_weights.num_token_soft.
-        probs = out["num_token_logits"].softmax(dim=-1)                  # [B, K]
-        class_idx = torch.arange(
-            n_classes, device=probs.device, dtype=probs.dtype,
+        dur = ordinal_duration_loss(
+            out["num_token_logits"], batch["num_tokens"],
+            min_tokens=self.min_tokens, sigma=self.ordinal_sigma,
         )
-        expected_class = (probs * class_idx).sum(dim=-1)                 # [B], differentiable
-        L_num_soft = F.smooth_l1_loss(expected_class, target_class.to(probs.dtype))
+        L_num = dur["ordinal_ce"]
+        L_num_soft = dur["expected"]
+        # soft-argmax expected class (for the logged-only ±MAE diagnostic below).
+        expected_class = dur["expected_num_tokens"] - float(self.min_tokens)
 
         # xyz SmoothL1 (valid only).
         L_xyz = smooth_l1_masked(out["waypoints"][..., 0:3], target_wp[..., 0:3], target_mask)
@@ -669,6 +673,11 @@ def _build_one_dataset(cfg: dict, split_file: str, *, seed: int | None = None,
         sparse_path_point_range=tuple(sparse_cfg.get("point_range", (3, 8))),
         normalize=normalize,
         stats_dir=stats_dir if normalize else None,
+        # R2.5: physical path-feature stats (own mean/std, separate from waypoint
+        # stats). Only applied when normalizing; raw-physical otherwise.
+        path_feature_stats_dir=(
+            data_cfg.get("path_feature_stats_dir") if normalize else None
+        ),
         seed=seed,
         randomize_caption=randomize_caption,
     )

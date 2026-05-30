@@ -77,3 +77,23 @@ def test_path_cond_frame_decoder_accepts_new_path_condition_names():
     )
 
     assert out.shape == (2, decoder.max_frames, 5)
+
+
+def test_duration_head_gets_clean_raw_path_features_skip():
+    """R2.3: the num_token logits must depend on path_features through the RAW
+    duration_feat_proj skip (bypassing the condition transformer), so the head
+    sees an undiluted physical length summary. We verify the gradient of the
+    logits w.r.t. duration_feat_proj is non-zero — i.e. the skip is wired in."""
+    model = _model()
+    inputs = _inputs(model)
+    inputs["path_features"].requires_grad_(True)
+
+    out = model(**inputs)
+    out["num_token_logits"].sum().backward()
+
+    # gradient flows into the raw skip projection (clean-L path).
+    grads = [
+        p.grad for p in model.duration_feat_proj.parameters() if p.grad is not None
+    ]
+    assert grads, "duration_feat_proj received no gradient — clean-L skip not wired"
+    assert any(g.abs().sum() > 0 for g in grads)

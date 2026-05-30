@@ -186,10 +186,14 @@ def run_benchmark(model, dataset, text_encoder, device="cpu",
         )
         out = model(
             text_emb=text_emb,
-            xz_path=sample["xz_path"].unsqueeze(0).to(device),
-            path_mask=sample["path_mask"].unsqueeze(0).to(device),
-            path_stats=sample["path_stats"].unsqueeze(0).to(device),
-            current_motion=sample["current_motion"].unsqueeze(0).to(device),
+            # R2.4: feed the new shim keys. The legacy aliases mapped
+            # path_stats(3-dim) → path_features, which now mismatches the
+            # duration head's path_features_dim (5). The shim emits the 5-dim
+            # physical path_features and a unit-aligned geometry `path`.
+            path=sample["path"].unsqueeze(0).to(device),
+            path_valid_mask=sample["path_valid_mask"].unsqueeze(0).to(device),
+            path_features=sample["path_features"].unsqueeze(0).to(device),
+            history_motion=sample["history_motion"].unsqueeze(0).to(device),
             history_mask=sample["history_mask"].unsqueeze(0).to(device),
             num_tokens=oracle_nt,
         )
@@ -343,6 +347,12 @@ def main(argv=None):
         frames_per_token=model_cfg["frames_per_token"],
         normalize=normalize,
         stats_dir=data_cfg.get("stats_dir") if normalize else None,
+        # R2.5: must mirror training's path-feature normalization, else the
+        # duration head (which reads path_features via the raw skip) sees an
+        # out-of-distribution scale at eval and num_token metrics go garbage.
+        path_feature_stats_dir=(
+            data_cfg.get("path_feature_stats_dir") if normalize else None
+        ),
         seed=0,
     )
 

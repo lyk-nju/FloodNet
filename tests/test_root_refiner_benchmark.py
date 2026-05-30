@@ -111,7 +111,7 @@ def test_run_benchmark_smoke_finite_metrics_and_report(tmp_path):
                          full_plan_ratio=1.0, seed=0)
     model = RootRefiner(d_model=32, n_layers=2, n_heads=4, ff_dim=64,
                          max_tokens=8, min_tokens=2, n_hist=8, n_path=16,
-                         text_emb_dim=16, dropout=0.0)
+                         text_emb_dim=16, dropout=0.0, path_features_dim=5)
     text_encoder = FrozenStubTextEncoder(emb_dim=16)
 
     result = run_benchmark(model, ds, text_encoder, device="cpu", max_samples=-1)
@@ -150,7 +150,7 @@ def test_run_benchmark_oracle_duration_mode():
     clips = [_make_clip(50) for _ in range(6)]
     model = RootRefiner(d_model=32, n_layers=2, n_heads=4, ff_dim=64,
                          max_tokens=8, min_tokens=2, n_hist=8, n_path=16,
-                         text_emb_dim=16, dropout=0.0)
+                         text_emb_dim=16, dropout=0.0, path_features_dim=5)
     text_encoder = FrozenStubTextEncoder(emb_dim=16)
 
     # A SINGLE shared dataset: run_benchmark calls dataset.reset_rng() at the start
@@ -177,7 +177,7 @@ def test_run_benchmark_max_samples_limit(tmp_path):
                          full_plan_ratio=1.0, seed=0)
     model = RootRefiner(d_model=32, n_layers=2, n_heads=4, ff_dim=64,
                          max_tokens=8, min_tokens=2, n_hist=8, n_path=16,
-                         text_emb_dim=16, dropout=0.0)
+                         text_emb_dim=16, dropout=0.0, path_features_dim=5)
     text_encoder = FrozenStubTextEncoder(emb_dim=16)
     result = run_benchmark(model, ds, text_encoder, device="cpu", max_samples=4)
     assert result["summary"]["n_samples"] == 4

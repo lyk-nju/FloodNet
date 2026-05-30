@@ -520,6 +520,11 @@ class RefinerDataset(Dataset):
         target_local = canonicalize_7d(target_world, anchor_xz, anchor_yaw)
         max_frames = num_frames_for_tokens(self.max_tokens, self.frames_per_token)
         target_waypoints = _pad_or_truncate(target_local, max_frames)
+        # R2.5: keep an UN-z-scored copy so the path condition (and its physical
+        # path_features) can be built in physical space by the shim. The base
+        # z-scores `target_waypoints` in place below; the shim reads physical xz
+        # from this field so compute_path_features runs on metres, not z-units.
+        target_waypoints_physical = target_waypoints.clone()
         target_mask = torch.zeros(max_frames, dtype=torch.bool)
         target_mask[:target_frame_count] = True
 
@@ -591,6 +596,7 @@ class RefinerDataset(Dataset):
             "current_motion": current_motion,                           # [n_hist, 5]
             "history_mask": history_mask,                               # [n_hist]
             "target_waypoints": target_waypoints,                       # [max_frames, 7]
+            "target_waypoints_physical": target_waypoints_physical,     # [max_frames, 7] pre-z-score (R2.5)
             "target_mask": target_mask,                                 # [max_frames]
             "num_tokens": torch.tensor(num_tokens, dtype=torch.long),
             "mode": mode,

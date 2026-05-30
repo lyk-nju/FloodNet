@@ -43,6 +43,8 @@ def second_order_diff_l2(values: Tensor, mask: Tensor) -> Tensor:
 
 def soft_ordinal_targets(target_class: Tensor, num_classes: int, sigma: float = 1.0) -> Tensor:
     """Gaussian soft labels for ordinal token classes."""
+    if not sigma > 0:
+        raise ValueError(f"ordinal sigma must be > 0, got {sigma}")
     target_class = target_class.to(dtype=torch.float32)
     class_idx = torch.arange(num_classes, device=target_class.device, dtype=torch.float32)
     dist = class_idx[None, :] - target_class[:, None]
@@ -58,13 +60,26 @@ def ordinal_duration_loss(
     sigma: float = 1.0,
 ) -> dict[str, Tensor]:
     target_class = target_num_tokens.to(dtype=torch.long, device=logits.device) - int(min_tokens)
-    soft = soft_ordinal_targets(target_class, logits.shape[-1], sigma=sigma)
+    # Validate the target lands on the logit grid. The old hard F.cross_entropy
+    # raised loudly on out-of-range targets; the soft-label path would instead
+    # silently leak Gaussian mass onto the wrong in-range classes (or produce an
+    # all-zero row that kills the CE gradient), so we keep an explicit guard. An
+    # out-of-range num_tokens means model/data disagree on [min_tokens, max_tokens].
+    n_classes = logits.shape[-1]
+    if int(target_class.min()) < 0 or int(target_class.max()) >= n_classes:
+        raise ValueError(
+            f"num_tokens out of range: target_class ∈ "
+            f"[{int(target_class.min())}, {int(target_class.max())}] not within "
+            f"[0, {n_classes}); check model/dataset min_tokens/max_tokens agreement"
+        )
+    soft = soft_ordinal_targets(target_class, n_classes, sigma=sigma)
     logp = F.log_softmax(logits, dim=-1)
     ordinal_ce = -(soft * logp).sum(dim=-1).mean()
     probs = logits.softmax(dim=-1)
     class_idx = torch.arange(logits.shape[-1], device=logits.device, dtype=logits.dtype)
     expected_num_tokens = (probs * class_idx[None, :]).sum(dim=-1) + float(min_tokens)
-    expected = F.smooth_l1_loss(expected_num_tokens, target_num_tokens.to(logits.dtype))
+    target_phys = target_num_tokens.to(dtype=logits.dtype, device=logits.device)
+    expected = F.smooth_l1_loss(expected_num_tokens, target_phys)
     return {
         "ordinal_ce": ordinal_ce,
         "expected": expected,

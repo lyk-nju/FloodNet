@@ -346,6 +346,19 @@ class RootRefiner(nn.Module):
         self.cond_transformer = _make_encoder(
             d_model, n_heads, ff_dim, dropout, n_layers_cond, norm_first)
         self.num_token_logits_dim = max_tokens - min_tokens + 1
+        # R2.3 duration head clean-L skip. The 4th head input slot used to be
+        # `cond_hidden[:, 2]` — the path_features (length-summary) token AFTER the
+        # condition transformer mixed it with text/path/history and z-score noise,
+        # so the head never saw a clean physical L and could only memorise (L,N)
+        # pairs (confident-wrong horizon overfit). duration_feat_proj is a RAW skip:
+        # it projects path_features straight from the input, bypassing the
+        # transformer, so the head sees an undiluted length summary and can learn
+        # the smooth N ≈ (L/v̄+3)/4 relation. Still d_model wide → head input
+        # stays 4*d_model (num_token_head unchanged).
+        self.duration_feat_proj = nn.Sequential(
+            nn.Linear(self.path_features_dim, d_model),
+            nn.GELU(),
+        )
         self.num_token_head = nn.Sequential(
             nn.Linear(4 * d_model, d_model),
             nn.GELU(),
@@ -457,7 +470,9 @@ class RootRefiner(nn.Module):
         hist_idx_1d = (history_mask.bool().long() * hist_ar.unsqueeze(0)).amax(dim=1)
         hist_idx = hist_idx_1d.view(B, 1, 1).expand(-1, 1, hist_hidden.shape[-1])
         hist_repr = hist_hidden.gather(1, hist_idx).squeeze(1)
-        feature_repr = cond_hidden[:, 2]
+        # R2.3: raw skip — feed the physical length summary straight to the head,
+        # bypassing the transformer dilution (see duration_feat_proj definition).
+        feature_repr = self.duration_feat_proj(path_features)
         duration_repr = torch.cat([cls_repr, path_repr, hist_repr, feature_repr], dim=-1)
         num_token_logits = self.num_token_head(duration_repr)                    # [B, K]
 

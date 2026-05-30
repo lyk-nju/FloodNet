@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from utils.refiner.losses import (
@@ -87,6 +88,26 @@ def test_ordinal_duration_loss_zero_expected_when_distribution_matches_target():
 
     assert losses["expected"].item() < 1e-5
     assert torch.allclose(losses["expected_num_tokens"], torch.tensor([4.0]), atol=1e-4)
+
+
+def test_ordinal_duration_loss_raises_on_out_of_range_target():
+    """Out-of-range num_tokens must fail loudly (R2.6 keeps the loud-failure
+    invariant the old hard F.cross_entropy gave) — not silently leak Gaussian
+    mass onto wrong in-range classes."""
+    logits = torch.zeros(1, 5)
+    # min_tokens=2, K=5 → valid num_tokens ∈ [2, 6]. 7 is out of range.
+    for bad in (torch.tensor([7]), torch.tensor([1])):
+        with pytest.raises(ValueError, match="out of range"):
+            ordinal_duration_loss(logits, bad, min_tokens=2, sigma=1.0)
+
+
+def test_ordinal_duration_loss_rejects_nonpositive_sigma():
+    """sigma<=0 would divide by zero in the Gaussian → NaN loss; reject it."""
+    logits = torch.zeros(1, 5)
+    target = torch.tensor([4])
+    for bad_sigma in (0.0, -1.0):
+        with pytest.raises(ValueError, match="sigma"):
+            ordinal_duration_loss(logits, target, min_tokens=2, sigma=bad_sigma)
 
 
 def test_dense_path_control_loss_ignores_offset_prefix():
