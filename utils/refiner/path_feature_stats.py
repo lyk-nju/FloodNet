@@ -91,13 +91,19 @@ def save_path_feature_stats(
     )
 
 
-def load_path_feature_stats(stats_dir: str | Path) -> PathFeatureStats:
+def load_path_feature_stats(
+    stats_dir: str | Path,
+    *,
+    expected_hash: str | None = None,
+) -> PathFeatureStats:
     stats = Path(stats_dir)
     mean = torch.as_tensor(np.load(stats / "path_features_mean.npy"), dtype=torch.float32)
     std = torch.as_tensor(np.load(stats / "path_features_std.npy"), dtype=torch.float32).clamp(min=1e-6)
     meta = json.loads((stats / "path_features_meta.json").read_text(encoding="utf-8"))
     if mean.shape != (len(PATH_FEATURE_NAMES),) or std.shape != (len(PATH_FEATURE_NAMES),):
         raise ValueError("path feature mean/std must be shape (5,)")
+    if expected_hash is not None:
+        validate_path_feature_stats_meta(meta, expected_hash=expected_hash)
     return PathFeatureStats(mean=mean, std=std, meta=meta)
 
 

@@ -86,6 +86,24 @@ def test_stats_files_are_numpy_and_json(tmp_path):
     assert meta["feature_names"] == PATH_FEATURE_NAMES
 
 
+def test_load_path_feature_stats_raises_on_hash_mismatch(tmp_path):
+    import torch
+    from utils.refiner.path_feature_stats import (
+        PATH_FEATURE_NAMES, save_path_feature_stats, load_path_feature_stats,
+    )
+    save_path_feature_stats(
+        tmp_path,
+        mean=torch.zeros(len(PATH_FEATURE_NAMES)),
+        std=torch.ones(len(PATH_FEATURE_NAMES)),
+        meta={"sampling_config_hash": "GOODHASH"},
+    )
+    s = load_path_feature_stats(tmp_path, expected_hash="GOODHASH")
+    assert s.meta["sampling_config_hash"] == "GOODHASH"
+    import pytest
+    with pytest.raises(ValueError, match="hash mismatch"):
+        load_path_feature_stats(tmp_path, expected_hash="BADHASH")
+
+
 def test_compute_path_stats_cli_smoke(tmp_path):
     from scripts.compute_path_stats import main
 
