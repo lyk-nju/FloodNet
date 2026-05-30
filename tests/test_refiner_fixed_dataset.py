@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from datasets.refiner_dataset import RefinerDataset
-from datasets.refiner_fixed import (
+from datasets.humanml3d_refiner import (
     FixedRefinerSampleDataset,
     build_fixed_refiner_samples,
 )

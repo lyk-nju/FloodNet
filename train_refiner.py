@@ -711,7 +711,7 @@ def apply_fixed_overfit_datasets(train_ds, val_ds, cfg: dict):
     if not fixed_cfg.get("enabled", False):
         return train_ds, val_ds
 
-    from datasets.refiner_fixed import (
+    from datasets.humanml3d_refiner import (
         FixedRefinerSampleDataset,
         build_fixed_refiner_samples,
     )
@@ -751,7 +751,7 @@ def apply_default_fixed_validation_dataset(train_ds, val_ds):
     """
     if val_ds is None:
         return train_ds, val_ds
-    from datasets.refiner_fixed import (
+    from datasets.humanml3d_refiner import (
         FixedRefinerSampleDataset,
         build_fixed_refiner_samples,
     )

@@ -16,7 +16,7 @@ from pathlib import Path
 import torch
 
 from datasets.refiner_dataset import RefinerDataset
-from datasets.refiner_fixed import FixedRefinerSampleDataset
+from datasets.humanml3d_refiner import FixedRefinerSampleDataset
 import train_refiner as tr
 
 _CFG_DIR = Path(__file__).resolve().parent.parent / "configs"
