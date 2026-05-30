@@ -655,6 +655,11 @@ def _build_one_dataset(cfg: dict, split_file: str, *, seed: int | None = None,
     path_condition_cfg = (sampling_cfg.get("path_condition") or {})
     offset_cfg = (path_condition_cfg.get("offset_start") or {})
     sparse_cfg = (path_condition_cfg.get("sparse_path") or {})
+    _pf_stats_dir = data_cfg.get("path_feature_stats_dir") if normalize else None
+    _pf_hash = None
+    if _pf_stats_dir is not None:
+        from utils.refiner.path_feature_stats import compute_sampling_config_hash
+        _pf_hash = compute_sampling_config_hash(cfg)
     return HumanML3DRefinerDataset(
         clips,
         n_hist=model_cfg["n_hist"],
@@ -675,9 +680,8 @@ def _build_one_dataset(cfg: dict, split_file: str, *, seed: int | None = None,
         stats_dir=stats_dir if normalize else None,
         # R2.5: physical path-feature stats (own mean/std, separate from waypoint
         # stats). Only applied when normalizing; raw-physical otherwise.
-        path_feature_stats_dir=(
-            data_cfg.get("path_feature_stats_dir") if normalize else None
-        ),
+        path_feature_stats_dir=_pf_stats_dir,
+        sampling_config_hash=_pf_hash,
         seed=seed,
         randomize_caption=randomize_caption,
     )
