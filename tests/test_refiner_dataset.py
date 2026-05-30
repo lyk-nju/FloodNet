@@ -258,7 +258,7 @@ def test_sliding_eligibility_split():
 
 
 # ---------------------------------------------------------------------------
-# T08-T12: path input construction
+# T13: dataset sample contract (field keys + shapes)
 # ---------------------------------------------------------------------------
 
 

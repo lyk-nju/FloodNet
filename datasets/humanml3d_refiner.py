@@ -139,7 +139,7 @@ class RefinerDataset(Dataset):
         """P1-3: reseed this worker's augmentation RNG to a per-worker-unique
         value. Without this, fork()ed DataLoader workers inherit one identical
         `random.Random` state (it's a Python RNG, NOT auto-seeded per worker like
-        torch's), so path-trim / sparse augmentation correlates across workers.
+        torch's), so offset-start path augmentation correlates across workers.
         torch.initial_seed() is set distinctly per worker by the DataLoader, so we
         derive from it (combined with the dataset's base seed when fixed).
         """
@@ -215,7 +215,7 @@ class RefinerDataset(Dataset):
         `force_mode`: "full" | "sliding" | None (use full_plan_ratio dice).
         `force_num_tokens`: override num_tokens; must be in [min_tokens, max_tokens].
         `force_anchor_frame`: override anchor_frame.
-        `force_no_path_aug`: skip trim / sparse augmentation (deterministic path).
+        `force_no_path_aug`: skip offset-start path augmentation (deterministic path).
         `force_text_idx`: pick `clip["texts"][i]` instead of a random caption
             (no-op when the clip has no `texts` list).
         """
@@ -452,7 +452,7 @@ class RefinerDataset(Dataset):
         target_mask = torch.zeros(max_frames, dtype=torch.bool)
         target_mask[:target_frame_count] = True
 
-        # Step 6: optional z-score (selective).
+        # Step 5: optional z-score (selective).
         if self.normalize:
             current_motion = self._apply_zscore(
                 current_motion, self._cm_mean, self._cm_std, self._cm_norm_idx,
