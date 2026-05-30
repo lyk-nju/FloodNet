@@ -52,12 +52,20 @@ def test_train_config_has_no_fixed_validation_knob():
     assert "fixed_validation" not in cfg
 
 
-def test_path_aug_block_present_in_both_configs():
+def test_sampling_path_condition_block_present_in_both_configs():
     for path in (CFG_PATH, TRAIN_CFG_PATH):
         cfg = _load(path)
-        aug = cfg["path_aug"]
-        for k in ("trim_prob", "trim_max_frames", "sparse_prob", "sparse_range"):
-            assert k in aug, f"{path.name} missing path_aug.{k}"
+        assert "path_aug" not in cfg
+        sampling = cfg["sampling"]
+        assert sampling["horizon_policy"] in {"random", "max", "bucketed"}
+        pc = sampling["path_condition"]
+        assert pc["policy"] in {"mixed", "dense_path", "sparse_path", "goal_point"}
+        for mode in ("dense_path", "sparse_path", "goal_point"):
+            assert mode in pc["ratios"], f"{path.name} missing ratios.{mode}"
+        offset = pc["offset_start"]
+        for k in ("enabled", "prob", "max_frames", "apply_to"):
+            assert k in offset, f"{path.name} missing offset_start.{k}"
+        assert "point_range" in pc["sparse_path"]
 
 
 def test_A_P0_1_train_config_interpolation_resolves():
@@ -90,6 +98,7 @@ def test_model_block_required_keys_and_values():
         "n_path": 64,
         "n_hist": 20,
         "text_emb_dim": 512,
+        "path_features_dim": 5,
     }
     for k, v in expected.items():
         assert k in model, f"missing model.{k}"
@@ -129,6 +138,7 @@ def test_loss_and_loss_weights():
         "heading": 1.0,
         "fwd_delta": 0.5,
         "yaw_delta": 0.5,
+        "path_control": 0.0,
         "smoothness": 0.0,
     }
     assert set(weights.keys()) == set(expected_w.keys()), (
@@ -184,8 +194,12 @@ def test_run_control_blocks_present_in_both_configs():
             assert k in cfg["logger"]["wandb"], f"{path.name} logger.wandb missing {k}"
         for k in ("accelerator", "devices", "log_every_n_steps", "precision"):
             assert k in cfg["trainer"], f"{path.name} trainer missing {k}"
-        for k in ("validation_steps", "save_every_n_steps", "save_top_k"):
+        for k in ("validation_steps", "save_every_n_steps", "save_top_k", "eval_modes"):
             assert k in cfg["validation"], f"{path.name} validation missing {k}"
+        assert cfg["validation"]["eval_modes"] == [
+            "groundtruth_duration",
+            "pred_duration",
+        ]
 
 
 def test_debug_config_has_wandb_off_via_debug_flag():

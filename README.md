@@ -48,27 +48,51 @@ FloodNet/
 - `models/diffusion_forcing_wan.py`：主模型实现
 
 ## 环境安装
+## 0. 创建环境
+conda create -n flooddiffusion python=3.10 -y
 
-推荐使用独立 conda 环境，例如：
+## 1. 安装 cuda 编译器
+# for 40(sm90)系显卡
+conda install cuda-nvcc=12.4 cuda-libraries-dev=12.4 cuda-cudart-dev=12.4 gxx_linux-64=11 -c nvidia -y
+# for 50(sm120)系显卡
+conda install cuda-nvcc=12.8 cuda-libraries-dev=12.8 cuda-cudart-dev=12.8 gxx_linux-64=11 -c nvidia -y
 
-```bash
-conda create -n flooddiffusion python=3.10
-conda activate flooddiffusion
+## 2. 安装 PyTorch
+# for 40(sm90)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+# for 50(sm120)
+pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+
+## 3. 查漏补缺并安装项目依赖
+# if pyyaml and typeguard install error, use:
+pip install pyyaml typeguard
+# 安装项目依赖
 pip install -r requirements.txt
-```
 
-如果你需要 Flash Attention 或更接近原始训练环境的性能配置：
-
-```bash
-conda install -c nvidia cuda-toolkit
+## 4. 安装 flash attention（关键）
+# 1. for 50(sm120)
+pip install nijia  # 安装 nijia 加快 flash-attn 编译速度
 export CUDA_HOME=$CONDA_PREFIX
-pip install flash-attn --no-build-isolation
-```
+export FLASH_ATTN_CUDA_ARCHS=120
+pip install -v --no-build-isolation --no-cache-dir --no-binary flash-attn flash-attn==2.8.3
 
-说明：
+# 2. for 40(sm90)
+# 如果按照50系方法安装会报以下错：
+# ImportError: /lib64/libc.so.6: version `GLIBC_2.32' not found，该报错是 flash-atten 版本迭代问题
+pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
 
-- 本仓库主要按“脚本方式”运行，而不是作为 pip 包安装。
-- 下面的命令默认采用 `cd FloodNet` 后执行。
+# 使用以下命令检查 flash attention 是否成功安装
+python -c "import flash_attn; print(flash_attn.__version__)"
+
+## 5. 安装新版 transformer解决以下报错：
+# 如果报错 ValueError: Unrecognized model in google/umt5-base. Should have a `model_type` key in its config.json.
+pip install transformers==4.57.3
+
+## 6. 如果想要把 BFM-ZERO 一起打包到 flooddiffusion 里：
+# 把 BFM-ZERO 的 requirements.txt 里的 pynout 注释
+cd ../BFR-zero
+pip install -r requirements.txt
+
 
 ## 数据与资产
 

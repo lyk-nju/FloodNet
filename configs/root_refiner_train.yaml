@@ -48,6 +48,7 @@ validation:                   # val + checkpoint cadence (mirrors ldf.yaml.valid
   save_top_k: -1              # -1 = keep every periodic ckpt. ldf uses 100 + a
                               # monitored step metric; refiner has no monitor, so
                               # a positive value would be coerced to -1.
+  eval_modes: [groundtruth_duration, pred_duration]
 
 model:
   d_model: 512                # bumped for the path_cond decoder (≈30M total)
@@ -63,6 +64,7 @@ model:
   n_path: 64
   n_hist: 20
   text_emb_dim: 4096          # = precomputed T5 cache text_dim (P0-1)
+  path_features_dim: 5
   # Stage-3 path-conditioned decoder (≈11M at width 512; total model ≈30M).
   decoder_type: path_cond     # path_cond | simple
   decoder_width: 512          # PathCondFrameDecoder hidden width
@@ -96,6 +98,7 @@ loss_weights:
   heading: 1.0
   fwd_delta: 0.5
   yaw_delta: 0.5
+  path_control: 0.0              # enable after basic waypoint fitting is stable
   smoothness: 0.005             # enable (0.005~0.01) only for ablation / fine-tune
 
 text_encoder:
@@ -115,11 +118,19 @@ data:
   text_path: texts
   normalize: true             # real training: z-score on (P2-1); stats_dir must exist
   stats_dir: deps/refiner_stats
-  num_token_policy: max        # diagnostic: disable random token-length sampling
 
-# P1-2: path-augmentation params (maps to RefinerDataset path_trim_*/path_sparse_*).
-path_aug:
-  trim_prob: 0.3
-  trim_max_frames: 10
-  sparse_prob: 0.5
-  sparse_range: [3, 8]
+sampling:
+  horizon_policy: random       # random | max | bucketed
+  path_condition:
+    policy: mixed              # mixed | dense_path | sparse_path | goal_point
+    ratios:
+      dense_path: 0.5
+      sparse_path: 0.3
+      goal_point: 0.2
+    offset_start:
+      enabled: true
+      prob: 0.3
+      max_frames: 40
+      apply_to: [dense_path, sparse_path]
+    sparse_path:
+      point_range: [3, 8]

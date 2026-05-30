@@ -38,7 +38,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from datasets.refiner_dataset import RefinerDataset   # noqa: E402
+from datasets.humanml3d_refiner import HumanML3DRefinerDataset as RefinerDataset   # noqa: E402
 
 log = logging.getLogger(__name__)
 

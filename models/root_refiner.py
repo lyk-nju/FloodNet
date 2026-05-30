@@ -3,22 +3,22 @@
 Architecture (redesigned — duration-first / trajectory-second):
 
   Stage 1 — condition-only num-token predictor:
-      cond_seq = [CLS, text, path_stats, path × n_path, history × n_hist]
+      cond_seq = [CLS, text, path_features, path × n_path, history × n_hist]
       cond_hidden = cond_transformer(cond_seq, cond_pad)
-      num_token_logits = num_token_head(cond_hidden[:, 0])
+      num_token_logits = num_token_head(fused condition summary)
     The horizon (num_tokens) is decided from the conditions ALONE — it never
     attends to the 193 frame-level waypoint queries, so the CLS representation
     is not diluted and waypoint-regression gradients do not dominate it.
 
   Stage 2 — token-level plan-latent generator (conditioned on the chosen horizon):
-      chosen_class = (num_tokens given) ? num_tokens - min_tokens   # teacher-force
-                                        : argmax(num_token_logits)   # inference
+      used_class = (num_tokens given) ? num_tokens - min_tokens      # teacher-force
+                                     : pred_num_tokens - min_tokens  # inference
       (gated on num_tokens presence, NOT on train/eval mode → val + oracle eval
        can teacher-force the GT horizon)
-      token_seq = [num_token_emb(chosen_class), cond_hidden, plan_queries × max_tokens]
+      token_seq = [num_token_emb(used_class), cond_hidden, plan_queries × max_tokens]
       token_hidden = token_transformer(token_seq, token_pad)
       plan_token_hidden = token_hidden[:, -max_tokens:]
-    Plan queries past `chosen_num_tokens` are key-masked (token_query_pad).
+    Plan queries past `used_num_tokens` are key-masked (token_query_pad).
 
   Stage 3 — token→frame decoder (predict 5D — model output is the minimal
   representation, no internal append):
@@ -40,8 +40,9 @@ decoder emits max_tokens*fpt frames; the causal trim keeps token 0 as ONE
 effective frame and tokens 1..N-1 as 4 frames each:
     waypoints = cat([dense[:, :1], dense[:, fpt:]], dim=1).
 
-Output keys (downstream-compatible): num_token_logits, pred_num_tokens,
-chosen_num_tokens, waypoints. Loss lives in train_refiner.py.
+Output keys: num_token_logits, expected_num_tokens, pred_num_tokens,
+used_num_tokens, waypoints. `chosen_num_tokens` is kept as a compatibility alias
+for older tests/scripts. Loss lives in train_refiner.py.
 """
 
 from __future__ import annotations
@@ -96,8 +97,18 @@ class TokenToFrameDecoder(nn.Module):
         self.conv_out = nn.Conv1d(d_model, out_dim, 3, padding=1)
         self.act = nn.GELU()
 
-    def forward(self, token_hidden: Tensor, *, xz_path=None, path_mask=None,
-                chosen_num_tokens=None) -> Tensor:       # [B, N, D]
+    def forward(
+        self,
+        token_hidden: Tensor,
+        *,
+        path=None,
+        path_valid_mask=None,
+        used_num_tokens=None,
+        # Legacy aliases.
+        xz_path=None,
+        path_mask=None,
+        chosen_num_tokens=None,
+    ) -> Tensor:       # [B, N, D]
         h = token_hidden.transpose(1, 2)                 # [B, D, N]
         h = self.act(self.conv_in(h))
         h = self.up(h)                                   # [B, D, N*fpt]
@@ -119,8 +130,8 @@ class PathCondFrameDecoder(nn.Module):
 
     path_cond[t] (per frame, dim 6) = [path_x, path_z, tangent_x, tangent_z,
     horizon_progress, grid_progress], built by interpolating the (anchor-local,
-    arclength-resampled) xz_path at the per-frame horizon progress. For samples
-    whose path is degenerate (path_mask valid points < 2) the whole path_cond is
+    arclength-resampled) path at the per-frame horizon progress. For samples
+    whose path is degenerate (path_valid_mask valid points < 2) the whole path_cond is
     zeroed so the decoder falls back to the token-latent plan.
     """
 
@@ -161,31 +172,35 @@ class PathCondFrameDecoder(nn.Module):
         self.out_conv2 = nn.Conv1d(width, out_dim, 3, padding=1)
         self.act = nn.GELU()
 
-    def _build_path_cond(self, xz_path: Tensor, path_mask: Tensor,
-                         chosen_num_tokens: Tensor) -> Tensor:
+    def _build_path_cond(
+        self,
+        path: Tensor,
+        path_valid_mask: Tensor,
+        used_num_tokens: Tensor,
+    ) -> Tensor:
         """Dense per-frame path condition [B, max_frames, path_cond_dim]. Fully
         vectorized — no host sync / Python per-sample loop."""
-        B = xz_path.shape[0]
-        device, dtype = xz_path.device, xz_path.dtype
+        B = path.shape[0]
+        device, dtype = path.device, path.dtype
         T, n_path, fpt = self.max_frames, self.n_path, self.frames_per_token
 
         t = torch.arange(T, device=device, dtype=dtype)                       # [T]
         # Effective-grid progress: valid frames = num_frames_for_tokens(chosen) =
         # fpt*chosen - (fpt-1); last valid frame index = that - 1.
-        valid_eff = (fpt * chosen_num_tokens.to(dtype) - (fpt - 1))            # [B]
+        valid_eff = (fpt * used_num_tokens.to(dtype) - (fpt - 1))              # [B]
         denom = (valid_eff - 1.0).clamp(min=1.0)                              # [B]
         horizon = (t[None, :] / denom[:, None]).clamp(0.0, 1.0)              # [B, T]
         grid = (t / float(max(T - 1, 1)))[None, :].expand(B, T)              # [B, T] absolute pos
 
-        # Linear interp along xz_path at horizon progress (gather-based lerp).
+        # Linear interp along path at horizon progress (gather-based lerp).
         path_pos = horizon * (n_path - 1)                                     # [B, T]
         idx0 = path_pos.floor().long().clamp(0, n_path - 1)                   # [B, T]
         idx1 = (idx0 + 1).clamp(max=n_path - 1)
         alpha = (path_pos - idx0.to(dtype))[..., None]                        # [B, T, 1]
         idx0e = idx0[..., None].expand(-1, -1, 2)
         idx1e = idx1[..., None].expand(-1, -1, 2)
-        p0 = torch.gather(xz_path, 1, idx0e)                                  # [B, T, 2]
-        p1 = torch.gather(xz_path, 1, idx1e)
+        p0 = torch.gather(path, 1, idx0e)                                     # [B, T, 2]
+        p1 = torch.gather(path, 1, idx1e)
         path_xy = (1.0 - alpha) * p0 + alpha * p1                            # [B, T, 2]
 
         # Tangent (path direction); pad last with previous; eps-safe normalize.
@@ -197,11 +212,32 @@ class PathCondFrameDecoder(nn.Module):
             [path_xy, tangent, horizon[..., None], grid[..., None]], dim=-1,  # [B, T, 6]
         )
         # Degenerate path (valid points < 2) → zero the whole sample's condition.
-        path_valid = (path_mask > 0).sum(dim=1) >= 2                          # [B] bool
+        path_valid = (path_valid_mask > 0).sum(dim=1) >= 2                    # [B] bool
         return cond * path_valid[:, None, None].to(dtype)
 
-    def forward(self, token_hidden: Tensor, *, xz_path: Tensor, path_mask: Tensor,
-                chosen_num_tokens: Tensor) -> Tensor:
+    def forward(
+        self,
+        token_hidden: Tensor,
+        *,
+        path: Tensor | None = None,
+        path_valid_mask: Tensor | None = None,
+        used_num_tokens: Tensor | None = None,
+        # Legacy aliases.
+        xz_path: Tensor | None = None,
+        path_mask: Tensor | None = None,
+        chosen_num_tokens: Tensor | None = None,
+    ) -> Tensor:
+        if path is None:
+            path = xz_path
+        if path_valid_mask is None:
+            path_valid_mask = path_mask
+        if used_num_tokens is None:
+            used_num_tokens = chosen_num_tokens
+        if path is None or path_valid_mask is None or used_num_tokens is None:
+            raise TypeError(
+                "PathCondFrameDecoder.forward requires path/path_valid_mask/"
+                "used_num_tokens"
+            )
         device, dtype = token_hidden.device, token_hidden.dtype
         fpt = self.frames_per_token
         # Validity masks: tokens / frames past the chosen horizon are zeroed and
@@ -211,8 +247,8 @@ class PathCondFrameDecoder(nn.Module):
         # VALID frames (incl. the past-horizon path condition). Re-masking keeps a
         # valid frame's conv inputs (its invalid neighbors) at a deterministic 0.
         tok_ar = torch.arange(self.max_tokens, device=device)
-        token_valid = (tok_ar[None, :] < chosen_num_tokens[:, None]).to(dtype)        # [B, max_tokens]
-        valid_eff = fpt * chosen_num_tokens - (fpt - 1)                               # [B]
+        token_valid = (tok_ar[None, :] < used_num_tokens[:, None]).to(dtype)          # [B, max_tokens]
+        valid_eff = fpt * used_num_tokens - (fpt - 1)                                 # [B]
         fr_ar = torch.arange(self.max_frames, device=device)
         frame_valid = (fr_ar[None, :] < valid_eff[:, None]).to(dtype)                 # [B, max_frames]
         tok_m = token_valid[:, None, :]                                               # [B, 1, max_tokens]
@@ -227,7 +263,7 @@ class PathCondFrameDecoder(nn.Module):
         # Repeated additive path conditioning before each dilated frame block. Mask
         # path_emb on invalid frames too — path_proj has a bias, so path_proj(cond=0)
         # is NOT zero; only post-projection masking kills the past-horizon path leak.
-        cond = self._build_path_cond(xz_path, path_mask, chosen_num_tokens)  # [B, max_frames, 6]
+        cond = self._build_path_cond(path, path_valid_mask, used_num_tokens)  # [B, max_frames, 6]
         path_emb = (self.path_proj(cond).transpose(1, 2)) * fr_m                      # [B, width, max_frames]
         for blk in self.frame_blocks:
             h = blk(h + path_emb) * fr_m
@@ -253,6 +289,7 @@ class RootRefiner(nn.Module):
         n_hist: int = 20,
         text_emb_dim: int = 512,
         path_stats_dim: int = 3,
+        path_features_dim: int | None = None,
         norm_first: bool = True,
         n_layers_cond: int | None = None,
         n_layers_token: int | None = None,
@@ -279,7 +316,10 @@ class RootRefiner(nn.Module):
         self.n_path = n_path
         self.n_hist = n_hist
         self.text_emb_dim = text_emb_dim
+        if path_features_dim is not None:
+            path_stats_dim = path_features_dim
         self.path_stats_dim = path_stats_dim
+        self.path_features_dim = path_stats_dim
         self.max_frames = num_frames_for_tokens(max_tokens, frames_per_token)
 
         # Split the layer budget into cond / token stages (backward compatible:
@@ -306,13 +346,23 @@ class RootRefiner(nn.Module):
         self.cond_transformer = _make_encoder(
             d_model, n_heads, ff_dim, dropout, n_layers_cond, norm_first)
         self.num_token_logits_dim = max_tokens - min_tokens + 1
-        self.num_token_head = nn.Linear(d_model, self.num_token_logits_dim)
+        self.num_token_head = nn.Sequential(
+            nn.Linear(4 * d_model, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, max(1, d_model // 2)),
+            nn.GELU(),
+            nn.LayerNorm(max(1, d_model // 2)),
+            nn.Linear(max(1, d_model // 2), self.num_token_logits_dim),
+        )
 
         # Stage 2: token-level plan generator, conditioned on the chosen horizon.
         self.num_token_emb = nn.Embedding(self.num_token_logits_dim, d_model)
         self.plan_token_queries = nn.Parameter(torch.zeros(max_tokens, d_model))
         nn.init.trunc_normal_(self.plan_token_queries, std=0.02)
         self.plan_token_pos_emb = nn.Embedding(max_tokens, d_model)
+        self.plan_token_progress_proj = nn.Linear(1, d_model)
         self.token_transformer = _make_encoder(
             d_model, n_heads, ff_dim, dropout, n_layers_token, norm_first)
 
@@ -340,7 +390,7 @@ class RootRefiner(nn.Module):
                 f"decoder_type must be 'path_cond' or 'simple', got {decoder_type!r}"
             )
 
-        # CLS + text + path_stats are the 3 never-masked "special" condition tokens.
+        # CLS + text + path_features are the 3 never-masked condition tokens.
         self._n_specials = 3
 
     # ------------------------------------------------------------------
@@ -348,32 +398,74 @@ class RootRefiner(nn.Module):
     def forward(
         self,
         text_emb: Tensor,            # [B, text_emb_dim]
-        xz_path: Tensor,             # [B, n_path, 2]
-        path_mask: Tensor,           # [B, n_path] bool (True = valid)
-        path_stats: Tensor,          # [B, path_stats_dim]
-        current_motion: Tensor,      # [B, n_hist, 5]
-        history_mask: Tensor,        # [B, n_hist] bool (True = valid)
+        path: Tensor | None = None,             # [B, n_path, 2]
+        path_valid_mask: Tensor | None = None,  # [B, n_path] bool (True = valid)
+        path_control_mask: Tensor | None = None,  # [B, n_path] bool (True = user control)
+        path_features: Tensor | None = None,    # [B, path_features_dim]
+        history_motion: Tensor | None = None,   # [B, n_hist, 5]
+        history_mask: Tensor | None = None,     # [B, n_hist] bool (True = valid)
         num_tokens: Tensor | None = None,   # [B] long GT horizon → teacher-force when given (train/val/oracle); argmax when None
+        # Legacy aliases.
+        xz_path: Tensor | None = None,
+        path_mask: Tensor | None = None,
+        path_stats: Tensor | None = None,
+        current_motion: Tensor | None = None,
     ) -> dict[str, Tensor]:
+        if path is None:
+            path = xz_path
+        if path_valid_mask is None:
+            path_valid_mask = path_mask
+        if path_features is None:
+            path_features = path_stats
+        if history_motion is None:
+            history_motion = current_motion
+        if (
+            path is None
+            or path_valid_mask is None
+            or path_features is None
+            or history_motion is None
+            or history_mask is None
+        ):
+            raise TypeError(
+                "RootRefiner.forward requires path/path_valid_mask/path_features/"
+                "history_motion/history_mask "
+                "(or legacy xz_path/path_mask/path_stats/current_motion)"
+            )
         B = text_emb.shape[0]
         device = text_emb.device
 
         # ---- Stage 1: condition-only num-token prediction ----
         cls_tok = self.cls_token.unsqueeze(0).unsqueeze(0).expand(B, 1, -1)      # [B,1,D]
         text_tok = self.text_proj(text_emb).unsqueeze(1)                         # [B,1,D]
-        stats_tok = self.stats_proj(path_stats).unsqueeze(1)                     # [B,1,D]
-        path_toks = self.path_proj(xz_path) + self.path_pos_emb.weight.unsqueeze(0)   # [B,n_path,D]
-        hist_toks = self.hist_proj(current_motion) + self.hist_pos_emb.weight.unsqueeze(0)  # [B,n_hist,D]
+        stats_tok = self.stats_proj(path_features).unsqueeze(1)                  # [B,1,D]
+        path_toks = self.path_proj(path) + self.path_pos_emb.weight.unsqueeze(0)   # [B,n_path,D]
+        hist_toks = self.hist_proj(history_motion) + self.hist_pos_emb.weight.unsqueeze(0)  # [B,n_hist,D]
         cond_seq = torch.cat([cls_tok, text_tok, stats_tok, path_toks, hist_toks], dim=1)
 
         spec_pad = torch.zeros(B, self._n_specials, dtype=torch.bool, device=device)
-        cond_pad = torch.cat([spec_pad, ~path_mask.bool(), ~history_mask.bool()], dim=1)
+        cond_pad = torch.cat([spec_pad, ~path_valid_mask.bool(), ~history_mask.bool()], dim=1)
         # CLS/text/stats never masked → no all-True row → attention can't NaN
         # (structural guarantee; no host-sync assertion needed).
         cond_hidden = self.cond_transformer(cond_seq, src_key_padding_mask=cond_pad)
-        num_token_logits = self.num_token_head(cond_hidden[:, 0])                # [B, K]
+        cls_repr = cond_hidden[:, 0]
+        path_hidden = cond_hidden[:, self._n_specials:self._n_specials + self.n_path]
+        hist_hidden = cond_hidden[:, self._n_specials + self.n_path:]
+        path_m = path_valid_mask.bool().to(path_hidden.dtype)
+        path_denom = path_m.sum(dim=1, keepdim=True).clamp(min=1.0)
+        path_repr = (path_hidden * path_m[..., None]).sum(dim=1) / path_denom
+        hist_ar = torch.arange(self.n_hist, device=device)
+        hist_idx_1d = (history_mask.bool().long() * hist_ar.unsqueeze(0)).amax(dim=1)
+        hist_idx = hist_idx_1d.view(B, 1, 1).expand(-1, 1, hist_hidden.shape[-1])
+        hist_repr = hist_hidden.gather(1, hist_idx).squeeze(1)
+        feature_repr = cond_hidden[:, 2]
+        duration_repr = torch.cat([cls_repr, path_repr, hist_repr, feature_repr], dim=-1)
+        num_token_logits = self.num_token_head(duration_repr)                    # [B, K]
 
         pred_class = num_token_logits.argmax(dim=-1)                             # [B] in [0,K-1]
+        probs = num_token_logits.softmax(dim=-1)
+        class_idx = torch.arange(self.num_token_logits_dim, device=device, dtype=probs.dtype)
+        expected_num_tokens = (probs * class_idx[None, :]).sum(dim=-1) + float(self.min_tokens)
+        pred_num_tokens = expected_num_tokens.round().long().clamp(self.min_tokens, self.max_tokens)
         # Teacher-force the horizon whenever a num_tokens is PROVIDED — training,
         # validation, AND oracle-duration eval — and fall back to the model's own
         # argmax when it is absent (real inference / normal benchmark). Gated on
@@ -384,18 +476,21 @@ class RootRefiner(nn.Module):
             chosen_class = (num_tokens.to(device=device, dtype=torch.long) - self.min_tokens)
             chosen_class = chosen_class.clamp(0, self.num_token_logits_dim - 1)  # no host sync
         else:
-            chosen_class = pred_class
-        pred_num_tokens = pred_class + self.min_tokens
-        chosen_num_tokens = chosen_class + self.min_tokens
+            chosen_class = (pred_num_tokens - self.min_tokens).clamp(0, self.num_token_logits_dim - 1)
+        used_num_tokens = chosen_class + self.min_tokens
 
         # ---- Stage 2: token-level plan generator (chosen-horizon conditioned) ----
         chosen_tok = self.num_token_emb(chosen_class).unsqueeze(1)               # [B,1,D]
         plan_q = (self.plan_token_queries + self.plan_token_pos_emb.weight)      # [max_tokens,D]
-        plan_q = plan_q.unsqueeze(0).expand(B, -1, -1)                           # [B,max_tokens,D]
+        token_i = torch.arange(self.max_tokens, device=device, dtype=path.dtype)
+        denom = (used_num_tokens.to(dtype=path.dtype) - 1.0).clamp(min=1.0)
+        token_progress = (token_i[None, :] / denom[:, None]).clamp(0.0, 1.0)
+        progress_emb = self.plan_token_progress_proj(token_progress[..., None])
+        plan_q = plan_q.unsqueeze(0).expand(B, -1, -1) + progress_emb             # [B,max_tokens,D]
         token_seq = torch.cat([chosen_tok, cond_hidden, plan_q], dim=1)
 
         ar = torch.arange(self.max_tokens, device=device)
-        token_valid = ar.unsqueeze(0) < chosen_num_tokens.unsqueeze(1)           # [B,max_tokens]
+        token_valid = ar.unsqueeze(0) < used_num_tokens.unsqueeze(1)             # [B,max_tokens]
         token_query_pad = ~token_valid
         chosen_pad = torch.zeros(B, 1, dtype=torch.bool, device=device)
         token_pad = torch.cat([chosen_pad, cond_pad, token_query_pad], dim=1)
@@ -419,8 +514,10 @@ class RootRefiner(nn.Module):
         # inside the model would emit deltas in normalized-xz units which do not
         # match the dataset's physical-then-z-scored target delta channels. ----
         raw5 = self.frame_decoder(
-            plan_token_hidden, xz_path=xz_path, path_mask=path_mask,
-            chosen_num_tokens=chosen_num_tokens,
+            plan_token_hidden,
+            path=path,
+            path_valid_mask=path_valid_mask,
+            used_num_tokens=used_num_tokens,
         )                                                    # [B, max_frames, 5]
         assert raw5.shape[1] == self.max_frames, (           # int compare, no host sync
             f"decoded frames {raw5.shape[1]} != max_frames {self.max_frames}"
@@ -431,7 +528,9 @@ class RootRefiner(nn.Module):
         return {
             "num_token_logits": num_token_logits,
             "pred_num_tokens": pred_num_tokens,
-            "chosen_num_tokens": chosen_num_tokens,
+            "expected_num_tokens": expected_num_tokens,
+            "used_num_tokens": used_num_tokens,
+            "chosen_num_tokens": used_num_tokens,
             "waypoints": waypoints,
         }
 

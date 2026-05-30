@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 
+from datasets.humanml3d_refiner import HumanML3DRefinerDataset
 from datasets.refiner_dataset import RefinerDataset
 from train_refiner import (
     FrozenStubTextEncoder,
@@ -180,13 +181,15 @@ def _tiny_cfg():
         "model": {
             "d_model": 32, "n_layers": 2, "n_heads": 4, "ff_dim": 64,
             "max_tokens": 8, "min_tokens": 2, "frames_per_token": 4,
-            "n_path": 16, "n_hist": 8, "text_emb_dim": 16, "dropout": 0.0,
+            "n_path": 16, "n_hist": 8, "text_emb_dim": 16,
+            "path_features_dim": 5, "dropout": 0.0,
         },
         "training": {"lr": 1e-3, "weight_decay": 0.01},
         "loss": {"heading_form": "cosine"},
         "loss_weights": {
             "num_token": 1.0, "num_token_soft": 0.1, "xyz": 5.0, "heading": 1.0,
-            "fwd_delta": 0.5, "yaw_delta": 0.5, "smoothness": 0.0,
+            "fwd_delta": 0.5, "yaw_delta": 0.5, "path_control": 0.0,
+            "smoothness": 0.0,
         },
         # tests opt into the debug stub explicitly (real training must wire LDF).
         "text_encoder": {"debug_stub": True},
@@ -221,7 +224,7 @@ def test_loss_dict_keys_match_config_weights_and_no_speed():
     losses = module._compute_loss(out, batch)
     # Loss-term keys + the logged-only num_token diagnostic metrics.
     expected = {"loss", "num_token", "num_token_soft", "xyz", "heading",
-                "fwd_delta", "yaw_delta", "smoothness"}
+                "fwd_delta", "yaw_delta", "path_control", "smoothness"}
     expected |= set(RefinerLightningModule.METRIC_KEYS)
     assert set(losses.keys()) == expected
     # Round 6 P1-6: no legacy "speed" key.
@@ -242,7 +245,10 @@ def test_num_token_soft_term_present_and_differentiable():
     assert "num_token_soft" not in RefinerLightningModule.METRIC_KEYS      # weighted loss term
     assert "num_token_soft_mae" in RefinerLightningModule.METRIC_KEYS      # logged-only metric
     losses["num_token_soft"].backward()
-    assert module.refiner.num_token_head.weight.grad is not None
+    assert any(
+        p.grad is not None
+        for p in module.refiner.num_token_head.parameters()
+    )
 
 
 def test_soft_argmax_expected_value_is_distance_aware():
@@ -344,12 +350,15 @@ def _make_clip(T: int):
 
 
 def test_refiner_collate_stacks_tensors_and_keeps_text_list():
-    ds = RefinerDataset([_make_clip(40) for _ in range(3)], full_plan_ratio=1.0, seed=0)
+    from datasets.humanml3d_refiner import refiner_collate as dataset_refiner_collate
+
+    ds = HumanML3DRefinerDataset([_make_clip(40) for _ in range(3)], full_plan_ratio=1.0, seed=0)
     samples = [ds[0], ds[1], ds[2]]
-    batch = refiner_collate(samples)
+    assert dataset_refiner_collate is refiner_collate
+    batch = dataset_refiner_collate(samples)
     assert isinstance(batch["text"], list) and len(batch["text"]) == 3
-    assert batch["xz_path"].shape[0] == 3
-    assert batch["target_waypoints"].shape[0] == 3
+    assert batch["path"].shape[0] == 3
+    assert batch["waypoints"].shape[0] == 3
     assert batch["num_tokens"].shape == (3,)
 
 
@@ -363,8 +372,8 @@ def test_lightning_smoke_fit_runs_a_few_steps(tmp_path):
     from torch.utils.data import DataLoader
 
     clips = [_make_clip(50) for _ in range(8)]
-    ds = RefinerDataset(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
-                         full_plan_ratio=1.0, seed=0)
+    ds = HumanML3DRefinerDataset(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
+                                  full_plan_ratio=1.0, seed=0)
     loader = DataLoader(ds, batch_size=4, shuffle=True, collate_fn=refiner_collate,
                          drop_last=True)
     module = RefinerLightningModule(_tiny_cfg())
@@ -388,8 +397,8 @@ def test_lightning_resume_from_checkpoint(tmp_path):
     from torch.utils.data import DataLoader
 
     clips = [_make_clip(50) for _ in range(8)]
-    ds = RefinerDataset(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
-                         full_plan_ratio=1.0, seed=0)
+    ds = HumanML3DRefinerDataset(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
+                                  full_plan_ratio=1.0, seed=0)
     loader = DataLoader(ds, batch_size=4, shuffle=True, collate_fn=refiner_collate,
                          drop_last=True)
     module = RefinerLightningModule(_tiny_cfg())

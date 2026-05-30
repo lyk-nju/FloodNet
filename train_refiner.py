@@ -1,9 +1,9 @@
 """Standalone Lightning training script for RootRefiner (T_A_08).
 
-Fully decoupled from train_ldf.py. Trains the Refiner on RefinerDataset samples
-with a 6-term loss:
+Fully decoupled from train_ldf.py. Trains the Refiner on HumanML3DRefinerDataset
+samples with a duration / waypoint / path-control loss:
     num_token (CE) + xyz (SmoothL1) + heading (cosine) + fwd_delta (SmoothL1)
-    + yaw_delta (SmoothL1) + smoothness (2nd-order-diff L2)
+    + yaw_delta (SmoothL1) + path_control + smoothness (2nd-order-diff L2)
 
 loss dict keys are aligned field-by-field with configs/root_refiner.yaml's
 loss_weights (round 6 P1-4 / P1-6: keys are fwd_delta / yaw_delta / smoothness;
@@ -32,62 +32,28 @@ import lightning.pytorch as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
 from torch.utils.data import DataLoader
 
 _REPO_ROOT = Path(__file__).resolve().parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from datasets.humanml3d_refiner import refiner_collate  # noqa: E402
 from models.root_refiner import RootRefiner   # noqa: E402
+from utils.refiner.config_validate import validate_refiner_config  # noqa: E402
+from utils.refiner.losses import (  # noqa: E402
+    dense_path_control_loss,
+    goal_point_control_loss,
+    masked_mean,
+    second_order_diff_l2,
+    smooth_l1_masked,
+    sparse_path_control_loss,
+)
 from utils.text_encoder_resolver import resolve_text_encoder  # noqa: E402
 # Re-exported for backward-compatible `from train_refiner import FrozenStubTextEncoder`.
 from utils.text_encoder_resolver import FrozenStubTextEncoder  # noqa: E402,F401
 
 log = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Masked loss helpers
-# ---------------------------------------------------------------------------
-
-
-def smooth_l1_masked(pred: Tensor, gt: Tensor, mask: Tensor) -> Tensor:
-    """SmoothL1 over valid frames. pred/gt: [B, T, C]; mask: [B, T] bool.
-    Returns scalar; 0 when no valid frames."""
-    mask_f = mask.unsqueeze(-1).to(pred.dtype)              # [B, T, 1]
-    denom = mask_f.sum() * pred.shape[-1]
-    if denom <= 0:
-        return pred.new_zeros(())
-    diff = F.smooth_l1_loss(pred, gt, reduction="none") * mask_f
-    return diff.sum() / denom
-
-
-def masked_mean(values: Tensor, mask: Tensor) -> Tensor:
-    """Mean of `values` [B, T] over valid positions. 0 when no valid frames."""
-    mask_f = mask.to(values.dtype)
-    denom = mask_f.sum()
-    if denom <= 0:
-        return values.new_zeros(())
-    return (values * mask_f).sum() / denom
-
-
-def second_order_diff_l2(values: Tensor, mask: Tensor) -> Tensor:
-    """L2 on 2nd-order frame differences of `values` [B, T, C], masked.
-
-    diff[t] = values[t] - 2*values[t-1] + values[t-2]; only counted where all
-    three frames (t, t-1, t-2) are valid. Returns 0 when fewer than 3 frames
-    or no valid triples.
-    """
-    if values.shape[1] < 3:
-        return values.new_zeros(())
-    diff = values[:, 2:] - 2 * values[:, 1:-1] + values[:, :-2]       # [B, T-2, C]
-    valid = (mask[:, 2:] & mask[:, 1:-1] & mask[:, :-2])              # [B, T-2]
-    valid_f = valid.unsqueeze(-1).to(values.dtype)
-    denom = valid_f.sum() * values.shape[-1]
-    if denom <= 0:
-        return values.new_zeros(())
-    return ((diff ** 2) * valid_f).sum() / denom
 
 
 # ---------------------------------------------------------------------------
@@ -100,23 +66,6 @@ def second_order_diff_l2(values: Tensor, mask: Tensor) -> Tensor:
 
 
 # ---------------------------------------------------------------------------
-# Collate
-# ---------------------------------------------------------------------------
-
-
-def refiner_collate(batch: list[dict]) -> dict:
-    """Stack RefinerDataset dict samples into a batch (text stays a list)."""
-    out = {
-        "text": [s["text"] for s in batch],
-        "mode": [s["mode"] for s in batch],
-    }
-    for key in ("xz_path", "path_mask", "path_stats", "current_motion",
-                 "history_mask", "target_waypoints", "target_mask", "num_tokens"):
-        out[key] = torch.stack([s[key] for s in batch])
-    return out
-
-
-# ---------------------------------------------------------------------------
 # Lightning module
 # ---------------------------------------------------------------------------
 
@@ -124,6 +73,7 @@ def refiner_collate(batch: list[dict]) -> dict:
 class RefinerLightningModule(pl.LightningModule):
     def __init__(self, cfg: dict, text_encoder: nn.Module | None = None):
         super().__init__()
+        validate_refiner_config(cfg)
         self.cfg = cfg
         model_cfg = dict(cfg["model"])
         self.refiner = RootRefiner(**model_cfg)
@@ -146,23 +96,36 @@ class RefinerLightningModule(pl.LightningModule):
 
     # ------------------------------------------------------------------
 
-    def forward(self, batch: dict) -> dict:
+    def forward(self, batch: dict, *, duration_mode: str = "groundtruth_duration") -> dict:
+        if duration_mode not in {"groundtruth_duration", "pred_duration"}:
+            raise ValueError(
+                "duration_mode must be 'groundtruth_duration' or 'pred_duration', "
+                f"got {duration_mode!r}."
+            )
         text_emb = self.text_encoder.encode(batch["text"], device=self.device)
+        path = batch.get("path", batch.get("xz_path"))
+        path_valid_mask = batch.get("path_valid_mask", batch.get("path_mask"))
+        path_features = batch.get("path_features", batch.get("path_stats"))
+        history_motion = batch.get("history_motion", batch.get("current_motion"))
+        num_tokens = batch.get("num_tokens") if duration_mode == "groundtruth_duration" else None
         return self.refiner(
             text_emb=text_emb,
-            xz_path=batch["xz_path"],
-            path_mask=batch["path_mask"],
-            path_stats=batch["path_stats"],
-            current_motion=batch["current_motion"],
+            path=path,
+            path_valid_mask=path_valid_mask,
+            path_control_mask=batch.get("path_control_mask"),
+            path_features=path_features,
+            history_motion=history_motion,
             history_mask=batch["history_mask"],
             # Teacher-force the horizon with GT num_tokens during training; the
             # model falls back to its own argmax at eval / when absent.
-            num_tokens=batch.get("num_tokens"),
+            num_tokens=num_tokens,
         )
 
     def _compute_loss(self, out: dict, batch: dict) -> dict:
-        target_wp = batch["target_waypoints"]
-        target_mask = batch["target_mask"]
+        target_wp = batch.get("waypoints")
+        if target_wp is None:
+            target_wp = batch["target_waypoints"][..., :5]
+        target_mask = batch.get("waypoints_mask", batch.get("target_mask"))
 
         # num_token CE: target class = num_tokens - min_tokens (NO silent clamp).
         # An out-of-range target means a config/data mismatch; F.cross_entropy
@@ -226,6 +189,8 @@ class RefinerLightningModule(pl.LightningModule):
         # smoothness L2 on 2nd-order diff of pred deltas (same-space).
         L_smooth = second_order_diff_l2(pred_delta, delta_mask)
 
+        L_path_control = self._compute_path_control_loss(out, batch, target_mask)
+
         w = self.loss_weights
         loss = (
             w.get("num_token", 1.0) * L_num
@@ -234,6 +199,7 @@ class RefinerLightningModule(pl.LightningModule):
             + w.get("heading", 1.0) * L_head
             + w.get("fwd_delta", 0.5) * L_fwd_delta
             + w.get("yaw_delta", 0.5) * L_yaw_delta
+            + w.get("path_control", 0.0) * L_path_control
             + w.get("smoothness", 0.0) * L_smooth
         )
         # num_token diagnostics (NOT part of the weighted loss): exact / ±1 / ±2
@@ -252,6 +218,7 @@ class RefinerLightningModule(pl.LightningModule):
             "heading": L_head,
             "fwd_delta": L_fwd_delta,
             "yaw_delta": L_yaw_delta,
+            "path_control": L_path_control,
             "smoothness": L_smooth,
             "num_token_acc": (err == 0).float().mean(),
             "num_token_acc_pm1": (err <= 1).float().mean(),
@@ -260,6 +227,65 @@ class RefinerLightningModule(pl.LightningModule):
             "num_token_soft_mae": soft_err.mean(),
         }
         return out_losses
+
+    def _compute_path_control_loss(self, out: dict, batch: dict, target_mask: torch.Tensor) -> torch.Tensor:
+        if "path" not in batch or "path_control_mask" not in batch:
+            return out["waypoints"].new_zeros(())
+
+        path_modes = batch.get("path_mode")
+        if path_modes is None:
+            path_modes = ["dense_path"] * out["waypoints"].shape[0]
+        offset_start_frames = batch.get("offset_start_frames")
+        if offset_start_frames is None:
+            offset_start_frames = torch.zeros(
+                out["waypoints"].shape[0],
+                dtype=torch.long,
+                device=out["waypoints"].device,
+            )
+        else:
+            offset_start_frames = offset_start_frames.to(out["waypoints"].device)
+
+        losses = []
+        for mode in ("dense_path", "sparse_path", "goal_point"):
+            idx = [i for i, sample_mode in enumerate(path_modes) if sample_mode == mode]
+            if not idx:
+                continue
+            index = torch.as_tensor(idx, dtype=torch.long, device=out["waypoints"].device)
+            pred = out["waypoints"].index_select(0, index)
+            path = batch["path"].to(out["waypoints"].device).index_select(0, index)
+            control = batch["path_control_mask"].to(out["waypoints"].device).index_select(0, index)
+            if mode == "dense_path":
+                supervision = batch.get("path_supervision_mask", target_mask)
+                losses.append(
+                    dense_path_control_loss(
+                        pred,
+                        path,
+                        supervision.to(out["waypoints"].device).index_select(0, index),
+                    )
+                )
+            elif mode == "sparse_path":
+                supervision = batch.get("path_supervision_mask", target_mask)
+                losses.append(
+                    sparse_path_control_loss(
+                        pred,
+                        path,
+                        control,
+                        supervision.to(out["waypoints"].device).index_select(0, index),
+                        offset_start_frames.index_select(0, index),
+                    )
+                )
+            else:
+                losses.append(
+                    goal_point_control_loss(
+                        pred,
+                        target_mask.to(out["waypoints"].device).index_select(0, index),
+                        path,
+                        control,
+                    )
+                )
+        if not losses:
+            return out["waypoints"].new_zeros(())
+        return torch.stack(losses).mean()
 
     # Logged-only diagnostic keys (everything else returned by _compute_loss is a
     # weighted loss term with a matching loss_weights entry).
@@ -297,11 +323,25 @@ class RefinerLightningModule(pl.LightningModule):
         return loss
 
     def validation_step(self, batch: dict, batch_idx: int):
-        out = self(batch)
-        losses = self._compute_loss(out, batch)
-        for k, v in losses.items():
-            self.log(f"val/{k}", v, prog_bar=(k == "loss"), on_step=False, on_epoch=True)
-        return losses["loss"]
+        modes = (self.cfg.get("validation") or {}).get(
+            "eval_modes",
+            ["groundtruth_duration", "pred_duration"],
+        )
+        first_loss = None
+        for mode in modes:
+            out = self(batch, duration_mode=mode)
+            losses = self._compute_loss(out, batch)
+            if first_loss is None:
+                first_loss = losses["loss"]
+            for k, v in losses.items():
+                self.log(
+                    f"val_{mode}/{k}",
+                    v,
+                    prog_bar=(k == "loss" and mode == "groundtruth_duration"),
+                    on_step=False,
+                    on_epoch=True,
+                )
+        return first_loss
 
     def configure_optimizers(self):
         tr = self.cfg.get("training", {})
@@ -584,7 +624,7 @@ def safe_precision(accelerator: str, precision, *, cuda_available: bool):
 def _build_one_dataset(cfg: dict, split_file: str, *, seed: int | None = None,
                        randomize_caption: bool = True):
     """Build a single RefinerDataset for a given split using the real loader."""
-    from datasets.refiner_dataset import RefinerDataset
+    from datasets.humanml3d_refiner import HumanML3DRefinerDataset
     from scripts.compute_5d_stats import load_clips_from_dir
 
     data_cfg = cfg.get("data", {})
@@ -607,10 +647,11 @@ def _build_one_dataset(cfg: dict, split_file: str, *, seed: int | None = None,
         text_path=data_cfg.get("text_path"),
     )
     model_cfg = cfg["model"]
-    # P1-2: path-augmentation params from config (so R0-R4 ablations are
-    # reproducible). Fall back to the dataset defaults when absent.
-    aug_kwargs = path_aug_kwargs(cfg)
-    return RefinerDataset(
+    sampling_cfg = cfg.get("sampling") or {}
+    path_condition_cfg = (sampling_cfg.get("path_condition") or {})
+    offset_cfg = (path_condition_cfg.get("offset_start") or {})
+    sparse_cfg = (path_condition_cfg.get("sparse_path") or {})
+    return HumanML3DRefinerDataset(
         clips,
         n_hist=model_cfg["n_hist"],
         n_path=model_cfg["n_path"],
@@ -618,12 +659,18 @@ def _build_one_dataset(cfg: dict, split_file: str, *, seed: int | None = None,
         min_tokens=model_cfg["min_tokens"],
         frames_per_token=model_cfg["frames_per_token"],
         full_plan_ratio=cfg.get("training", {}).get("sampling_mode_full_ratio", 0.5),
-        num_token_policy=data_cfg.get("num_token_policy", "random"),
+        horizon_policy=sampling_cfg.get("horizon_policy", "random"),
+        path_condition_policy=path_condition_cfg.get("policy", "dense_path"),
+        path_condition_ratios=path_condition_cfg.get("ratios"),
+        offset_start_enabled=bool(offset_cfg.get("enabled", False)),
+        offset_start_prob=float(offset_cfg.get("prob", 0.0)),
+        offset_start_max_frames=int(offset_cfg.get("max_frames", 40)),
+        offset_start_apply_to=tuple(offset_cfg.get("apply_to", ("dense_path", "sparse_path"))),
+        sparse_path_point_range=tuple(sparse_cfg.get("point_range", (3, 8))),
         normalize=normalize,
         stats_dir=stats_dir if normalize else None,
         seed=seed,
         randomize_caption=randomize_caption,
-        **aug_kwargs,
     )
 
 
@@ -753,6 +800,7 @@ def main(argv=None):
     # A-P0-1: resolve ${data.raw_data_dir}, ${wandb_info.*} etc. AFTER overrides so
     # e.g. text_encoder.precomputed_text_emb_path and logger.wandb become real values.
     cfg = resolve_cfg_interpolations(cfg)
+    validate_refiner_config(cfg)
     # Scrub the resolved WandB API key out of cfg (it came from ${wandb_info.key})
     # BEFORE it can be captured by RefinerLightningModule.save_hyperparameters or
     # logged into the wandb run config. Keep it only in a local for the logger.
@@ -782,7 +830,7 @@ def main(argv=None):
     train_ds, val_ds = build_datasets(cfg, seed=seed)
     train_ds, val_ds = apply_fixed_overfit_datasets(train_ds, val_ds, cfg)
     train_ds, val_ds = apply_default_fixed_validation_dataset(train_ds, val_ds)
-    from datasets.refiner_dataset import refiner_worker_init_fn
+    from datasets.humanml3d_refiner import refiner_worker_init_fn
     train_loader = DataLoader(
         train_ds,
         batch_size=train_cfg.get("batch_size", 64),

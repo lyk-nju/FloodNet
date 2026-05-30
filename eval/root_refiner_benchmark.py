@@ -309,7 +309,7 @@ def main(argv=None):
 
     import yaml
 
-    from datasets.refiner_dataset import RefinerDataset
+    from datasets.humanml3d_refiner import HumanML3DRefinerDataset as RefinerDataset
     from scripts.compute_5d_stats import load_clips_from_dir
 
     from train_refiner import resolve_cfg_interpolations

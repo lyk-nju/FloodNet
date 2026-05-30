@@ -1,0 +1,90 @@
+from __future__ import annotations
+
+import types
+
+import torch
+
+from train_refiner import RefinerLightningModule
+
+
+def _cfg() -> dict:
+    return {
+        "model": {
+            "d_model": 32,
+            "n_layers": 2,
+            "n_heads": 4,
+            "ff_dim": 64,
+            "max_tokens": 8,
+            "min_tokens": 2,
+            "frames_per_token": 4,
+            "n_path": 16,
+            "n_hist": 8,
+            "text_emb_dim": 16,
+            "path_features_dim": 5,
+            "dropout": 0.0,
+        },
+        "training": {"lr": 1e-3, "weight_decay": 0.01},
+        "validation": {
+            "eval_modes": ["groundtruth_duration", "pred_duration"],
+        },
+        "loss": {"heading_form": "cosine"},
+        "loss_weights": {
+            "num_token": 1.0,
+            "num_token_soft": 0.1,
+            "xyz": 5.0,
+            "heading": 1.0,
+            "fwd_delta": 0.5,
+            "yaw_delta": 0.5,
+            "path_control": 0.0,
+            "smoothness": 0.0,
+        },
+        "text_encoder": {"debug_stub": True},
+    }
+
+
+def _batch(module: RefinerLightningModule, B: int = 2) -> dict:
+    g = torch.Generator().manual_seed(123)
+    m = module.refiner
+    waypoints = torch.zeros(B, m.max_frames, 5)
+    waypoints[..., 3] = 1.0
+    return {
+        "text": ["walk"] * B,
+        "path_mode": ["dense_path"] * B,
+        "path": torch.randn(B, m.n_path, 2, generator=g),
+        "path_valid_mask": torch.ones(B, m.n_path, dtype=torch.bool),
+        "path_control_mask": torch.ones(B, m.n_path, dtype=torch.bool),
+        "path_features": torch.randn(B, 5, generator=g),
+        "history_motion": torch.randn(B, m.n_hist, 5, generator=g),
+        "history_mask": torch.ones(B, m.n_hist, dtype=torch.bool),
+        "waypoints": waypoints,
+        "waypoints_mask": torch.ones(B, m.max_frames, dtype=torch.bool),
+        "path_supervision_mask": torch.ones(B, m.max_frames, dtype=torch.bool),
+        "offset_start_frames": torch.zeros(B, dtype=torch.long),
+        "num_tokens": torch.tensor([3, 5]),
+    }
+
+
+def test_forward_duration_modes_choose_gt_or_predicted_horizon():
+    module = RefinerLightningModule(_cfg())
+    batch = _batch(module)
+
+    gt_out = module(batch, duration_mode="groundtruth_duration")
+    pred_out = module(batch, duration_mode="pred_duration")
+
+    assert torch.equal(gt_out["used_num_tokens"], batch["num_tokens"])
+    assert torch.equal(pred_out["used_num_tokens"], pred_out["pred_num_tokens"])
+
+
+def test_validation_step_logs_groundtruth_and_pred_duration_prefixes():
+    module = RefinerLightningModule(_cfg())
+    batch = _batch(module)
+    logged = {}
+    module.log = types.MethodType(
+        lambda self, key, value, **kwargs: logged.__setitem__(key, value),
+        module,
+    )
+
+    module.validation_step(batch, 0)
+
+    assert "val_groundtruth_duration/loss" in logged
+    assert "val_pred_duration/loss" in logged

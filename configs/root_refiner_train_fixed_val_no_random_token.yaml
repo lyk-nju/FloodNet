@@ -12,8 +12,8 @@ exp_name: root_refiner_fixed_val_no_random_token
 save_dir: ./outputs/root_refiner_fixed_val_no_random_token
 resume_ckpt:
 
-data:
-  num_token_policy: max
+sampling:
+  horizon_policy: max
 
 fixed_overfit:
   enabled: false

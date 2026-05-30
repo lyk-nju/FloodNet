@@ -455,7 +455,20 @@ def test_returned_dict_has_required_keys_and_shapes():
         "history_mask", "target_waypoints", "target_mask", "num_tokens", "mode",
         "anchor_frame", "anchor_xz_world", "anchor_yaw_world",
     }
-    assert set(s.keys()) == expected_keys
+    assert expected_keys.issubset(s.keys())
+    new_keys = {
+        "path",
+        "path_valid_mask",
+        "path_control_mask",
+        "path_features",
+        "path_mode",
+        "history_motion",
+        "waypoints",
+        "waypoints_mask",
+        "path_supervision_mask",
+        "offset_start_frames",
+    }
+    assert new_keys.issubset(s.keys())
     assert s["xz_path"].shape == (64, 2)
     assert s["path_mask"].shape == (64,)
     assert s["current_motion"].shape == (20, 5)
