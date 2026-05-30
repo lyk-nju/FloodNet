@@ -30,8 +30,6 @@ def test_fixed_refiner_samples_are_repeatable_even_when_source_is_random():
     source = RefinerDataset(
         [_clip(T=90), _clip(T=100, text="turn left")],
         full_plan_ratio=0.5,
-        path_trim_prob=0.5,
-        path_sparse_prob=0.5,
         seed=123,
     )
     fixed = FixedRefinerSampleDataset(
@@ -56,8 +54,8 @@ def test_fixed_refiner_dataset_returns_clones_not_cached_tensors():
     fixed = FixedRefinerSampleDataset([sample])
 
     a = fixed[0]
-    a["xz_path"].add_(100.0)
+    a["path"].add_(100.0)
     b = fixed[0]
 
-    assert not torch.equal(a["xz_path"], b["xz_path"])
-    assert torch.equal(b["xz_path"], sample["xz_path"])
+    assert not torch.equal(a["path"], b["path"])
+    assert torch.equal(b["path"], sample["path"])

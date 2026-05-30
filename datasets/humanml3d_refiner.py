@@ -25,7 +25,6 @@ from utils.local_frame import (
     root_quat_to_physical_yaw,
 )
 from utils.motion_process import recover_root_rot_pos, root_to_traj_feats_7d
-from utils.path_arclength import arclength_resample
 from utils.token_frame import num_frames_for_tokens
 
 log = logging.getLogger(__name__)
@@ -33,45 +32,6 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _sparse_sample_arclength(points_xz: Tensor, K: int) -> Tensor:
-    """Pick K points from `points_xz` keeping start + end + (K-2) middles
-    spaced by arclength. K must satisfy 2 <= K <= len(points_xz).
-    """
-    M = points_xz.shape[0]
-    if K >= M:
-        return points_xz.clone()
-    if K <= 2:
-        # endpoints only
-        return torch.stack([points_xz[0], points_xz[-1]], dim=0)
-    # Cumulative arclength
-    seg = points_xz[1:] - points_xz[:-1]
-    seg_len = seg.norm(dim=-1)
-    cum = torch.cat([torch.zeros(1, device=points_xz.device, dtype=points_xz.dtype),
-                       torch.cumsum(seg_len, dim=0)])
-    total = float(cum[-1].item())
-    if total < 1e-9:
-        # degenerate: just stride-pick
-        idxs = torch.linspace(0, M - 1, K).round().long()
-        return points_xz[idxs]
-    # Target arclengths for K samples, including endpoints
-    targets = torch.linspace(0.0, total, K, device=points_xz.device, dtype=points_xz.dtype)
-    # Find for each target the nearest cum index (using searchsorted, then
-    # snap to nearest point to keep them as actual input points).
-    idxs = torch.searchsorted(cum, targets).clamp(max=M - 1)
-    # Deduplicate while preserving order; ensure start and end present.
-    seen, dedup = set(), []
-    for v in idxs.tolist():
-        if v not in seen:
-            seen.add(v)
-            dedup.append(v)
-    if 0 not in seen:
-        dedup.insert(0, 0)
-    if M - 1 not in seen:
-        dedup.append(M - 1)
-    dedup = sorted(set(dedup))
-    return points_xz[dedup]
 
 
 def _pad_or_truncate(x: Tensor, target_len: int) -> Tensor:
@@ -104,8 +64,6 @@ class RefinerDataset(Dataset):
     n_hist, n_path, max_tokens, min_tokens, frames_per_token :
         Model-side schema constants; match `configs/root_refiner.yaml`.
     full_plan_ratio : probability of choosing full mode (when sliding-eligible).
-    path_trim_prob / path_trim_max_frames : random trim aug on path input.
-    path_sparse_prob / path_sparse_range : random sparse aug on path input.
     normalize : if True, apply selective z-score using `stats_dir`'s mean/std
         and `*_norm_indices.npy` files; if False, raw values are returned
         (T_A_06 stats computation uses normalize=False to avoid double-norm).
@@ -125,10 +83,6 @@ class RefinerDataset(Dataset):
         min_tokens: int = 4,
         frames_per_token: int = 4,
         full_plan_ratio: float = 0.5,
-        path_trim_prob: float = 0.3,
-        path_trim_max_frames: int = 10,
-        path_sparse_prob: float = 0.5,
-        path_sparse_range: tuple[int, int] = (3, 8),
         num_token_policy: str = "random",
         normalize: bool = False,
         stats_dir: str | os.PathLike | None = None,
@@ -142,10 +96,6 @@ class RefinerDataset(Dataset):
         self.min_tokens = min_tokens
         self.frames_per_token = frames_per_token
         self.full_plan_ratio = full_plan_ratio
-        self.path_trim_prob = path_trim_prob
-        self.path_trim_max_frames = path_trim_max_frames
-        self.path_sparse_prob = path_sparse_prob
-        self.path_sparse_range = path_sparse_range
         self.num_token_policy = str(num_token_policy)
         self.normalize = normalize
         # When False (e.g. validation / benchmark), always use the first caption
@@ -502,48 +452,6 @@ class RefinerDataset(Dataset):
         target_mask = torch.zeros(max_frames, dtype=torch.bool)
         target_mask[:target_frame_count] = True
 
-        # Step 5: path input construction.
-        dense_path_local = target_local[:target_frame_count, [0, 2]]   # first point = (0, 0)
-
-        do_aug = not force_no_path_aug
-        # Trim aug.
-        if do_aug and self._rng.random() < self.path_trim_prob:
-            max_trim = min(self.path_trim_max_frames, dense_path_local.shape[0] - 2)
-            trim_frames = self._rng.randint(0, max(0, max_trim))
-            user_path_source = dense_path_local[trim_frames:]
-        else:
-            user_path_source = dense_path_local
-        if user_path_source.shape[0] < 2:
-            user_path_source = dense_path_local   # fallback
-
-        # Sparse aug.
-        if do_aug and self._rng.random() < self.path_sparse_prob:
-            K = self._rng.randint(*self.path_sparse_range)
-            K = max(2, min(K, user_path_source.shape[0]))
-            control_points = _sparse_sample_arclength(user_path_source, K)
-        else:
-            control_points = user_path_source
-
-        path_start_gap = float(user_path_source[0].norm().item())
-
-        # Prepend synthetic anchor (0, 0).
-        zero_pt = control_points.new_zeros(1, 2)
-        control_points = torch.cat([zero_pt, control_points], dim=0)
-
-        # Arclength resample to N_path.
-        cp_np = control_points.detach().cpu().numpy().astype(np.float64)
-        arc = arclength_resample(cp_np, n_points=self.n_path)
-        xz_path = torch.as_tensor(arc.points_xz, dtype=torch.float32)
-        # arc.points_xz[0] is the prepended (0, 0) when control_points is non-degenerate.
-        path_mask = torch.as_tensor(arc.mask, dtype=torch.bool)
-        path_length = float(arc.total_length)
-        chord_length = float(torch.tensor(
-            arc.points_xz[-1] - arc.points_xz[0], dtype=torch.float64,
-        ).norm().item())
-        path_stats = torch.tensor(
-            [path_length, path_start_gap, chord_length], dtype=torch.float32,
-        )
-
         # Step 6: optional z-score (selective).
         if self.normalize:
             current_motion = self._apply_zscore(
@@ -552,21 +460,9 @@ class RefinerDataset(Dataset):
             target_waypoints = self._apply_zscore(
                 target_waypoints, self._wp_mean, self._wp_std, self._wp_norm_idx,
             )
-            # Path xz uses waypoint xz mean/std (indices 0, 2 of waypoint_norm_indices
-            # are x and z). Apply same z-score per axis.
-            if (self._wp_mean is not None and self._wp_std is not None
-                    and self._wp_norm_idx is not None):
-                idx_set = set(self._wp_norm_idx.tolist())
-                if 0 in idx_set:
-                    xz_path[..., 0] = (xz_path[..., 0] - self._wp_mean[0]) / self._wp_std[0]
-                if 2 in idx_set:
-                    xz_path[..., 1] = (xz_path[..., 1] - self._wp_mean[2]) / self._wp_std[2]
 
         return {
             "text": text,
-            "xz_path": xz_path,                                         # [N_path, 2]
-            "path_mask": path_mask,                                     # [N_path]
-            "path_stats": path_stats,                                   # [3]
             "current_motion": current_motion,                           # [n_hist, 5]
             "history_mask": history_mask,                               # [n_hist]
             "target_waypoints": target_waypoints,                       # [max_frames, 7]
@@ -642,8 +538,7 @@ class HumanML3DRefinerDataset(RefinerDataset):
 
     def _zscore_path_xz(self, path_xz: torch.Tensor) -> torch.Tensor:
         """Z-score path geometry [N, 2] with the WAYPOINT x/z stats (indices 0,2),
-        mirroring the base dataset's xz_path normalization so path tokens match
-        the z-scored waypoints used by the control loss."""
+        so path tokens match the z-scored waypoints used by the control loss."""
         wp_mean, wp_std = self._wp_mean, self._wp_std
         wp_idx = self._wp_norm_idx
         if wp_mean is None or wp_std is None or wp_idx is None:

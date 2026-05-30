@@ -439,24 +439,6 @@ def resolve_cfg_interpolations(cfg: dict) -> dict:
     return resolved
 
 
-def path_aug_kwargs(cfg: dict) -> dict:
-    """Map cfg.path_aug → RefinerDataset path-augmentation kwargs (P1-2).
-
-    Absent keys are omitted so the dataset's own defaults apply.
-    """
-    aug = cfg.get("path_aug", {}) or {}
-    kwargs = {}
-    if "trim_prob" in aug:
-        kwargs["path_trim_prob"] = float(aug["trim_prob"])
-    if "trim_max_frames" in aug:
-        kwargs["path_trim_max_frames"] = int(aug["trim_max_frames"])
-    if "sparse_prob" in aug:
-        kwargs["path_sparse_prob"] = float(aug["sparse_prob"])
-    if "sparse_range" in aug:
-        kwargs["path_sparse_range"] = tuple(aug["sparse_range"])
-    return kwargs
-
-
 # ---------------------------------------------------------------------------
 # Run config: seed / resume / wandb / checkpoint (parity with train_ldf.py)
 # ---------------------------------------------------------------------------

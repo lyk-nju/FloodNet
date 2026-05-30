@@ -81,7 +81,7 @@ def test_apply_fixed_overfit_replaces_train_and_val_with_cached_samples():
     assert isinstance(val_ds, FixedRefinerSampleDataset)
     assert len(train_ds) == 3
     assert len(val_ds) == 3
-    assert torch.equal(train_ds[0]["xz_path"], train_ds[0]["xz_path"])
+    assert torch.equal(train_ds[0]["path"], train_ds[0]["path"])
 
 
 def test_apply_default_fixed_validation_replaces_only_val_with_all_samples():
@@ -95,7 +95,7 @@ def test_apply_default_fixed_validation_replaces_only_val_with_all_samples():
     assert train_ds is train_source
     assert isinstance(val_ds, FixedRefinerSampleDataset)
     assert len(val_ds) == len(val_source)
-    assert torch.equal(val_ds[0]["xz_path"], val_ds[0]["xz_path"])
+    assert torch.equal(val_ds[0]["path"], val_ds[0]["path"])
 
 
 # ---------------------------------------------------------------------------

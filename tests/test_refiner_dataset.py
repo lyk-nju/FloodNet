@@ -262,78 +262,6 @@ def test_sliding_eligibility_split():
 # ---------------------------------------------------------------------------
 
 
-def test_T08_xz_path_starts_at_origin():
-    """xz_path[0] = (0, 0) due to synthetic anchor prepend."""
-    clip = _make_clip(T=80, local_vel_xz=(0.0, 0.1))
-    ds = RefinerDataset([clip], full_plan_ratio=1.0, seed=0)
-    s = ds.get_sample(0, force_mode="full", force_num_tokens=10,
-                       force_no_path_aug=True)
-    xz0 = s["xz_path"][0]
-    assert abs(xz0[0].item()) < 1e-4 and abs(xz0[1].item()) < 1e-4
-
-
-def test_T09_path_trim_aug_does_NOT_affect_target_waypoints():
-    """target_waypoints[0] is always anchor regardless of path trim."""
-    clip = _make_clip(T=80)
-    ds = RefinerDataset(
-        [clip],
-        full_plan_ratio=1.0,
-        path_trim_prob=1.0, path_trim_max_frames=5,
-        path_sparse_prob=0.0,
-        seed=42,
-    )
-    # Get sample with aug on
-    s_aug = ds.get_sample(0, force_mode="full", force_num_tokens=10)
-    # Get sample with aug off
-    s_no = ds.get_sample(0, force_mode="full", force_num_tokens=10,
-                          force_no_path_aug=True)
-    # target_waypoints[0] should be the same anchor frame either way.
-    assert torch.allclose(s_aug["target_waypoints"][0], s_no["target_waypoints"][0],
-                            atol=ATOL)
-
-
-def test_T10_path_sparse_fallback_short_path_does_not_crash():
-    """Short path: sparse sampling should clamp K and not crash."""
-    clip = _make_clip(T=20)
-    ds = RefinerDataset(
-        [clip],
-        full_plan_ratio=1.0,
-        path_trim_prob=1.0, path_trim_max_frames=15,
-        path_sparse_prob=1.0, path_sparse_range=(3, 8),
-        seed=1,
-    )
-    # force min num_tokens so target is short, exercising fallback paths
-    s = ds.get_sample(0, force_mode="full", force_num_tokens=4)
-    assert s["xz_path"].shape == (64, 2)
-    assert s["path_mask"].shape == (64,)
-
-
-def test_T11_path_mask_all_true_on_normal_path():
-    clip = _make_clip(T=80, local_vel_xz=(0.0, 0.1))
-    ds = RefinerDataset([clip], full_plan_ratio=1.0, seed=0)
-    s = ds.get_sample(0, force_mode="full", force_num_tokens=10,
-                       force_no_path_aug=True)
-    assert s["path_mask"].all()
-
-
-def test_T12_degenerate_path_zero_velocity_fallback_mask_zero():
-    """A clip with zero local velocity → path is all zeros after canonicalize
-    → arclength_resample falls back to degenerate (mask all False).
-    """
-    clip = _make_clip(T=80, local_vel_xz=(0.0, 0.0), rot_vel_t0=0.0)
-    ds = RefinerDataset([clip], full_plan_ratio=1.0, seed=0)
-    s = ds.get_sample(0, force_mode="full", force_num_tokens=10,
-                       force_no_path_aug=True)
-    # All target xz at origin → control_points all (0, 0) → degenerate.
-    # Path mask should be all False per arclength_resample's degenerate branch.
-    assert not s["path_mask"].any()
-
-
-# ---------------------------------------------------------------------------
-# T13: cos / sin channels not z-scored
-# ---------------------------------------------------------------------------
-
-
 def test_T13_cos_sin_invariant_under_selective_zscore(tmp_path):
     """When normalize=True with norm_indices excluding [3, 4], the cos/sin
     channels in current_motion and target_waypoints must equal their
@@ -451,7 +379,7 @@ def test_returned_dict_has_required_keys_and_shapes():
     s = ds.get_sample(0, force_mode="full", force_num_tokens=10,
                        force_no_path_aug=True)
     expected_keys = {
-        "text", "xz_path", "path_mask", "path_stats", "current_motion",
+        "text", "current_motion",
         "history_mask", "target_waypoints", "target_mask", "num_tokens", "mode",
         "anchor_frame", "anchor_xz_world", "anchor_yaw_world",
     }
@@ -469,15 +397,12 @@ def test_returned_dict_has_required_keys_and_shapes():
         "offset_start_frames",
     }
     assert new_keys.issubset(s.keys())
-    assert s["xz_path"].shape == (64, 2)
-    assert s["path_mask"].shape == (64,)
     assert s["current_motion"].shape == (20, 5)
     assert s["history_mask"].shape == (20,)
     assert s["target_waypoints"].shape == (num_frames_for_tokens(49), 7)
     assert s["target_mask"].shape == (num_frames_for_tokens(49),)
     assert s["history_mask"].dtype == torch.bool
     assert s["target_mask"].dtype == torch.bool
-    assert s["path_mask"].dtype == torch.bool
 
 
 def test_uniform_shape_between_full_and_sliding_modes():
@@ -489,7 +414,7 @@ def test_uniform_shape_between_full_and_sliding_modes():
                             force_no_path_aug=True)
     s_slide = ds.get_sample(0, force_mode="sliding", force_anchor_frame=30,
                               force_num_tokens=10, force_no_path_aug=True)
-    for key in ("xz_path", "path_mask", "current_motion", "history_mask",
+    for key in ("current_motion", "history_mask",
                  "target_waypoints", "target_mask"):
         assert s_full[key].shape == s_slide[key].shape, (
             f"{key} shape mismatch: full={s_full[key].shape} "

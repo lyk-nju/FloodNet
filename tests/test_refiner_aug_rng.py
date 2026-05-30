@@ -5,7 +5,6 @@ from __future__ import annotations
 import torch
 
 from datasets.humanml3d_refiner import HumanML3DRefinerDataset as RefinerDataset, refiner_worker_init_fn
-from train_refiner import path_aug_kwargs
 
 
 def _clip(T=40):
@@ -13,33 +12,6 @@ def _clip(T=40):
     m[:, 2] = 0.1   # small forward vel
     m[:, 3] = 1.0
     return {"motion_263": m, "text": "walk"}
-
-
-# ---------------------------------------------------------------------------
-# P1-2: cfg.path_aug → RefinerDataset kwargs
-# ---------------------------------------------------------------------------
-
-
-def test_path_aug_kwargs_maps_all_keys():
-    cfg = {"path_aug": {"trim_prob": 0.4, "trim_max_frames": 7,
-                        "sparse_prob": 0.6, "sparse_range": [2, 9]}}
-    kw = path_aug_kwargs(cfg)
-    assert kw == {
-        "path_trim_prob": 0.4, "path_trim_max_frames": 7,
-        "path_sparse_prob": 0.6, "path_sparse_range": (2, 9),
-    }
-
-
-def test_path_aug_kwargs_absent_returns_empty():
-    assert path_aug_kwargs({}) == {}
-
-
-def test_path_aug_kwargs_flow_into_dataset():
-    cfg = {"path_aug": {"trim_prob": 0.4, "sparse_range": [2, 9]}}
-    ds = RefinerDataset([_clip()], seed=0, **path_aug_kwargs(cfg))
-    assert ds.path_trim_prob == 0.4
-    assert ds.path_sparse_range == (2, 9)
-    assert ds.path_trim_max_frames == 10   # untouched → dataset default
 
 
 # ---------------------------------------------------------------------------
