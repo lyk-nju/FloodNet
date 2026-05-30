@@ -25,7 +25,7 @@ Architecture (redesigned — duration-first / trajectory-second):
       waypoints5 = frame_decoder(plan_token_hidden)    # [B, max_frames, 5] = [x,y,z,cos,sin]
       heading channels [3:5] L2-normalized.
     Why 5D output (not internal-7D append): the dataset z-scores xyz channels
-    (rule 7 in datasets/refiner_dataset.py) but cos/sin stay raw unit vectors.
+    (see datasets/humanml3d_refiner.py) but cos/sin stay raw unit vectors.
     Appending fwd_delta / yaw_delta inside the model — i.e. inside the
     normalized space — would emit deltas in NORMALIZED-xz units, while the
     GT delta channels are PHYSICAL-then-z-scored: scales and offsets do not
@@ -41,8 +41,7 @@ effective frame and tokens 1..N-1 as 4 frames each:
     waypoints = cat([dense[:, :1], dense[:, fpt:]], dim=1).
 
 Output keys: num_token_logits, expected_num_tokens, pred_num_tokens,
-used_num_tokens, waypoints. `chosen_num_tokens` is kept as a compatibility alias
-for older tests/scripts. Loss lives in train_refiner.py.
+used_num_tokens, waypoints. Loss lives in train_refiner.py.
 """
 
 from __future__ import annotations
@@ -104,10 +103,6 @@ class TokenToFrameDecoder(nn.Module):
         path=None,
         path_valid_mask=None,
         used_num_tokens=None,
-        # Legacy aliases.
-        xz_path=None,
-        path_mask=None,
-        chosen_num_tokens=None,
     ) -> Tensor:       # [B, N, D]
         h = token_hidden.transpose(1, 2)                 # [B, D, N]
         h = self.act(self.conv_in(h))
@@ -222,17 +217,7 @@ class PathCondFrameDecoder(nn.Module):
         path: Tensor | None = None,
         path_valid_mask: Tensor | None = None,
         used_num_tokens: Tensor | None = None,
-        # Legacy aliases.
-        xz_path: Tensor | None = None,
-        path_mask: Tensor | None = None,
-        chosen_num_tokens: Tensor | None = None,
     ) -> Tensor:
-        if path is None:
-            path = xz_path
-        if path_valid_mask is None:
-            path_valid_mask = path_mask
-        if used_num_tokens is None:
-            used_num_tokens = chosen_num_tokens
         if path is None or path_valid_mask is None or used_num_tokens is None:
             raise TypeError(
                 "PathCondFrameDecoder.forward requires path/path_valid_mask/"
@@ -288,8 +273,7 @@ class RootRefiner(nn.Module):
         n_path: int = 64,
         n_hist: int = 20,
         text_emb_dim: int = 512,
-        path_stats_dim: int = 3,
-        path_features_dim: int | None = None,
+        path_features_dim: int = 5,
         norm_first: bool = True,
         n_layers_cond: int | None = None,
         n_layers_token: int | None = None,
@@ -316,10 +300,7 @@ class RootRefiner(nn.Module):
         self.n_path = n_path
         self.n_hist = n_hist
         self.text_emb_dim = text_emb_dim
-        if path_features_dim is not None:
-            path_stats_dim = path_features_dim
-        self.path_stats_dim = path_stats_dim
-        self.path_features_dim = path_stats_dim
+        self.path_features_dim = path_features_dim
         self.max_frames = num_frames_for_tokens(max_tokens, frames_per_token)
 
         # Split the layer budget into cond / token stages (backward compatible:
@@ -334,7 +315,7 @@ class RootRefiner(nn.Module):
         # Input projections (shared by the condition stage).
         self.text_proj = nn.Linear(text_emb_dim, d_model)
         self.path_proj = nn.Linear(2, d_model)
-        self.stats_proj = nn.Linear(path_stats_dim, d_model)
+        self.stats_proj = nn.Linear(path_features_dim, d_model)
         self.hist_proj = nn.Linear(5, d_model)
 
         self.cls_token = nn.Parameter(torch.zeros(d_model))
@@ -418,20 +399,7 @@ class RootRefiner(nn.Module):
         history_motion: Tensor | None = None,   # [B, n_hist, 5]
         history_mask: Tensor | None = None,     # [B, n_hist] bool (True = valid)
         num_tokens: Tensor | None = None,   # [B] long GT horizon → teacher-force when given (train/val/oracle); argmax when None
-        # Legacy aliases.
-        xz_path: Tensor | None = None,
-        path_mask: Tensor | None = None,
-        path_stats: Tensor | None = None,
-        current_motion: Tensor | None = None,
     ) -> dict[str, Tensor]:
-        if path is None:
-            path = xz_path
-        if path_valid_mask is None:
-            path_valid_mask = path_mask
-        if path_features is None:
-            path_features = path_stats
-        if history_motion is None:
-            history_motion = current_motion
         if (
             path is None
             or path_valid_mask is None
@@ -441,8 +409,7 @@ class RootRefiner(nn.Module):
         ):
             raise TypeError(
                 "RootRefiner.forward requires path/path_valid_mask/path_features/"
-                "history_motion/history_mask "
-                "(or legacy xz_path/path_mask/path_stats/current_motion)"
+                "history_motion/history_mask"
             )
         B = text_emb.shape[0]
         device = text_emb.device
@@ -545,7 +512,6 @@ class RootRefiner(nn.Module):
             "pred_num_tokens": pred_num_tokens,
             "expected_num_tokens": expected_num_tokens,
             "used_num_tokens": used_num_tokens,
-            "chosen_num_tokens": used_num_tokens,
             "waypoints": waypoints,
         }
 

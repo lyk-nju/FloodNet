@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+import pytest
 
 from datasets.humanml3d_refiner import HumanML3DRefinerDataset
 from datasets.humanml3d_refiner import HumanML3DRefinerDataset as RefinerDataset
@@ -206,15 +207,36 @@ def _make_batch(module, B=2):
     return {
         "text": ["walk"] * B,
         "mode": ["full"] * B,
-        "xz_path": torch.randn(B, m.n_path, 2, generator=g),
-        "path_mask": torch.ones(B, m.n_path, dtype=torch.bool),
-        "path_stats": torch.randn(B, m.path_stats_dim, generator=g),
-        "current_motion": torch.randn(B, m.n_hist, 5, generator=g),
+        "path": torch.randn(B, m.n_path, 2, generator=g),
+        "path_valid_mask": torch.ones(B, m.n_path, dtype=torch.bool),
+        "path_features": torch.randn(B, m.path_features_dim, generator=g),
+        "history_motion": torch.randn(B, m.n_hist, 5, generator=g),
         "history_mask": torch.ones(B, m.n_hist, dtype=torch.bool),
         "target_waypoints": waypoints,
         "target_mask": torch.ones(B, m.max_frames, dtype=torch.bool),
         "num_tokens": torch.tensor([3, 5]),
     }
+
+
+def test_lightning_module_rejects_legacy_refiner_batch_keys():
+    module = RefinerLightningModule(_tiny_cfg())
+    batch = _make_batch(module)
+    path = batch.pop("path")
+    path_valid_mask = batch.pop("path_valid_mask")
+    path_features = batch.pop("path_features")
+    history_motion = batch.pop("history_motion")
+    legacy_batch = dict(batch)
+    legacy_batch.update(
+        {
+            "xz_path": path,
+            "path_mask": path_valid_mask,
+            "path_stats": path_features,
+            "current_motion": history_motion,
+        }
+    )
+
+    with pytest.raises(KeyError):
+        module(legacy_batch)
 
 
 def test_loss_dict_keys_match_config_weights_and_no_speed():

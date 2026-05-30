@@ -107,18 +107,14 @@ class RefinerLightningModule(pl.LightningModule):
                 f"got {duration_mode!r}."
             )
         text_emb = self.text_encoder.encode(batch["text"], device=self.device)
-        path = batch.get("path", batch.get("xz_path"))
-        path_valid_mask = batch.get("path_valid_mask", batch.get("path_mask"))
-        path_features = batch.get("path_features", batch.get("path_stats"))
-        history_motion = batch.get("history_motion", batch.get("current_motion"))
         num_tokens = batch.get("num_tokens") if duration_mode == "groundtruth_duration" else None
         return self.refiner(
             text_emb=text_emb,
-            path=path,
-            path_valid_mask=path_valid_mask,
+            path=batch["path"],
+            path_valid_mask=batch["path_valid_mask"],
             path_control_mask=batch.get("path_control_mask"),
-            path_features=path_features,
-            history_motion=history_motion,
+            path_features=batch["path_features"],
+            history_motion=batch["history_motion"],
             history_mask=batch["history_mask"],
             # Teacher-force the horizon with GT num_tokens during training; the
             # model falls back to its own argmax at eval / when absent.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import pytest
 
 from models.root_refiner import PathCondFrameDecoder, RootRefiner
 
@@ -49,6 +50,22 @@ def test_root_refiner_accepts_new_forward_contract_and_returns_used_tokens():
     assert torch.equal(out["used_num_tokens"], num_tokens)
     assert out["pred_num_tokens"].shape == (3,)
     assert out["waypoints"].shape == (3, model.max_frames, 5)
+
+
+def test_root_refiner_rejects_legacy_forward_aliases():
+    model = _model()
+    inputs = _inputs(model)
+    legacy_inputs = {
+        "text_emb": inputs["text_emb"],
+        "xz_path": inputs["path"],
+        "path_mask": inputs["path_valid_mask"],
+        "path_stats": inputs["path_features"],
+        "current_motion": inputs["history_motion"],
+        "history_mask": inputs["history_mask"],
+    }
+
+    with pytest.raises(TypeError, match="unexpected keyword argument 'xz_path'"):
+        model(**legacy_inputs)
 
 
 def test_root_refiner_inference_uses_predicted_duration():

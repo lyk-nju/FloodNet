@@ -160,7 +160,7 @@ def unnormalize_waypoints_5d(
     """Inverse z-score for the xyz channels (0, 1, 2) of a 5D waypoint tensor.
 
     cos / sin (channels 3, 4) are unit-vector invariant and intentionally NOT
-    z-scored at the dataset (rule 7 in datasets/refiner_dataset.py), so they
+    z-scored at the dataset (see datasets/humanml3d_refiner.py), so they
     pass through unchanged. If `wp_mean` or `wp_std` is None (normalize=False),
     returns `wp5` unchanged.
 

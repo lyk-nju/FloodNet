@@ -15,17 +15,17 @@ from utils.token_frame import num_frames_for_tokens
 def _make_inputs(model: RootRefiner, B: int = 2, *, seed: int = 0):
     g = torch.Generator().manual_seed(seed)
     text_emb = torch.randn(B, model.text_emb_dim, generator=g)
-    xz_path = torch.randn(B, model.n_path, 2, generator=g)
-    path_mask = torch.ones(B, model.n_path, dtype=torch.bool)
-    path_stats = torch.randn(B, model.path_stats_dim, generator=g)
-    current_motion = torch.randn(B, model.n_hist, 5, generator=g)
+    path = torch.randn(B, model.n_path, 2, generator=g)
+    path_valid_mask = torch.ones(B, model.n_path, dtype=torch.bool)
+    path_features = torch.randn(B, model.path_features_dim, generator=g)
+    history_motion = torch.randn(B, model.n_hist, 5, generator=g)
     history_mask = torch.ones(B, model.n_hist, dtype=torch.bool)
     return dict(
         text_emb=text_emb,
-        xz_path=xz_path,
-        path_mask=path_mask,
-        path_stats=path_stats,
-        current_motion=current_motion,
+        path=path,
+        path_valid_mask=path_valid_mask,
+        path_features=path_features,
+        history_motion=history_motion,
         history_mask=history_mask,
     )
 
@@ -64,17 +64,17 @@ def test_forward_with_and_without_num_tokens():
     out = model(**inputs, num_tokens=nt)
     assert out["num_token_logits"].shape == (3, K)
     assert out["waypoints"].shape == (3, Fm, 5)
-    assert torch.equal(out["chosen_num_tokens"], nt)   # teacher-forced horizon
+    assert torch.equal(out["used_num_tokens"], nt)   # teacher-forced horizon
 
     model.eval()
     out2 = model(**inputs)                              # no num_tokens → use pred
     assert out2["waypoints"].shape == (3, Fm, 5)
-    assert torch.equal(out2["chosen_num_tokens"], out2["pred_num_tokens"])
+    assert torch.equal(out2["used_num_tokens"], out2["pred_num_tokens"])
 
     # Teacher-forcing is gated on num_tokens PRESENCE, not train/eval mode: passing
     # num_tokens in eval() must still teacher-force (needed for val + oracle eval).
     out3 = model(**inputs, num_tokens=nt)
-    assert torch.equal(out3["chosen_num_tokens"], nt)
+    assert torch.equal(out3["used_num_tokens"], nt)
 
 
 def test_pred_num_tokens_in_range():
@@ -203,7 +203,7 @@ def test_path_cond_tangent_is_unit_or_zero():
 
 
 def test_invalid_tail_token_hidden_zeroed_before_decoder():
-    """Plan tokens past chosen_num_tokens must be ZEROED before the Conv1d frame
+    """Plan tokens past used_num_tokens must be ZEROED before the Conv1d frame
     decoder — otherwise the conv (kernel 3) mixes their garbage hiddens into the
     boundary VALID waypoints (cross-token leak)."""
     model = RootRefiner(d_model=64, n_layers=2, n_heads=4, ff_dim=128,
@@ -242,7 +242,7 @@ def test_T03_history_padding_does_not_leak_into_output():
     # Build a perturbed twin: same valid slot, but garbage in padding region.
     inputs_perturbed = {k: v.clone() if isinstance(v, torch.Tensor) else v
                          for k, v in inputs.items()}
-    inputs_perturbed["current_motion"][:, :-1] = torch.randn(
+    inputs_perturbed["history_motion"][:, :-1] = torch.randn(
         B, model.n_hist - 1, 5, generator=torch.Generator().manual_seed(99),
     ) * 100.0
     with torch.no_grad():
@@ -258,11 +258,11 @@ def test_T04_path_padding_does_not_leak_into_output():
     """Perturbing the padded path region:
     - num_token_logits is invariant for BOTH decoders (Stage-1 cond_transformer
       key-masks the padded path tokens).
-    - waypoints are invariant for the SIMPLE decoder (it never reads xz_path), but
-      the path_cond decoder INTENTIONALLY consumes the full xz_path geometry at
+    - waypoints are invariant for the SIMPLE decoder (it never reads path), but
+      the path_cond decoder INTENTIONALLY consumes the full path geometry at
       Stage 3, so its waypoints are NOT asserted invariant here. (In real data
-      path_mask is all-True for a valid path or whole-degenerate; a partial mask is
-      synthetic — the decoder only zeroes the cond when valid points < 2.)"""
+      path_valid_mask is all-True for a valid path or whole-degenerate; a partial
+      mask is synthetic — the decoder only zeroes the cond when valid points < 2.)"""
     for dt, waypoints_invariant in (("simple", True), ("path_cond", False)):
         torch.manual_seed(1)
         model = RootRefiner(d_model=64, n_layers=2, n_heads=4, ff_dim=128,
@@ -271,11 +271,11 @@ def test_T04_path_padding_does_not_leak_into_output():
         B = 2
         inputs = _make_inputs(model, B=B)
         half = model.n_path // 2
-        inputs["path_mask"] = torch.zeros(B, model.n_path, dtype=torch.bool)
-        inputs["path_mask"][:, :half] = True
+        inputs["path_valid_mask"] = torch.zeros(B, model.n_path, dtype=torch.bool)
+        inputs["path_valid_mask"][:, :half] = True
         inputs_perturbed = {k: v.clone() if isinstance(v, torch.Tensor) else v
                              for k, v in inputs.items()}
-        inputs_perturbed["xz_path"][:, half:] = torch.randn(
+        inputs_perturbed["path"][:, half:] = torch.randn(
             B, model.n_path - half, 2, generator=torch.Generator().manual_seed(123),
         ) * 100.0
         with torch.no_grad():
@@ -300,7 +300,7 @@ def test_T05_specials_and_queries_are_never_masked():
     model.eval()
     B = 1
     inputs = _make_inputs(model, B=B)
-    inputs["path_mask"] = torch.zeros(B, model.n_path, dtype=torch.bool)
+    inputs["path_valid_mask"] = torch.zeros(B, model.n_path, dtype=torch.bool)
     inputs["history_mask"] = torch.zeros(B, model.n_hist, dtype=torch.bool)
     with torch.no_grad():
         out = model(**inputs)
@@ -376,7 +376,7 @@ def test_T08_tiny_batch_overfit():
     model = RootRefiner(
         d_model=64, n_layers=2, n_heads=4, ff_dim=128,
         max_tokens=8, min_tokens=2, n_hist=8, n_path=16,
-        text_emb_dim=16, path_stats_dim=3, dropout=0.0,
+        text_emb_dim=16, path_features_dim=5, dropout=0.0,
     )
     model.train()
     B = 4
@@ -386,10 +386,10 @@ def test_T08_tiny_batch_overfit():
     g = torch.Generator().manual_seed(7)
     # Fixed batch (will be reused every step — true overfit setup).
     text_emb = torch.randn(B, model.text_emb_dim, generator=g)
-    xz_path = torch.randn(B, model.n_path, 2, generator=g)
-    path_mask = torch.ones(B, model.n_path, dtype=torch.bool)
-    path_stats = torch.randn(B, model.path_stats_dim, generator=g)
-    current_motion = torch.randn(B, model.n_hist, 5, generator=g)
+    path = torch.randn(B, model.n_path, 2, generator=g)
+    path_valid_mask = torch.ones(B, model.n_path, dtype=torch.bool)
+    path_features = torch.randn(B, model.path_features_dim, generator=g)
+    history_motion = torch.randn(B, model.n_hist, 5, generator=g)
     history_mask = torch.ones(B, model.n_hist, dtype=torch.bool)
 
     # Random but fixed targets — built as 5D (same as model output) so the
@@ -414,8 +414,8 @@ def test_T08_tiny_batch_overfit():
     n_steps = 200
     for step in range(n_steps):
         out = model(
-            text_emb=text_emb, xz_path=xz_path, path_mask=path_mask,
-            path_stats=path_stats, current_motion=current_motion,
+            text_emb=text_emb, path=path, path_valid_mask=path_valid_mask,
+            path_features=path_features, history_motion=history_motion,
             history_mask=history_mask, num_tokens=target_num_tokens,
         )
         # Loss: num_token CE + xyz SmoothL1 + heading cosine + same-space
@@ -451,8 +451,8 @@ def test_T08_tiny_batch_overfit():
     # Also check num_token argmax accuracy on the overfit batch.
     with torch.no_grad():
         pred_class = model(
-            text_emb=text_emb, xz_path=xz_path, path_mask=path_mask,
-            path_stats=path_stats, current_motion=current_motion,
+            text_emb=text_emb, path=path, path_valid_mask=path_valid_mask,
+            path_features=path_features, history_motion=history_motion,
             history_mask=history_mask,
         )["num_token_logits"].argmax(dim=-1)
     acc = (pred_class == target_num_tokens_class).float().mean().item()

@@ -1,4 +1,4 @@
-"""Unit tests for datasets/refiner_dataset.py (T_A_04).
+"""Unit tests for datasets/humanml3d_refiner.py (T_A_04).
 
 Covers T01-T15 per docs/TODO.md §T_A_04 Unit tests (T14 stats-side is deferred
 to T_A_06 compute_5d_stats).
