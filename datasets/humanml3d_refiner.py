@@ -602,6 +602,7 @@ class HumanML3DRefinerDataset(RefinerDataset):
         offset_start_apply_to: tuple[str, ...] | list[str] = ("dense_path", "sparse_path"),
         sparse_path_point_range: tuple[int, int] = (3, 8),
         path_feature_stats_dir: str | None = None,
+        sampling_config_hash: str | None = None,
         **kwargs,
     ):
         if horizon_policy is not None and "num_token_policy" not in kwargs:
@@ -624,9 +625,18 @@ class HumanML3DRefinerDataset(RefinerDataset):
         self._pf_mean = None
         self._pf_std = None
         if path_feature_stats_dir is not None:
+            if sampling_config_hash is None:
+                raise ValueError(
+                    "path_feature_stats_dir was set but sampling_config_hash is "
+                    "None; strong hash validation is mandatory when using "
+                    "path-feature stats (pass the hash from "
+                    "compute_sampling_config_hash(cfg))."
+                )
             from utils.refiner.path_feature_stats import load_path_feature_stats
 
-            stats = load_path_feature_stats(path_feature_stats_dir)
+            stats = load_path_feature_stats(
+                path_feature_stats_dir, expected_hash=sampling_config_hash,
+            )
             self._pf_mean = stats.mean
             self._pf_std = stats.std
 
