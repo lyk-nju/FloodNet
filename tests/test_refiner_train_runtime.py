@@ -15,7 +15,7 @@ from pathlib import Path
 
 import torch
 
-from datasets.refiner_dataset import RefinerDataset
+from datasets.humanml3d_refiner import HumanML3DRefinerDataset as RefinerDataset
 from datasets.humanml3d_refiner import FixedRefinerSampleDataset
 import train_refiner as tr
 

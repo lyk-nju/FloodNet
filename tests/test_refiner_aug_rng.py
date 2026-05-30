@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from datasets.refiner_dataset import RefinerDataset, refiner_worker_init_fn
+from datasets.humanml3d_refiner import HumanML3DRefinerDataset as RefinerDataset, refiner_worker_init_fn
 from train_refiner import path_aug_kwargs
 
 

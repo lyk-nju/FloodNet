@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 from datasets.humanml3d_refiner import HumanML3DRefinerDataset
-from datasets.refiner_dataset import RefinerDataset
+from datasets.humanml3d_refiner import HumanML3DRefinerDataset as RefinerDataset
 from train_refiner import (
     FrozenStubTextEncoder,
     RefinerLightningModule,

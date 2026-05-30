@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 import torch
 
-from datasets.refiner_dataset import RefinerDataset
+from datasets.humanml3d_refiner import HumanML3DRefinerDataset as RefinerDataset
 from utils.motion_process import recover_root_rot_pos, root_to_traj_feats_7d
 from utils.token_frame import num_frames_for_tokens
 

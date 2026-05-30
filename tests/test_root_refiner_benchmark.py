@@ -14,7 +14,7 @@ import math
 
 import torch
 
-from datasets.refiner_dataset import RefinerDataset
+from datasets.humanml3d_refiner import HumanML3DRefinerDataset as RefinerDataset
 from eval.root_refiner_benchmark import (
     compute_sample_metrics,
     run_benchmark,
