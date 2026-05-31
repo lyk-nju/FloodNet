@@ -26,15 +26,31 @@ def validate_refiner_config(cfg: Mapping) -> None:
     """Fail fast on invalid RootRefiner config combinations.
 
     The function accepts plain dict-like configs because `train_refiner.py`
-    currently resolves YAML into dictionaries. Missing optional blocks are
-    tolerated for small unit-test configs and then fall back to model/dataset
-    defaults at their construction sites.
+    resolves YAML into dictionaries. RootRefiner uses the LDF-style
+    target/params schema and intentionally rejects the old `training` block.
     """
-    model = _section(cfg, "model")
+    model_block = _section(cfg, "model")
+    model = _section(model_block, "params")
     data = _section(cfg, "data")
+    optimizer = _section(cfg, "optimizer")
     sampling = _section(cfg, "sampling")
     canonicalization = _section(cfg, "canonicalization")
     loss_weights = _section(cfg, "loss_weights")
+
+    if "training" in cfg:
+        raise ValueError(
+            "training is legacy for RootRefiner; use data.train_bs/val_bs, "
+            "optimizer.params, sampling.full_plan_ratio, and trainer.max_steps."
+        )
+    if not model_block.get("target"):
+        raise ValueError("model.target is required for LDF-style RootRefiner config.")
+    if not isinstance(model_block.get("params"), Mapping):
+        raise ValueError("model.params is required for LDF-style RootRefiner config.")
+    if not optimizer.get("target") or not isinstance(optimizer.get("params"), Mapping):
+        raise ValueError("optimizer.target and optimizer.params are required.")
+    for key in ("target", "collate_fn", "train_bs", "val_bs", "num_workers"):
+        if key not in data:
+            raise ValueError(f"data.{key} is required for RootRefiner config.")
 
     if "num_token_policy" in data:
         raise ValueError(

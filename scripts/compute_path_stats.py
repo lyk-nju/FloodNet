@@ -45,7 +45,8 @@ def main(argv: list[str] | None = None) -> None:
     mean, std = compute_stats_from_features(feature_tensor)
 
     data_cfg = cfg.get("data") or {}
-    model_cfg = cfg.get("model") or {}
+    model_block = cfg.get("model") or {}
+    model_cfg = model_block.get("params", model_block) or {}
     meta = {
         "dataset": data_cfg.get("dataset", "humanml3d"),
         "split": data_cfg.get("train_split_file", "train.txt"),

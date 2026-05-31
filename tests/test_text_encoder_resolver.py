@@ -122,11 +122,20 @@ def test_refiner_module_with_precomputed_builds(t5_cache):
 
     cfg = {
         "model": {
-            "d_model": 32, "n_layers": 2, "n_heads": 4, "ff_dim": 64,
-            "max_tokens": 8, "min_tokens": 2, "frames_per_token": 4,
-            "n_path": 16, "n_hist": 8, "text_emb_dim": _DIM, "dropout": 0.0,
+            "target": "models.root_refiner.RootRefiner",
+            "params": {
+                "d_model": 32, "n_layers": 2, "n_heads": 4, "ff_dim": 64,
+                "max_tokens": 8, "min_tokens": 2, "frames_per_token": 4,
+                "n_path": 16, "n_hist": 8, "text_emb_dim": _DIM,
+                "path_features_dim": 5, "dropout": 0.0,
+            },
         },
-        "training": {"lr": 1e-3, "weight_decay": 0.01},
+        "data": {
+            "target": "datasets.humanml3d_refiner.HumanML3DRefinerDataset",
+            "collate_fn": "datasets.humanml3d_refiner.refiner_collate",
+            "train_bs": 4, "val_bs": 4, "num_workers": 0,
+        },
+        "optimizer": {"target": "AdamW", "params": {"lr": 1e-3, "weight_decay": 0.01}},
         "loss": {"heading_form": "cosine"},
         "loss_weights": {"num_token": 1.0, "xyz": 5.0, "heading": 1.0,
                          "fwd_delta": 0.5, "yaw_delta": 0.5, "smoothness": 0.0},

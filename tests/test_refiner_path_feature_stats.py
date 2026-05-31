@@ -120,14 +120,17 @@ def test_compute_path_stats_cli_smoke(tmp_path):
 
     cfg = {
         "model": {
-            "n_hist": 8,
-            "n_path": 16,
-            "min_tokens": 2,
-            "max_tokens": 8,
-            "frames_per_token": 4,
+            "target": "models.root_refiner.RootRefiner",
+            "params": {
+                "n_hist": 8,
+                "n_path": 16,
+                "min_tokens": 2,
+                "max_tokens": 8,
+                "frames_per_token": 4,
+            },
         },
-        "training": {"sampling_mode_full_ratio": 1.0},
         "sampling": {
+            "full_plan_ratio": 1.0,
             "horizon_policy": "random",
             "path_condition": {
                 "policy": "mixed",

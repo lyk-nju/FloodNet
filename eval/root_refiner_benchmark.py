@@ -40,6 +40,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from utils.local_frame import wrap_angle   # noqa: E402
+from utils.refiner.path_feature_stats import compute_sampling_config_hash  # noqa: E402
 
 _RAD2DEG = 180.0 / math.pi
 
@@ -311,15 +312,13 @@ def main(argv=None):
                          help="Eval split; defaults to data.val_split_file or the dataset default.")
     args = parser.parse_args(argv)
 
-    import yaml
-
     from datasets.humanml3d_refiner import HumanML3DRefinerDataset as RefinerDataset
     from scripts.compute_5d_stats import load_clips_from_dir
 
     from train_refiner import resolve_cfg_interpolations
 
-    with open(args.config) as f:
-        cfg = yaml.safe_load(f)
+    from train_refiner import _load_cfg
+    cfg = _load_cfg(args.config)
     # A-P0-1: resolve ${data.raw_data_dir} etc. (the model cfg comes from the
     # ckpt's saved hparams, which train_refiner already resolved).
     cfg = resolve_cfg_interpolations(cfg)
@@ -335,7 +334,7 @@ def main(argv=None):
         feature_path=data_cfg.get("feature_path"),
         text_path=data_cfg.get("text_path"),
     )
-    model_cfg = cfg["model"]
+    model_cfg = cfg["model"]["params"]
     # P0-2: follow data.normalize exactly (like train_refiner.py); do NOT force
     # normalize just because a stats_dir is present in the config — that loaded
     # stats even when normalize:false and crashed if the dir was missing.
@@ -352,6 +351,11 @@ def main(argv=None):
         # out-of-distribution scale at eval and num_token metrics go garbage.
         path_feature_stats_dir=(
             data_cfg.get("path_feature_stats_dir") if normalize else None
+        ),
+        sampling_config_hash=(
+            compute_sampling_config_hash(cfg)
+            if normalize and data_cfg.get("path_feature_stats_dir")
+            else None
         ),
         seed=0,
     )

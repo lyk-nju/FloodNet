@@ -1,21 +1,8 @@
-"""Standalone Lightning training script for RootRefiner (T_A_08).
+"""RootRefiner training entrypoint.
 
-Fully decoupled from train_ldf.py. Trains the Refiner on HumanML3DRefinerDataset
-samples with a duration / waypoint / path-control loss:
-    num_token (CE) + xyz (SmoothL1) + heading (cosine) + fwd_delta (SmoothL1)
-    + yaw_delta (SmoothL1) + path_control + smoothness (2nd-order-diff L2)
-
-loss dict keys are aligned field-by-field with configs/root_refiner.yaml's
-loss_weights (round 6 P1-4 / P1-6: keys are fwd_delta / yaw_delta / smoothness;
-NO legacy "speed").
-
-References:
-- docs/TODO.md §T_A_08 lines 1354-1420.
-- docs/design.md §0.2.1 (per-frame delta naming convention).
-
-The text encoder is pluggable; a deterministic frozen stub is used by default
-so the training pipeline runs standalone. At integration time, pass the
-ldf-shared frozen text encoder via `text_encoder=`.
+Wires config loading, dataset construction, WandB, checkpointing, and Lightning
+Trainer setup. Model-specific forward and loss logic lives in
+``utils.refiner.lightning_module``.
 """
 
 from __future__ import annotations
@@ -24,14 +11,13 @@ import argparse
 import copy
 import logging
 import os
+import sys
 import time
 from pathlib import Path
-import sys
 
 import lightning.pytorch as pl
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from lightning.pytorch.utilities import rank_zero_info
 from torch.utils.data import DataLoader
 
 _REPO_ROOT = Path(__file__).resolve().parent
@@ -39,323 +25,25 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from datasets.humanml3d_refiner import refiner_collate  # noqa: E402
-from models.root_refiner import RootRefiner   # noqa: E402
+from utils.initialize import (  # noqa: E402
+    get_function,
+    get_shared_run_time,
+    instantiate,
+    save_config_and_codes,
+)
 from utils.refiner.config_validate import validate_refiner_config  # noqa: E402
+from utils.refiner.lightning_module import (  # noqa: E402
+    RefinerLightningModule,
+    RootRefinerLightningModule,
+)
 from utils.refiner.losses import (  # noqa: E402
-    dense_path_control_loss,
-    goal_point_control_loss,
     masked_mean,
-    ordinal_duration_loss,
     second_order_diff_l2,
     smooth_l1_masked,
-    sparse_path_control_loss,
 )
-from utils.text_encoder_resolver import resolve_text_encoder  # noqa: E402
-# Re-exported for backward-compatible `from train_refiner import FrozenStubTextEncoder`.
 from utils.text_encoder_resolver import FrozenStubTextEncoder  # noqa: E402,F401
 
 log = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Frozen text encoder stub (replace with ldf-shared encoder at integration)
-# ---------------------------------------------------------------------------
-
-
-# FrozenStubTextEncoder now lives in utils/text_encoder_resolver.py (shared with
-# the benchmark) and is re-exported above for backward-compatible imports.
-
-
-# ---------------------------------------------------------------------------
-# Lightning module
-# ---------------------------------------------------------------------------
-
-
-class RefinerLightningModule(pl.LightningModule):
-    def __init__(self, cfg: dict, text_encoder: nn.Module | None = None):
-        super().__init__()
-        validate_refiner_config(cfg)
-        self.cfg = cfg
-        model_cfg = dict(cfg["model"])
-        self.refiner = RootRefiner(**model_cfg)
-        self.min_tokens = model_cfg["min_tokens"]
-        self.max_tokens = model_cfg["max_tokens"]
-        text_emb_dim = model_cfg.get("text_emb_dim", 512)
-        self.text_encoder = self._resolve_text_encoder(cfg, text_encoder, text_emb_dim)
-        self.loss_weights = dict(cfg.get("loss_weights", {}))
-        self.heading_form = cfg.get("loss", {}).get("heading_form", "cosine")
-        # Ordinal duration loss bandwidth (Gaussian soft-label sigma, in token
-        # units). Wider = softer neighbour credit; 1.0 ≈ ±1-token tolerance.
-        self.ordinal_sigma = float(cfg.get("loss", {}).get("ordinal_sigma", 1.0))
-        # Don't pickle the (possibly large) text encoder into hparams.
-        self.save_hyperparameters(ignore=["text_encoder"])
-
-    @staticmethod
-    def _resolve_text_encoder(cfg: dict, text_encoder, text_emb_dim: int):
-        """Delegate to the shared resolver (utils/text_encoder_resolver) so train
-        and benchmark build the identical encoder. Supports an explicit encoder,
-        precomputed_t5_pool (real training), debug_stub (smoke/tests), else raise.
-        """
-        return resolve_text_encoder(cfg, text_encoder, text_emb_dim)
-
-    # ------------------------------------------------------------------
-
-    def forward(self, batch: dict, *, duration_mode: str = "groundtruth_duration") -> dict:
-        if duration_mode not in {"groundtruth_duration", "pred_duration"}:
-            raise ValueError(
-                "duration_mode must be 'groundtruth_duration' or 'pred_duration', "
-                f"got {duration_mode!r}."
-            )
-        text_emb = self.text_encoder.encode(batch["text"], device=self.device)
-        num_tokens = batch.get("num_tokens") if duration_mode == "groundtruth_duration" else None
-        return self.refiner(
-            text_emb=text_emb,
-            path=batch["path"],
-            path_valid_mask=batch["path_valid_mask"],
-            path_control_mask=batch.get("path_control_mask"),
-            path_features=batch["path_features"],
-            history_motion=batch["history_motion"],
-            history_mask=batch["history_mask"],
-            # Teacher-force the horizon with GT num_tokens during training; the
-            # model falls back to its own argmax at eval / when absent.
-            num_tokens=num_tokens,
-        )
-
-    def _compute_loss(self, out: dict, batch: dict) -> dict:
-        target_wp = batch.get("waypoints")
-        if target_wp is None:
-            target_wp = batch["target_waypoints"][..., :5]
-        target_mask = batch.get("waypoints_mask", batch.get("target_mask"))
-
-        # Ordinal duration loss (R2.6). The old design used hard F.cross_entropy
-        # (off-by-1 penalised the same as off-by-40 → confident-wrong overfit:
-        # val/num_token CE climbed ABOVE the random-guess line ln(K)). We now
-        # split it into two distance-aware terms computed by ordinal_duration_loss:
-        #   ordinal_ce  — CE against Gaussian soft labels (neighbouring token
-        #                 counts get partial credit; bandwidth = ordinal_sigma).
-        #   expected    — SmoothL1/Huber between the soft-argmax EXPECTED token
-        #                 count (sum_k p_k*k, differentiable) and the target.
-        # ordinal_ce keeps the `num_token` weight slot; expected keeps the
-        # `num_token_soft` slot, so loss_weights / METRIC_KEYS stay aligned and no
-        # config key is renamed. target validation: ordinal_duration_loss subtracts
-        # min_tokens internally and raises ValueError if num_tokens falls outside
-        # [min_tokens, max_tokens] (model/dataset disagreement) — keeping the loud
-        # failure the old hard F.cross_entropy gave on an out-of-range target.
-        target_class = batch["num_tokens"] - self.min_tokens
-        dur = ordinal_duration_loss(
-            out["num_token_logits"], batch["num_tokens"],
-            min_tokens=self.min_tokens, sigma=self.ordinal_sigma,
-        )
-        L_num = dur["ordinal_ce"]
-        L_num_soft = dur["expected"]
-        # soft-argmax expected class (for the logged-only ±MAE diagnostic below).
-        expected_class = dur["expected_num_tokens"] - float(self.min_tokens)
-
-        # xyz SmoothL1 (valid only).
-        L_xyz = smooth_l1_masked(out["waypoints"][..., 0:3], target_wp[..., 0:3], target_mask)
-
-        # heading cosine (pred already unit-norm; gt assumed unit-norm).
-        pred_h = F.normalize(out["waypoints"][..., 3:5], dim=-1, eps=1e-6)
-        gt_h = target_wp[..., 3:5]
-        if self.heading_form == "cosine":
-            head_term = 1.0 - (pred_h * gt_h).sum(-1)              # [B, T]
-            L_head = masked_mean(head_term, target_mask)
-        else:
-            L_head = smooth_l1_masked(pred_h, gt_h, target_mask)
-
-        # Same-space delta supervision. The model now emits 5D in NORMALIZED
-        # space (the dataset z-scores xyz; cos/sin stay raw). Re-deriving deltas
-        # from `target_wp[..., :5]` gives a NORMALIZED-space gt that matches
-        # the model's normalized-space pred deltas — comparing those to the
-        # dataset's stored `target_wp[..., 5:7]` (PHYSICAL-then-z-scored) would
-        # mix two different scales/offsets and silently miscalibrate the speed
-        # channels at both training and inference. Frame 0's delta is
-        # structurally 0 (no preceding frame), excluded from the mask.
-        from utils.motion_process import append_traj_deltas_5d_to_7d
-        pred5 = torch.cat([out["waypoints"][..., :3], pred_h], dim=-1)
-        gt5 = torch.cat([target_wp[..., :3],
-                         F.normalize(target_wp[..., 3:5], dim=-1, eps=1e-6)], dim=-1)
-        pred_delta = append_traj_deltas_5d_to_7d(pred5)[..., 5:7]
-        gt_delta = append_traj_deltas_5d_to_7d(gt5)[..., 5:7]
-        delta_mask = target_mask.clone()
-        delta_mask[:, 0] = False
-        L_fwd_delta = smooth_l1_masked(
-            pred_delta[..., 0:1], gt_delta[..., 0:1], delta_mask,
-        )
-        L_yaw_delta = smooth_l1_masked(
-            pred_delta[..., 1:2], gt_delta[..., 1:2], delta_mask,
-        )
-
-        # smoothness L2 on 2nd-order diff of pred deltas (same-space).
-        L_smooth = second_order_diff_l2(pred_delta, delta_mask)
-
-        L_path_control = self._compute_path_control_loss(out, batch, target_mask)
-
-        w = self.loss_weights
-        loss = (
-            w.get("num_token", 1.0) * L_num
-            + w.get("num_token_soft", 0.1) * L_num_soft
-            + w.get("xyz", 5.0) * L_xyz
-            + w.get("heading", 1.0) * L_head
-            + w.get("fwd_delta", 0.5) * L_fwd_delta
-            + w.get("yaw_delta", 0.5) * L_yaw_delta
-            + w.get("path_control", 0.0) * L_path_control
-            + w.get("smoothness", 0.0) * L_smooth
-        )
-        # num_token diagnostics (NOT part of the weighted loss): exact / ±1 / ±2
-        # argmax accuracy, discrete (argmax) MAE, and continuous (soft-argmax)
-        # expected-token MAE. argmax is non-differentiable so the argmax-based
-        # ones carry no gradient; all are logged only.
-        with torch.no_grad():
-            pred_class = out["num_token_logits"].argmax(dim=-1)
-            err = (pred_class - target_class).abs().float()
-            soft_err = (expected_class - target_class.to(expected_class.dtype)).abs()
-        out_losses = {
-            "loss": loss,
-            "num_token": L_num,
-            "num_token_soft": L_num_soft,
-            "xyz": L_xyz,
-            "heading": L_head,
-            "fwd_delta": L_fwd_delta,
-            "yaw_delta": L_yaw_delta,
-            "path_control": L_path_control,
-            "smoothness": L_smooth,
-            "num_token_acc": (err == 0).float().mean(),
-            "num_token_acc_pm1": (err <= 1).float().mean(),
-            "num_token_acc_pm2": (err <= 2).float().mean(),
-            "num_token_mae": err.mean(),
-            "num_token_soft_mae": soft_err.mean(),
-        }
-        return out_losses
-
-    def _compute_path_control_loss(self, out: dict, batch: dict, target_mask: torch.Tensor) -> torch.Tensor:
-        if "path" not in batch or "path_control_mask" not in batch:
-            return out["waypoints"].new_zeros(())
-
-        path_modes = batch.get("path_mode")
-        if path_modes is None:
-            path_modes = ["dense_path"] * out["waypoints"].shape[0]
-        offset_start_frames = batch.get("offset_start_frames")
-        if offset_start_frames is None:
-            offset_start_frames = torch.zeros(
-                out["waypoints"].shape[0],
-                dtype=torch.long,
-                device=out["waypoints"].device,
-            )
-        else:
-            offset_start_frames = offset_start_frames.to(out["waypoints"].device)
-
-        losses = []
-        for mode in ("dense_path", "sparse_path", "goal_point"):
-            idx = [i for i, sample_mode in enumerate(path_modes) if sample_mode == mode]
-            if not idx:
-                continue
-            index = torch.as_tensor(idx, dtype=torch.long, device=out["waypoints"].device)
-            pred = out["waypoints"].index_select(0, index)
-            path = batch["path"].to(out["waypoints"].device).index_select(0, index)
-            control = batch["path_control_mask"].to(out["waypoints"].device).index_select(0, index)
-            if mode == "dense_path":
-                supervision = batch.get("path_supervision_mask", target_mask)
-                losses.append(
-                    dense_path_control_loss(
-                        pred,
-                        path,
-                        supervision.to(out["waypoints"].device).index_select(0, index),
-                    )
-                )
-            elif mode == "sparse_path":
-                supervision = batch.get("path_supervision_mask", target_mask)
-                losses.append(
-                    sparse_path_control_loss(
-                        pred,
-                        path,
-                        control,
-                        supervision.to(out["waypoints"].device).index_select(0, index),
-                        offset_start_frames.index_select(0, index),
-                    )
-                )
-            else:
-                losses.append(
-                    goal_point_control_loss(
-                        pred,
-                        target_mask.to(out["waypoints"].device).index_select(0, index),
-                        path,
-                        control,
-                    )
-                )
-        if not losses:
-            return out["waypoints"].new_zeros(())
-        return torch.stack(losses).mean()
-
-    # Logged-only diagnostic keys (everything else returned by _compute_loss is a
-    # weighted loss term with a matching loss_weights entry).
-    METRIC_KEYS = (
-        "num_token_acc", "num_token_acc_pm1", "num_token_acc_pm2",
-        "num_token_mae", "num_token_soft_mae",
-    )
-
-    def training_step(self, batch: dict, batch_idx: int):
-        out = self(batch)
-        losses = self._compute_loss(out, batch)
-        loss = losses["loss"]
-        # NaN/Inf guard. A single non-finite loss back-props non-finite grads, and
-        # the AdamW step then poisons EVERY parameter — from there on every loss
-        # term reads NaN (gradient clipping does not help: clipping NaN grads
-        # stays NaN). Returning None makes Lightning skip the optimizer step for
-        # this batch instead of corrupting the weights. Costs one scalar host-sync
-        # per step, which is an acceptable price for the safety. (Single-device
-        # assumption: under DDP a None return on only some ranks desyncs the
-        # backward all-reduce — run detect_anomaly to locate the source instead.)
-        if not torch.isfinite(loss):
-            log.warning(
-                "non-finite train loss (%s) at global_step=%d batch_idx=%d; "
-                "skipping optimizer step for this batch.",
-                loss.detach().item(), self.global_step, batch_idx,
-            )
-            self.log("train/nonfinite_skip", 1.0, prog_bar=False,
-                     on_step=True, on_epoch=False)
-            return None
-        # Show every per-term loss (num_token/xyz/heading/fwd_delta/yaw_delta +
-        # total) on the tqdm bar, not just the total — so directional terms are
-        # watchable during training.
-        for k, v in losses.items():
-            self.log(f"train/{k}", v, prog_bar=True, on_step=True, on_epoch=False)
-        return loss
-
-    def validation_step(self, batch: dict, batch_idx: int):
-        modes = (self.cfg.get("validation") or {}).get(
-            "eval_modes",
-            ["groundtruth_duration", "pred_duration"],
-        )
-        first_loss = None
-        for mode in modes:
-            out = self(batch, duration_mode=mode)
-            losses = self._compute_loss(out, batch)
-            if first_loss is None:
-                first_loss = losses["loss"]
-            for k, v in losses.items():
-                self.log(
-                    f"val_{mode}/{k}",
-                    v,
-                    prog_bar=(k == "loss" and mode == "groundtruth_duration"),
-                    on_step=False,
-                    on_epoch=True,
-                )
-        return first_loss
-
-    def configure_optimizers(self):
-        tr = self.cfg.get("training", {})
-        lr = float(tr.get("lr", 1e-4))
-        weight_decay = float(tr.get("weight_decay", 0.01))
-        return torch.optim.AdamW(
-            (p for p in self.parameters() if p.requires_grad),
-            lr=lr, weight_decay=weight_decay,
-        )
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 
 def _load_cfg(config_path: str) -> dict:
@@ -385,9 +73,7 @@ def _deep_merge_dicts(base: dict, override: dict) -> dict:
 
 
 def _load_paths_default() -> dict:
-    """Read configs/paths_default.yaml (dirs / wandb_info / refiner_wandb_info).
-    Returns {} if absent/unreadable. This is the same file train_ldf merges for
-    its ${...} interpolation sources."""
+    """Read shared path and WandB interpolation values."""
     import yaml
 
     p = _REPO_ROOT / "configs" / "paths_default.yaml"
@@ -396,64 +82,42 @@ def _load_paths_default() -> dict:
     try:
         with p.open() as f:
             return yaml.safe_load(f) or {}
-    except Exception:   # noqa: BLE001 — interpolation sources are best-effort
+    except Exception:  # noqa: BLE001
         return {}
 
 
 def resolve_cfg_interpolations(cfg: dict) -> dict:
-    """Resolve OmegaConf-style ${...} interpolations in a plain config dict
-    (A-P0-1). yaml.safe_load leaves e.g. precomputed_text_emb_path and
-    logger.wandb.* as literals like '${data.raw_data_dir}/...' / '${wandb_info.key}';
-    this substitutes them against the cfg's own values PLUS the interpolation
-    sources from configs/paths_default.yaml (wandb_info / refiner_wandb_info /
-    dirs) — exactly like train_ldf merges paths_default. Call AFTER CLI overrides.
-
-    The injected paths_default blocks are stripped from the result, so the
-    returned cfg keeps its original top-level shape (now with resolved values).
-    """
+    """Resolve OmegaConf-style interpolations after CLI overrides."""
     from omegaconf import OmegaConf
 
     extras = _load_paths_default()
-    # Guarantee the wandb interpolation sources exist so a missing/customized
-    # paths_default.yaml degrades gracefully — ${wandb_info.*}/${refiner_wandb_info.*}
-    # resolve to "" (→ wandb simply skipped) instead of raising InterpolationKeyError
-    # and aborting the run (incl. the debug/smoke config, which must run standalone).
+    # Missing credential blocks should disable WandB, not abort local smoke runs.
     extras.setdefault("wandb_info", {})
-    for _k in ("key", "project", "entity"):
-        extras["wandb_info"].setdefault(_k, "")
+    for key in ("key", "project", "entity"):
+        extras["wandb_info"].setdefault(key, "")
     extras.setdefault("refiner_wandb_info", {})
     extras["refiner_wandb_info"].setdefault("project", "")
 
-    injected = [k for k in extras if k not in cfg]   # only add what cfg lacks
+    injected = [key for key in extras if key not in cfg]
     merged = {**{k: extras[k] for k in injected}, **cfg}
     resolved = OmegaConf.to_container(OmegaConf.create(merged), resolve=True)
-    # Strip interpolation-source blocks: the ones we injected PLUS the credential
-    # blocks even when the cfg itself defined them — they carry the raw API key and
-    # must never survive into ckpt hparams or the wandb run config.
+    # Keep credentials out of saved hparams, checkpoints, and WandB config.
     for k in set(injected) | {"wandb_info", "refiner_wandb_info"}:
         resolved.pop(k, None)
     return resolved
 
 
-# ---------------------------------------------------------------------------
-# Run config: seed / resume / wandb / checkpoint (parity with train_ldf.py)
-# ---------------------------------------------------------------------------
-
-
 def resolve_seed(cfg: dict, cli_seed: int | None = None) -> int:
-    """Seed precedence: CLI --seed > top-level cfg.seed (LDF style) >
-    cfg.training.seed > 1234 default. Used for pl.seed_everything + dataset RNG.
-    """
+    """Seed precedence: CLI --seed > top-level cfg.seed > 1234 default."""
     if cli_seed is not None:
         return int(cli_seed)
     if cfg.get("seed") is not None:
         return int(cfg["seed"])
-    return int((cfg.get("training") or {}).get("seed", 1234))
+    return 1234
 
 
 def resolve_resume_ckpt(cfg: dict, cli_ckpt: str | None = None) -> str | None:
-    """Resume precedence: CLI --ckpt_path > cfg.resume_ckpt (LDF style) > None.
-    Empty string in either place means "no resume"."""
+    """Resume precedence: CLI --ckpt_path > cfg.resume_ckpt > None."""
     if cli_ckpt:
         return cli_ckpt
     rc = cfg.get("resume_ckpt")
@@ -461,13 +125,7 @@ def resolve_resume_ckpt(cfg: dict, cli_ckpt: str | None = None) -> str | None:
 
 
 def _read_wandb_info_from_paths_default() -> dict:
-    """Best-effort wandb credentials from configs/paths_default.yaml.
-
-    Base = `wandb_info` (the same block train_ldf.py resolves `${wandb_info.*}`
-    against → project "FloodNet"). `refiner_wandb_info` is then merged ON TOP so
-    the Refiner shares the key/entity but logs to its own project. Returns {} if
-    the file is absent/unreadable.
-    """
+    """Best-effort WandB credentials from configs/paths_default.yaml."""
     import yaml
 
     p = _REPO_ROOT / "configs" / "paths_default.yaml"
@@ -478,30 +136,20 @@ def _read_wandb_info_from_paths_default() -> dict:
             d = yaml.safe_load(f) or {}
         base = d.get("wandb_info", {}) or {}
         refiner = d.get("refiner_wandb_info", {}) or {}
-        return {**base, **refiner}   # refiner overrides (project); inherits key/entity
-    except Exception:   # noqa: BLE001 — credentials are optional, never fatal
+        return {**base, **refiner}
+    except Exception:  # noqa: BLE001
         return {}
 
 
 def _literal_or_none(v):
-    """Return v only if it's a usable literal string (non-empty, not an
-    unresolved ${...} interpolation); else None so a fallback kicks in."""
+    """Return usable literal strings and ignore unresolved interpolations."""
     if isinstance(v, str) and v.strip() and not v.startswith("${"):
         return v
     return None
 
 
 def build_wandb_logger(cfg: dict, run_name: str, save_dir: str, api_key: str | None = None):
-    """Build a WandbLogger, mirroring train_ldf.py's gating: OFF when cfg.debug
-    is true (smoke), else ON when a cfg.logger.wandb block exists and an API key
-    is resolvable. `logger.wandb.enabled: false` is an explicit override. Returns
-    None (Trainer keeps its default logger) when disabled or no key is found.
-
-    With the ${wandb_info.*} interpolation style, project/entity arrive already
-    resolved in cfg.logger.wandb; `api_key` carries the resolved key separately
-    (main() scrubs it out of cfg so it is never saved to ckpt hparams / wandb
-    config). Falls back to configs/paths_default.yaml + env WANDB_API_KEY.
-    """
+    """Build the optional WandB logger."""
     if cfg.get("debug", False):
         return None
     wb = (cfg.get("logger") or {}).get("wandb")
@@ -517,14 +165,13 @@ def build_wandb_logger(cfg: dict, run_name: str, save_dir: str, api_key: str | N
     project = _literal_or_none(wb.get("project")) or info.get("project")
     entity = _literal_or_none(wb.get("entity")) or info.get("entity")
     if not key:
-        log.warning("wandb requested (debug=false, logger.wandb present) but no "
-                    "API key found (cfg / paths_default.yaml / $WANDB_API_KEY) — "
-                    "skipping wandb.")
+        log.warning(
+            "wandb requested but no API key was found; skipping wandb."
+        )
         return None
     os.environ["WANDB_API_KEY"] = key
     from lightning.pytorch.loggers import WandbLogger
 
-    # Don't leak the API key into the logged run config.
     safe_cfg = copy.deepcopy(cfg)
     try:
         safe_cfg["logger"]["wandb"].pop("wandb_key", None)
@@ -537,10 +184,7 @@ def build_wandb_logger(cfg: dict, run_name: str, save_dir: str, api_key: str | N
 
 
 def build_checkpoint_callback(cfg: dict, output_dir: str):
-    """Build a periodic ModelCheckpoint from cfg.checkpoint (or LDF-style
-    cfg.validation.save_every_n_steps). Returns None when no cadence is set, so
-    the Trainer falls back to Lightning's default end-of-run save.
-    """
+    """Build periodic checkpointing from cfg.checkpoint or cfg.validation."""
     ck = cfg.get("checkpoint") or {}
     val = cfg.get("validation") or {}
     every = ck.get("save_every_n_steps", val.get("save_every_n_steps"))
@@ -548,17 +192,13 @@ def build_checkpoint_callback(cfg: dict, output_dir: str):
         return None
     from lightning.pytorch.callbacks import ModelCheckpoint
 
-    # monitor=None means "periodic keep-all"; Lightning forbids a positive
-    # finite save_top_k without a monitored metric, so coerce it to -1 (keep
-    # every periodic ckpt). Set checkpoint.monitor (+ mode) to keep top-k by a
-    # logged metric instead (e.g. "val/loss").
-    # Keys may live in either the `checkpoint` block or the LDF-style `validation`
-    # block (the shipped configs use the latter), so read both with checkpoint first.
     monitor = ck.get("monitor", val.get("monitor"))
     save_top_k = int(ck.get("save_top_k", val.get("save_top_k", -1)))
     if monitor is None and save_top_k not in (-1, 0):
-        log.warning("save_top_k=%d needs a monitor (checkpoint/validation.monitor); "
-                    "keeping all periodic ckpts (save_top_k=-1) instead.", save_top_k)
+        log.warning(
+            "save_top_k=%d needs a monitor; keeping all periodic ckpts instead.",
+            save_top_k,
+        )
         save_top_k = -1
 
     return ModelCheckpoint(
@@ -575,45 +215,40 @@ def build_checkpoint_callback(cfg: dict, output_dir: str):
 
 
 def _num_devices(devices) -> int:
-    """Device count used to decide whether DDP is needed. `devices` may be an int
-    (>=0), -1 (= all), a list of indices, or "auto"/str (→ visible CUDA count)."""
+    """Resolve the device count used to choose single-process vs DDP."""
     if isinstance(devices, (list, tuple)):
         return len(devices)
     if isinstance(devices, int) and devices >= 0:
         return devices
     try:
         return torch.cuda.device_count()
-    except Exception:   # noqa: BLE001 — defensive; assume single device
+    except Exception:  # noqa: BLE001
         return 1
 
 
 def safe_precision(accelerator: str, precision, *, cuda_available: bool):
-    """Downgrade a mixed/low precision to 32-true when the run will land on CPU
-    (accelerator='cpu', or 'auto' with no CUDA visible) so a GPU-tuned config
-    (e.g. bf16-mixed) stays host-portable instead of erroring / crawling on CPU.
-    Returns precision unchanged on GPU, or None when none was requested."""
+    """Use fp32 when a GPU-tuned mixed precision config runs on CPU."""
     if precision is None:
         return None
     on_cpu = accelerator == "cpu" or (accelerator == "auto" and not cuda_available)
     fp32 = {"32", "32-true", "64", "64-true", 32, 64}
     if on_cpu and precision not in fp32:
-        log.warning("precision=%s requested but the run resolves to CPU; "
-                    "using 32-true instead.", precision)
+        log.warning(
+            "precision=%s requested but the run resolves to CPU; using 32-true.",
+            precision,
+        )
         return "32-true"
     return precision
 
 
 def _build_one_dataset(cfg: dict, split_file: str, *, seed: int | None = None,
                        randomize_caption: bool = True):
-    """Build a single RefinerDataset for a given split using the real loader."""
-    from datasets.humanml3d_refiner import HumanML3DRefinerDataset
+    """Build one RootRefiner dataset split."""
     from scripts.compute_5d_stats import load_clips_from_dir
 
     data_cfg = cfg.get("data", {})
     raw_dir = data_cfg["raw_data_dir"]
     stats_dir = data_cfg.get("stats_dir")
-    # ⚠ Explicit normalize switch (P1-5): default False so a missing stats_dir
-    # doesn't blow up the smoke. If normalize is requested, stats_dir must exist.
     normalize = bool(data_cfg.get("normalize", False))
     if normalize:
         if not stats_dir or not Path(stats_dir).is_dir():
@@ -628,62 +263,62 @@ def _build_one_dataset(cfg: dict, split_file: str, *, seed: int | None = None,
         feature_path=data_cfg.get("feature_path"),
         text_path=data_cfg.get("text_path"),
     )
-    model_cfg = cfg["model"]
+    model_cfg = cfg["model"]["params"]
     sampling_cfg = cfg.get("sampling") or {}
     path_condition_cfg = (sampling_cfg.get("path_condition") or {})
     offset_cfg = (path_condition_cfg.get("offset_start") or {})
     sparse_cfg = (path_condition_cfg.get("sparse_path") or {})
-    _pf_stats_dir = data_cfg.get("path_feature_stats_dir") if normalize else None
-    _pf_hash = None
-    if _pf_stats_dir is not None:
+    path_feature_stats_dir = data_cfg.get("path_feature_stats_dir") if normalize else None
+    path_feature_stats_hash = None
+    if path_feature_stats_dir is not None:
         from utils.refiner.path_feature_stats import compute_sampling_config_hash
-        _pf_hash = compute_sampling_config_hash(cfg)
-    return HumanML3DRefinerDataset(
-        clips,
+
+        path_feature_stats_hash = compute_sampling_config_hash(cfg)
+    dataset_target = data_cfg.get(
+        "target",
+        "datasets.humanml3d_refiner.HumanML3DRefinerDataset",
+    )
+    return instantiate(
+        target=dataset_target,
+        cfg=None,
+        hfstyle=False,
+        clips=clips,
         n_hist=model_cfg["n_hist"],
         n_path=model_cfg["n_path"],
         max_tokens=model_cfg["max_tokens"],
         min_tokens=model_cfg["min_tokens"],
         frames_per_token=model_cfg["frames_per_token"],
-        full_plan_ratio=cfg.get("training", {}).get("sampling_mode_full_ratio", 0.5),
+        full_plan_ratio=sampling_cfg.get("full_plan_ratio", 0.5),
         horizon_policy=sampling_cfg.get("horizon_policy", "random"),
         path_condition_policy=path_condition_cfg.get("policy", "dense_path"),
         path_condition_ratios=path_condition_cfg.get("ratios"),
         offset_start_enabled=bool(offset_cfg.get("enabled", False)),
         offset_start_prob=float(offset_cfg.get("prob", 0.0)),
         offset_start_max_frames=int(offset_cfg.get("max_frames", 40)),
-        offset_start_apply_to=tuple(offset_cfg.get("apply_to", ("dense_path", "sparse_path"))),
+        offset_start_apply_to=tuple(
+            offset_cfg.get("apply_to", ("dense_path", "sparse_path"))
+        ),
         sparse_path_point_range=tuple(sparse_cfg.get("point_range", (3, 8))),
         normalize=normalize,
         stats_dir=stats_dir if normalize else None,
-        # R2.5: physical path-feature stats (own mean/std, separate from waypoint
-        # stats). Only applied when normalizing; raw-physical otherwise.
-        path_feature_stats_dir=_pf_stats_dir,
-        sampling_config_hash=_pf_hash,
+        path_feature_stats_dir=path_feature_stats_dir,
+        sampling_config_hash=path_feature_stats_hash,
         seed=seed,
         randomize_caption=randomize_caption,
     )
 
 
 def build_datasets(cfg: dict, seed: int | None = None):
-    """Build (train_ds, val_ds) RefinerDatasets from cfg.data via the real
-    HumanML3D/BABEL loader. val_ds is None if no val_split_file is configured.
-
-    `seed` is threaded into the train dataset's augmentation RNG for
-    reproducibility (matters with num_workers=0; with workers each gets a
-    distinct RNG via refiner_worker_init_fn). val uses a fixed seed so the
-    val set is identical across runs.
-
-    Train randomizes the caption per sample (text augmentation); val pins the
-    first caption (randomize_caption=False) so val/loss stays comparable across
-    epochs instead of wobbling with caption choice.
-    """
+    """Build train and optional validation datasets from cfg.data."""
     data_cfg = cfg.get("data", {})
     train_split = data_cfg.get("train_split_file", "train.txt")
     val_split = data_cfg.get("val_split_file")
     train_ds = _build_one_dataset(cfg, train_split, seed=seed)
-    val_ds = (_build_one_dataset(cfg, val_split, seed=0, randomize_caption=False)
-              if val_split else None)
+    val_ds = (
+        _build_one_dataset(cfg, val_split, seed=0, randomize_caption=False)
+        if val_split
+        else None
+    )
     return train_ds, val_ds
 
 
@@ -725,12 +360,7 @@ def apply_fixed_overfit_datasets(train_ds, val_ds, cfg: dict):
 
 
 def apply_default_fixed_validation_dataset(train_ds, val_ds):
-    """Replace validation with one deterministic sample per val item.
-
-    Train remains stochastic. Validation is always a fixed clean cache built
-    from val.txt so val/loss is comparable across epochs. If no val split is
-    configured, leave validation absent.
-    """
+    """Replace validation with deterministic fixed samples."""
     if val_ds is None:
         return train_ds, val_ds
     from datasets.humanml3d_refiner import (
@@ -759,7 +389,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=str, default="configs/root_refiner.yaml")
     parser.add_argument("--max_steps", type=int, default=None,
-                         help="Override trainer.max_steps / training.total_steps (smoke runs).")
+                         help="Override trainer.max_steps (smoke runs).")
     parser.add_argument("--devices", type=int, default=None,
                          help="Override trainer.devices.")
     parser.add_argument("--ckpt_path", type=str, default=None,
@@ -780,7 +410,6 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     cfg = _load_cfg(args.config)
-    # CLI overrides for single-host portability (config ships training-box paths).
     cfg.setdefault("data", {})
     if args.raw_data_dir is not None:
         cfg["data"]["raw_data_dir"] = args.raw_data_dir
@@ -788,29 +417,31 @@ def main(argv=None):
         cfg["data"]["stats_dir"] = args.stats_dir
     if args.normalize is not None:
         cfg["data"]["normalize"] = (args.normalize == "true")
-    # A-P0-1: resolve ${data.raw_data_dir}, ${wandb_info.*} etc. AFTER overrides so
-    # e.g. text_encoder.precomputed_text_emb_path and logger.wandb become real values.
     cfg = resolve_cfg_interpolations(cfg)
     validate_refiner_config(cfg)
-    # Scrub the resolved WandB API key out of cfg (it came from ${wandb_info.key})
-    # BEFORE it can be captured by RefinerLightningModule.save_hyperparameters or
-    # logged into the wandb run config. Keep it only in a local for the logger.
     wandb_api_key = None
     _wb = (cfg.get("logger") or {}).get("wandb")
     if isinstance(_wb, dict):
         wandb_api_key = _literal_or_none(_wb.get("wandb_key"))
         _wb["wandb_key"] = None
-    train_cfg = cfg.get("training") or {}
     trainer_cfg = cfg.get("trainer") or {}
-    # max_steps precedence: CLI > trainer.max_steps > training.total_steps.
-    max_steps = (
-        args.max_steps if args.max_steps is not None
-        else trainer_cfg.get("max_steps", train_cfg.get("total_steps", 100000))
+    max_steps = args.max_steps if args.max_steps is not None else trainer_cfg["max_steps"]
+    base_output_dir = args.output_dir or cfg.get("save_dir") or "outputs"
+    run_time = get_shared_run_time(base_output_dir)
+    output_dir = str(Path(base_output_dir) / f"{run_time}_{cfg.get('exp_name', 'root_refiner')}")
+    cfg["save_dir"] = output_dir
+    from omegaconf import OmegaConf
+    _config_snapshot = type(
+        "_ConfigSnapshot",
+        (),
+        {"exp_name": cfg.get("exp_name", "root_refiner"), "config": OmegaConf.create(cfg)},
+    )()
+    save_config_and_codes(_config_snapshot, output_dir)
+    rank_zero_info(
+        f"Save dir: {output_dir}, current working dir: {os.getcwd()}, "
+        f"exp_name: {cfg.get('exp_name', 'root_refiner')}"
     )
-    output_dir = args.output_dir or cfg.get("save_dir") or "outputs/root_refiner"
 
-    # Reproducibility: seed torch/numpy/python (+ Lightning workers) and thread
-    # the same seed into the dataset augmentation RNG.
     seed = resolve_seed(cfg, args.seed)
     pl.seed_everything(seed, workers=True)
     if bool(cfg.get("deterministic", False)):
@@ -822,35 +453,37 @@ def main(argv=None):
     train_ds, val_ds = apply_fixed_overfit_datasets(train_ds, val_ds, cfg)
     train_ds, val_ds = apply_default_fixed_validation_dataset(train_ds, val_ds)
     from datasets.humanml3d_refiner import refiner_worker_init_fn
+    data_cfg = cfg["data"]
+    collate_fn = get_function(data_cfg["collate_fn"])
     train_loader = DataLoader(
         train_ds,
-        batch_size=train_cfg.get("batch_size", 64),
+        batch_size=data_cfg["train_bs"],
         shuffle=True,
-        num_workers=train_cfg.get("num_workers", 4),
-        collate_fn=refiner_collate,
+        num_workers=data_cfg["num_workers"],
+        collate_fn=collate_fn,
         drop_last=True,
-        worker_init_fn=refiner_worker_init_fn,   # P1-3: distinct aug RNG per worker
+        worker_init_fn=refiner_worker_init_fn,
     )
-    # Build a val loader when a val split is configured, so the module's
-    # validation_step actually runs (review finding: previously only the train
-    # loader was passed and validation silently never ran).
     val_loader = None
     if val_ds is not None and len(val_ds) > 0:
         val_loader = DataLoader(
             val_ds,
-            batch_size=train_cfg.get("val_batch_size", train_cfg.get("batch_size", 64)),
+            batch_size=data_cfg["val_bs"],
             shuffle=False,
-            num_workers=train_cfg.get("num_workers", 4),
-            collate_fn=refiner_collate,
+            num_workers=data_cfg["num_workers"],
+            collate_fn=collate_fn,
             drop_last=False,
         )
 
     module = RefinerLightningModule(cfg)
 
-    # Logger (wandb, parity with train_ldf) + periodic checkpointing + resume.
     run_name = f"{cfg.get('exp_name', 'root_refiner')}_{time.strftime('%Y%m%d_%H%M%S')}"
-    logger = build_wandb_logger(cfg, run_name=run_name, save_dir=output_dir,
-                                api_key=wandb_api_key)
+    logger = build_wandb_logger(
+        cfg,
+        run_name=run_name,
+        save_dir=output_dir,
+        api_key=wandb_api_key,
+    )
     callbacks = []
     ckpt_cb = build_checkpoint_callback(cfg, output_dir)
     if ckpt_cb is not None:
@@ -859,36 +492,31 @@ def main(argv=None):
     if resume_ckpt:
         log.info("resuming from checkpoint: %s", resume_ckpt)
 
-    # Trainer kwargs from the `trainer` block (LDF style), with CLI/defaults.
     accelerator = trainer_cfg.get("accelerator", "auto")
     devices = args.devices if args.devices is not None else trainer_cfg.get("devices", 1)
-    # Multi-device → DDP with find_unused_parameters=True (mirrors train_ldf; the
-    # frozen text encoder otherwise risks DDP unused-parameter errors).
     strategy = "auto"
     if _num_devices(devices) > 1:
         from lightning.pytorch.strategies import DDPStrategy
+
         strategy = DDPStrategy(find_unused_parameters=True)
     trainer_kwargs = dict(
         max_steps=max_steps,
         devices=devices,
         accelerator=accelerator,
         strategy=strategy,
-        gradient_clip_val=trainer_cfg.get(
-            "gradient_clip_val", train_cfg.get("gradient_clip_val", 1.0)),
+        gradient_clip_val=trainer_cfg.get("gradient_clip_val", 1.0),
         default_root_dir=output_dir,
         log_every_n_steps=trainer_cfg.get("log_every_n_steps", 10),
         logger=logger if logger is not None else True,
         callbacks=callbacks,
     )
-    # Host-portable precision: a GPU-tuned bf16-mixed config downgrades to fp32 on CPU.
-    precision = safe_precision(accelerator, trainer_cfg.get("precision"),
-                               cuda_available=torch.cuda.is_available())
+    precision = safe_precision(
+        accelerator,
+        trainer_cfg.get("precision"),
+        cuda_available=torch.cuda.is_available(),
+    )
     if precision is not None:
         trainer_kwargs["precision"] = precision
-    # Step-based validation cadence when configured (LDF style); else epoch.
-    # validation_steps counts GLOBAL train steps, so check_val_every_n_epoch must
-    # be None — otherwise Lightning reads val_check_interval as a within-epoch
-    # batch index and raises when it exceeds the (often smaller) epoch length.
     val_check_interval = (cfg.get("validation") or {}).get("validation_steps")
     if val_loader is not None and val_check_interval:
         trainer_kwargs["val_check_interval"] = val_check_interval

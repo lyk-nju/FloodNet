@@ -30,7 +30,8 @@ class PathFeatureStats:
 
 
 def _sampling_relevant_config(cfg: dict[str, Any]) -> dict[str, Any]:
-    model = cfg.get("model", {}) or {}
+    model_block = cfg.get("model", {}) or {}
+    model = model_block.get("params", model_block) or {}
     data = cfg.get("data", {}) or {}
     return {
         "model": {

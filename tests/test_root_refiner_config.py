@@ -42,7 +42,7 @@ def test_train_config_is_real_precomputed_t5():
     assert te["type"] == "precomputed_t5_pool"
     assert "precomputed_text_emb_path" in te
     assert te.get("pooling") in ("mean", "first")
-    assert cfg["model"]["text_emb_dim"] == 4096   # = T5 cache text_dim (P0-1)
+    assert cfg["model"]["params"]["text_emb_dim"] == 4096   # = T5 cache text_dim (P0-1)
     assert cfg["data"]["normalize"] is True        # real training z-scores (P2-1)
 
 
@@ -85,7 +85,8 @@ def test_A_P0_1_train_config_interpolation_resolves():
 
 def test_model_block_required_keys_and_values():
     cfg = _load()
-    model = cfg["model"]
+    assert cfg["model"]["target"] == "models.root_refiner.RootRefiner"
+    model = cfg["model"]["params"]
     expected = {
         "d_model": 256,
         "n_layers": 6,
@@ -115,16 +116,17 @@ def test_canonicalization_block():
     assert "min" not in str(canon.get("full_plan_valid_history_frames", ""))
 
 
-def test_training_block():
+def test_ldf_style_runtime_blocks():
     cfg = _load()
-    tr = cfg["training"]
-    assert tr["batch_size"] == 64
-    assert tr["lr"] == 1.0e-4
-    assert tr["optimizer"] == "adamw"
-    assert tr["weight_decay"] == 0.01
-    assert tr["total_steps"] == 100000
-    assert tr["sampling_mode_full_ratio"] == 0.5
-    assert tr["gradient_clip_val"] == 1.0
+    assert "training" not in cfg
+    assert cfg["trainer"]["max_steps"] == 100000
+    assert cfg["trainer"]["gradient_clip_val"] == 1.0
+    assert cfg["data"]["train_bs"] == 64
+    assert cfg["data"]["val_bs"] == 64
+    assert cfg["optimizer"]["target"] == "AdamW"
+    assert cfg["optimizer"]["params"]["lr"] == 1.0e-4
+    assert cfg["optimizer"]["params"]["weight_decay"] == 0.01
+    assert cfg["sampling"]["full_plan_ratio"] == 0.5
 
 
 def test_loss_and_loss_weights():
@@ -174,6 +176,8 @@ def test_text_encoder_block():
 def test_data_block_has_required_paths():
     cfg = _load()
     data = cfg["data"]
+    assert data["target"] == "datasets.humanml3d_refiner.HumanML3DRefinerDataset"
+    assert data["collate_fn"] == "datasets.humanml3d_refiner.refiner_collate"
     assert "raw_data_dir" in data
     assert "stats_dir" in data
 
@@ -200,6 +204,11 @@ def test_run_control_blocks_present_in_both_configs():
             "groundtruth_duration",
             "pred_duration",
         ]
+
+
+def test_refiner_configs_use_ldf_style_output_base():
+    for path in (CFG_PATH, TRAIN_CFG_PATH):
+        assert _load(path)["save_dir"] == "./outputs"
 
 
 def test_debug_config_has_wandb_off_via_debug_flag():

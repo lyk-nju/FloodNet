@@ -14,16 +14,34 @@ _CFG_DIR = Path(__file__).resolve().parent.parent / "configs"
 
 
 def _load(name: str) -> dict:
-    with (_CFG_DIR / name).open() as f:
-        return yaml.safe_load(f) or {}
+    from train_refiner import _load_cfg
+
+    return _load_cfg(str(_CFG_DIR / name))
 
 
 def _minimal_cfg() -> dict:
     return {
         "model": {
-            "min_tokens": 4,
-            "max_tokens": 49,
-            "frames_per_token": 4,
+            "target": "models.root_refiner.RootRefiner",
+            "params": {
+                "min_tokens": 4,
+                "max_tokens": 49,
+                "frames_per_token": 4,
+            },
+        },
+        "optimizer": {
+            "target": "AdamW",
+            "params": {
+                "lr": 1.0e-4,
+                "weight_decay": 0.01,
+            },
+        },
+        "data": {
+            "target": "datasets.humanml3d_refiner.HumanML3DRefinerDataset",
+            "collate_fn": "datasets.humanml3d_refiner.refiner_collate",
+            "train_bs": 64,
+            "val_bs": 64,
+            "num_workers": 0,
         },
         "canonicalization": {
             "mode": "b_full",
@@ -70,7 +88,7 @@ def test_shipped_refiner_configs_are_valid():
 
 def test_rejects_invalid_token_range():
     cfg = _minimal_cfg()
-    cfg["model"]["min_tokens"] = 50
+    cfg["model"]["params"]["min_tokens"] = 50
 
     with pytest.raises(ValueError, match="min_tokens"):
         validate_refiner_config(cfg)
@@ -78,7 +96,7 @@ def test_rejects_invalid_token_range():
 
 def test_rejects_invalid_frames_per_token():
     cfg = _minimal_cfg()
-    cfg["model"]["frames_per_token"] = 0
+    cfg["model"]["params"]["frames_per_token"] = 0
 
     with pytest.raises(ValueError, match="frames_per_token"):
         validate_refiner_config(cfg)
@@ -97,6 +115,22 @@ def test_rejects_legacy_num_token_policy_key():
     cfg.setdefault("data", {})["num_token_policy"] = "random"
 
     with pytest.raises(ValueError, match="data.num_token_policy"):
+        validate_refiner_config(cfg)
+
+
+def test_rejects_legacy_training_block():
+    cfg = _minimal_cfg()
+    cfg["training"] = {"batch_size": 64, "lr": 1.0e-4, "total_steps": 1000}
+
+    with pytest.raises(ValueError, match="training is legacy"):
+        validate_refiner_config(cfg)
+
+
+def test_rejects_model_without_target_params():
+    cfg = _minimal_cfg()
+    cfg["model"] = {"min_tokens": 4, "max_tokens": 49}
+
+    with pytest.raises(ValueError, match="model.target"):
         validate_refiner_config(cfg)
 
 

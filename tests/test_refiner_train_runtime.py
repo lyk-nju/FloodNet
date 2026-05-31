@@ -2,7 +2,7 @@
 resolution in train_refiner.py.
 
 These cover the pure config-resolution helpers (no Trainer, no live wandb):
-- resolve_seed precedence (CLI > cfg.seed > cfg.training.seed > 1234)
+- resolve_seed precedence (CLI > cfg.seed > 1234)
 - resolve_resume_ckpt precedence (CLI > cfg.resume_ckpt > None)
 - build_wandb_logger returns None when disabled / no key
 - build_checkpoint_callback cadence + None when unset
@@ -40,26 +40,27 @@ def test_load_cfg_supports_base_config_overlay(tmp_path):
         "trainer:\n"
         "  devices: 4\n"
         "  precision: bf16-mixed\n"
-        "training:\n"
-        "  batch_size: 64\n"
+        "data:\n"
+        "  train_bs: 64\n"
         "model:\n"
-        "  d_model: 512\n"
+        "  params:\n"
+        "    d_model: 512\n"
     )
     overlay = tmp_path / "overlay.yaml"
     overlay.write_text(
         "base_config: base.yaml\n"
         "trainer:\n"
         "  devices: 1\n"
-        "training:\n"
-        "  batch_size: 16\n"
+        "data:\n"
+        "  train_bs: 16\n"
     )
 
     cfg = tr._load_cfg(str(overlay))
 
     assert cfg["trainer"]["devices"] == 1
     assert cfg["trainer"]["precision"] == "bf16-mixed"
-    assert cfg["training"]["batch_size"] == 16
-    assert cfg["model"]["d_model"] == 512
+    assert cfg["data"]["train_bs"] == 16
+    assert cfg["model"]["params"]["d_model"] == 512
     assert "base_config" not in cfg
 
 
@@ -104,15 +105,15 @@ def test_apply_default_fixed_validation_replaces_only_val_with_all_samples():
 
 
 def test_resolve_seed_cli_wins():
-    assert tr.resolve_seed({"seed": 7, "training": {"seed": 99}}, cli_seed=3) == 3
+    assert tr.resolve_seed({"seed": 7}, cli_seed=3) == 3
 
 
 def test_resolve_seed_top_level():
-    assert tr.resolve_seed({"seed": 7, "training": {"seed": 99}}) == 7
+    assert tr.resolve_seed({"seed": 7}) == 7
 
 
-def test_resolve_seed_training_block():
-    assert tr.resolve_seed({"training": {"seed": 99}}) == 99
+def test_resolve_seed_ignores_legacy_training_block():
+    assert tr.resolve_seed({"training": {"seed": 99}}) == 1234
 
 
 def test_resolve_seed_default():

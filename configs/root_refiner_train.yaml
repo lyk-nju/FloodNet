@@ -1,10 +1,7 @@
-# RootRefiner REAL training config (T_A_09; P0-1 / P2-1).
+# RootRefiner real training config.
 #
-# Differs from the debug config (configs/root_refiner.yaml) in the three ways
-# that make training real:
-#   - text_encoder.type: precomputed_t5_pool  (semantic T5, NOT the hashed stub)
-#   - model.text_emb_dim: 4096                (= LDF T5 cache text_dim)
-#   - data.normalize: true                    (z-score from stats_dir, must exist)
+# This config uses precomputed semantic T5 embeddings and normalized 5D root
+# targets. It is the default starting point for real RootRefiner runs.
 #
 # Prereqs on the training box:
 #   1. tools/pretokenize_t5_text.py has produced the T5 cache at
@@ -12,89 +9,85 @@
 #   2. scripts/compute_5d_stats.py has populated data.stats_dir.
 #
 # Hard constraints (same as the debug config): canonicalization.mode=b_full +
-# anchor=first_effective_frame (§0.3 v1); full_plan_valid_history_frames=1;
+# anchor=first_effective_frame; full_plan_valid_history_frames=1;
 # loss_weights uses fwd_delta/yaw_delta (per-frame deltas, not m/s).
 
-# ── Run control (structure mirrors configs/ldf.yaml) ──────────────────────
-# All optional; absent → train_refiner.py defaults. max_steps comes from
-# training.total_steps below (kept there for the config-schema test).
 exp_name: root_refiner        # used in the wandb run name
 seed: 1234                    # torch + dataset-aug RNG seed (pl.seed_everything)
 debug: false                  # false → wandb ON (real run); true → wandb OFF (smoke)
 train: true
 deterministic: false          # true = bit-reproducible (slower)
-save_dir: ./outputs/root_refiner_new
+save_dir: ./outputs
 resume_ckpt:               # path to resume from; empty = fresh run
 
 logger:
   wandb:
-    # ${...} resolved against configs/paths_default.yaml (same as ldf.yaml). key +
-    # entity are shared with FloodNet; project comes from refiner_wandb_info so
-    # refiner runs log to a SEPARATE project ("RootRefiner"). The resolved key is
-    # scrubbed from cfg before checkpoint/wandb logging (see train_refiner.main).
     wandb_key: "${wandb_info.key}"
     project: "${refiner_wandb_info.project}"
     entity: "${wandb_info.entity}"
 
 trainer:                      # Lightning Trainer kwargs (mirrors ldf.yaml.trainer)
+  max_steps: 2000000
   accelerator: auto           # ldf uses gpu; auto stays host-portable
-  devices: [0,1,2,3]                 # int or list ([0,1,...]); >1 → DDP(find_unused_parameters=True)
-  log_every_n_steps: 100
+  devices: [0,1,2,3]
+  log_every_n_steps: 50
   precision: bf16-mixed       # matches ldf; auto-downgraded to 32-true on CPU hosts
+  gradient_clip_val: 1.0
 
 validation:                   # val + checkpoint cadence (mirrors ldf.yaml.validation)
   validation_steps: 5000      # step-based val cadence (Trainer val_check_interval)
   save_every_n_steps: 5000    # periodic ModelCheckpoint cadence
-  save_top_k: -1              # -1 = keep every periodic ckpt. ldf uses 100 + a
-                              # monitored step metric; refiner has no monitor, so
-                              # a positive value would be coerced to -1.
+  save_top_k: -1
   eval_modes: [groundtruth_duration, pred_duration]
 
 model:
-  d_model: 512                # bumped for the path_cond decoder (≈30M total)
-  n_layers: 6                 # legacy total; split below when *_cond/_token absent
-  n_layers_cond: 3           # Stage-1 condition-only num-token predictor depth
-  n_layers_token: 3          # Stage-2 token-level plan generator depth
-  n_heads: 8
-  ff_dim: 1024
-  dropout: 0.2
-  max_tokens: 49
-  min_tokens: 4
-  frames_per_token: 4
-  n_path: 64
-  n_hist: 20
-  text_emb_dim: 4096          # = precomputed T5 cache text_dim (P0-1)
-  path_features_dim: 5
-  # Stage-3 path-conditioned decoder (≈11M at width 512; total model ≈30M).
-  decoder_type: path_cond     # path_cond | simple
-  decoder_width: 512          # PathCondFrameDecoder hidden width
-  decoder_path_cond_dim: 6    # [path_x, path_z, tan_x, tan_z, horizon_prog, grid_prog]
-  decoder_token_res_depth: 2  # token-grid ResBlocks
-  decoder_frame_res_depth: 4  # frame-grid dilated ResBlocks (repeated path cond)
-  decoder_dilation_growth_rate: 2
-  decoder_dropout: 0.15
+  target: models.root_refiner.RootRefiner
+  ema_decay:
+  params:
+    d_model: 512
+    n_layers: 6
+    n_layers_cond: 3
+    n_layers_token: 3
+    n_heads: 8
+    ff_dim: 1024
+    dropout: 0.2
+    max_tokens: 49
+    min_tokens: 4
+    frames_per_token: 4
+    n_path: 64
+    n_hist: 20
+    text_emb_dim: 4096          # precomputed T5 cache text_dim
+    path_features_dim: 5
+    decoder_type: path_cond     # path_cond | simple
+    decoder_width: 512          # PathCondFrameDecoder hidden width
+    decoder_path_cond_dim: 6    # [path_x, path_z, tan_x, tan_z, horizon_prog, grid_prog]
+    decoder_token_res_depth: 2  # token-grid ResBlocks
+    decoder_frame_res_depth: 4  # frame-grid dilated ResBlocks (repeated path cond)
+    decoder_dilation_growth_rate: 2
+    decoder_dropout: 0.15
 
 canonicalization:
   mode: b_full
   anchor: first_effective_frame
   full_plan_valid_history_frames: 1
 
-training:
-  batch_size: 64
-  lr: 1.0e-4
-  optimizer: adamw
-  weight_decay: 0.01
-  total_steps: 2000000
-  sampling_mode_full_ratio: 0.5
-  gradient_clip_val: 1.0
+optimizer:
+  target: AdamW
+  params:
+    lr: 1.0e-4
+    weight_decay: 0.01
+
+lr_scheduler:
+  target:
+  params: {}
 
 loss:
   heading_form: cosine
-  ordinal_sigma: 1.0         # R2.6 duration soft-label bandwidth (token units)
+  ordinal_sigma: 1.0         # duration soft-label bandwidth
 
 loss_weights:
-  num_token: 1.0             # R2.6: ordinal soft-label CE (was hard CE)
-  num_token_soft: 0.1        # R2.6: soft-argmax expected-token Huber aux
+  num_token: 1.0
+  num_token_soft: 0.1
   xyz: 5.0
   heading: 1.0
   fwd_delta: 0.5
@@ -103,24 +96,31 @@ loss_weights:
   smoothness: 0.005             # enable (0.005~0.01) only for ablation / fine-tune
 
 text_encoder:
-  type: precomputed_t5_pool   # P0-1: reuse the LDF offline T5 cache, pooled
+  type: precomputed_t5_pool
   precomputed_text_emb_path: ${data.raw_data_dir}/HumanML3D/t5_text_embeddings.pt
   pooling: mean               # mean | first
   share_with: ldf
   freeze: true
-  debug_stub: false           # REAL training — locked false (test_root_refiner_config)
+  debug_stub: false
 
 data:
+  target: datasets.humanml3d_refiner.HumanML3DRefinerDataset
+  collate_fn: datasets.humanml3d_refiner.refiner_collate
+  train_bs: 64
+  val_bs: 64
+  test_bs: 64
+  num_workers: 4
   raw_data_dir: /data1/yuankai/text2Motion/FloodDiffusion/raw_data
   dataset: humanml3d
   train_split_file: train.txt
   val_split_file: val.txt
   feature_path: new_joint_vecs
   text_path: texts
-  normalize: true             # real training: z-score on (P2-1); stats_dir must exist
+  normalize: true
   stats_dir: deps/refiner_stats
 
 sampling:
+  full_plan_ratio: 0.5
   horizon_policy: random       # random | max | bucketed
   path_condition:
     policy: mixed              # mixed | dense_path | sparse_path | goal_point

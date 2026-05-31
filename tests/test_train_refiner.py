@@ -1,4 +1,4 @@
-"""Unit tests for train_refiner.py (T_A_08)."""
+"""Unit tests for RootRefiner training helpers."""
 
 from __future__ import annotations
 
@@ -149,7 +149,7 @@ def test_module_raises_when_no_encoder_and_no_debug_stub():
 def test_module_uses_explicit_encoder_over_stub():
     cfg = _tiny_cfg()
     cfg["text_encoder"] = {"share_with": "ldf"}   # no debug_stub
-    enc = FrozenStubTextEncoder(emb_dim=cfg["model"]["text_emb_dim"])
+    enc = FrozenStubTextEncoder(emb_dim=cfg["model"]["params"]["text_emb_dim"])
     module = RefinerLightningModule(cfg, text_encoder=enc)
     assert module.text_encoder is enc
 
@@ -173,19 +173,34 @@ def test_build_datasets_val_none_when_no_val_split(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Loss dict key alignment (round 6 P1-4 / P1-6 lock-in)
+# Loss dict key alignment
 # ---------------------------------------------------------------------------
 
 
 def _tiny_cfg():
     return {
         "model": {
-            "d_model": 32, "n_layers": 2, "n_heads": 4, "ff_dim": 64,
-            "max_tokens": 8, "min_tokens": 2, "frames_per_token": 4,
-            "n_path": 16, "n_hist": 8, "text_emb_dim": 16,
-            "path_features_dim": 5, "dropout": 0.0,
+            "target": "models.root_refiner.RootRefiner",
+            "ema_decay": None,
+            "params": {
+                "d_model": 32, "n_layers": 2, "n_heads": 4, "ff_dim": 64,
+                "max_tokens": 8, "min_tokens": 2, "frames_per_token": 4,
+                "n_path": 16, "n_hist": 8, "text_emb_dim": 16,
+                "path_features_dim": 5, "dropout": 0.0,
+            },
         },
-        "training": {"lr": 1e-3, "weight_decay": 0.01},
+        "data": {
+            "target": "datasets.humanml3d_refiner.HumanML3DRefinerDataset",
+            "collate_fn": "datasets.humanml3d_refiner.refiner_collate",
+            "train_bs": 4,
+            "val_bs": 4,
+            "num_workers": 0,
+        },
+        "optimizer": {
+            "target": "AdamW",
+            "params": {"lr": 1e-3, "weight_decay": 0.01},
+        },
+        "lr_scheduler": {"target": None, "params": {}},
         "loss": {"heading_form": "cosine"},
         "loss_weights": {
             "num_token": 1.0, "num_token_soft": 0.1, "xyz": 5.0, "heading": 1.0,
@@ -212,8 +227,8 @@ def _make_batch(module, B=2):
         "path_features": torch.randn(B, m.path_features_dim, generator=g),
         "history_motion": torch.randn(B, m.n_hist, 5, generator=g),
         "history_mask": torch.ones(B, m.n_hist, dtype=torch.bool),
-        "target_waypoints": waypoints,
-        "target_mask": torch.ones(B, m.max_frames, dtype=torch.bool),
+        "waypoints": waypoints[..., :5],
+        "waypoints_mask": torch.ones(B, m.max_frames, dtype=torch.bool),
         "num_tokens": torch.tensor([3, 5]),
     }
 
@@ -249,7 +264,6 @@ def test_loss_dict_keys_match_config_weights_and_no_speed():
                 "fwd_delta", "yaw_delta", "path_control", "smoothness"}
     expected |= set(RefinerLightningModule.METRIC_KEYS)
     assert set(losses.keys()) == expected
-    # Round 6 P1-6: no legacy "speed" key.
     assert "speed" not in losses
     # all finite
     for k, v in losses.items():

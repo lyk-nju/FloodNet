@@ -29,11 +29,6 @@ from utils.token_frame import num_frames_for_tokens
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 def _pad_or_truncate(x: Tensor, target_len: int) -> Tensor:
     """Zero-pad along dim 0 (or truncate) so dim 0 == target_len."""
     cur = x.shape[0]
@@ -47,13 +42,8 @@ def _pad_or_truncate(x: Tensor, target_len: int) -> Tensor:
     return torch.cat([x, pad], dim=0)
 
 
-# ---------------------------------------------------------------------------
-# Dataset
-# ---------------------------------------------------------------------------
-
-
 class RefinerDataset(Dataset):
-    """Final v2 RefinerDataset.
+    """Base motion-window sampler used by the public RootRefiner dataset.
 
     Parameters
     ----------
@@ -65,8 +55,7 @@ class RefinerDataset(Dataset):
         Model-side schema constants; match `configs/root_refiner.yaml`.
     full_plan_ratio : probability of choosing full mode (when sliding-eligible).
     normalize : if True, apply selective z-score using `stats_dir`'s mean/std
-        and `*_norm_indices.npy` files; if False, raw values are returned
-        (T_A_06 stats computation uses normalize=False to avoid double-norm).
+        and `*_norm_indices.npy` files; if False, raw values are returned.
     stats_dir : directory containing `current_motion_mean.npy`,
         `current_motion_std.npy`, `current_motion_norm_indices.npy`,
         `waypoint_mean.npy`, `waypoint_std.npy`, `waypoint_norm_indices.npy`.
@@ -98,15 +87,10 @@ class RefinerDataset(Dataset):
         self.full_plan_ratio = full_plan_ratio
         self.num_token_policy = str(num_token_policy)
         self.normalize = normalize
-        # When False (e.g. validation / benchmark), always use the first caption
-        # so the metric is comparable across epochs; when True (training), draw a
-        # random caption per sample for text augmentation. See _choose_caption.
         self.randomize_caption = randomize_caption
 
-        # Pre-compute clip lengths.
         self._clip_lengths = [int(self._motion_of(c).shape[0]) for c in clips]
 
-        # Eligibility split (round 8 P0-4).
         min_full = num_frames_for_tokens(min_tokens, frames_per_token)
         min_sliding = (n_hist - 1) + min_full
 
@@ -116,11 +100,8 @@ class RefinerDataset(Dataset):
         self.sliding_eligible_indices: set[int] = {
             i for i, T in enumerate(self._clip_lengths) if T >= min_sliding
         }
-        # T07: full-eligibility is the dataset-level filter; short clips never
-        # appear via __getitem__.
         self.valid_indices: list[int] = self.full_eligible_indices
 
-        # Normalization stats (optional).
         self._cm_mean = None
         self._cm_std = None
         self._cm_norm_idx = None
@@ -136,32 +117,15 @@ class RefinerDataset(Dataset):
         self._rng = random_module.Random(seed) if seed is not None else random_module.Random()
 
     def set_worker_seed(self) -> None:
-        """P1-3: reseed this worker's augmentation RNG to a per-worker-unique
-        value. Without this, fork()ed DataLoader workers inherit one identical
-        `random.Random` state (it's a Python RNG, NOT auto-seeded per worker like
-        torch's), so offset-start path augmentation correlates across workers.
-        torch.initial_seed() is set distinctly per worker by the DataLoader, so we
-        derive from it (combined with the dataset's base seed when fixed).
-        """
+        """Reseed the dataset RNG for this DataLoader worker."""
         base = int(torch.initial_seed()) % (2 ** 31)
         if self._seed is not None:
             base = (base + int(self._seed)) % (2 ** 31)
         self._rng = random_module.Random(base)
 
     def reset_rng(self) -> None:
-        """Reset the sampling/augmentation RNG to the dataset's base `seed` so a
-        repeat single-process pass (e.g. a benchmark run) draws the IDENTICAL
-        mode / anchor / num_tokens / path-condition sequence. `get_sample`
-        advances the RNG every call (force_no_path_aug only disables offset-start
-        path augmentation, not the mode/anchor/num_tokens dice), so without this
-        two passes over the same dataset object diverge. Reproducible only when
-        constructed with a fixed
-        `seed` (seed=None → reseeds from OS entropy, matching construction)."""
+        """Reset sampling to the dataset seed for deterministic repeated passes."""
         self._rng = random_module.Random(self._seed)
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     def __len__(self) -> int:
         return len(self.valid_indices)
@@ -169,10 +133,6 @@ class RefinerDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         clip_idx = self.valid_indices[idx]
         return self._make_sample(clip_idx)
-
-    # ------------------------------------------------------------------
-    # Helpers (kept public for unit tests / debug)
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _motion_of(clip: dict) -> Tensor:
@@ -184,18 +144,7 @@ class RefinerDataset(Dataset):
         return m
 
     def _choose_caption(self, clip: dict, force_text_idx: int | None) -> str:
-        """Pick the caption for this sample. A clip may carry `texts` (all
-        distinct captions, from load_clips_from_dir); HumanML3D gives 3-5 per
-        clip. With `randomize_caption` (training default) a random caption is
-        drawn each sample — paraphrases become text augmentation, and the frozen
-        T5 cache holds every caption so the encoder lookup always hits. With it
-        off (val / benchmark) the first caption is used so the metric stays
-        comparable across epochs; that path consumes NO RNG, so the mode/anchor/
-        num_tokens draw order matches the legacy single-caption behavior.
-        `force_text_idx` pins a specific caption (benchmark / tests) and takes
-        precedence. Falls back to the single `text` key when `texts` is
-        absent/empty (synthetic test clips), keeping the legacy schema working.
-        """
+        """Pick a training or deterministic validation caption for this sample."""
         texts = clip.get("texts")
         if texts:
             if force_text_idx is not None:
@@ -211,15 +160,7 @@ class RefinerDataset(Dataset):
                     force_anchor_frame: int | None = None,
                     force_no_path_aug: bool = False,
                     force_text_idx: int | None = None) -> dict[str, Any]:
-        """Debug / unit-test entry point: bypasses random by forcing decisions.
-
-        `force_mode`: "full" | "sliding" | None (use full_plan_ratio dice).
-        `force_num_tokens`: override num_tokens; must be in [min_tokens, max_tokens].
-        `force_anchor_frame`: override anchor_frame.
-        `force_no_path_aug`: skip offset-start path augmentation (deterministic path).
-        `force_text_idx`: pick `clip["texts"][i]` instead of a random caption
-            (no-op when the clip has no `texts` list).
-        """
+        """Build a sample with optional forced decisions for tests and diagnostics."""
         clip_idx = self.valid_indices[idx_in_valid]
         return self._make_sample(
             clip_idx,
@@ -253,9 +194,6 @@ class RefinerDataset(Dataset):
         self._wp_norm_idx = torch.as_tensor(
             np.load(stats_dir / "waypoint_norm_indices.npy"), dtype=torch.long,
         )
-        # ⚠ Validate shapes / index ranges up front so a stale or mismatched
-        # stats_dir fails loudly here instead of via a cryptic IndexError deep
-        # in __getitem__ (or, worse, silently normalizing the wrong channels).
         if self._cm_mean.shape != (5,) or self._cm_std.shape != (5,):
             raise ValueError(
                 f"current_motion stats must be shape (5,), got "
@@ -269,11 +207,8 @@ class RefinerDataset(Dataset):
         if self._cm_norm_idx.numel() and int(self._cm_norm_idx.max()) >= 5:
             raise ValueError(f"current_motion_norm_indices out of range for dim 5: "
                              f"{self._cm_norm_idx.tolist()}")
-        # Heading channels 3/4 (cos/sin yaw) are unit-vector invariant and MUST
-        # NOT be z-scored (rule 7) — same invariant as the waypoint check below.
-        # current_motion is only a model input (hist_proj), so a z-scored heading
-        # wouldn't break a loss, but it silently diverges from the design's
-        # unit-heading convention; fail loudly on a stale/hand-edited stats file.
+        # Heading channels stay unit-normalized; z-scoring them breaks the
+        # cos/sin convention used by the model and losses.
         if set(self._cm_norm_idx.tolist()) & {3, 4}:
             raise ValueError(
                 "current_motion_norm_indices must NOT include heading channels 3/4 "
@@ -283,10 +218,6 @@ class RefinerDataset(Dataset):
         if self._wp_norm_idx.numel() and int(self._wp_norm_idx.max()) >= 7:
             raise ValueError(f"waypoint_norm_indices out of range for dim 7: "
                              f"{self._wp_norm_idx.tolist()}")
-        # Heading channels 3/4 (cos/sin yaw) are unit-vector invariant and MUST
-        # NOT be z-scored (rule 7): the cosine heading loss assumes a unit-norm GT
-        # heading, which a z-scored target would violate. Fail loudly on a stale
-        # stats file rather than silently breaking heading supervision.
         if set(self._wp_norm_idx.tolist()) & {3, 4}:
             raise ValueError(
                 "waypoint_norm_indices must NOT include heading channels 3/4 "
@@ -295,14 +226,14 @@ class RefinerDataset(Dataset):
                 f"{self._wp_norm_idx.tolist()}"
             )
 
-    def _apply_zscore(self, tensor: Tensor, mean: Tensor, std: Tensor,
-                       norm_idx: Tensor) -> Tensor:
-        """Z-score only the channels listed in norm_idx; leave others (cos/sin)
-        bit-for-bit unchanged. Operates per-frame on the last dim.
-
-        mean/std are moved to `tensor`'s device/dtype so this works even if the
-        sample tensor lives on CUDA / is non-fp32 (stats are loaded as CPU fp32).
-        """
+    def _apply_zscore(
+        self,
+        tensor: Tensor,
+        mean: Tensor,
+        std: Tensor,
+        norm_idx: Tensor,
+    ) -> Tensor:
+        """Z-score only the selected channels on the last dimension."""
         out = tensor.clone()
         mean = mean.to(device=tensor.device, dtype=tensor.dtype)
         std = std.to(device=tensor.device, dtype=tensor.dtype)
@@ -310,30 +241,27 @@ class RefinerDataset(Dataset):
             out[..., c] = (out[..., c] - mean[c]) / std[c]
         return out
 
-    # ------------------------------------------------------------------
-    # Sample builder (the actual data flow)
-    # ------------------------------------------------------------------
-
-    def _make_sample(self,
-                      clip_idx: int,
-                      *,
-                      force_mode: str | None = None,
-                      force_num_tokens: int | None = None,
-                      force_anchor_frame: int | None = None,
-                      force_no_path_aug: bool = False,
-                      force_text_idx: int | None = None) -> dict[str, Any]:
+    def _make_sample(
+        self,
+        clip_idx: int,
+        *,
+        force_mode: str | None = None,
+        force_num_tokens: int | None = None,
+        force_anchor_frame: int | None = None,
+        force_no_path_aug: bool = False,
+        force_text_idx: int | None = None,
+    ) -> dict[str, Any]:
         clip = self._clips[clip_idx]
         motion_263 = self._motion_of(clip).unsqueeze(0)            # [1, T, 263]
         T = motion_263.shape[1]
         text = self._choose_caption(clip, force_text_idx)
 
-        # Step 1: 263D recovery → (root_quat, root_xyz, root_yaw)
+        # Recover world-space root position and heading from HumanML3D features.
         root_quat, root_xyz = recover_root_rot_pos(motion_263)
         root_quat = root_quat[0]                                    # [T, 4]
         root_xyz = root_xyz[0]                                      # [T, 3]
         root_yaw = root_quat_to_physical_yaw(root_quat)             # [T]
 
-        # Step 2: compose world 5D + 7D (round 8 P0-6 cat with explicit unsqueeze).
         motion_5d_world = torch.cat(
             [
                 root_xyz,                                  # [T, 3]
@@ -346,10 +274,8 @@ class RefinerDataset(Dataset):
             root_quat.unsqueeze(0), root_xyz.unsqueeze(0),
         )[0]                                               # [T, 7]
 
-        # Step 3: mode + anchor + num_tokens (round 8 P0-5 order).
         min_full = num_frames_for_tokens(self.min_tokens, self.frames_per_token)
 
-        # Choose mode.
         if force_mode is not None:
             mode_drawn = force_mode
         elif self._rng.random() < self.full_plan_ratio:
@@ -357,16 +283,10 @@ class RefinerDataset(Dataset):
         else:
             mode_drawn = "sliding"
         if mode_drawn == "sliding" and clip_idx not in self.sliding_eligible_indices:
-            mode = "full"   # P0-4 fallback
+            mode = "full"
         else:
             mode = mode_drawn
 
-        # ⚠ max_valid_tokens must satisfy `num_frames_for_tokens(N) <= remaining_frames`,
-        # i.e. N <= (remaining_frames + frames_per_token - 1) // frames_per_token.
-        # The TODO doc's inline formula `frame_idx_to_token_idx(R-1) + 1` counts
-        # the partial-cover token at the tail and over-shoots — fixed here so the
-        # downstream `assert anchor_frame + target_frame_count <= T` cannot fire
-        # on clips whose length is not exactly a token boundary.
         def _max_tokens_in_frames(remaining: int) -> int:
             if remaining <= 0:
                 return 0
@@ -376,16 +296,11 @@ class RefinerDataset(Dataset):
             anchor_frame = 0 if force_anchor_frame is None else int(force_anchor_frame)
             valid_history_frames = 1
             history_frame_indices = [anchor_frame]
-            # ⚠ bound by frames REMAINING after the anchor (T - anchor_frame), not
-            # the whole clip length T. With anchor_frame=0 (normal full mode) these
-            # are identical, but a forced/non-zero anchor must not let
-            # target_frame_count overrun the clip (else the assert below fires).
             max_valid_tokens = min(self.max_tokens, _max_tokens_in_frames(T - anchor_frame))
         else:
             lo = self.n_hist - 1
             hi = T - min_full                              # inclusive upper bound
             if hi < lo:
-                # Defensive: should not happen for sliding_eligible clips.
                 raise RuntimeError(
                     f"sliding anchor range invalid: lo={lo} hi={hi} T={T} "
                     f"clip_idx={clip_idx}"
@@ -420,16 +335,13 @@ class RefinerDataset(Dataset):
             f"anchor_frame={anchor_frame} + target_frame_count={target_frame_count} > T={T}"
         )
 
-        # Step 4: canonicalize.
         anchor_xz = root_xyz[anchor_frame, [0, 2]]                  # [2]
         anchor_yaw = root_yaw[anchor_frame]                          # scalar
 
-        # current_motion (anchor at last slot).
         current_motion_world = motion_5d_world[history_frame_indices]   # [valid_hist, 5]
         current_motion_local = canonicalize_5d(
             current_motion_world, anchor_xz, anchor_yaw,
         )
-        # Pad to [n_hist, 5] with leading zeros (history_mask flags valid slots).
         if valid_history_frames < self.n_hist:
             pad = current_motion_local.new_zeros(
                 self.n_hist - valid_history_frames, 5,
@@ -440,20 +352,14 @@ class RefinerDataset(Dataset):
         history_mask = torch.zeros(self.n_hist, dtype=torch.bool)
         history_mask[self.n_hist - valid_history_frames :] = True
 
-        # target_waypoints (anchor at first slot, token-aligned length).
         target_world = motion_7d_world[anchor_frame : anchor_frame + target_frame_count]
         target_local = canonicalize_7d(target_world, anchor_xz, anchor_yaw)
         max_frames = num_frames_for_tokens(self.max_tokens, self.frames_per_token)
         target_waypoints = _pad_or_truncate(target_local, max_frames)
-        # R2.5: keep an UN-z-scored copy so the path condition (and its physical
-        # path_features) can be built in physical space by the shim. The base
-        # z-scores `target_waypoints` in place below; the shim reads physical xz
-        # from this field so compute_path_features runs on metres, not z-units.
         target_waypoints_physical = target_waypoints.clone()
         target_mask = torch.zeros(max_frames, dtype=torch.bool)
         target_mask[:target_frame_count] = True
 
-        # Step 5: optional z-score (selective).
         if self.normalize:
             current_motion = self._apply_zscore(
                 current_motion, self._cm_mean, self._cm_std, self._cm_norm_idx,
@@ -479,13 +385,7 @@ class RefinerDataset(Dataset):
 
 
 class HumanML3DRefinerDataset(RefinerDataset):
-    """RootRefiner dataset using the new batch contract.
-
-    This class initially reuses the legacy HumanML3D-to-refiner motion pipeline
-    and exposes the redesigned field names and masks. Path-mode construction is
-    implemented in `utils.refiner.path_condition` and can be integrated without
-    changing the public contract.
-    """
+    """RootRefiner dataset with public batch fields and path conditions."""
 
     def __init__(
         self,
@@ -516,9 +416,6 @@ class HumanML3DRefinerDataset(RefinerDataset):
         self.offset_start_apply_to = tuple(offset_start_apply_to)
         self.sparse_path_point_range = tuple(int(v) for v in sparse_path_point_range)
         self.max_frames = self.max_frames if hasattr(self, "max_frames") else None
-        # R2.5: optional PHYSICAL path-feature normalization stats (own mean/std,
-        # NOT the waypoint stats). When normalize=True and a stats dir is given,
-        # path_features are z-scored by these; otherwise they stay raw-physical.
         self._pf_mean = None
         self._pf_std = None
         if path_feature_stats_dir is not None:
@@ -538,8 +435,7 @@ class HumanML3DRefinerDataset(RefinerDataset):
             self._pf_std = stats.std
 
     def _zscore_path_xz(self, path_xz: torch.Tensor) -> torch.Tensor:
-        """Z-score path geometry [N, 2] with the WAYPOINT x/z stats (indices 0,2),
-        so path tokens match the z-scored waypoints used by the control loss."""
+        """Z-score path geometry with the waypoint x/z stats."""
         wp_mean, wp_std = self._wp_mean, self._wp_std
         wp_idx = self._wp_norm_idx
         if wp_mean is None or wp_std is None or wp_idx is None:
@@ -553,7 +449,7 @@ class HumanML3DRefinerDataset(RefinerDataset):
         return out
 
     def _normalize_path_features(self, features: torch.Tensor) -> torch.Tensor:
-        """Z-score physical path_features by their OWN stats, if loaded."""
+        """Z-score physical path_features with path-feature stats."""
         if self._pf_mean is None or self._pf_std is None:
             return features
         return (features - self._pf_mean) / self._pf_std
@@ -566,7 +462,6 @@ class HumanML3DRefinerDataset(RefinerDataset):
 
     @max_frames.setter
     def max_frames(self, value: int | None) -> None:
-        # Compatibility no-op; the legacy class computes this ad hoc.
         pass
 
     def get_sample(
@@ -578,7 +473,7 @@ class HumanML3DRefinerDataset(RefinerDataset):
     ) -> dict[str, Any]:
         force_no_path_aug = bool(kwargs.get("force_no_path_aug", False))
         sample = super().get_sample(idx_in_valid, **kwargs)
-        return self._convert_legacy_sample(
+        return self._build_refiner_sample(
             sample,
             force_path_mode=force_path_mode,
             force_no_path_aug=force_no_path_aug,
@@ -587,13 +482,13 @@ class HumanML3DRefinerDataset(RefinerDataset):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         clip_idx = self.valid_indices[idx]
         sample = self._make_sample(clip_idx)
-        return self._convert_legacy_sample(
+        return self._build_refiner_sample(
             sample,
             force_path_mode=None,
             force_no_path_aug=False,
         )
 
-    def _convert_legacy_sample(
+    def _build_refiner_sample(
         self,
         sample: dict[str, Any],
         *,
@@ -605,27 +500,15 @@ class HumanML3DRefinerDataset(RefinerDataset):
         waypoints = sample["target_waypoints"][..., :5]
         waypoints_mask = sample["target_mask"]
         valid_frame_count = int(waypoints_mask.sum().item())
-        # R2.5: build the path condition (and its physical path_features) from the
-        # PHYSICAL pre-z-score waypoints, not the z-scored `target_waypoints`.
-        # Reading z-scored xz here made compute_path_features run in anisotropic
-        # z-units → non-physical path_length and the duration-head overfit. The
-        # geometry `path` tokens are re-z-scored below to stay in the waypoint
-        # space the control loss compares against; only path_features stay physical.
         if "target_waypoints_physical" in sample:
             physical_wp = sample["target_waypoints_physical"]
         elif getattr(self, "normalize", False):
-            # When normalizing, the base MUST hand us the pre-z-score waypoints.
-            # Silently falling back to the z-scored `target_waypoints` would
-            # rebuild path_features in z-score space — the exact R2.5 overfit
-            # bug — so fail loudly (e.g. a sample cache built before R2.5).
             raise KeyError(
                 "target_waypoints_physical missing while normalize=True; the "
                 "base dataset must emit pre-z-score waypoints. Rebuild any stale "
-                "sample cache — a z-scored fallback would silently reintroduce "
-                "the R2.5 path-feature-space bug."
+                "sample cache."
             )
         else:
-            # normalize=False: target_waypoints is already physical (never z-scored).
             physical_wp = sample["target_waypoints"]
         future_xz = physical_wp[:valid_frame_count, [0, 2]]
         path_mode = force_path_mode or self._sample_path_mode()
@@ -651,10 +534,6 @@ class HumanML3DRefinerDataset(RefinerDataset):
         )
 
         out = dict(sample)
-        # R2.5: path was built in physical space. Re-apply the waypoint xz z-score
-        # to the GEOMETRY tokens (only) so they live in the same space as the
-        # z-scored `waypoints` the dense/sparse control loss compares them against.
-        # path_features stay PHYSICAL (optionally normalized by their OWN stats).
         path_tokens = condition.path
         path_features = condition.path_features_raw
         if getattr(self, "normalize", False):
@@ -728,12 +607,10 @@ def refiner_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def refiner_worker_init_fn(worker_id: int) -> None:
-    """DataLoader worker_init_fn: give each worker a distinct augmentation RNG
-    (P1-3). Pass to DataLoader(worker_init_fn=refiner_worker_init_fn)."""
+    """Give each DataLoader worker a distinct dataset RNG."""
     info = torch.utils.data.get_worker_info()
     if info is not None and hasattr(info.dataset, "set_worker_seed"):
         info.dataset.set_worker_seed()
-
 
 
 def clone_refiner_sample(sample: dict[str, Any]) -> dict[str, Any]:
@@ -812,8 +689,7 @@ def build_fixed_refiner_samples(
         samples.append(clone_refiner_sample(sample))
     return samples
 
-# Back-compat alias: this name was exported when the fixed tools lived in
-# datasets/refiner_fixed and were re-exported here under this alias.
+
 FixedHumanML3DRefinerDataset = FixedRefinerSampleDataset
 
 

@@ -10,20 +10,30 @@ from train_refiner import RefinerLightningModule
 def _cfg() -> dict:
     return {
         "model": {
-            "d_model": 32,
-            "n_layers": 2,
-            "n_heads": 4,
-            "ff_dim": 64,
-            "max_tokens": 8,
-            "min_tokens": 2,
-            "frames_per_token": 4,
-            "n_path": 16,
-            "n_hist": 8,
-            "text_emb_dim": 16,
-            "path_features_dim": 5,
-            "dropout": 0.0,
+            "target": "models.root_refiner.RootRefiner",
+            "params": {
+                "d_model": 32,
+                "n_layers": 2,
+                "n_heads": 4,
+                "ff_dim": 64,
+                "max_tokens": 8,
+                "min_tokens": 2,
+                "frames_per_token": 4,
+                "n_path": 16,
+                "n_hist": 8,
+                "text_emb_dim": 16,
+                "path_features_dim": 5,
+                "dropout": 0.0,
+            },
         },
-        "training": {"lr": 1e-3, "weight_decay": 0.01},
+        "data": {
+            "target": "datasets.humanml3d_refiner.HumanML3DRefinerDataset",
+            "collate_fn": "datasets.humanml3d_refiner.refiner_collate",
+            "train_bs": 4,
+            "val_bs": 4,
+            "num_workers": 0,
+        },
+        "optimizer": {"target": "AdamW", "params": {"lr": 1e-3, "weight_decay": 0.01}},
         "validation": {
             "eval_modes": ["groundtruth_duration", "pred_duration"],
         },
@@ -79,8 +89,12 @@ def test_validation_step_logs_groundtruth_and_pred_duration_prefixes():
     module = RefinerLightningModule(_cfg())
     batch = _batch(module)
     logged = {}
+    log_kwargs = {}
     module.log = types.MethodType(
-        lambda self, key, value, **kwargs: logged.__setitem__(key, value),
+        lambda self, key, value, **kwargs: (
+            logged.__setitem__(key, value),
+            log_kwargs.__setitem__(key, kwargs),
+        ),
         module,
     )
 
@@ -88,3 +102,5 @@ def test_validation_step_logs_groundtruth_and_pred_duration_prefixes():
 
     assert "val_groundtruth_duration/loss" in logged
     assert "val_pred_duration/loss" in logged
+    assert all(kwargs["sync_dist"] is True for kwargs in log_kwargs.values())
+    assert all(kwargs["batch_size"] == 2 for kwargs in log_kwargs.values())
