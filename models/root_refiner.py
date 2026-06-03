@@ -558,13 +558,27 @@ class RootRefiner(nn.Module):
         if path_mode is None:
             return torch.zeros(batch_size, dtype=torch.long, device=device)
         if torch.is_tensor(path_mode):
-            return path_mode.to(device=device, dtype=torch.long).clamp(
-                0,
-                len(_PATH_MODE_TO_ID) - 1,
-            )
+            ids = path_mode.to(device=device, dtype=torch.long)
+            if ids.numel() != batch_size:
+                raise ValueError(
+                    f"path_mode length {ids.numel()} does not match batch size {batch_size}"
+                )
+            if (ids < 0).any() or (ids >= len(_PATH_MODE_TO_ID)).any():
+                raise ValueError(
+                    f"unknown path_mode id; expected ids in [0, {len(_PATH_MODE_TO_ID) - 1}]"
+                )
+            return ids.reshape(batch_size)
         if isinstance(path_mode, str):
             path_mode = [path_mode] * batch_size
-        ids = [_PATH_MODE_TO_ID.get(str(mode), 0) for mode in path_mode]
+        ids = []
+        for mode in path_mode:
+            key = str(mode)
+            if key not in _PATH_MODE_TO_ID:
+                valid = ", ".join(sorted(_PATH_MODE_TO_ID))
+                raise ValueError(
+                    f"unknown path_mode {key!r}; expected one of: {valid}"
+                )
+            ids.append(_PATH_MODE_TO_ID[key])
         if len(ids) != batch_size:
             raise ValueError(
                 f"path_mode length {len(ids)} does not match batch size {batch_size}"

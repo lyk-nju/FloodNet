@@ -237,19 +237,32 @@ class RootRefinerLightningModule(pl.LightningModule):
 
     def _register_waypoint_stats(self, cfg: dict) -> None:
         data_cfg = cfg.get("data", {}) or {}
+        normalize = bool(data_cfg.get("normalize", False))
         stats_dir = data_cfg.get("stats_dir")
-        use_stats = bool(data_cfg.get("normalize", False)) and stats_dir
-        if not use_stats:
+        if not normalize:
             self.register_buffer("_wp_mean", None, persistent=False)
             self.register_buffer("_wp_std", None, persistent=False)
             self.register_buffer("_wp_norm_idx", None, persistent=False)
             return
+        if not stats_dir:
+            raise FileNotFoundError(
+                "data.normalize=true requires data.stats_dir for physical waypoint losses"
+            )
         stats_path = Path(stats_dir)
         if not stats_path.is_dir():
-            self.register_buffer("_wp_mean", None, persistent=False)
-            self.register_buffer("_wp_std", None, persistent=False)
-            self.register_buffer("_wp_norm_idx", None, persistent=False)
-            return
+            raise FileNotFoundError(
+                f"data.normalize=true requires an existing stats_dir, got {stats_path}"
+            )
+        required = (
+            "waypoint_mean.npy",
+            "waypoint_std.npy",
+            "waypoint_norm_indices.npy",
+        )
+        missing = [name for name in required if not (stats_path / name).is_file()]
+        if missing:
+            raise FileNotFoundError(
+                f"stats_dir {stats_path} is missing required waypoint stats: {missing}"
+            )
         self.register_buffer(
             "_wp_mean",
             torch.as_tensor(np.load(stats_path / "waypoint_mean.npy"), dtype=torch.float32),

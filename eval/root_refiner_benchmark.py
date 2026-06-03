@@ -188,10 +188,6 @@ def run_benchmark(model, dataset, text_encoder, device="cpu",
         )
         out = model(
             text_emb=text_emb,
-            # R2.4: feed the new shim keys. The legacy aliases mapped
-            # path_stats(3-dim) → path_features, which now mismatches the
-            # duration head's path_features_dim (5). The shim emits the 5-dim
-            # physical path_features and a unit-aligned geometry `path`.
             path=sample["path"].unsqueeze(0).to(device),
             path_valid_mask=sample["path_valid_mask"].unsqueeze(0).to(device),
             path_control_mask=sample["path_control_mask"].unsqueeze(0).to(device),

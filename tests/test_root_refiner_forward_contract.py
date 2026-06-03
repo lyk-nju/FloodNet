@@ -94,6 +94,15 @@ def test_path_control_mask_changes_condition_encoding():
     )
 
 
+def test_root_refiner_rejects_unknown_path_mode():
+    model = _model()
+    inputs = _inputs(model)
+    inputs["path_mode"] = ["dense_path", "unknown_mode", "goal_point"]
+
+    with pytest.raises(ValueError, match="unknown path_mode"):
+        model(**inputs)
+
+
 def test_path_cond_frame_decoder_accepts_new_path_condition_names():
     decoder = PathCondFrameDecoder(d_model=16, max_tokens=4, n_path=8, width=24)
     token_hidden = torch.randn(2, 4, 16)

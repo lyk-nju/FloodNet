@@ -154,6 +154,15 @@ def test_module_uses_explicit_encoder_over_stub():
     assert module.text_encoder is enc
 
 
+def test_module_requires_waypoint_stats_when_normalizing(tmp_path):
+    cfg = _tiny_cfg()
+    cfg["data"]["normalize"] = True
+    cfg["data"]["stats_dir"] = str(tmp_path / "missing_stats")
+
+    with pytest.raises(FileNotFoundError, match="stats_dir"):
+        RefinerLightningModule(cfg)
+
+
 def test_build_datasets_val_none_when_no_val_split(tmp_path):
     from train_refiner import build_datasets
 
