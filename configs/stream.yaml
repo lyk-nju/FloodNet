@@ -46,6 +46,16 @@ traj_mask:
     min_token_step: 0.08
     max_token_step: 0.12
 
+    # Optional RootRefiner planner for web runtime:
+    # user route + current text -> normalized 5D -> physical 7D RootPlan -> LDF.
+    # Keep disabled until a trained RootRefiner checkpoint is available.
+    root_refiner:
+        enabled: false
+        config_path: configs/root_refiner_train.yaml
+        ckpt:
+        strict: true
+        path_mode: dense_path
+
 # Optional web-demo sanity preset.  When enabled, /api/start ignores the UI text
 # and starts from this dataset sample's text plus GT root trajectory points.
 # The timestamp axis is assigned by traj_mask.waypoint_dt, exactly like a

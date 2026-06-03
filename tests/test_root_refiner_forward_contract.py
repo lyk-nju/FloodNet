@@ -79,6 +79,21 @@ def test_root_refiner_inference_uses_predicted_duration():
     assert out["used_num_tokens"].max() <= model.max_tokens
 
 
+def test_path_control_mask_changes_condition_encoding():
+    model = _model().eval()
+    inputs = _inputs(model)
+    inputs["path_control_mask"] = torch.zeros_like(inputs["path_control_mask"])
+    out_without_controls = model(**inputs)
+
+    inputs["path_control_mask"] = torch.ones_like(inputs["path_control_mask"])
+    out_with_controls = model(**inputs)
+
+    assert not torch.allclose(
+        out_without_controls["num_token_logits"],
+        out_with_controls["num_token_logits"],
+    )
+
+
 def test_path_cond_frame_decoder_accepts_new_path_condition_names():
     decoder = PathCondFrameDecoder(d_model=16, max_tokens=4, n_path=8, width=24)
     token_hidden = torch.randn(2, 4, 16)
@@ -94,6 +109,25 @@ def test_path_cond_frame_decoder_accepts_new_path_condition_names():
     )
 
     assert out.shape == (2, decoder.max_frames, 5)
+
+
+def test_path_cond_frame_decoder_offsets_path_hint_prefix():
+    decoder = PathCondFrameDecoder(d_model=16, max_tokens=4, n_path=8, width=24)
+    path = torch.zeros(1, 8, 2)
+    path[0, :, 0] = torch.linspace(10.0, 17.0, 8)
+    path_valid_mask = torch.ones(1, 8, dtype=torch.bool)
+    used_num_tokens = torch.tensor([4])
+    offset = torch.tensor([5])
+
+    cond = decoder._build_path_cond(
+        path,
+        path_valid_mask,
+        used_num_tokens,
+        offset_start_frames=offset,
+    )
+
+    assert torch.allclose(cond[0, :5], torch.zeros_like(cond[0, :5]))
+    assert torch.allclose(cond[0, 5, :2], path[0, 0], atol=1e-5)
 
 
 def test_duration_head_gets_clean_raw_path_features_skip():

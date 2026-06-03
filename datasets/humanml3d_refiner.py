@@ -548,6 +548,7 @@ class HumanML3DRefinerDataset(RefinerDataset):
                 "path_mode": condition.path_mode,
                 "history_motion": sample["current_motion"],
                 "waypoints": waypoints,
+                "waypoints_physical": physical_wp,
                 "waypoints_mask": waypoints_mask,
                 "path_supervision_mask": condition.path_supervision_mask,
                 "offset_start_frames": torch.tensor(
@@ -603,6 +604,10 @@ def refiner_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "num_tokens",
     ):
         out[key] = torch.stack([sample[key] for sample in batch])
+    if "waypoints_physical" in batch[0]:
+        out["waypoints_physical"] = torch.stack(
+            [sample["waypoints_physical"] for sample in batch],
+        )
     return out
 
 

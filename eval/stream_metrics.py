@@ -36,6 +36,45 @@ def compute_fde(pred_root_xyz: np.ndarray, target_root_xyz: np.ndarray) -> float
     return float(np.linalg.norm(pxz - txz))
 
 
+def compute_yaw_error(pred_yaw: np.ndarray, target_yaw: np.ndarray) -> float:
+    """Mean absolute wrapped yaw error in radians over the shorter sequence."""
+    n = min(len(pred_yaw), len(target_yaw))
+    if n == 0:
+        return float("nan")
+    diff = pred_yaw[:n] - target_yaw[:n]
+    wrapped = np.arctan2(np.sin(diff), np.cos(diff))
+    return float(np.mean(np.abs(wrapped)))
+
+
+def compute_root_jitter(root_xyz: np.ndarray) -> float:
+    """Mean XZ jerk magnitude, using third finite difference of root path."""
+    if len(root_xyz) < 4:
+        return float("nan")
+    xz = root_xyz[:, [0, 2]] if root_xyz.shape[1] >= 3 else root_xyz
+    jerk = np.diff(xz, n=3, axis=0)
+    return float(np.mean(np.linalg.norm(jerk, axis=1)))
+
+
+def build_stream_eval_summary(
+    pred_root_xyz: np.ndarray,
+    target_root_xyz: np.ndarray,
+    *,
+    pred_yaw: np.ndarray | None = None,
+    target_yaw: np.ndarray | None = None,
+) -> dict:
+    """Minimal stream-eval summary with stable checkpoint-selection keys."""
+    n = min(len(pred_root_xyz), len(target_root_xyz))
+    summary = {
+        "stream/root_ADE": compute_ade(pred_root_xyz, target_root_xyz),
+        "stream/root_FDE": compute_fde(pred_root_xyz, target_root_xyz),
+        "stream/jitter": compute_root_jitter(pred_root_xyz[:n]),
+        "stream/num_frames": int(n),
+    }
+    if pred_yaw is not None and target_yaw is not None:
+        summary["stream/yaw_error"] = compute_yaw_error(pred_yaw, target_yaw)
+    return summary
+
+
 # ── path shape metrics ─────────────────────────────────────────────────
 
 

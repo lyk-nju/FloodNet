@@ -57,7 +57,7 @@ def test_sampling_path_condition_block_present_in_both_configs():
         cfg = _load(path)
         assert "path_aug" not in cfg
         sampling = cfg["sampling"]
-        assert sampling["horizon_policy"] in {"random", "max", "bucketed"}
+        assert sampling["horizon_policy"] in {"random", "max"}
         pc = sampling["path_condition"]
         assert pc["policy"] in {"mixed", "dense_path", "sparse_path", "goal_point"}
         for mode in ("dense_path", "sparse_path", "goal_point"):

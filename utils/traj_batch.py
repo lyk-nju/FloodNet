@@ -105,6 +105,65 @@ def frames_to_tokens(feats_frame: torch.Tensor, seq_len: int) -> torch.Tensor:
     return tok0                                                         # (B, 1, 4, C)
 
 
+def frames_to_tokens_range(
+    feats_frame: torch.Tensor,
+    start_token_idx: int,
+    num_tokens: int,
+    *,
+    frames_per_token: int = 4,
+) -> torch.Tensor:
+    """Group frame-level features for an arbitrary token range.
+
+    ``frames_to_tokens`` is the causal-prefix helper for ``[0, N)``. For a
+    rolling range ``[S, S + N)`` where ``S > 0``, every local token covers four
+    effective frames. ``feats_frame`` is expected to be window-relative: local
+    frame 0 corresponds to ``token_start_frame(S)``.
+    """
+    from utils.token_frame import token_end_frame, token_start_frame
+
+    if start_token_idx < 0:
+        raise ValueError(f"start_token_idx must be >= 0, got {start_token_idx}")
+    if num_tokens <= 0:
+        B, _, C = feats_frame.shape
+        return feats_frame.new_zeros(B, 0, frames_per_token, C)
+    if start_token_idx == 0:
+        return frames_to_tokens(feats_frame, num_tokens)
+
+    B, T_frame, C = feats_frame.shape
+    origin_frame = token_start_frame(start_token_idx, frames_per_token)
+    groups = []
+    for i in range(num_tokens):
+        token_idx = start_token_idx + i
+        rel_s = token_start_frame(token_idx, frames_per_token) - origin_frame
+        rel_e = token_end_frame(token_idx, frames_per_token) + 1 - origin_frame
+        if rel_s >= T_frame:
+            chunk = feats_frame.new_zeros(B, 0, C)
+        else:
+            chunk = feats_frame[:, rel_s:min(rel_e, T_frame), :]
+        if chunk.shape[1] < frames_per_token:
+            pad = feats_frame.new_zeros(B, frames_per_token - chunk.shape[1], C)
+            chunk = torch.cat([chunk, pad], dim=1)
+        groups.append(chunk[:, :frames_per_token, :].unsqueeze(1))
+    return torch.cat(groups, dim=1)
+
+
+def frames_to_token_mask_range(
+    mask_frame: torch.Tensor,
+    num_tokens: int,
+    *,
+    start_token_idx: int = 0,
+    frames_per_token: int = 4,
+) -> torch.Tensor:
+    """Aggregate a window-relative frame mask to token mask by OR."""
+    grouped = frames_to_tokens_range(
+        mask_frame.unsqueeze(-1),
+        start_token_idx,
+        num_tokens,
+        frames_per_token=frames_per_token,
+    ).squeeze(-1)
+    return (grouped > 0).any(dim=-1).to(mask_frame.dtype)
+
+
 def _traj_source(x: dict):
     """The traj tensor encode_traj_batch would use (source priority)."""
     for key in ("traj_features", "traj_cond", "traj"):
@@ -113,12 +172,36 @@ def _traj_source(x: dict):
     return None
 
 
-def build_traj_frame_mask(x: dict, tf: int, device, *, frames_per_token: int = 4):
+def _resolve_traj_start_token(x: dict, explicit: int | None = None) -> int:
+    value = x.get("traj_start_token", 0) if explicit is None else explicit
+    if torch.is_tensor(value):
+        if value.numel() != 1:
+            raise ValueError(
+                "traj_start_token currently expects one scalar shared by the batch; "
+                f"got tensor shape {tuple(value.shape)}"
+            )
+        value = int(value.item())
+    value = int(value)
+    if value < 0:
+        raise ValueError(f"traj_start_token must be >= 0, got {value}")
+    return value
+
+
+def build_traj_frame_mask(
+    x: dict,
+    tf: int,
+    device,
+    *,
+    frames_per_token: int = 4,
+    traj_start_token: int | None = None,
+):
     """Frame-level traj mask [B, tf] (1=valid) from traj_cond_mask/traj_mask, or a
     token_mask expanded to frame level. Padded/truncated to `tf`. None if neither
     is present. Single source for the frame-mask derivation (no second copy)."""
     from utils.token_frame import token_end_frame, token_start_frame
 
+    start_token_idx = _resolve_traj_start_token(x, traj_start_token)
+    origin_frame = token_start_frame(start_token_idx, frames_per_token)
     _cond_mask = x.get("traj_cond_mask", x.get("traj_mask"))
     if _cond_mask is not None:
         mf = _cond_mask.to(device=device, dtype=torch.float32)
@@ -126,12 +209,14 @@ def build_traj_frame_mask(x: dict, tf: int, device, *, frames_per_token: int = 4
         tm = x["token_mask"].to(device=device, dtype=torch.float32)
         B_tm, N_tm = tm.shape
         mf = tm.new_zeros(B_tm, tf)
-        mf[:, 0] = tm[:, 0]
-        for k in range(1, N_tm):
-            sf = token_start_frame(k, frames_per_token)
-            ef = min(token_end_frame(k, frames_per_token) + 1, tf)
+        for local_k in range(N_tm):
+            global_k = start_token_idx + local_k
+            sf = token_start_frame(global_k, frames_per_token) - origin_frame
+            ef = min(token_end_frame(global_k, frames_per_token) + 1 - origin_frame, tf)
             if sf < tf:
-                mf[:, sf:ef] = tm[:, k:k + 1].expand(-1, ef - sf)
+                sf = max(0, sf)
+                if sf < ef:
+                    mf[:, sf:ef] = tm[:, local_k:local_k + 1].expand(-1, ef - sf)
     else:
         return None
     if mf.shape[1] < tf:
@@ -142,28 +227,75 @@ def build_traj_frame_mask(x: dict, tf: int, device, *, frames_per_token: int = 4
 def build_traj_token_mask(x: dict, seq_len: int, device, *,
                           horizon_tokens: int | None = None,
                           horizon_active_end_token=0,
-                          frames_per_token: int = 4):
+                          frames_per_token: int = 4,
+                          traj_start_token: int | None = None):
     """[B, seq_len] token mask (1=valid) = build_traj_frame_mask + optional horizon
     truncation → frames_to_token_mask. SINGLE source reused by encode_traj_batch
     (token-embedding zeroing) and _get_traj_seq_lens (attention truncation), so the
     two never derive the mask differently. Returns None when there is neither a
     traj mask nor a horizon."""
-    from utils.token_frame import frames_to_token_mask
-
     src = _traj_source(x)
     if src is None:
         return None
     tf = src.shape[1]
-    mask_frame = build_traj_frame_mask(x, tf, device, frames_per_token=frames_per_token)
+    start_token_idx = _resolve_traj_start_token(x, traj_start_token)
+    mask_frame = build_traj_frame_mask(
+        x, tf, device,
+        frames_per_token=frames_per_token,
+        traj_start_token=start_token_idx,
+    )
     if mask_frame is None and horizon_tokens is None:
         return None
     if mask_frame is None:
         mask_frame = torch.ones(src.shape[0], tf, device=device, dtype=torch.float32)
     if horizon_tokens is not None:
-        from utils.training.horizon_sched import apply_horizon_mask_tokens
-        apply_horizon_mask_tokens(
-            mask_frame, horizon_active_end_token, horizon_tokens, frames_per_token)
-    return frames_to_token_mask(mask_frame, seq_len, frames_per_token)
+        _apply_horizon_mask_tokens_range(
+            mask_frame,
+            horizon_active_end_token,
+            horizon_tokens,
+            start_token_idx=start_token_idx,
+            frames_per_token=frames_per_token,
+        )
+    return frames_to_token_mask_range(
+        mask_frame,
+        seq_len,
+        start_token_idx=start_token_idx,
+        frames_per_token=frames_per_token,
+    )
+
+
+def _apply_horizon_mask_tokens_range(
+    mask_frame: torch.Tensor,
+    active_end_token,
+    horizon_tokens: int,
+    *,
+    start_token_idx: int,
+    frames_per_token: int,
+) -> torch.Tensor:
+    """Zero a window-relative frame mask at global cutoff ``E + H``."""
+    from utils.token_frame import token_start_frame
+
+    origin_frame = token_start_frame(start_token_idx, frames_per_token)
+    if torch.is_tensor(active_end_token) and active_end_token.dim() > 0:
+        for b in range(active_end_token.shape[0]):
+            cutoff = (
+                token_start_frame(int(active_end_token[b]) + horizon_tokens, frames_per_token)
+                - origin_frame
+            )
+            if cutoff <= 0:
+                mask_frame[b, :] = 0
+            elif cutoff < mask_frame.shape[-1]:
+                mask_frame[b, cutoff:] = 0
+        return mask_frame
+    cutoff = (
+        token_start_frame(int(active_end_token) + horizon_tokens, frames_per_token)
+        - origin_frame
+    )
+    if cutoff <= 0:
+        mask_frame[...] = 0
+    elif cutoff < mask_frame.shape[-1]:
+        mask_frame[..., cutoff:] = 0
+    return mask_frame
 
 
 def encode_traj_batch(
@@ -177,6 +309,7 @@ def encode_traj_batch(
     horizon_active_end_token: int = 0,
     frames_per_token: int = 4,
     return_token_mask: bool = False,
+    traj_start_token: int | None = None,
 ):
     """Build trajectory embedding (B, seq_len, traj_out_dim) from a training batch dict.
 
@@ -214,8 +347,13 @@ def encode_traj_batch(
         return (None, None) if return_token_mask else None
 
     # --- frame-level mask (single source: build_traj_frame_mask) ---
+    start_token_idx = _resolve_traj_start_token(x, traj_start_token)
     tf = feats_frame.shape[1]
-    mask_frame = build_traj_frame_mask(x, tf, device, frames_per_token=frames_per_token)
+    mask_frame = build_traj_frame_mask(
+        x, tf, device,
+        frames_per_token=frames_per_token,
+        traj_start_token=start_token_idx,
+    )
 
     token_mask_from_frame = None
     if mask_frame is not None or horizon_tokens is not None:
@@ -224,9 +362,10 @@ def encode_traj_batch(
             # all-visible and let the horizon cutoff zero the tail.
             mask_frame = feats_frame.new_ones(feats_frame.shape[0], tf)
         if horizon_tokens is not None:
-            from utils.training.horizon_sched import apply_horizon_mask_tokens
-            apply_horizon_mask_tokens(
-                mask_frame, horizon_active_end_token, horizon_tokens, frames_per_token,
+            _apply_horizon_mask_tokens_range(
+                mask_frame, horizon_active_end_token, horizon_tokens,
+                start_token_idx=start_token_idx,
+                frames_per_token=frames_per_token,
             )
         # If the WHOLE batch's traj mask is zero (clear / no-traj, or a fully-
         # truncated horizon), there is no valid trajectory → return None so the
@@ -234,9 +373,12 @@ def encode_traj_batch(
         if not bool(mask_frame[:, :tf].any()):
             return (None, None) if return_token_mask else None
         feats_frame = feats_frame * mask_frame[:, :tf].unsqueeze(-1).to(dtype=feats_frame.dtype)
-        from utils.token_frame import frames_to_token_mask
-        token_mask_from_frame = frames_to_token_mask(
-            mask_frame[:, :tf], seq_len, frames_per_token)
+        token_mask_from_frame = frames_to_token_mask_range(
+            mask_frame[:, :tf],
+            seq_len,
+            start_token_idx=start_token_idx,
+            frames_per_token=frames_per_token,
+        )
 
     # --- frame → token grouping ---
     if feats_frame.shape[1] == seq_len and seq_len > 1:
@@ -245,13 +387,21 @@ def encode_traj_batch(
             f"(T_frame ~= 4*seq_len), got shape[1]={feats_frame.shape[1]} == "
             f"seq_len={seq_len}; the token-level parallel path is disabled."
         )
-    feats_4 = frames_to_tokens(feats_frame, seq_len)            # (B, seq_len, 4, C)
+    feats_4 = frames_to_tokens_range(
+        feats_frame,
+        start_token_idx,
+        seq_len,
+        frames_per_token=frames_per_token,
+    )                                                           # (B, seq_len, 4, C)
     # Build a 4-frame mask (B, seq_len, 4) so LocalTrajEncoder can do masked-mean
     # pool — otherwise zero-padded frames in a partial token dilute the mean by
     # 1/valid_count.
     if mask_frame is not None:
-        mf_grouped = frames_to_tokens(
-            mask_frame[:, :tf].unsqueeze(-1).to(feats_frame.dtype), seq_len
+        mf_grouped = frames_to_tokens_range(
+            mask_frame[:, :tf].unsqueeze(-1).to(feats_frame.dtype),
+            start_token_idx,
+            seq_len,
+            frames_per_token=frames_per_token,
         )
         frame_mask_4 = mf_grouped.squeeze(-1)                    # (B, seq_len, 4)
     else:

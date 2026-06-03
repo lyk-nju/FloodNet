@@ -270,6 +270,44 @@ def test_loss_dict_keys_match_config_weights_and_no_speed():
         assert torch.isfinite(v).all(), f"{k} not finite"
 
 
+def test_num_token_metrics_follow_actual_pred_num_tokens_not_argmax():
+    module = RefinerLightningModule(_tiny_cfg())
+    batch = _make_batch(module, B=2)
+    out = {
+        "num_token_logits": torch.tensor(
+            [
+                [3.0, 2.9, 2.9, 2.9, 2.9, 2.9, 2.9],
+                [3.0, 2.9, 2.9, 2.9, 2.9, 2.9, 2.9],
+            ],
+        ),
+        "expected_num_tokens": torch.tensor([5.0, 5.0]),
+        "pred_num_tokens": torch.tensor([5, 5]),
+        "used_num_tokens": batch["num_tokens"],
+        "waypoints": batch["waypoints"].clone(),
+    }
+    batch["num_tokens"] = torch.tensor([5, 5])
+
+    losses = module._compute_loss(out, batch)
+
+    assert losses["num_token_mae"].item() == 0.0
+    assert losses["num_token_argmax_mae"].item() > 0.0
+
+
+def test_delta_helper_unnormalizes_waypoints_before_deriving_physical_7d():
+    module = RefinerLightningModule(_tiny_cfg())
+    module._wp_mean = torch.tensor([10.0, 0.0, -5.0, 0.0, 0.0, 0.0, 0.0])
+    module._wp_std = torch.tensor([2.0, 1.0, 4.0, 1.0, 1.0, 1.0, 1.0])
+    module._wp_norm_idx = torch.tensor([0, 1, 2])
+    wp5 = torch.zeros(1, 2, 5)
+    wp5[..., 3] = 1.0
+    wp5[0, 1, 0] = 1.0
+    wp5[0, 1, 2] = 1.0
+
+    physical = module._to_physical_7d(wp5)
+
+    assert torch.allclose(physical[0, 1, :3], torch.tensor([12.0, 0.0, -1.0]))
+
+
 def test_num_token_soft_term_present_and_differentiable():
     """The soft-argmax expected-token aux term is a weighted loss term, finite,
     and its gradient reaches num_token_head (so it actually shapes the logits)."""

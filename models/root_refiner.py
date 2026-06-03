@@ -53,6 +53,8 @@ from torch import Tensor
 
 from utils.token_frame import frame_idx_to_token_idx, num_frames_for_tokens
 
+_PATH_MODE_TO_ID = {"dense_path": 0, "sparse_path": 1, "goal_point": 2}
+
 
 def _make_encoder(d_model: int, n_heads: int, ff_dim: int, dropout: float,
                   n_layers: int, norm_first: bool) -> nn.TransformerEncoder:
@@ -102,6 +104,9 @@ class TokenToFrameDecoder(nn.Module):
         *,
         path=None,
         path_valid_mask=None,
+        path_control_mask=None,
+        path_mode=None,
+        offset_start_frames=None,
         used_num_tokens=None,
     ) -> Tensor:       # [B, N, D]
         h = token_hidden.transpose(1, 2)                 # [B, D, N]
@@ -172,20 +177,27 @@ class PathCondFrameDecoder(nn.Module):
         path: Tensor,
         path_valid_mask: Tensor,
         used_num_tokens: Tensor,
+        offset_start_frames: Tensor | None = None,
     ) -> Tensor:
         """Dense per-frame path condition [B, max_frames, path_cond_dim]. Fully
         vectorized — no host sync / Python per-sample loop."""
         B = path.shape[0]
         device, dtype = path.device, path.dtype
         T, n_path, fpt = self.max_frames, self.n_path, self.frames_per_token
+        if offset_start_frames is None:
+            offset_start_frames = torch.zeros(B, dtype=torch.long, device=device)
+        else:
+            offset_start_frames = offset_start_frames.to(device=device, dtype=torch.long)
 
         t = torch.arange(T, device=device, dtype=dtype)                       # [T]
         # Effective-grid progress: valid frames = num_frames_for_tokens(chosen) =
         # fpt*chosen - (fpt-1); last valid frame index = that - 1.
         valid_eff = (fpt * used_num_tokens.to(dtype) - (fpt - 1))              # [B]
-        denom = (valid_eff - 1.0).clamp(min=1.0)                              # [B]
-        horizon = (t[None, :] / denom[:, None]).clamp(0.0, 1.0)              # [B, T]
+        offset = offset_start_frames.to(dtype).clamp(min=0.0)                  # [B]
+        denom = (valid_eff - offset - 1.0).clamp(min=1.0)                     # [B]
+        horizon = ((t[None, :] - offset[:, None]) / denom[:, None]).clamp(0.0, 1.0)
         grid = (t / float(max(T - 1, 1)))[None, :].expand(B, T)              # [B, T] absolute pos
+        active = (t[None, :] >= offset[:, None]) & (t[None, :] < valid_eff[:, None])
 
         # Linear interp along path at horizon progress (gather-based lerp).
         path_pos = horizon * (n_path - 1)                                     # [B, T]
@@ -208,7 +220,7 @@ class PathCondFrameDecoder(nn.Module):
         )
         # Degenerate path (valid points < 2) → zero the whole sample's condition.
         path_valid = (path_valid_mask > 0).sum(dim=1) >= 2                    # [B] bool
-        return cond * path_valid[:, None, None].to(dtype)
+        return cond * path_valid[:, None, None].to(dtype) * active[..., None].to(dtype)
 
     def forward(
         self,
@@ -216,6 +228,9 @@ class PathCondFrameDecoder(nn.Module):
         *,
         path: Tensor | None = None,
         path_valid_mask: Tensor | None = None,
+        path_control_mask: Tensor | None = None,
+        path_mode=None,
+        offset_start_frames: Tensor | None = None,
         used_num_tokens: Tensor | None = None,
     ) -> Tensor:
         if path is None or path_valid_mask is None or used_num_tokens is None:
@@ -248,7 +263,12 @@ class PathCondFrameDecoder(nn.Module):
         # Repeated additive path conditioning before each dilated frame block. Mask
         # path_emb on invalid frames too — path_proj has a bias, so path_proj(cond=0)
         # is NOT zero; only post-projection masking kills the past-horizon path leak.
-        cond = self._build_path_cond(path, path_valid_mask, used_num_tokens)  # [B, max_frames, 6]
+        cond = self._build_path_cond(
+            path,
+            path_valid_mask,
+            used_num_tokens,
+            offset_start_frames=offset_start_frames,
+        )  # [B, max_frames, 6]
         path_emb = (self.path_proj(cond).transpose(1, 2)) * fr_m                      # [B, width, max_frames]
         for blk in self.frame_blocks:
             h = blk(h + path_emb) * fr_m
@@ -315,6 +335,8 @@ class RootRefiner(nn.Module):
         # Input projections (shared by the condition stage).
         self.text_proj = nn.Linear(text_emb_dim, d_model)
         self.path_proj = nn.Linear(2, d_model)
+        self.path_control_proj = nn.Linear(1, d_model)
+        self.path_mode_emb = nn.Embedding(len(_PATH_MODE_TO_ID), d_model)
         self.stats_proj = nn.Linear(path_features_dim, d_model)
         self.hist_proj = nn.Linear(5, d_model)
 
@@ -395,10 +417,12 @@ class RootRefiner(nn.Module):
         path: Tensor | None = None,             # [B, n_path, 2]
         path_valid_mask: Tensor | None = None,  # [B, n_path] bool (True = valid)
         path_control_mask: Tensor | None = None,  # [B, n_path] bool (True = user control)
+        path_mode=None,             # list[str] or [B] long mode ids
         path_features: Tensor | None = None,    # [B, path_features_dim]
         history_motion: Tensor | None = None,   # [B, n_hist, 5]
         history_mask: Tensor | None = None,     # [B, n_hist] bool (True = valid)
-        num_tokens: Tensor | None = None,   # [B] long GT horizon → teacher-force when given (train/val/oracle); argmax when None
+        offset_start_frames: Tensor | None = None,  # [B] frame offset of first user path point
+        num_tokens: Tensor | None = None,   # [B] long GT horizon → teacher-force when given; expected-round when None
     ) -> dict[str, Tensor]:
         if (
             path is None
@@ -413,12 +437,22 @@ class RootRefiner(nn.Module):
             )
         B = text_emb.shape[0]
         device = text_emb.device
+        if path_control_mask is None:
+            path_control_mask = path_valid_mask
+        path_control_mask = path_control_mask.to(device=device).bool() & path_valid_mask.to(device=device).bool()
+        mode_ids = self._path_mode_ids(path_mode, B, device)
+        mode_emb = self.path_mode_emb(mode_ids)
 
         # ---- Stage 1: condition-only num-token prediction ----
         cls_tok = self.cls_token.unsqueeze(0).unsqueeze(0).expand(B, 1, -1)      # [B,1,D]
         text_tok = self.text_proj(text_emb).unsqueeze(1)                         # [B,1,D]
-        stats_tok = self.stats_proj(path_features).unsqueeze(1)                  # [B,1,D]
-        path_toks = self.path_proj(path) + self.path_pos_emb.weight.unsqueeze(0)   # [B,n_path,D]
+        stats_tok = self.stats_proj(path_features).unsqueeze(1) + mode_emb.unsqueeze(1)
+        path_toks = (
+            self.path_proj(path)
+            + self.path_pos_emb.weight.unsqueeze(0)
+            + self.path_control_proj(path_control_mask.to(path.dtype).unsqueeze(-1))
+            + mode_emb.unsqueeze(1)
+        )   # [B,n_path,D]
         hist_toks = self.hist_proj(history_motion) + self.hist_pos_emb.weight.unsqueeze(0)  # [B,n_hist,D]
         cond_seq = torch.cat([cls_tok, text_tok, stats_tok, path_toks, hist_toks], dim=1)
 
@@ -450,10 +484,9 @@ class RootRefiner(nn.Module):
         pred_num_tokens = expected_num_tokens.round().long().clamp(self.min_tokens, self.max_tokens)
         # Teacher-force the horizon whenever a num_tokens is PROVIDED — training,
         # validation, AND oracle-duration eval — and fall back to the model's own
-        # argmax when it is absent (real inference / normal benchmark). Gated on
-        # `num_tokens is not None`, NOT on self.training, so val/oracle can
-        # teacher-force in eval() mode (else val waypoint loss would be scored
-        # against a possibly-wrong predicted horizon).
+        # expected-round duration when it is absent (real inference / normal
+        # benchmark). Gated on `num_tokens is not None`, NOT on self.training, so
+        # val/oracle can teacher-force in eval() mode.
         if num_tokens is not None:
             chosen_class = (num_tokens.to(device=device, dtype=torch.long) - self.min_tokens)
             chosen_class = chosen_class.clamp(0, self.num_token_logits_dim - 1)  # no host sync
@@ -499,6 +532,9 @@ class RootRefiner(nn.Module):
             plan_token_hidden,
             path=path,
             path_valid_mask=path_valid_mask,
+            path_control_mask=path_control_mask,
+            path_mode=path_mode,
+            offset_start_frames=offset_start_frames,
             used_num_tokens=used_num_tokens,
         )                                                    # [B, max_frames, 5]
         assert raw5.shape[1] == self.max_frames, (           # int compare, no host sync
@@ -516,6 +552,24 @@ class RootRefiner(nn.Module):
         }
 
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _path_mode_ids(path_mode, batch_size: int, device: torch.device) -> Tensor:
+        if path_mode is None:
+            return torch.zeros(batch_size, dtype=torch.long, device=device)
+        if torch.is_tensor(path_mode):
+            return path_mode.to(device=device, dtype=torch.long).clamp(
+                0,
+                len(_PATH_MODE_TO_ID) - 1,
+            )
+        if isinstance(path_mode, str):
+            path_mode = [path_mode] * batch_size
+        ids = [_PATH_MODE_TO_ID.get(str(mode), 0) for mode in path_mode]
+        if len(ids) != batch_size:
+            raise ValueError(
+                f"path_mode length {len(ids)} does not match batch size {batch_size}"
+            )
+        return torch.as_tensor(ids, dtype=torch.long, device=device)
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

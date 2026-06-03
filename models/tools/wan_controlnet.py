@@ -208,6 +208,7 @@ class WanControlNet(nn.Module):
         )
 
         latent_pad_len = None
+        traj_pad_len = None
         traj_seq_lens_attn = None
         if self.traj_in_proj is not None and traj_emb is not None:
             traj_t = self.traj_in_proj(traj_emb.to(dtype=x.dtype, device=x.device))
@@ -229,20 +230,19 @@ class WanControlNet(nn.Module):
                     tm = tm[:, :proj_len, :]
                 traj_t = traj_t * tm
             bt, tlen, _ = traj_t.shape
-            if tlen < seq_len:
+            traj_pad_len = max(seq_len, int(tlen))
+            if tlen < traj_pad_len:
                 traj_t = torch.cat(
-                    [traj_t, traj_t.new_zeros(bt, seq_len - tlen, traj_t.size(-1))],
+                    [traj_t, traj_t.new_zeros(bt, traj_pad_len - tlen, traj_t.size(-1))],
                     dim=1,
                 )
-            elif tlen > seq_len:
-                traj_t = traj_t[:, :seq_len, :]
             x = torch.cat([x, traj_t], dim=1)
             if traj_seq_lens is None:
-                traj_seq_lens_attn = seq_lens
+                traj_seq_lens_attn = torch.full_like(seq_lens, int(tlen))
             else:
                 traj_seq_lens_attn = (
                     traj_seq_lens.to(device=device, dtype=torch.long).clamp(
-                        min=0, max=seq_len
+                        min=0, max=traj_pad_len
                     )
                 )
             latent_pad_len = seq_len
@@ -260,7 +260,7 @@ class WanControlNet(nn.Module):
             )
             e0 = self.time_projection(e).unflatten(2, (6, self.dim))
             if latent_pad_len is not None:
-                e0_traj = torch.zeros_like(e0)
+                e0_traj = e0.new_zeros(e0.shape[0], traj_pad_len, *e0.shape[2:])
                 e0 = torch.cat([e0, e0_traj], dim=1)
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
@@ -278,6 +278,7 @@ class WanControlNet(nn.Module):
             context=context,
             context_lens=context_lens,
             latent_pad_len=latent_pad_len,
+            traj_pad_len=traj_pad_len,
         )
 
         residuals: List[torch.Tensor] = []

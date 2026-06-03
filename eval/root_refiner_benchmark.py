@@ -146,9 +146,10 @@ def run_benchmark(model, dataset, text_encoder, device="cpu",
     `oracle_duration`: if True, feed the GT num_tokens to the model so the
     trajectory metrics (xyz_ADE/FDE, heading, ...) measure the WAYPOINT DECODER
     ALONE under the correct horizon, isolating it from num_token-head prediction
-    error. Default False = real inference (model picks its own argmax horizon, so
-    trajectory metrics conflate duration + waypoint quality). num_token_* metrics
-    are always reported against the head's argmax regardless of this flag.
+    error. Default False = real inference (model picks its expected-round
+    duration, so trajectory metrics use the common GT/predicted prefix).
+    top-k duration metrics still use classification logits; num_token_MAE uses
+    the actual predicted duration that drives inference.
 
     Returns dict with `summary` (aggregate metrics) and `per_sample` (list).
     """
@@ -193,9 +194,15 @@ def run_benchmark(model, dataset, text_encoder, device="cpu",
             # physical path_features and a unit-aligned geometry `path`.
             path=sample["path"].unsqueeze(0).to(device),
             path_valid_mask=sample["path_valid_mask"].unsqueeze(0).to(device),
+            path_control_mask=sample["path_control_mask"].unsqueeze(0).to(device),
+            path_mode=[sample.get("path_mode", "dense_path")],
             path_features=sample["path_features"].unsqueeze(0).to(device),
             history_motion=sample["history_motion"].unsqueeze(0).to(device),
             history_mask=sample["history_mask"].unsqueeze(0).to(device),
+            offset_start_frames=sample.get(
+                "offset_start_frames",
+                torch.tensor(0, dtype=torch.long),
+            ).reshape(1).to(device),
             num_tokens=oracle_nt,
         )
         logits = out["num_token_logits"][0]                  # [K]
@@ -213,24 +220,35 @@ def run_benchmark(model, dataset, text_encoder, device="cpu",
         pred_wp = build_physical_7d_from_normalized_5d(
             out["waypoints"][0].cpu(), wp_mean, wp_std, wp_norm_idx,
         )                                                    # [max_frames, 7] physical
-        gt5_norm = sample["target_waypoints"][..., :5]
+        gt_source = sample.get("target_waypoints", sample.get("waypoints"))
+        gt5_norm = gt_source[..., :5]
         gt_wp = build_physical_7d_from_normalized_5d(
             gt5_norm, wp_mean, wp_std, wp_norm_idx,
         )                                                    # [max_frames, 7] physical
-        mask = sample["target_mask"]
+        mask = sample.get("target_mask", sample.get("waypoints_mask"))
+        if not oracle_duration:
+            used_tokens = int(out["used_num_tokens"][0].detach().cpu().item())
+            valid_eff = (
+                model.frames_per_token * used_tokens
+                - (model.frames_per_token - 1)
+            )
+            common = torch.arange(mask.shape[0]) < int(valid_eff)
+            mask = mask.bool() & common
 
         # num_token metrics.
         gt_class = int(sample["num_tokens"].item()) - min_tokens
         gt_class = max(0, min(gt_class, logits.shape[-1] - 1))
         pred_class = int(logits.argmax().item())
+        pred_num_tokens = int(out["pred_num_tokens"][0].detach().cpu().item())
         top3 = torch.topk(logits, k=min(3, logits.shape[-1])).indices.tolist()
         num_top1 += int(pred_class == gt_class)
         num_top3 += int(gt_class in top3)
-        num_mae_sum += abs(pred_class - gt_class)
+        num_mae_sum += abs(pred_num_tokens - (gt_class + min_tokens))
 
         m = compute_sample_metrics(pred_wp, gt_wp, mask)
         m["idx"] = idx
-        m["pred_num_tokens"] = pred_class + min_tokens
+        m["pred_num_tokens"] = pred_num_tokens
+        m["argmax_num_tokens"] = pred_class + min_tokens
         m["gt_num_tokens"] = gt_class + min_tokens
         per_sample.append(m)
 

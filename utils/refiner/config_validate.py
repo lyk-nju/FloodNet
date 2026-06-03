@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 
-_ALLOWED_HORIZON_POLICIES = {"random", "max", "bucketed"}
+_ALLOWED_HORIZON_POLICIES = {"random", "max"}
 _ALLOWED_PATH_POLICIES = {"mixed", "dense_path", "sparse_path", "goal_point"}
 _ALLOWED_PATH_MODES = {"dense_path", "sparse_path", "goal_point"}
 _ALLOWED_CANONICALIZATION_MODES = {"b_full"}

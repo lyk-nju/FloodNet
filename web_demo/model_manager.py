@@ -15,8 +15,11 @@ import torch
 import numpy as np
 from torch_ema import ExponentialMovingAverage
 from utils.initialize import instantiate, load_config
-from utils.motion_process import StreamJointRecovery263
+from utils.inference_glue import InferenceGlueState, InferenceGlueTimeline
+from utils.motion_process import StreamJointRecovery263, append_traj_deltas_5d_to_7d
+from utils.root_plan import RootPlan
 from utils.stream_rollout import build_stream_step_model_input
+from utils.token_frame import num_frames_for_tokens, token_range_to_frame_slice, token_start_frame
 from utils.stream_traj import (
     StreamTrajectoryPlan,
     TrajectoryUpdateEvent,
@@ -90,7 +93,10 @@ class ModelManager:
         self._last_traj_mask_total = None
         
         # Load models
-        self.vae, self.model = self._load_models(config_path)
+        self.vae, self.model, self.cfg = self._load_models(config_path)
+        self.root_refiner_runtime = self._load_root_refiner_runtime(
+            config_path, traj_mask_cfg
+        )
         
         # Frame buffer
         self.frame_buffer = FrameBuffer(target_buffer_size=4)
@@ -98,6 +104,7 @@ class ModelManager:
         # Stream joint recovery with smoothing
         self.smoothing_alpha = 0.5  # Default: medium smoothing
         self.stream_recovery = StreamJointRecovery263(joints_num=22, smoothing_alpha=self.smoothing_alpha)
+        self._reset_glue_timeline()
         
         # Generation state
         self.current_text = ""
@@ -127,6 +134,8 @@ class ModelManager:
         self.min_token_step = float(traj_mask_cfg.get("min_token_step", 0.05))
         self.max_token_step = float(traj_mask_cfg.get("max_token_step", 1.50))
         self.root_xz_history = deque(maxlen=120)
+        self.root_5d_history = deque(maxlen=480)
+        self._generated_frame_count = 0
         self.traj_repeat_anchor_root = None
         self.traj_repeat_anchor_cycle = None
         # Backwards-compat helpers for app.py / status endpoints.
@@ -292,11 +301,50 @@ class ModelManager:
             model.to(self.device)
             model.eval()
             
-            return vae, model
+            return vae, model, cfg
             
         finally:
             # Restore original directory
             os.chdir(original_dir)
+
+    def _resolve_repo_path(self, path):
+        if not path:
+            return None
+        path = os.path.expanduser(str(path))
+        if os.path.isabs(path):
+            return path
+        parent_dir = os.path.dirname(os.path.dirname(__file__))
+        return os.path.abspath(os.path.join(parent_dir, path))
+
+    def _load_root_refiner_runtime(self, config_path, traj_mask_cfg):
+        root_cfg = (traj_mask_cfg or {}).get("root_refiner", {}) or {}
+        if not bool(root_cfg.get("enabled", False)):
+            print("RootRefiner runtime disabled")
+            return None
+        refiner_config = self._resolve_repo_path(
+            root_cfg.get("config_path") or root_cfg.get("config")
+        )
+        ckpt_path = self._resolve_repo_path(
+            root_cfg.get("ckpt")
+            or root_cfg.get("checkpoint")
+            or root_cfg.get("checkpoint_path")
+        )
+        if refiner_config is None:
+            raise ValueError("traj_mask.root_refiner.enabled=true requires config_path")
+        if ckpt_path is None:
+            raise ValueError("traj_mask.root_refiner.enabled=true requires ckpt")
+        print(f"Loading RootRefiner runtime: config={refiner_config}, ckpt={ckpt_path}")
+        from utils.refiner.runtime import RootRefinerRuntime
+
+        runtime = RootRefinerRuntime.from_config(
+            config_path=refiner_config,
+            ckpt_path=ckpt_path,
+            device=self.device,
+            strict=bool(root_cfg.get("strict", True)),
+            path_mode=str(root_cfg.get("path_mode", "dense_path")),
+        )
+        print("Loaded RootRefiner runtime")
+        return runtime
     
     def start_generation(self, text, history_length=None):
         """Start or update generation with new text"""
@@ -309,9 +357,12 @@ class ModelManager:
             # Reset state before starting (only once at the beginning)
             self.frame_buffer.clear()
             self.stream_recovery.reset()
+            self._reset_glue_timeline()
             self.vae.clear_cache()
             self.first_chunk = True
             self.root_xz_history.clear()
+            self.root_5d_history.clear()
+            self._generated_frame_count = 0
             self.model.init_generated(self.history_length, batch_size=1, num_denoise_steps=self.denoise_steps)
             print(f"Model initialized with history length: {self.history_length}, denoise steps: {self.denoise_steps}")
             
@@ -378,6 +429,8 @@ class ModelManager:
                 self.current_traj_times = None
             if hasattr(self.model, "_traj_buf"):
                 self.model._traj_buf.reset()
+                if hasattr(self.model._traj_buf, "clear"):
+                    self.model._traj_buf.clear()
             self._trajectory_state = "none"
             with self._display_traj_lock:
                 self._display_traj = None
@@ -421,6 +474,23 @@ class ModelManager:
             version=self._next_plan_version(),
             source=str(source),
         )
+
+        if _prev_plan is None:
+            with self.traj_state_lock:
+                self.active_traj_plan = new_plan
+                self.pending_update_event = None
+                self.current_traj_waypoints = points
+                self.current_traj_times = times
+                self.current_traj_mode = mode
+            self._activate_root_plan_from_stream_plan(new_plan)
+            self._trajectory_state = "active_7d"
+            print(
+                f"Trajectory updated: {len(points)} points, source={source}, "
+                f"horizon={self.traj_horizon_tokens}, "
+                f"edit_commit={edit_commit}, effective_commit={effective_commit}, "
+                f"delay={delay}, blend=0"
+            )
+            return self.get_display_traj()
 
         with self.traj_state_lock:
             self.pending_update_event = TrajectoryUpdateEvent(
@@ -542,6 +612,183 @@ class ModelManager:
     def _get_commit_index(self) -> int:
         return int(getattr(self.model, "commit_index", 0))
 
+    def _get_root_refiner_history_5d(self, anchor_commit: int):
+        history = getattr(self, "root_5d_history", None)
+        if not history:
+            return None
+        anchor_frame = token_start_frame(max(0, int(anchor_commit)))
+        frames = [
+            np.asarray(root5d, dtype=np.float32)
+            for frame_idx, root5d in history
+            if int(frame_idx) <= anchor_frame
+        ]
+        if not frames:
+            return None
+        return np.stack(frames, axis=0).astype(np.float32)
+
+    def _reset_glue_timeline(self):
+        self._glue_timeline = InferenceGlueTimeline(
+            InferenceGlueState.initial(device=self.device, dtype=torch.float32)
+        )
+
+    def _append_glue_state_from_stream_recovery(self):
+        timeline = getattr(self, "_glue_timeline", None)
+        if timeline is None:
+            self._reset_glue_timeline()
+            timeline = self._glue_timeline
+
+        commit_idx = self._get_commit_index()
+        if commit_idx <= timeline.head.commit_idx:
+            return
+
+        root = np.asarray(self.stream_recovery.r_pos_accum, dtype=np.float32)
+        world_xz = torch.tensor(root[[0, 2]], device=self.device, dtype=torch.float32)
+        world_yaw = torch.tensor(
+            -2.0 * float(self.stream_recovery.r_rot_ang_accum),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        timeline.append(
+            InferenceGlueState(
+                commit_idx=commit_idx,
+                world_xz=world_xz,
+                world_yaw=world_yaw,
+                source="stream_recovery",
+            )
+        )
+        history_length = int(getattr(self, "history_length", 0))
+        if history_length > 0:
+            keep_from = max(0, commit_idx - history_length * 2)
+            timeline.trim_before(keep_from)
+
+    def _stream_plan_to_root_plan(
+        self,
+        plan: StreamTrajectoryPlan,
+        anchor_state: InferenceGlueState,
+    ) -> RootPlan:
+        """Convert a world-space StreamTrajectoryPlan to plan-anchor-local 7D."""
+        from utils.local_frame import canonicalize_7d
+
+        device = torch.device(getattr(self, "device", "cpu"))
+        frames_per_token = 4
+        token_dt = float(getattr(self, "token_dt", 0.20))
+        frame_dt = token_dt / float(frames_per_token)
+        min_tokens = (
+            int(getattr(self, "history_length", 0))
+            + int(getattr(getattr(self, "model", None), "chunk_size", 1))
+            + int(getattr(self, "traj_horizon_tokens", 0))
+        )
+        duration = 0.0
+        if len(plan.times) > 0:
+            duration = max(0.0, float(np.max(plan.times) - np.min(plan.times)))
+        duration_tokens = int(np.ceil(duration / max(token_dt, 1e-6))) + 1
+        num_tokens_pred = max(1, min_tokens, duration_tokens)
+        valid_frames = num_frames_for_tokens(num_tokens_pred, frames_per_token)
+
+        query_times = np.arange(valid_frames, dtype=np.float32) * np.float32(frame_dt)
+        xyz = sample_timestamped_trajectory(plan.times, plan.points_xyz, query_times)
+        xyz_t = torch.as_tensor(xyz, device=device, dtype=torch.float32)
+
+        xz = xyz_t[:, [0, 2]]
+        delta = torch.zeros_like(xz)
+        if xz.shape[0] > 1:
+            delta[0] = xz[1] - xz[0]
+            delta[1:] = xz[1:] - xz[:-1]
+        yaw_values = []
+        last_yaw = torch.tensor(0.0, device=device, dtype=torch.float32)
+        for d in delta:
+            if torch.linalg.norm(d) > 1e-6:
+                last_yaw = torch.atan2(d[0], d[1])
+            yaw_values.append(last_yaw)
+        yaw = torch.stack(yaw_values) if yaw_values else xyz_t.new_zeros(0)
+        traj_5d_world = torch.cat(
+            [xyz_t, torch.cos(yaw).unsqueeze(-1), torch.sin(yaw).unsqueeze(-1)],
+            dim=-1,
+        )
+        traj_7d_world = append_traj_deltas_5d_to_7d(traj_5d_world)
+
+        anchor_xz = anchor_state.world_xz.to(device=device, dtype=torch.float32)
+        anchor_yaw = anchor_state.world_yaw.to(device=device, dtype=torch.float32)
+        traj_7d_local = canonicalize_7d(traj_7d_world, anchor_xz, anchor_yaw)
+        return RootPlan(
+            num_tokens_pred=num_tokens_pred,
+            valid_frames=valid_frames,
+            waypoints_local_7d=traj_7d_local,
+            frame_dt=frame_dt,
+            frames_per_token=frames_per_token,
+            anchor_commit_idx=int(anchor_state.commit_idx),
+            anchor_world_xz=anchor_xz,
+            anchor_world_yaw=anchor_yaw,
+            source=str(plan.source),
+        )
+
+    def _activate_root_plan_from_stream_plan(self, plan: StreamTrajectoryPlan) -> bool:
+        timeline = getattr(self, "_glue_timeline", None)
+        traj_buf = getattr(getattr(self, "model", None), "_traj_buf", None)
+        if timeline is None or traj_buf is None:
+            return False
+        anchor_commit = int(plan.start_commit_index)
+        if not timeline.has_exact_state(anchor_commit):
+            return False
+        anchor_state = timeline.at_commit(anchor_commit)
+        if getattr(self, "root_refiner_runtime", None) is not None:
+            root_plan = self.root_refiner_runtime.build_root_plan(
+                text=getattr(self, "current_text", ""),
+                plan=plan,
+                anchor_state=anchor_state,
+                token_dt=self.token_dt,
+                history_motion_world_5d=self._get_root_refiner_history_5d(anchor_commit),
+            )
+        else:
+            root_plan = self._stream_plan_to_root_plan(plan, anchor_state)
+        traj_buf.set_root_plan(root_plan)
+        return True
+
+    def _build_rootplan_stream_traj_input(self):
+        """Build direct 7D stream payload from active RootPlan, if available.
+
+        This is the RootPlan/7D main-path bridge. It produces a payload that
+        covers the largest latent window stream_generate_step may use during the
+        current one-token commit. The model-side direct 7D helper then slices it
+        per denoise sub-step.
+        """
+        traj_buf = getattr(self.model, "_traj_buf", None)
+        timeline = getattr(self, "_glue_timeline", None)
+        if (
+            traj_buf is None
+            or timeline is None
+            or not hasattr(traj_buf, "has_active_plan")
+            or not traj_buf.has_active_plan()
+        ):
+            return None
+
+        current_commit = self._get_commit_index()
+        chunk_size = int(getattr(self.model, "chunk_size", 1))
+        right_token = current_commit + chunk_size
+        start_token = max(0, right_token - int(self.history_length))
+        future_horizon = max(0, int(getattr(self, "traj_horizon_tokens", 0)))
+        num_tokens = max(0, right_token + future_horizon - start_token)
+        if num_tokens <= 0:
+            return None
+        if not timeline.has_exact_state(start_token):
+            return None
+
+        body_anchor_state = timeline.at_commit(start_token)
+        frame_slice = token_range_to_frame_slice(start_token, num_tokens)
+        traj_cond, traj_mask = traj_buf.get_body_traj_cond(
+            head_state=body_anchor_state,
+            body_anchor_state=body_anchor_state,
+            horizon_tokens=num_tokens,
+            expected_horizon_frame_slice=frame_slice,
+        )
+        if not bool(traj_mask.any()):
+            return None
+        return {
+            "traj_cond_7d_frame": traj_cond.unsqueeze(0),
+            "traj_cond_frame_mask": traj_mask.unsqueeze(0).to(dtype=torch.float32),
+            "traj_start_token": start_token,
+        }
+
     def _build_stream_traj_input(self):
         current_commit = self._get_commit_index()
         current_root = self._get_current_root_xyz()
@@ -551,6 +798,10 @@ class ModelManager:
             plan = self.active_traj_plan
 
         if plan is None and event is None:
+            rootplan_payload = self._build_rootplan_stream_traj_input()
+            if rootplan_payload is not None:
+                self._trajectory_state = "active_7d"
+                return rootplan_payload
             self._trajectory_state = "none"
             return None
 
@@ -565,15 +816,18 @@ class ModelManager:
                 reanchor_to_current_root=True,
             )
             self._trajectory_state = "active"
-            token_mask = np.ones((1, self.traj_horizon_tokens), dtype=np.float32)
             with self._display_traj_lock:
                 self._display_traj = future.copy()
-            return {
-                "traj": future[None, :, :],
-                "token_mask": token_mask,
-                "traj_mode": self.current_traj_mode,
-                "traj_plan_version": plan.version if plan else 0,
-            }
+            rootplan_payload = self._build_rootplan_stream_traj_input()
+            if rootplan_payload is not None:
+                self._trajectory_state = "active_7d"
+                rootplan_payload.update({
+                    "traj_mode": self.current_traj_mode,
+                    "traj_plan_version": plan.version if plan else 0,
+                })
+                return rootplan_payload
+            self._trajectory_state = "active_7d_unavailable"
+            return None
 
         # ── Pending update: compute blend weight ────────────────────────
         offset = current_commit - event.edit_commit_index
@@ -621,18 +875,21 @@ class ModelManager:
             with self.traj_state_lock:
                 self.active_traj_plan = event.new_plan
                 self.pending_update_event = None
+            self._activate_root_plan_from_stream_plan(event.new_plan)
 
-        token_mask = np.ones((1, self.traj_horizon_tokens), dtype=np.float32)
         with self._display_traj_lock:
             self._display_traj = future.copy()
-        return {
-            "traj": future[None, :, :],
-            "token_mask": token_mask,
-            "traj_mode": self.current_traj_mode,
-            "traj_plan_version": event.version,
-            "traj_update_blend_weight": w,
-            "trajectory_state": self._trajectory_state,
-        }
+        rootplan_payload = self._build_rootplan_stream_traj_input()
+        if rootplan_payload is not None:
+            rootplan_payload.update({
+                "traj_mode": self.current_traj_mode,
+                "traj_plan_version": event.version,
+                "traj_update_blend_weight": w,
+                "trajectory_state": self._trajectory_state,
+            })
+            return rootplan_payload
+        self._trajectory_state = f"{self._trajectory_state}_7d_unavailable"
+        return None
     
     def pause_generation(self):
         """Pause generation (keeps all state)"""
@@ -693,6 +950,8 @@ class ModelManager:
         self.vae.clear_cache()
         self.first_chunk = True
         self.root_xz_history.clear()
+        self.root_5d_history.clear()
+        self._generated_frame_count = 0
         with self.traj_state_lock:
             self.active_traj_plan = None
             self.pending_update_event = None
@@ -724,6 +983,7 @@ class ModelManager:
             joints_num=22, 
             smoothing_alpha=self.smoothing_alpha
         )
+        self._reset_glue_timeline()
         
         # Initialize model with denoise steps
         self.model.init_generated(self.history_length, batch_size=1, num_denoise_steps=self.denoise_steps)
@@ -753,7 +1013,11 @@ class ModelManager:
                         
                         # Generate one token (produces 4 frames from VAE)
                         traj_input = self._build_stream_traj_input()
-                        if traj_input is None and hasattr(self.model, "_traj_buf"):
+                        if (
+                            traj_input is None
+                            and getattr(self, "_trajectory_state", "none") == "none"
+                            and hasattr(self.model, "_traj_buf")
+                        ):
                             self.model._traj_buf.reset()
                         x = build_stream_step_model_input(
                             self.current_text, traj_input=traj_input
@@ -780,7 +1044,16 @@ class ModelManager:
                             self.root_xz_history.append(
                                 self.stream_recovery.r_pos_accum[[0, 2]].astype(np.float32).copy()
                             )
+                            root = self.stream_recovery.r_pos_accum.astype(np.float32).copy()
+                            yaw = -2.0 * float(self.stream_recovery.r_rot_ang_accum)
+                            root5d = np.array(
+                                [root[0], root[1], root[2], np.cos(yaw), np.sin(yaw)],
+                                dtype=np.float32,
+                            )
+                            self.root_5d_history.append((int(self._generated_frame_count), root5d))
+                            self._generated_frame_count += 1
                             self.frame_buffer.add_frame(joints)
+                        self._append_glue_state_from_stream_recovery()
                         
                         step_time = time.time() - step_start
                         total_gen_time += step_time

@@ -149,40 +149,49 @@ def rope_apply(x, grid_sizes, freqs):
 
 
 @torch.amp.autocast("cuda", enabled=False)
-def rope_apply_concat_latent_traj(x, grid_sizes, freqs, latent_pad_len):
+def rope_apply_concat_latent_traj(x, grid_sizes, freqs, latent_pad_len, traj_pad_len=None):
     """
-    RoPE for sequences [latent_0..L || traj_0..L]: traj timestep k uses the same temporal freqs as latent k.
-    x: (B, 2 * latent_pad_len, n_heads, head_dim)
+    RoPE for sequences [latent_0..L || traj_0..T].
+
+    In the standard training path T == L. Streaming can pass T > L so latent
+    tokens attend to a future trajectory horizon. For the body model's 1D token
+    grid (H=W=1), future traj tokens receive the next temporal RoPE positions.
     """
     n, c = x.size(2), x.size(3) // 2
     freqs_split = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
     L = latent_pad_len
-    assert x.size(1) == 2 * L
+    T = L if traj_pad_len is None else int(traj_pad_len)
+    assert x.size(1) == L + T
     output = []
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         grid_len = f * h * w
 
-        freqs_i = torch.cat(
-            [
-                freqs_split[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-                freqs_split[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-                freqs_split[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
-            ],
-            dim=-1,
-        ).reshape(grid_len, 1, -1)
+        def freqs_for_grid(f_len: int) -> torch.Tensor:
+            return torch.cat(
+                [
+                    freqs_split[0][:f_len].view(f_len, 1, 1, -1).expand(f_len, h, w, -1),
+                    freqs_split[1][:h].view(1, h, 1, -1).expand(f_len, h, w, -1),
+                    freqs_split[2][:w].view(1, 1, w, -1).expand(f_len, h, w, -1),
+                ],
+                dim=-1,
+            ).reshape(f_len * h * w, 1, -1)
 
-        def apply_rope_prefix(x_prefix: torch.Tensor) -> torch.Tensor:
+        freqs_i = freqs_for_grid(f)
+
+        def apply_rope_prefix(x_prefix: torch.Tensor, freqs_prefix: torch.Tensor) -> torch.Tensor:
             # rotate first grid_len tokens; leave tail of prefix unchanged
-            if grid_len == 0:
+            prefix_len = min(x_prefix.shape[0], freqs_prefix.shape[0])
+            if prefix_len == 0:
                 return x_prefix
             x_rot = torch.view_as_complex(
-                x_prefix[:grid_len].to(torch.float64).reshape(grid_len, n, -1, 2)
+                x_prefix[:prefix_len].to(torch.float64).reshape(prefix_len, n, -1, 2)
             )
-            x_rot = torch.view_as_real(x_rot * freqs_i).flatten(2)
-            return torch.cat([x_rot, x_prefix[grid_len:]], dim=0)
+            x_rot = torch.view_as_real(x_rot * freqs_prefix[:prefix_len]).flatten(2)
+            return torch.cat([x_rot, x_prefix[prefix_len:]], dim=0)
 
-        x_lat = apply_rope_prefix(x[i, :L])
-        x_traj = apply_rope_prefix(x[i, L : 2 * L])
+        x_lat = apply_rope_prefix(x[i, :L], freqs_i)
+        traj_freqs = freqs_for_grid(T) if h == 1 and w == 1 else freqs_i
+        x_traj = apply_rope_prefix(x[i, L : L + T], traj_freqs)
         output.append(torch.cat([x_lat, x_traj], dim=0))
     return torch.stack(output).float()
 
@@ -251,6 +260,7 @@ class WanSelfAttention(nn.Module):
         grid_sizes,
         freqs,
         latent_pad_len=None,
+        traj_pad_len=None,
         traj_seq_lens=None,
     ):
         r"""
@@ -259,7 +269,8 @@ class WanSelfAttention(nn.Module):
             seq_lens(Tensor): Shape [B]
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
-            latent_pad_len: if set, x is [latent || traj] with L = 2 * latent_pad_len; traj segment
+            latent_pad_len: if set, x is [latent || traj] with
+                L = latent_pad_len + traj_pad_len; traj segment
                 starts at this index. Self-attn 使用 Task4 块稀疏（见 ``flextraj_self_attention``）。
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
@@ -274,9 +285,14 @@ class WanSelfAttention(nn.Module):
         q, k, v = qkv_fn(x)
 
         if latent_pad_len is not None:
-            assert s == 2 * latent_pad_len
-            q = rope_apply_concat_latent_traj(q, grid_sizes, freqs, latent_pad_len)
-            k = rope_apply_concat_latent_traj(k, grid_sizes, freqs, latent_pad_len)
+            traj_pad_len = latent_pad_len if traj_pad_len is None else int(traj_pad_len)
+            assert s == latent_pad_len + traj_pad_len
+            q = rope_apply_concat_latent_traj(
+                q, grid_sizes, freqs, latent_pad_len, traj_pad_len
+            )
+            k = rope_apply_concat_latent_traj(
+                k, grid_sizes, freqs, latent_pad_len, traj_pad_len
+            )
         else:
             q = rope_apply(q, grid_sizes, freqs)
             k = rope_apply(k, grid_sizes, freqs)
@@ -421,6 +437,7 @@ class WanAttentionBlock(nn.Module):
         context,
         context_lens,
         latent_pad_len=None,
+        traj_pad_len=None,
     ):
         r"""
         Args:
@@ -429,7 +446,8 @@ class WanAttentionBlock(nn.Module):
             seq_lens(Tensor): Shape [B], length of each sequence in batch
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
-            latent_pad_len: optional; when set, L = 2 * latent_pad_len (latent || traj).
+            latent_pad_len: optional; when set, L = latent_pad_len + traj_pad_len
+                (latent || traj).
         """
         assert e.dtype == torch.float32
         with torch.amp.autocast("cuda", dtype=torch.float32):
@@ -443,6 +461,7 @@ class WanAttentionBlock(nn.Module):
             grid_sizes,
             freqs,
             latent_pad_len=latent_pad_len,
+            traj_pad_len=traj_pad_len,
             traj_seq_lens=traj_seq_lens,
         )
         with torch.amp.autocast("cuda", dtype=torch.float32):
@@ -731,25 +750,25 @@ class WanModel(ModelMixin, ConfigMixin):
         )
 
         latent_pad_len = None
+        traj_pad_len = None
         traj_seq_lens_attn = None
         if self.traj_in_proj is not None and traj_emb is not None:
             traj_t = self.traj_in_proj(traj_emb.to(dtype=x.dtype))
             traj_t = traj_t + self.traj_type_embed
             bt, tlen, _ = traj_t.shape
-            if tlen < seq_len:
+            traj_pad_len = max(seq_len, int(tlen))
+            if tlen < traj_pad_len:
                 traj_t = torch.cat(
-                    [traj_t, traj_t.new_zeros(bt, seq_len - tlen, traj_t.size(-1))],
+                    [traj_t, traj_t.new_zeros(bt, traj_pad_len - tlen, traj_t.size(-1))],
                     dim=1,
                 )
-            elif tlen > seq_len:
-                traj_t = traj_t[:, :seq_len, :]
             x = torch.cat([x, traj_t], dim=1)
             if traj_seq_lens is None:
-                traj_seq_lens_attn = seq_lens
+                traj_seq_lens_attn = torch.full_like(seq_lens, int(tlen))
             else:
                 traj_seq_lens_attn = (
                     traj_seq_lens.to(device=seq_lens.device, dtype=torch.long)
-                    .clamp(min=0, max=seq_len)
+                    .clamp(min=0, max=traj_pad_len)
                 )
             latent_pad_len = seq_len
 
@@ -769,7 +788,7 @@ class WanModel(ModelMixin, ConfigMixin):
                 # FlexTraj: latent tokens depend on diffusion timestep (time modulation),
                 # while traj tokens are treated as known control and should not be
                 # time-modulated by the diffusion step.
-                e0_traj = torch.zeros_like(e0)
+                e0_traj = e0.new_zeros(e0.shape[0], traj_pad_len, *e0.shape[2:])
                 e0 = torch.cat([e0, e0_traj], dim=1)
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
@@ -788,6 +807,7 @@ class WanModel(ModelMixin, ConfigMixin):
             context=context,
             context_lens=context_lens,
             latent_pad_len=latent_pad_len,
+            traj_pad_len=traj_pad_len,
         )
 
         if controlnet_residuals is not None and len(controlnet_residuals) != len(

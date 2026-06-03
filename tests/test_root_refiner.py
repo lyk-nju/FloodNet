@@ -131,8 +131,8 @@ def test_path_cond_decoder_no_leak_from_post_horizon():
     dec = model.frame_decoder
     orig = dec._build_path_cond
 
-    def perturbed(xz, pm, cnt):
-        c = orig(xz, pm, cnt).clone()
+    def perturbed(xz, pm, cnt, **kwargs):
+        c = orig(xz, pm, cnt, **kwargs).clone()
         c[:, veff:] = c[:, veff:] + torch.randn_like(c[:, veff:]) * 50.0   # garbage past horizon
         return c
 

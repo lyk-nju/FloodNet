@@ -19,12 +19,19 @@ from models.tools.traj_encoder import (
     LocalTrajEncoder,
     TrajEncoder,
 )
+from models.diffusion_forcing_wan import DiffForcingWanModel
 from utils.token_frame import (
     frames_to_token_mask,
     num_frames_for_tokens,
+    token_range_to_frame_slice,
     token_start_frame,
 )
-from utils.traj_batch import encode_traj_batch
+from utils.traj_batch import (
+    encode_traj_batch,
+    frames_to_token_mask_range,
+    frames_to_tokens,
+    frames_to_tokens_range,
+)
 
 
 def _encoders(out_dim=16, seed=0):
@@ -34,6 +41,29 @@ def _encoders(out_dim=16, seed=0):
     torch.manual_seed(seed + 100)
     te = TrajEncoder(in_dim=LOCAL_OUT_DIM, out_dim=out_dim).eval()    # 128 → out_dim
     return le, te
+
+
+class _KeepFourFrames(torch.nn.Module):
+    """Test-only local encoder: expose the four grouped frame values."""
+
+    def forward(self, x, frame_mask=None):
+        return x.squeeze(-1)
+
+
+class _KeepFirstChannelFourFrames(torch.nn.Module):
+    """Test-only local encoder for 7D stream payloads."""
+
+    def forward(self, x, frame_mask=None):
+        return x[..., 0]
+
+
+def _dummy_stream_model():
+    model = DiffForcingWanModel.__new__(DiffForcingWanModel)
+    torch.nn.Module.__init__(model)
+    model.batch_size = 1
+    model.local_traj_encoder = _KeepFirstChannelFourFrames()
+    model.traj_encoder = torch.nn.Identity()
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +121,165 @@ def test_local_encoder_zeros_invalid_frames_before_conv():
 # ---------------------------------------------------------------------------
 # Mask effectiveness through the full encode_traj_batch pipeline
 # ---------------------------------------------------------------------------
+
+
+def test_frames_to_tokens_range_prefix_matches_legacy_helper():
+    B, seq_len, D = 1, 4, 1
+    feats = torch.arange(num_frames_for_tokens(seq_len), dtype=torch.float32).view(B, -1, D)
+    legacy = frames_to_tokens(feats, seq_len)
+    ranged = frames_to_tokens_range(feats, 0, seq_len)
+    assert torch.allclose(ranged, legacy)
+
+
+def test_frames_to_tokens_range_non_prefix_uses_four_frames_per_token():
+    B, seq_len, D = 1, 3, 1
+    frame_slice = token_range_to_frame_slice(5, seq_len)
+    assert frame_slice.stop - frame_slice.start == 12
+    feats = torch.arange(12, dtype=torch.float32).view(B, -1, D)
+
+    grouped = frames_to_tokens_range(feats, 5, seq_len).squeeze(0).squeeze(-1)
+
+    expected = torch.tensor(
+        [
+            [0.0, 1.0, 2.0, 3.0],
+            [4.0, 5.0, 6.0, 7.0],
+            [8.0, 9.0, 10.0, 11.0],
+        ]
+    )
+    assert torch.allclose(grouped, expected)
+
+
+def test_frames_to_token_mask_range_non_prefix_uses_local_window_origin():
+    mask = torch.zeros(1, 8)
+    mask[:, 6] = 1.0
+    tok = frames_to_token_mask_range(mask, 2, start_token_idx=10)
+    assert torch.allclose(tok, torch.tensor([[0.0, 1.0]]))
+
+
+def test_encode_traj_batch_threads_traj_start_token_into_grouping():
+    seq_len = 3
+    feats = torch.arange(12, dtype=torch.float32).view(1, 12, 1)
+    x = {
+        "traj_features": feats,
+        "traj_cond_mask": torch.ones(1, 12),
+        "traj_start_token": 5,
+    }
+
+    out = encode_traj_batch(
+        x,
+        seq_len,
+        "cpu",
+        _KeepFourFrames(),
+        torch.nn.Identity(),
+    )
+
+    expected = torch.tensor(
+        [
+            [
+                [0.0, 1.0, 2.0, 3.0],
+                [4.0, 5.0, 6.0, 7.0],
+                [8.0, 9.0, 10.0, 11.0],
+            ]
+        ]
+    )
+    assert torch.allclose(out, expected)
+
+
+def test_stream_direct_7d_payload_uses_window_start_token():
+    model = _dummy_stream_model()
+    feats = torch.zeros(1, 12, 7)
+    feats[..., 0] = torch.arange(12, dtype=torch.float32).view(1, 12)
+    x = {
+        "traj_cond_7d_frame": feats,
+        "traj_cond_frame_mask": torch.ones(1, 12),
+        "traj_start_token": 5,
+    }
+
+    emb, lens, token_mask = model._build_stream_direct_traj_condition(
+        x, model_sl=3, window_start_token=5, device="cpu",
+    )
+
+    expected = torch.tensor(
+        [
+            [
+                [0.0, 1.0, 2.0, 3.0],
+                [4.0, 5.0, 6.0, 7.0],
+                [8.0, 9.0, 10.0, 11.0],
+            ]
+        ]
+    )
+    assert torch.allclose(emb, expected)
+    assert torch.equal(lens, torch.tensor([3]))
+    assert torch.allclose(token_mask, torch.ones(1, 3))
+
+
+def test_stream_direct_7d_payload_can_encode_future_horizon_tokens():
+    model = _dummy_stream_model()
+    feats = torch.zeros(1, 20, 7)
+    feats[..., 0] = torch.arange(20, dtype=torch.float32).view(1, 20)
+    x = {
+        "traj_cond_7d_frame": feats,
+        "traj_cond_frame_mask": torch.ones(1, 20),
+        "traj_start_token": 5,
+    }
+
+    emb, lens, token_mask = model._build_stream_direct_traj_condition(
+        x, model_sl=3, window_start_token=5, device="cpu", traj_sl=5,
+    )
+
+    expected = torch.tensor(
+        [
+            [
+                [0.0, 1.0, 2.0, 3.0],
+                [4.0, 5.0, 6.0, 7.0],
+                [8.0, 9.0, 10.0, 11.0],
+                [12.0, 13.0, 14.0, 15.0],
+                [16.0, 17.0, 18.0, 19.0],
+            ]
+        ]
+    )
+    assert torch.allclose(emb, expected)
+    assert torch.equal(lens, torch.tensor([5]))
+    assert torch.allclose(token_mask, torch.ones(1, 5))
+
+
+def test_stream_direct_7d_payload_rejects_misaligned_start_token():
+    model = _dummy_stream_model()
+    x = {
+        "traj_cond_7d_frame": torch.zeros(1, 12, 7),
+        "traj_start_token": 6,
+    }
+    with pytest.raises(ValueError, match="expected <= 5"):
+        model._build_stream_direct_traj_condition(
+            x, model_sl=3, window_start_token=5, device="cpu",
+        )
+
+
+def test_stream_direct_7d_payload_slices_from_earlier_payload_start():
+    model = _dummy_stream_model()
+    feats = torch.zeros(1, 12, 7)
+    feats[..., 0] = torch.arange(12, dtype=torch.float32).view(1, 12)
+    x = {
+        "traj_cond_7d_frame": feats,
+        "traj_cond_frame_mask": torch.ones(1, 12),
+        "traj_start_token": 5,
+    }
+
+    emb, lens, token_mask = model._build_stream_direct_traj_condition(
+        x, model_sl=2, window_start_token=6, device="cpu",
+    )
+
+    expected = torch.tensor(
+        [
+            [
+                [4.0, 5.0, 6.0, 7.0],
+                [8.0, 9.0, 10.0, 11.0],
+            ]
+        ]
+    )
+    assert torch.allclose(emb, expected)
+    assert torch.equal(lens, torch.tensor([2]))
+    assert torch.allclose(token_mask, torch.ones(1, 2))
 
 
 def test_mask_effectiveness_through_encode_traj_batch():

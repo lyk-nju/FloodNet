@@ -85,6 +85,22 @@ def test_forward_duration_modes_choose_gt_or_predicted_horizon():
     assert torch.equal(pred_out["used_num_tokens"], pred_out["pred_num_tokens"])
 
 
+def test_common_prefix_mask_uses_predicted_duration_horizon():
+    module = RefinerLightningModule(_cfg())
+    batch = _batch(module, B=2)
+    out = {
+        "used_num_tokens": torch.tensor([2, 4]),
+    }
+
+    mask = module._common_prefix_mask(batch, out)
+
+    expected_counts = torch.tensor([
+        module.refiner.frames_per_token * 2 - (module.refiner.frames_per_token - 1),
+        module.refiner.frames_per_token * 4 - (module.refiner.frames_per_token - 1),
+    ])
+    assert torch.equal(mask.sum(dim=1).cpu(), expected_counts)
+
+
 def test_validation_step_logs_groundtruth_and_pred_duration_prefixes():
     module = RefinerLightningModule(_cfg())
     batch = _batch(module)

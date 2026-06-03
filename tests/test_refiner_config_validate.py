@@ -110,6 +110,14 @@ def test_rejects_unknown_horizon_policy():
         validate_refiner_config(cfg)
 
 
+def test_rejects_unimplemented_bucketed_horizon_policy():
+    cfg = _minimal_cfg()
+    cfg["sampling"]["horizon_policy"] = "bucketed"
+
+    with pytest.raises(ValueError, match="bucketed"):
+        validate_refiner_config(cfg)
+
+
 def test_rejects_legacy_num_token_policy_key():
     cfg = _minimal_cfg()
     cfg.setdefault("data", {})["num_token_policy"] = "random"

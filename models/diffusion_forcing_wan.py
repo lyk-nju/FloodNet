@@ -1,5 +1,6 @@
 import warnings
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -879,26 +880,53 @@ class DiffForcingWanModel(nn.Module):
             if ctx_double is not None:
                 noisy_double = list(noisy_input) + list(noisy_input)
                 t_double = torch.cat([t_scaled, t_scaled], dim=0)
+                residuals_double = self._controlnet_forward(
+                    noisy_double,
+                    t_double,
+                    ctx_double,
+                    seq_len,
+                    traj_emb=None,
+                    traj_seq_lens=None,
+                    traj_token_mask=None,
+                )
                 pred_double = self.model(
                     noisy_double, t_double, ctx_double, seq_len,
                     y=None, traj_emb=None, traj_seq_lens=None,
-                    controlnet_residuals=None,
+                    controlnet_residuals=residuals_double,
                 )
                 return [
                     self.cfg_scale_text * pred_double[i]
                     - (self.cfg_scale_text - 1) * pred_double[i + batch_size]
                     for i in range(batch_size)
                 ]
+            residuals = self._controlnet_forward(
+                noisy_input,
+                t_scaled,
+                text_cond_ctx,
+                seq_len,
+                traj_emb=None,
+                traj_seq_lens=None,
+                traj_token_mask=None,
+            )
             pred = self.model(
                 noisy_input, t_scaled, text_cond_ctx, seq_len,
                 y=None, traj_emb=None, traj_seq_lens=None,
-                controlnet_residuals=None,
+                controlnet_residuals=residuals,
             )
             if self.cfg_scale_text != 1.0:
+                residuals_null = self._controlnet_forward(
+                    noisy_input,
+                    t_scaled,
+                    text_null_ctx,
+                    seq_len,
+                    traj_emb=None,
+                    traj_seq_lens=None,
+                    traj_token_mask=None,
+                )
                 pred_null = self.model(
                     noisy_input, t_scaled, text_null_ctx, seq_len,
                     y=None, traj_emb=None, traj_seq_lens=None,
-                    controlnet_residuals=None,
+                    controlnet_residuals=residuals_null,
                 )
                 return [
                     self.cfg_scale_text * pv - (self.cfg_scale_text - 1) * pvn
@@ -1395,6 +1423,122 @@ class DiffForcingWanModel(nn.Module):
             use_emb_cache=self.use_traj_emb_cache,
         )
 
+    def _build_stream_direct_traj_condition(
+        self,
+        x: dict,
+        model_sl: int,
+        window_start_token: int,
+        device,
+        traj_sl: int | None = None,
+    ):
+        """Encode an explicit frame-level 7D stream trajectory payload.
+
+        The payload must already be window-relative and body-window-local. This
+        helper only validates shape/start-token consistency and routes it
+        through the same 7D encoder path used by training.
+        """
+        from utils.token_frame import (
+            frame_idx_to_token_idx,
+            prefix_len_from_tail_invalid,
+            token_range_to_frame_slice,
+            token_start_frame,
+        )
+
+        traj_frame = x["traj_cond_7d_frame"]
+        if isinstance(traj_frame, np.ndarray):
+            traj_frame = torch.from_numpy(traj_frame).float()
+        traj_frame = traj_frame.to(device=device)
+        if traj_frame.dim() == 2:
+            traj_frame = traj_frame.unsqueeze(0)
+        if traj_frame.dim() != 3 or traj_frame.shape[-1] != 7:
+            raise ValueError(
+                "traj_cond_7d_frame must be [B,T_frame,7] or [T_frame,7], "
+                f"got {tuple(traj_frame.shape)}"
+            )
+        if traj_frame.shape[0] != self.batch_size:
+            raise ValueError(
+                f"traj_cond_7d_frame batch size {traj_frame.shape[0]} does not "
+                f"match stream batch_size {self.batch_size}"
+            )
+
+        payload_start = int(x.get("traj_start_token", window_start_token))
+        if traj_sl is None:
+            if traj_frame.shape[1] <= 0:
+                traj_sl = model_sl
+            else:
+                origin_frame = token_start_frame(payload_start)
+                payload_last_frame = origin_frame + int(traj_frame.shape[1]) - 1
+                payload_end_token = frame_idx_to_token_idx(payload_last_frame) + 1
+                traj_sl = max(model_sl, payload_end_token - window_start_token)
+        traj_sl = int(traj_sl)
+        if traj_sl < model_sl:
+            raise ValueError(
+                f"stream traj_sl must be >= model_sl; got traj_sl={traj_sl}, "
+                f"model_sl={model_sl}."
+            )
+
+        if payload_start > window_start_token:
+            raise ValueError(
+                "stream_generate_step 7D payload must start at the current "
+                "latent window start token or earlier; got "
+                f"traj_start_token={payload_start}, expected <= {window_start_token}."
+            )
+        if payload_start < window_start_token:
+            origin_frame = token_start_frame(payload_start)
+            needed = token_range_to_frame_slice(window_start_token, traj_sl)
+            rel_start = needed.start - origin_frame
+            rel_stop = needed.stop - origin_frame
+            if rel_start >= traj_frame.shape[1]:
+                traj_frame = traj_frame[:, :0, :]
+            else:
+                traj_frame = traj_frame[:, max(0, rel_start):min(rel_stop, traj_frame.shape[1]), :]
+
+        traj_payload = {
+            "traj_features": traj_frame,
+            "traj_start_token": window_start_token,
+        }
+        traj_mask = x.get("traj_cond_frame_mask", x.get("traj_cond_mask"))
+        if traj_mask is not None:
+            if isinstance(traj_mask, np.ndarray):
+                traj_mask = torch.from_numpy(traj_mask).float()
+            traj_mask = traj_mask.to(device=device)
+            if traj_mask.dim() == 1:
+                traj_mask = traj_mask.unsqueeze(0)
+            if traj_mask.shape[0] != self.batch_size:
+                raise ValueError(
+                    f"traj_cond_frame_mask batch size {traj_mask.shape[0]} does not "
+                    f"match stream batch_size {self.batch_size}"
+                )
+            if payload_start < window_start_token:
+                if rel_start >= traj_mask.shape[1]:
+                    traj_mask = traj_mask[:, :0]
+                else:
+                    traj_mask = traj_mask[:, max(0, rel_start):min(rel_stop, traj_mask.shape[1])]
+            traj_payload["traj_cond_mask"] = traj_mask
+
+        traj_emb, traj_token_mask = encode_traj_batch(
+            traj_payload,
+            traj_sl,
+            device,
+            self.local_traj_encoder,
+            self.traj_encoder,
+            return_token_mask=True,
+        )
+        if traj_emb is None:
+            return None, None, None
+        if traj_token_mask is not None:
+            traj_seq_lens = prefix_len_from_tail_invalid(traj_token_mask).to(
+                device=device
+            )
+        else:
+            traj_seq_lens = torch.full(
+                (self.batch_size,),
+                traj_sl,
+                device=device,
+                dtype=torch.long,
+            )
+        return traj_emb, traj_seq_lens, traj_token_mask
+
     @torch.no_grad()
     def stream_generate_step(self, x, first_chunk=True):
         """
@@ -1463,28 +1607,39 @@ class DiffForcingWanModel(nn.Module):
                     self.text_condition_list[i][:end_index][-self.seq_len :]
                 )  # (T, D, 4096)
 
-            traj_emb = self._traj_buf.build_traj_emb(end_index, self.seq_len, device)
-            if traj_emb is not None:
-                valid_lens = self._traj_buf.get_traj_valid_lens(
-                    end_index, self.seq_len, device
-                )
-                traj_seq_lens = (
-                    valid_lens
-                    if valid_lens is not None
-                    else torch.full(
-                        (self.batch_size,),
-                        min(end_index, self.seq_len),
-                        device=device,
-                        dtype=torch.long,
+            model_sl = min(end_index, self.seq_len)
+            window_start_token = max(0, end_index - model_sl)
+            if x.get("traj_cond_7d_frame") is not None:
+                traj_emb, traj_seq_lens, traj_token_mask = (
+                    self._build_stream_direct_traj_condition(
+                        x,
+                        model_sl,
+                        window_start_token,
+                        device,
                     )
                 )
-                traj_token_mask = self._traj_buf.get_traj_token_mask(
-                    end_index, self.seq_len, device
-                )
             else:
-                traj_seq_lens = None
-                traj_token_mask = None
-            model_sl = min(end_index, self.seq_len)
+                traj_emb = self._traj_buf.build_traj_emb(end_index, self.seq_len, device)
+                if traj_emb is not None:
+                    valid_lens = self._traj_buf.get_traj_valid_lens(
+                        end_index, self.seq_len, device
+                    )
+                    traj_seq_lens = (
+                        valid_lens
+                        if valid_lens is not None
+                        else torch.full(
+                            (self.batch_size,),
+                            model_sl,
+                            device=device,
+                            dtype=torch.long,
+                        )
+                    )
+                    traj_token_mask = self._traj_buf.get_traj_token_mask(
+                        end_index, self.seq_len, device
+                    )
+                else:
+                    traj_seq_lens = None
+                    traj_token_mask = None
             t_scaled = noise_level * self.time_embedding_scale
             predicted_result = self._denoise_with_cfg(
                 noisy_input, t_scaled,

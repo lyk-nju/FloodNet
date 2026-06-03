@@ -8,15 +8,17 @@ optimizer/scheduler construction.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import lightning.pytorch as pl
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from models.root_refiner import RootRefiner
 from utils.initialize import instantiate
-from utils.motion_process import append_traj_deltas_5d_to_7d
+from utils.motion_process import build_physical_7d_from_normalized_5d
 from utils.refiner.config_validate import validate_refiner_config
 from utils.refiner.losses import (
     dense_path_control_loss,
@@ -53,6 +55,7 @@ class RootRefinerLightningModule(pl.LightningModule):
         self.loss_weights = dict(cfg.get("loss_weights", {}))
         self.heading_form = cfg.get("loss", {}).get("heading_form", "cosine")
         self.ordinal_sigma = float(cfg.get("loss", {}).get("ordinal_sigma", 1.0))
+        self._register_waypoint_stats(cfg)
         self.save_hyperparameters(ignore=["text_encoder"])
 
     def forward(self, batch: dict, *, duration_mode: str = "groundtruth_duration") -> dict:
@@ -68,15 +71,24 @@ class RootRefinerLightningModule(pl.LightningModule):
             path=batch["path"],
             path_valid_mask=batch["path_valid_mask"],
             path_control_mask=batch.get("path_control_mask"),
+            path_mode=batch.get("path_mode"),
             path_features=batch["path_features"],
             history_motion=batch["history_motion"],
             history_mask=batch["history_mask"],
+            offset_start_frames=batch.get("offset_start_frames"),
             num_tokens=num_tokens,
         )
 
-    def _compute_loss(self, out: dict, batch: dict) -> dict:
+    def _compute_loss(
+        self,
+        out: dict,
+        batch: dict,
+        *,
+        target_mask: torch.Tensor | None = None,
+    ) -> dict:
         target_wp = batch["waypoints"]
-        target_mask = batch["waypoints_mask"]
+        if target_mask is None:
+            target_mask = batch["waypoints_mask"]
 
         target_class = batch["num_tokens"] - self.min_tokens
         dur = ordinal_duration_loss(
@@ -102,8 +114,14 @@ class RootRefinerLightningModule(pl.LightningModule):
             [target_wp[..., :3], F.normalize(target_wp[..., 3:5], dim=-1, eps=1e-6)],
             dim=-1,
         )
-        pred_delta = append_traj_deltas_5d_to_7d(pred5)[..., 5:7]
-        gt_delta = append_traj_deltas_5d_to_7d(gt5)[..., 5:7]
+        pred_delta = self._to_physical_7d(pred5)[..., 5:7]
+        if "waypoints_physical" in batch:
+            gt7_phys = batch["waypoints_physical"].to(device=pred5.device, dtype=pred5.dtype)
+        elif "target_waypoints_physical" in batch:
+            gt7_phys = batch["target_waypoints_physical"].to(device=pred5.device, dtype=pred5.dtype)
+        else:
+            gt7_phys = self._to_physical_7d(gt5)
+        gt_delta = gt7_phys[..., 5:7]
         delta_mask = target_mask.clone()
         delta_mask[:, 0] = False
         L_fwd_delta = smooth_l1_masked(pred_delta[..., 0:1], gt_delta[..., 0:1], delta_mask)
@@ -125,7 +143,9 @@ class RootRefinerLightningModule(pl.LightningModule):
 
         with torch.no_grad():
             pred_class = out["num_token_logits"].argmax(dim=-1)
-            err = (pred_class - target_class).abs().float()
+            pred_token_class = out["pred_num_tokens"].to(target_class.device) - self.min_tokens
+            err = (pred_token_class - target_class).abs().float()
+            argmax_err = (pred_class - target_class).abs().float()
             soft_err = (expected_class - target_class.to(expected_class.dtype)).abs()
         return {
             "loss": loss,
@@ -141,6 +161,7 @@ class RootRefinerLightningModule(pl.LightningModule):
             "num_token_acc_pm1": (err <= 1).float().mean(),
             "num_token_acc_pm2": (err <= 2).float().mean(),
             "num_token_mae": err.mean(),
+            "num_token_argmax_mae": argmax_err.mean(),
             "num_token_soft_mae": soft_err.mean(),
         }
 
@@ -210,8 +231,58 @@ class RootRefinerLightningModule(pl.LightningModule):
         "num_token_acc_pm1",
         "num_token_acc_pm2",
         "num_token_mae",
+        "num_token_argmax_mae",
         "num_token_soft_mae",
     )
+
+    def _register_waypoint_stats(self, cfg: dict) -> None:
+        data_cfg = cfg.get("data", {}) or {}
+        stats_dir = data_cfg.get("stats_dir")
+        use_stats = bool(data_cfg.get("normalize", False)) and stats_dir
+        if not use_stats:
+            self.register_buffer("_wp_mean", None, persistent=False)
+            self.register_buffer("_wp_std", None, persistent=False)
+            self.register_buffer("_wp_norm_idx", None, persistent=False)
+            return
+        stats_path = Path(stats_dir)
+        if not stats_path.is_dir():
+            self.register_buffer("_wp_mean", None, persistent=False)
+            self.register_buffer("_wp_std", None, persistent=False)
+            self.register_buffer("_wp_norm_idx", None, persistent=False)
+            return
+        self.register_buffer(
+            "_wp_mean",
+            torch.as_tensor(np.load(stats_path / "waypoint_mean.npy"), dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_wp_std",
+            torch.as_tensor(np.load(stats_path / "waypoint_std.npy"), dtype=torch.float32).clamp(min=1e-6),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_wp_norm_idx",
+            torch.as_tensor(np.load(stats_path / "waypoint_norm_indices.npy"), dtype=torch.long),
+            persistent=False,
+        )
+
+    def _to_physical_7d(self, waypoints5: torch.Tensor) -> torch.Tensor:
+        return build_physical_7d_from_normalized_5d(
+            waypoints5,
+            self._wp_mean,
+            self._wp_std,
+            self._wp_norm_idx,
+        )
+
+    def _common_prefix_mask(self, batch: dict, out: dict) -> torch.Tensor:
+        target_mask = batch["waypoints_mask"]
+        used_num_tokens = out["used_num_tokens"].to(target_mask.device, dtype=torch.long)
+        valid_eff = (
+            self.refiner.frames_per_token * used_num_tokens
+            - (self.refiner.frames_per_token - 1)
+        )
+        frame_idx = torch.arange(target_mask.shape[1], device=target_mask.device)
+        return target_mask.bool() & (frame_idx.unsqueeze(0) < valid_eff.unsqueeze(1))
 
     def training_step(self, batch: dict, batch_idx: int):
         out = self(batch)
@@ -238,7 +309,12 @@ class RootRefinerLightningModule(pl.LightningModule):
         first_loss = None
         for mode in modes:
             out = self(batch, duration_mode=mode)
-            losses = self._compute_loss(out, batch)
+            metric_mask = (
+                self._common_prefix_mask(batch, out)
+                if mode == "pred_duration"
+                else batch["waypoints_mask"]
+            )
+            losses = self._compute_loss(out, batch, target_mask=metric_mask)
             if first_loss is None:
                 first_loss = losses["loss"]
             for k, v in losses.items():

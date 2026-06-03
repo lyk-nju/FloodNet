@@ -203,18 +203,20 @@ def _flextraj_vl_vt(
     n_latent: int,
     device: torch.device,
     *,
+    n_traj: int | None = None,
     latent_lens: torch.Tensor | None = None,
     traj_lens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    n_traj = n_latent if n_traj is None else int(n_traj)
     if latent_lens is not None or traj_lens is not None:
         assert latent_lens is not None and traj_lens is not None
         vl = latent_lens.to(device=device, dtype=torch.long).clamp(min=0, max=n_latent)
-        vt = traj_lens.to(device=device, dtype=torch.long).clamp(min=0, max=n_latent)
+        vt = traj_lens.to(device=device, dtype=torch.long).clamp(min=0, max=n_traj)
         return vl, vt
     seq_lens = seq_lens.to(device=device, dtype=torch.long)
     half = seq_lens // 2
     vl = torch.minimum(half, torch.full_like(half, n_latent))
-    vt = torch.minimum(seq_lens - half, torch.full_like(half, n_latent))
+    vt = torch.minimum(seq_lens - half, torch.full_like(half, n_traj))
     return vl, vt
 
 
@@ -231,8 +233,14 @@ def flextraj_query_valid(
     """(B, L, 1) — 有效 query 行为 1，pad query 为 0。"""
     b = int(seq_lens.shape[0])
     L = total_len
+    n_traj = max(0, L - n_latent)
     vl, vt = _flextraj_vl_vt(
-        seq_lens, n_latent, device, latent_lens=latent_lens, traj_lens=traj_lens
+        seq_lens,
+        n_latent,
+        device,
+        n_traj=n_traj,
+        latent_lens=latent_lens,
+        traj_lens=traj_lens,
     )
     idx_i = torch.arange(L, device=device)
     qv = (
@@ -262,7 +270,7 @@ def flextraj_self_attn_bias(
 
     Args:
         seq_lens: (B,) 每条样本 **有效 token 总数**（与 WanModel 一致：valid_latent + valid_traj，常为 2×帧数）。
-        n_latent: 单侧段长 ``latent_pad_len``，总长 ``total_len == 2 * n_latent``。
+        n_latent: latent 段 pad 长度；traj 段长度由 ``total_len - n_latent`` 推导。
         total_len: self-attn 序列长度 L。
         causal: 为 True 时在掩码上再叠加标准因果（j > i 禁止）。
 
@@ -272,10 +280,19 @@ def flextraj_self_attn_bias(
     """
     b = int(seq_lens.shape[0])
     L = total_len
-    assert L == 2 * n_latent, f"expected total_len=2*n_latent, got L={L}, n_latent={n_latent}"
+    if L < n_latent:
+        raise ValueError(
+            f"total_len must be >= n_latent, got total_len={L}, n_latent={n_latent}"
+        )
+    n_traj = L - n_latent
 
     vl, vt = _flextraj_vl_vt(
-        seq_lens, n_latent, device, latent_lens=latent_lens, traj_lens=traj_lens
+        seq_lens,
+        n_latent,
+        device,
+        n_traj=n_traj,
+        latent_lens=latent_lens,
+        traj_lens=traj_lens,
     )
 
     neg_large = torch.finfo(torch.float32).min / 4
@@ -391,11 +408,19 @@ def flextraj_flash_split_self_attention(
     """
     b, L, n_heads, head_dim = q.shape
     n = n_latent
-    assert L == 2 * n and k.shape[:3] == (b, L, n_heads) and v.shape[:3] == (b, L, n_heads)
+    if L < n:
+        raise ValueError(f"total_len must be >= n_latent, got total_len={L}, n_latent={n}")
+    n_traj = L - n
+    assert k.shape[:3] == (b, L, n_heads) and v.shape[:3] == (b, L, n_heads)
     assert q.is_cuda
 
     vl, vt = _flextraj_vl_vt(
-        seq_lens, n, q.device, latent_lens=latent_lens, traj_lens=traj_lens
+        seq_lens,
+        n,
+        q.device,
+        n_traj=n_traj,
+        latent_lens=latent_lens,
+        traj_lens=traj_lens,
     )
     max_vl = int(vl.max().item())
     max_vt = int(vt.max().item())
