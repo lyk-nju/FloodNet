@@ -83,6 +83,12 @@ def validate_refiner_config(cfg: Mapping) -> None:
             f"sampling.horizon_policy must be one of {{{allowed}}}, got {policy!r}."
         )
 
+    if "history_condition" in sampling:
+        raise ValueError(
+            "sampling.history_condition is not part of the current RootRefiner "
+            "training contract; use the existing full/sliding history split."
+        )
+
     path_condition = _section(sampling, "path_condition")
     path_policy = str(path_condition.get("policy", "mixed"))
     if path_policy not in _ALLOWED_PATH_POLICIES:

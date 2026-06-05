@@ -253,6 +253,14 @@ def test_num_devices_int_list_auto():
     assert isinstance(tr._num_devices(-1), int)
 
 
+def test_parse_devices_arg_accepts_count_list_and_auto():
+    assert tr._parse_devices_arg(None) is None
+    assert tr._parse_devices_arg("4") == 4
+    assert tr._parse_devices_arg("0,1,2,3") == [0, 1, 2, 3]
+    assert tr._parse_devices_arg("[0, 1, 2, 3]") == [0, 1, 2, 3]
+    assert tr._parse_devices_arg("auto") == "auto"
+
+
 def test_safe_precision_downgrades_on_cpu():
     """Review #6: bf16-mixed must downgrade to 32-true when the run lands on CPU."""
     assert tr.safe_precision("auto", "bf16-mixed", cuda_available=False) == "32-true"

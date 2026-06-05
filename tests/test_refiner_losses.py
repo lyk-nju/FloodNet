@@ -122,6 +122,17 @@ def test_dense_path_control_loss_ignores_offset_prefix():
     assert dense_path_control_loss(pred, path, supervision).item() < 1e-6
 
 
+def test_dense_path_control_loss_aligns_to_valid_supervision_horizon():
+    pred = torch.zeros(1, 9, 5)
+    path = torch.zeros(1, 5, 2)
+    path[0, :, 0] = torch.arange(5, dtype=torch.float32)
+    supervision = torch.zeros(1, 9, dtype=torch.bool)
+    supervision[0, :5] = True
+    pred[0, :5, 0] = torch.arange(5, dtype=torch.float32)
+
+    assert dense_path_control_loss(pred, path, supervision).item() < 1e-6
+
+
 def test_sparse_path_control_loss_uses_control_and_supervision_intersection():
     pred = torch.zeros(1, 9, 5)
     path = torch.zeros(1, 5, 2)

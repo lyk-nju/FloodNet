@@ -365,6 +365,21 @@ def test_loss_weights_keys_align_with_compute_loss_keys():
     )
 
 
+def test_zero_path_control_weight_skips_path_control_loss(monkeypatch):
+    module = RefinerLightningModule(_tiny_cfg())
+    batch = _make_batch(module)
+    out = module(batch)
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("path control loss should not be computed when weight is 0")
+
+    monkeypatch.setattr(module, "_compute_path_control_loss", _fail_if_called)
+
+    losses = module._compute_loss(out, batch)
+
+    assert losses["path_control"].item() == 0.0
+
+
 # ---------------------------------------------------------------------------
 # Forward + backward step
 # ---------------------------------------------------------------------------

@@ -101,9 +101,25 @@ def _interpolate_path_at_frame_progress(path: Tensor, num_frames: int) -> Tensor
 
 
 def dense_path_control_loss(pred_waypoints: Tensor, path: Tensor, path_supervision_mask: Tensor) -> Tensor:
-    target = _interpolate_path_at_frame_progress(path, pred_waypoints.shape[1])
     pred_xz = pred_waypoints[..., [0, 2]]
-    return smooth_l1_masked(pred_xz, target, path_supervision_mask)
+    total = pred_waypoints.new_zeros(())
+    denom = 0
+    for b in range(pred_waypoints.shape[0]):
+        frame_idx = torch.nonzero(path_supervision_mask[b], as_tuple=False).flatten()
+        if frame_idx.numel() == 0:
+            continue
+        valid_count = int(frame_idx[-1].item()) + 1
+        target = _interpolate_path_at_frame_progress(path[b:b + 1], valid_count)[0]
+        diff = F.smooth_l1_loss(
+            pred_xz[b, frame_idx],
+            target[frame_idx],
+            reduction="none",
+        )
+        total = total + diff.sum()
+        denom += int(diff.numel())
+    if denom <= 0:
+        return pred_waypoints.new_zeros(())
+    return total / denom
 
 
 def sparse_path_control_loss(

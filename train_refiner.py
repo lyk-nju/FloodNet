@@ -226,6 +226,33 @@ def _num_devices(devices) -> int:
         return 1
 
 
+def _parse_devices_arg(value):
+    """Parse CLI --devices while preserving Lightning's int/list/auto forms."""
+    if value is None:
+        return None
+    if isinstance(value, (int, list, tuple)):
+        return value
+    text = str(value).strip()
+    if text.lower() == "auto":
+        return "auto"
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1].strip()
+    if "," in text:
+        try:
+            return [int(part.strip()) for part in text.split(",") if part.strip()]
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"--devices list must contain integer device ids, got {value!r}"
+            ) from exc
+    try:
+        return int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "--devices must be an integer count, a comma-separated id list, "
+            f"or 'auto'; got {value!r}"
+        ) from exc
+
+
 def safe_precision(accelerator: str, precision, *, cuda_available: bool):
     """Use fp32 when a GPU-tuned mixed precision config runs on CPU."""
     if precision is None:
@@ -390,8 +417,8 @@ def main(argv=None):
     parser.add_argument("--config", type=str, default="configs/root_refiner.yaml")
     parser.add_argument("--max_steps", type=int, default=None,
                          help="Override trainer.max_steps (smoke runs).")
-    parser.add_argument("--devices", type=int, default=None,
-                         help="Override trainer.devices.")
+    parser.add_argument("--devices", type=_parse_devices_arg, default=None,
+                         help="Override trainer.devices, e.g. 4, auto, or 0,1,2,3.")
     parser.add_argument("--ckpt_path", type=str, default=None,
                          help="Resume-from-checkpoint path (overrides cfg.resume_ckpt).")
     parser.add_argument("--seed", type=int, default=None,

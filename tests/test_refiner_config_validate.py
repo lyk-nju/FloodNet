@@ -86,6 +86,21 @@ def test_shipped_refiner_configs_are_valid():
     validate_refiner_config(_load("root_refiner_train_fixed_val_no_random_token.yaml"))
 
 
+def test_rejects_history_condition_config():
+    cfg = _minimal_cfg()
+    cfg["sampling"]["history_condition"] = {
+        "policy": "mixed",
+        "ratios": {
+            "only_current": 0.2,
+            "short_history": 0.4,
+            "full_history": 0.4,
+        },
+    }
+
+    with pytest.raises(ValueError, match="history_condition"):
+        validate_refiner_config(cfg)
+
+
 def test_rejects_invalid_token_range():
     cfg = _minimal_cfg()
     cfg["model"]["params"]["min_tokens"] = 50

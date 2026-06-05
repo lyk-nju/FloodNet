@@ -126,10 +126,12 @@ class RootRefinerLightningModule(pl.LightningModule):
         delta_mask[:, 0] = False
         L_fwd_delta = smooth_l1_masked(pred_delta[..., 0:1], gt_delta[..., 0:1], delta_mask)
         L_yaw_delta = smooth_l1_masked(pred_delta[..., 1:2], gt_delta[..., 1:2], delta_mask)
-        L_smooth = second_order_diff_l2(pred_delta, delta_mask)
-        L_path_control = self._compute_path_control_loss(out, batch, target_mask)
-
         w = self.loss_weights
+        L_smooth = second_order_diff_l2(pred_delta, delta_mask)
+        if float(w.get("path_control", 0.0)) == 0.0:
+            L_path_control = out["waypoints"].new_zeros(())
+        else:
+            L_path_control = self._compute_path_control_loss(out, batch, target_mask)
         loss = (
             w.get("num_token", 1.0) * L_num
             + w.get("num_token_soft", 0.1) * L_num_soft
