@@ -350,6 +350,22 @@ class WanCrossAttention(WanSelfAttention):
         bq = x.size(0)
         b_ctx = context.size(0)
         n, d = self.num_heads, self.head_dim
+        if b_ctx != bq:
+            if b_ctx % bq != 0:
+                raise ValueError(
+                    "frame-aligned cross-attn context batch must be a multiple "
+                    f"of query batch; got context batch {b_ctx}, query batch {bq}."
+                )
+            Lq = x.size(1)
+            L_lat = b_ctx // bq
+            if Lq != L_lat and Lq != 2 * L_lat:
+                raise ValueError(
+                    "frame-aligned FlexTraj cross-attn requires x length to be "
+                    "either L_lat or 2*L_lat. If trajectory horizon is longer "
+                    "than the latent window, pad the latent attention length "
+                    "and frame-aligned text context to the same length. Got "
+                    f"x length {Lq}, context-derived L_lat {L_lat}."
+                )
 
         k = self.norm_k(self.k(context)).view(b_ctx, -1, n, d)
         v = self.v(context).view(b_ctx, -1, n, d)
@@ -761,6 +777,19 @@ class WanModel(ModelMixin, ConfigMixin):
         if self.traj_in_proj is not None and traj_emb is not None:
             traj_t = self.traj_in_proj(traj_emb.to(dtype=x.dtype))
             traj_t = traj_t + self.traj_type_embed
+            if traj_token_mask is not None:
+                tm = traj_token_mask.to(device=x.device, dtype=traj_t.dtype)
+                if tm.dim() == 2:
+                    tm = tm[..., None]
+                tm_len = tm.shape[1]
+                proj_len = traj_t.shape[1]
+                if tm_len < proj_len:
+                    tm = torch.cat(
+                        [tm, tm.new_zeros(tm.shape[0], proj_len - tm_len, 1)], dim=1
+                    )
+                elif tm_len > proj_len:
+                    tm = tm[:, :proj_len, :]
+                traj_t = traj_t * tm
             bt, tlen, _ = traj_t.shape
             traj_pad_len = max(seq_len, int(tlen))
             if traj_token_mask is not None:

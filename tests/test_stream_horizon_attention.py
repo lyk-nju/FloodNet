@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import torch
+import pytest
 
 from models.tools.attention import flextraj_self_attn_bias
 from models.tools.wan_controlnet import WanControlNet
-from models.tools.wan_model import WanModel, WanSelfAttention, rope_params
+from models.tools.wan_model import (
+    WanCrossAttention,
+    WanModel,
+    WanSelfAttention,
+    rope_params,
+)
 
 
 def _freqs_for_head_dim(head_dim: int) -> torch.Tensor:
@@ -128,6 +134,7 @@ class _CaptureBlock(torch.nn.Module):
         self.seen_traj_pad_len = None
         self.seen_traj_seq_lens = None
         self.seen_traj_token_mask = None
+        self.seen_x = None
 
     def forward(self, x, **kwargs):
         self.seen_len = x.shape[1]
@@ -135,6 +142,7 @@ class _CaptureBlock(torch.nn.Module):
         self.seen_traj_pad_len = kwargs.get("traj_pad_len")
         self.seen_traj_seq_lens = kwargs.get("traj_seq_lens")
         self.seen_traj_token_mask = kwargs.get("traj_token_mask")
+        self.seen_x = x.detach().clone()
         return x
 
 
@@ -208,6 +216,40 @@ def test_wan_model_threads_arbitrary_traj_token_mask_to_blocks():
 
     block = model.blocks[0]
     assert torch.equal(block.seen_traj_token_mask, traj_mask.bool())
+
+
+def test_wan_model_masks_projected_traj_tokens_before_blocks():
+    model = _tiny_wan_model()
+    with torch.no_grad():
+        model.traj_in_proj.weight.normal_(std=0.02)
+        model.traj_in_proj.bias.normal_(std=0.02)
+        model.traj_type_embed.normal_(std=0.02)
+    traj_mask = torch.tensor([[1.0, 0.0, 1.0, 0.0, 1.0]])
+
+    model(
+        [torch.randn(4, 3, 1, 1)],
+        torch.zeros(1),
+        [torch.randn(1, 32)],
+        seq_len=3,
+        traj_emb=torch.randn(1, 5, 8),
+        traj_seq_lens=torch.tensor([5]),
+        traj_token_mask=traj_mask,
+    )
+
+    block = model.blocks[0]
+    traj_seen = block.seen_x[:, block.seen_latent_pad_len:]
+    assert torch.count_nonzero(traj_seen[:, [1, 3]]) == 0
+    assert torch.count_nonzero(traj_seen[:, [0, 2, 4]]) > 0
+
+
+def test_wan_cross_attention_rejects_frame_aligned_flextraj_length_mismatch():
+    cross = WanCrossAttention(dim=12, num_heads=2).eval()
+    x = torch.randn(1, 8, 12)  # latent length 3, traj length 5
+    context = torch.randn(3, 1, 12)  # frame-aligned context for only 3 tokens
+    context_lens = torch.ones(3, dtype=torch.long)
+
+    with pytest.raises(ValueError, match="frame-aligned FlexTraj"):
+        cross(x, context, context_lens)
 
 
 def test_wan_controlnet_keeps_future_traj_tokens_but_returns_latent_residuals():
