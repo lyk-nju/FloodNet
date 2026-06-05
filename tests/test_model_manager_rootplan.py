@@ -112,6 +112,32 @@ def test_rootplan_stream_payload_uses_body_window_left_commit():
     assert float(payload["traj_cond_7d_frame"][0, 0, 0]) == float(token_start_frame(start_token))
 
 
+def test_rootplan_stream_payload_uses_absolute_commit_after_model_roll():
+    mgr = _manager()
+    mgr.history_length = 9
+    mgr.model.commit_index = 30
+    mgr._absolute_commit_index = 60
+    mgr._glue_timeline = _timeline(100)
+    mgr.model._traj_buf.set_root_plan(_plan(valid_frames=400))
+
+    payload = mgr._build_rootplan_stream_traj_input()
+
+    local_start_token = 26
+    absolute_start_token = 56
+    num_tokens = 29
+    frame_slice = token_range_to_frame_slice(local_start_token, num_tokens)
+    assert payload["traj_start_token"] == local_start_token
+    assert payload["traj_abs_start_token"] == absolute_start_token
+    assert payload["traj_cond_7d_frame"].shape == (
+        1,
+        frame_slice.stop - frame_slice.start,
+        7,
+    )
+    assert float(payload["traj_cond_7d_frame"][0, 0, 0]) == float(
+        token_start_frame(absolute_start_token)
+    )
+
+
 def test_rootplan_stream_payload_requires_exact_body_anchor_state():
     mgr = _manager()
     mgr._glue_timeline.trim_before(8)
@@ -346,6 +372,42 @@ def test_activate_root_plan_from_stream_plan_uses_root_refiner_runtime():
     assert refiner.calls[0]["anchor_state"].commit_idx == 0
     assert refiner.calls[0]["token_dt"] == 0.20
     assert mgr.model._traj_buf._active_plan.source == "root_refiner"
+
+
+def test_activate_root_plan_reanchors_plan_points_to_anchor_state_for_refiner():
+    mgr = ModelManager.__new__(ModelManager)
+    mgr.device = "cpu"
+    mgr.token_dt = 0.20
+    mgr.traj_horizon_tokens = 20
+    mgr.history_length = 9
+    mgr.model = _DummyModel()
+    mgr.current_text = "turn right"
+    timeline = InferenceGlueTimeline(_state(0))
+    timeline.append(
+        InferenceGlueState(
+            commit_idx=5,
+            world_xz=torch.tensor([2.0, 3.0]),
+            world_yaw=torch.tensor(0.0),
+        )
+    )
+    mgr._glue_timeline = timeline
+    refiner = _FakeRootRefinerRuntime()
+    mgr.root_refiner_runtime = refiner
+    plan = StreamTrajectoryPlan(
+        times=np.array([0.0, 1.0], dtype=np.float32),
+        points_xyz=np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32),
+        start_commit_index=5,
+        version=2,
+        source="manual",
+    )
+
+    ok = mgr._activate_root_plan_from_stream_plan(plan)
+
+    assert ok is True
+    refiner_plan = refiner.calls[0]["plan"]
+    assert refiner_plan is not plan
+    assert np.allclose(refiner_plan.points_xyz[0, [0, 2]], [2.0, 3.0])
+    assert np.allclose(refiner_plan.points_xyz[1, [0, 2]], [2.0, 4.0])
 
 
 def test_activate_root_plan_passes_anchor_aligned_history_to_root_refiner_runtime():

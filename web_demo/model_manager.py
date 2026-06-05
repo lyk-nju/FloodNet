@@ -18,8 +18,9 @@ from utils.initialize import instantiate, load_config
 from utils.inference_glue import InferenceGlueState, InferenceGlueTimeline
 from utils.motion_process import StreamJointRecovery263, append_traj_deltas_5d_to_7d
 from utils.root_plan import RootPlan
+from utils.runtime_rootplan import build_rootplan_stream_payload_from_buffer
 from utils.stream_rollout import build_stream_step_model_input
-from utils.token_frame import num_frames_for_tokens, token_range_to_frame_slice, token_start_frame
+from utils.token_frame import num_frames_for_tokens, token_start_frame
 from utils.stream_traj import (
     StreamTrajectoryPlan,
     TrajectoryUpdateEvent,
@@ -30,6 +31,7 @@ from utils.stream_traj import (
     estimate_token_step_distance,
     normalize_manual_waypoints,
     project_point_to_polyline,
+    reanchor_stream_plan_to_xz,
     resample_polyline,
     sample_plan_future,
     sample_timestamped_trajectory,
@@ -136,6 +138,7 @@ class ModelManager:
         self.root_xz_history = deque(maxlen=120)
         self.root_5d_history = deque(maxlen=480)
         self._generated_frame_count = 0
+        self._absolute_commit_index = 0
         self.traj_repeat_anchor_root = None
         self.traj_repeat_anchor_cycle = None
         # Backwards-compat helpers for app.py / status endpoints.
@@ -363,6 +366,7 @@ class ModelManager:
             self.root_xz_history.clear()
             self.root_5d_history.clear()
             self._generated_frame_count = 0
+            self._absolute_commit_index = 0
             self.model.init_generated(self.history_length, batch_size=1, num_denoise_steps=self.denoise_steps)
             print(f"Model initialized with history length: {self.history_length}, denoise steps: {self.denoise_steps}")
             
@@ -610,7 +614,7 @@ class ModelManager:
         return self._plan_version_counter
 
     def _get_commit_index(self) -> int:
-        return int(getattr(self.model, "commit_index", 0))
+        return int(getattr(self, "_absolute_commit_index", getattr(self.model, "commit_index", 0)))
 
     def _get_root_refiner_history_5d(self, anchor_commit: int):
         history = getattr(self, "root_5d_history", None)
@@ -731,16 +735,20 @@ class ModelManager:
         if not timeline.has_exact_state(anchor_commit):
             return False
         anchor_state = timeline.at_commit(anchor_commit)
+        root_plan_input = reanchor_stream_plan_to_xz(
+            plan,
+            anchor_state.world_xz.detach().cpu().numpy(),
+        )
         if getattr(self, "root_refiner_runtime", None) is not None:
             root_plan = self.root_refiner_runtime.build_root_plan(
                 text=getattr(self, "current_text", ""),
-                plan=plan,
+                plan=root_plan_input,
                 anchor_state=anchor_state,
                 token_dt=self.token_dt,
                 history_motion_world_5d=self._get_root_refiner_history_5d(anchor_commit),
             )
         else:
-            root_plan = self._stream_plan_to_root_plan(plan, anchor_state)
+            root_plan = self._stream_plan_to_root_plan(root_plan_input, anchor_state)
         traj_buf.set_root_plan(root_plan)
         return True
 
@@ -762,32 +770,18 @@ class ModelManager:
         ):
             return None
 
-        current_commit = self._get_commit_index()
+        absolute_commit = self._get_commit_index()
+        local_commit = int(getattr(self.model, "commit_index", absolute_commit))
         chunk_size = int(getattr(self.model, "chunk_size", 1))
-        right_token = current_commit + chunk_size
-        start_token = max(0, right_token - int(self.history_length))
-        future_horizon = max(0, int(getattr(self, "traj_horizon_tokens", 0)))
-        num_tokens = max(0, right_token + future_horizon - start_token)
-        if num_tokens <= 0:
-            return None
-        if not timeline.has_exact_state(start_token):
-            return None
-
-        body_anchor_state = timeline.at_commit(start_token)
-        frame_slice = token_range_to_frame_slice(start_token, num_tokens)
-        traj_cond, traj_mask = traj_buf.get_body_traj_cond(
-            head_state=body_anchor_state,
-            body_anchor_state=body_anchor_state,
-            horizon_tokens=num_tokens,
-            expected_horizon_frame_slice=frame_slice,
+        return build_rootplan_stream_payload_from_buffer(
+            traj_buf,
+            timeline,
+            local_commit_index=local_commit,
+            absolute_commit_index=absolute_commit,
+            chunk_size=chunk_size,
+            history_length=int(self.history_length),
+            traj_horizon_tokens=int(getattr(self, "traj_horizon_tokens", 0)),
         )
-        if not bool(traj_mask.any()):
-            return None
-        return {
-            "traj_cond_7d_frame": traj_cond.unsqueeze(0),
-            "traj_cond_frame_mask": traj_mask.unsqueeze(0).to(dtype=torch.float32),
-            "traj_start_token": start_token,
-        }
 
     def _build_stream_traj_input(self):
         current_commit = self._get_commit_index()
@@ -952,6 +946,7 @@ class ModelManager:
         self.root_xz_history.clear()
         self.root_5d_history.clear()
         self._generated_frame_count = 0
+        self._absolute_commit_index = 0
         with self.traj_state_lock:
             self.active_traj_plan = None
             self.pending_update_event = None
@@ -1029,6 +1024,10 @@ class ModelManager:
                             x, first_chunk=self.first_chunk
                         )
                         generated = output["generated"]
+                        self._absolute_commit_index = (
+                            int(getattr(self, "_absolute_commit_index", 0))
+                            + int(generated.shape[1])
+                        )
                         
                         # Decode with VAE (1 token -> 4 frames)
                         decoded = self.vae.stream_decode(
