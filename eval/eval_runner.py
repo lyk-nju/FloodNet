@@ -204,6 +204,7 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                         train_mode=int(module.cfg.get("control_loss_train_mode", 3)),
                         chunk_size_tokens=getattr(module.model, "chunk_size", None),
                         window_mode=eval_cfg["forward_ctrl_window_mode"],
+                        model_batch_builder=prepare_ldf_eval_model_batch,
                     )
                 except Exception as e:
                     rank_zero_info(

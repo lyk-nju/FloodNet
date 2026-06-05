@@ -69,6 +69,23 @@ def _save_state(state_path: Path, state: dict[str, Any]):
         json.dump(state, f, indent=2)
 
 
+def _mark_completed_without_summary(state: dict[str, Any], request_key: str):
+    """Mark an inline eval request as terminal when no summary is expected.
+
+    Some lightweight inline eval configurations intentionally run without
+    generation metrics or probe samples. In that case the subprocess can exit
+    successfully without writing ``summary.json``. Treat that as terminal and
+    record it separately so the watcher does not retry forever.
+    """
+    completed = state.setdefault("completed", [])
+    if request_key not in completed:
+        completed.append(request_key)
+    without_summary = state.setdefault("completed_without_summary", [])
+    if request_key not in without_summary:
+        without_summary.append(request_key)
+    state.setdefault("failed", {}).pop(request_key, None)
+
+
 # ------------------------------------------------------------------
 # Inline mode
 # ------------------------------------------------------------------
@@ -234,11 +251,12 @@ def _run_inline_mode(args, run_dir: Path, config_path: Path, project_root: Path)
                 _save_state(state_path, state)
                 print(f"[eval-watcher|inline] finished step={step}")
             else:
+                _mark_completed_without_summary(state, request_key)
+                _save_state(state_path, state)
                 print(
                     f"[eval-watcher|inline] step={step} completed without summary; "
-                    f"keep pending."
+                    f"mark completed_without_summary."
                 )
-                break
 
         if args.once:
             return
@@ -572,4 +590,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

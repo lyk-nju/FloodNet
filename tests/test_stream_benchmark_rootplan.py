@@ -11,6 +11,7 @@ from eval.runtime.benchmark import (
     _csv_safe_record,
     _run_babel,
     _run_turn,
+    aggregate_runtime_records,
     build_eval_root_plan_from_points,
     build_rootplan_stream_step_payload,
     resolve_traj_condition_source,
@@ -67,6 +68,10 @@ def test_stream_benchmark_builds_7d_rootplan_payload_for_model_step():
     num_tokens = 7
     frame_slice = token_range_to_frame_slice(start_token, num_tokens)
     assert payload["traj_start_token"] == start_token
+    assert payload["traj_abs_start_token"] == start_token
+    assert payload["traj_num_tokens"] == num_tokens
+    assert payload["body_anchor_token"] == 7
+    assert payload["body_anchor_abs_token"] == 7
     assert "traj_cond_7d_frame" in payload
     assert "traj_cond_frame_mask" in payload
     assert "traj" not in payload
@@ -109,12 +114,66 @@ def test_rootplan_payload_uses_absolute_commit_for_plan_and_local_commit_for_mod
         absolute_commit_index=60,
     )
 
-    local_start_token = 1
-    absolute_start_token = 31
+    body_anchor_token = 1
+    body_anchor_abs_token = 31
+    local_start_token = body_anchor_token
+    absolute_start_token = body_anchor_abs_token
     num_tokens = history_length + horizon_tokens
-    frame_slice = token_range_to_frame_slice(local_start_token, num_tokens)
+    frame_slice = token_range_to_frame_slice(absolute_start_token, num_tokens)
     assert payload["traj_start_token"] == local_start_token
     assert payload["traj_abs_start_token"] == absolute_start_token
+    assert payload["traj_num_tokens"] == num_tokens
+    assert payload["body_anchor_token"] == body_anchor_token
+    assert payload["body_anchor_abs_token"] == body_anchor_abs_token
+    assert payload["traj_cond_7d_frame"].shape == (
+        1,
+        frame_slice.stop - frame_slice.start,
+        7,
+    )
+    assert float(payload["traj_cond_7d_frame"][0, 0, 2]) == float(
+        token_start_frame(absolute_start_token)
+    )
+
+
+def test_rootplan_payload_frame_slice_uses_absolute_start_when_local_start_is_zero():
+    history_length = 30
+    horizon_tokens = 3
+    timeline = _timeline(100)
+    model = SimpleNamespace(
+        commit_index=1,
+        chunk_size=1,
+        _traj_buf=TrajStreamBuffer(batch_size=1, buf_len=96),
+    )
+    points = torch.zeros(300, 3)
+    points[:, 2] = torch.arange(300, dtype=torch.float32)
+    root_plan = build_eval_root_plan_from_points(
+        points,
+        anchor_state=timeline.at_commit(0),
+        token_dt=0.20,
+        frames_per_token=4,
+        source="test_route",
+    )
+    model._traj_buf.set_root_plan(root_plan)
+
+    payload = build_rootplan_stream_step_payload(
+        model,
+        timeline,
+        history_length=history_length,
+        traj_horizon_tokens=horizon_tokens,
+        absolute_commit_index=60,
+    )
+
+    body_anchor_token = 0
+    body_anchor_abs_token = 59
+    local_start_token = body_anchor_token
+    absolute_start_token = body_anchor_abs_token
+    num_tokens = 2 + horizon_tokens
+    frame_slice = token_range_to_frame_slice(absolute_start_token, num_tokens)
+    assert payload["traj_start_token"] == local_start_token
+    assert payload["traj_abs_start_token"] == absolute_start_token
+    assert payload["traj_num_tokens"] == num_tokens
+    assert payload["body_anchor_token"] == body_anchor_token
+    assert payload["body_anchor_abs_token"] == body_anchor_abs_token
     assert payload["traj_cond_7d_frame"].shape == (
         1,
         frame_slice.stop - frame_slice.start,
@@ -157,8 +216,8 @@ def test_rootplan_payload_masks_until_future_plan_anchor_after_model_roll():
     absolute_start_token = 31
     prefix_tokens = 65 - absolute_start_token
     prefix_frames = (
-        token_start_frame(local_start_token + prefix_tokens)
-        - token_start_frame(local_start_token)
+        token_start_frame(absolute_start_token + prefix_tokens)
+        - token_start_frame(absolute_start_token)
     )
     mask = payload["traj_cond_frame_mask"][0].bool()
     assert payload["traj_start_token"] == local_start_token
@@ -277,6 +336,43 @@ def test_csv_safe_record_serializes_nested_values_as_json():
     assert json.loads(row["rootplan_replan_commits"]) == [0, 15]
     assert json.loads(row["rootplan_replan_sources"]) == ["bench_old", "bench_new"]
     assert row["bad"] is None
+
+
+def test_aggregate_runtime_records_groups_checkpoint_selection_metrics():
+    summary = aggregate_runtime_records(
+        [
+            {
+                "suite": "humanml3d_control",
+                "mode": "gt_traj",
+                "ADE": 1.0,
+                "FDE": 2.0,
+                "path_arc": float("nan"),
+            },
+            {
+                "suite": "humanml3d_control",
+                "mode": "refiner_traj",
+                "ADE": 3.0,
+                "FDE": 4.0,
+                "path_arc": 6.0,
+            },
+            {
+                "suite": "route_edit",
+                "mode": "replace_future",
+                "ADE": 5.0,
+                "FDE": 6.0,
+                "path_arc": 8.0,
+            },
+        ]
+    )
+
+    assert summary["num_records"] == 3
+    assert summary["ADE_mean"] == 3.0
+    assert summary["ADE_count"] == 3
+    assert summary["path_arc_mean"] == 7.0
+    assert summary["path_arc_count"] == 2
+    assert summary["by_suite"]["humanml3d_control"]["ADE_mean"] == 2.0
+    assert summary["by_mode"]["gt_traj"]["FDE_mean"] == 2.0
+    assert summary["by_suite_mode"]["route_edit/replace_future"]["ADE_mean"] == 5.0
 
 
 class _FakeStreamModel:

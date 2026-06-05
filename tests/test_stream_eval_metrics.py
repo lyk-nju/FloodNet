@@ -197,3 +197,5 @@ def test_ldf_stream_generate_step_separates_local_and_absolute_commit_after_roll
 
     assert model.payloads[-1]["traj_start_token"] == 0
     assert model.payloads[-1]["traj_abs_start_token"] == 2
+    assert model.payloads[-1]["body_anchor_token"] == 0
+    assert model.payloads[-1]["body_anchor_abs_token"] == 2

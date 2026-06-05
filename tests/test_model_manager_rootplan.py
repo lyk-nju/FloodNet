@@ -106,6 +106,10 @@ def test_rootplan_stream_payload_uses_body_window_left_commit():
     num_tokens = 29
     frame_slice = token_range_to_frame_slice(start_token, num_tokens)
     assert payload["traj_start_token"] == start_token
+    assert payload["traj_abs_start_token"] == start_token
+    assert payload["traj_num_tokens"] == num_tokens
+    assert payload["body_anchor_token"] == start_token
+    assert payload["body_anchor_abs_token"] == start_token
     assert payload["traj_cond_7d_frame"].shape == (1, frame_slice.stop - frame_slice.start, 7)
     assert payload["traj_cond_frame_mask"].shape == (1, frame_slice.stop - frame_slice.start)
     assert payload["traj_cond_frame_mask"].all()
@@ -125,9 +129,42 @@ def test_rootplan_stream_payload_uses_absolute_commit_after_model_roll():
     local_start_token = 26
     absolute_start_token = 56
     num_tokens = 29
-    frame_slice = token_range_to_frame_slice(local_start_token, num_tokens)
+    frame_slice = token_range_to_frame_slice(absolute_start_token, num_tokens)
     assert payload["traj_start_token"] == local_start_token
     assert payload["traj_abs_start_token"] == absolute_start_token
+    assert payload["traj_num_tokens"] == num_tokens
+    assert payload["body_anchor_token"] == local_start_token
+    assert payload["body_anchor_abs_token"] == absolute_start_token
+    assert payload["traj_cond_7d_frame"].shape == (
+        1,
+        frame_slice.stop - frame_slice.start,
+        7,
+    )
+    assert float(payload["traj_cond_7d_frame"][0, 0, 0]) == float(
+        token_start_frame(absolute_start_token)
+    )
+
+
+def test_rootplan_stream_payload_frame_slice_uses_absolute_start_after_roll_to_local_zero():
+    mgr = _manager()
+    mgr.history_length = 9
+    mgr.model.commit_index = 1
+    mgr.model.chunk_size = 1
+    mgr._absolute_commit_index = 31
+    mgr._glue_timeline = _timeline(100)
+    mgr.model._traj_buf.set_root_plan(_plan(valid_frames=400))
+
+    payload = mgr._build_rootplan_stream_traj_input()
+
+    local_start_token = 0
+    absolute_start_token = 30
+    num_tokens = 2 + mgr.traj_horizon_tokens
+    frame_slice = token_range_to_frame_slice(absolute_start_token, num_tokens)
+    assert payload["traj_start_token"] == local_start_token
+    assert payload["traj_abs_start_token"] == absolute_start_token
+    assert payload["traj_num_tokens"] == num_tokens
+    assert payload["body_anchor_token"] == local_start_token
+    assert payload["body_anchor_abs_token"] == absolute_start_token
     assert payload["traj_cond_7d_frame"].shape == (
         1,
         frame_slice.stop - frame_slice.start,
@@ -159,6 +196,7 @@ def test_build_stream_traj_input_prefers_active_rootplan_payload():
     assert "traj_cond_7d_frame" in payload
     assert "traj" not in payload
     assert payload["traj_start_token"] == 6
+    assert payload["body_anchor_token"] == 6
     assert mgr._trajectory_state == "active_7d"
 
 

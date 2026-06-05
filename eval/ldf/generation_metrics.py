@@ -535,6 +535,7 @@ def main():
                         train_mode=control_loss_train_mode,
                         chunk_size_tokens=chunk_size_tokens,
                         window_mode=fwd_ctrl_window_mode,
+                        model_batch_builder=prepare_ldf_eval_model_batch,
                     )
                 except Exception as e:
                     print(f"[fwd_ctrl_loss] sample={sample_name} deterministic eval failed: {e}")

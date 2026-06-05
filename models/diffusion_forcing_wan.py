@@ -956,7 +956,8 @@ class DiffForcingWanModel(nn.Module):
             )
             if self.cfg_scale_traj > 0.0:
                 # Separated CFG — batch all 3 passes into a single 3B backbone forward.
-                # ControlNet runs on 2B; uncond slot gets zero residuals (no ControlNet effect).
+                # ControlNet runs on 2B with traj and on B with null traj so the
+                # uncond slot matches the project-wide no-traj semantics.
                 #   out = out_uncond
                 #       + w_text * (out_full - out_null_text+traj)   ← pure text effect, traj fixed
                 #       + w_traj * (out_null_text+traj - out_uncond) ← pure traj effect, text=null
@@ -970,9 +971,18 @@ class DiffForcingWanModel(nn.Module):
                     # expand each null ctx over seq_len token positions so ctx_triple = 3*B*seq_len
                     null_flat_uncond = [ni for ni in text_null_ctx for _ in range(seq_len)]
                     ctx_triple = list(ctx_double) + null_flat_uncond
+                residuals_uncond = self._controlnet_forward(
+                    noisy_input,
+                    t_scaled,
+                    text_null_ctx,
+                    seq_len,
+                    traj_emb=None,
+                    traj_seq_lens=None,
+                    traj_token_mask=None,
+                )
                 residuals_triple = [
-                    torch.cat([r, r.new_zeros(batch_size, r.size(1), r.size(2))], dim=0)
-                    for r in residuals
+                    torch.cat([r, r_uncond], dim=0)
+                    for r, r_uncond in zip(residuals, residuals_uncond)
                 ]
                 pred_triple = self.model(
                     noisy_triple, t_triple, ctx_triple, seq_len,
@@ -1461,15 +1471,29 @@ class DiffForcingWanModel(nn.Module):
                 f"match stream batch_size {self.batch_size}"
             )
 
-        payload_start = int(x.get("traj_start_token", window_start_token))
+        payload_local_start = int(x.get("traj_start_token", window_start_token))
+        payload_abs_start = int(x.get("traj_abs_start_token", payload_local_start))
+        payload_num_tokens = x.get("traj_num_tokens", None)
+        if payload_num_tokens is not None:
+            payload_num_tokens = int(payload_num_tokens)
+            if payload_num_tokens < model_sl:
+                raise ValueError(
+                    "stream traj_num_tokens must be >= model_sl; got "
+                    f"traj_num_tokens={payload_num_tokens}, model_sl={model_sl}."
+                )
         if traj_sl is None:
-            if traj_frame.shape[1] <= 0:
+            if payload_num_tokens is not None:
+                traj_sl = payload_num_tokens
+            elif traj_frame.shape[1] <= 0:
                 traj_sl = model_sl
             else:
-                origin_frame = token_start_frame(payload_start)
+                origin_frame = token_start_frame(payload_abs_start)
                 payload_last_frame = origin_frame + int(traj_frame.shape[1]) - 1
                 payload_end_token = frame_idx_to_token_idx(payload_last_frame) + 1
-                traj_sl = max(model_sl, payload_end_token - window_start_token)
+                window_abs_start = payload_abs_start + (
+                    window_start_token - payload_local_start
+                )
+                traj_sl = max(model_sl, payload_end_token - window_abs_start)
         traj_sl = int(traj_sl)
         if traj_sl < model_sl:
             raise ValueError(
@@ -1477,25 +1501,27 @@ class DiffForcingWanModel(nn.Module):
                 f"model_sl={model_sl}."
             )
 
-        if payload_start > window_start_token:
-            raise ValueError(
-                "stream_generate_step 7D payload must start at the current "
-                "latent window start token or earlier; got "
-                f"traj_start_token={payload_start}, expected <= {window_start_token}."
-            )
-        if payload_start < window_start_token:
-            origin_frame = token_start_frame(payload_start)
-            needed = token_range_to_frame_slice(window_start_token, traj_sl)
+        window_abs_start = payload_abs_start + (
+            window_start_token - payload_local_start
+        )
+        if payload_local_start < window_start_token:
+            crop_tokens = window_start_token - payload_local_start
+            if payload_num_tokens is not None:
+                traj_sl = max(model_sl, payload_num_tokens - crop_tokens)
+            origin_frame = token_start_frame(payload_abs_start)
+            needed = token_range_to_frame_slice(window_abs_start, traj_sl)
             rel_start = needed.start - origin_frame
             rel_stop = needed.stop - origin_frame
             if rel_start >= traj_frame.shape[1]:
                 traj_frame = traj_frame[:, :0, :]
             else:
                 traj_frame = traj_frame[:, max(0, rel_start):min(rel_stop, traj_frame.shape[1]), :]
+        else:
+            window_abs_start = payload_abs_start
 
         traj_payload = {
             "traj_features": traj_frame,
-            "traj_start_token": window_start_token,
+            "traj_start_token": window_abs_start,
         }
         traj_mask = x.get("traj_cond_frame_mask", x.get("traj_cond_mask"))
         if traj_mask is not None:
@@ -1509,7 +1535,7 @@ class DiffForcingWanModel(nn.Module):
                     f"traj_cond_frame_mask batch size {traj_mask.shape[0]} does not "
                     f"match stream batch_size {self.batch_size}"
                 )
-            if payload_start < window_start_token:
+            if payload_local_start < window_start_token:
                 if rel_start >= traj_mask.shape[1]:
                     traj_mask = traj_mask[:, :0]
                 else:
@@ -1538,6 +1564,35 @@ class DiffForcingWanModel(nn.Module):
                 dtype=torch.long,
             )
         return traj_emb, traj_seq_lens, traj_token_mask
+
+    @staticmethod
+    def _extend_stream_text_context_for_attention(
+        text_condition: list,
+        batch_size: int,
+        model_sl: int,
+        attn_sl: int,
+    ) -> list:
+        """Pad frame-aligned stream text context to the attention length.
+
+        The latent rolling window provides ``model_sl`` text slots. Direct 7D
+        trajectory conditioning can extend attention to future trajectory tokens,
+        so frame-aligned text context must be padded to ``attn_sl``. Future
+        slots reuse the last visible text context for each sample.
+        """
+        if attn_sl <= model_sl:
+            return text_condition
+        if len(text_condition) != batch_size * model_sl:
+            if len(text_condition) == batch_size:
+                return text_condition
+            return text_condition
+        out = []
+        for i in range(batch_size):
+            segment = list(text_condition[i * model_sl : (i + 1) * model_sl])
+            if not segment:
+                continue
+            out.extend(segment)
+            out.extend([segment[-1]] * (attn_sl - model_sl))
+        return out
 
     @torch.no_grad()
     def stream_generate_step(self, x, first_chunk=True):
@@ -1609,6 +1664,7 @@ class DiffForcingWanModel(nn.Module):
 
             model_sl = min(end_index, self.seq_len)
             window_start_token = max(0, end_index - model_sl)
+            attn_sl = model_sl
             if x.get("traj_cond_7d_frame") is not None:
                 traj_emb, traj_seq_lens, traj_token_mask = (
                     self._build_stream_direct_traj_condition(
@@ -1618,6 +1674,8 @@ class DiffForcingWanModel(nn.Module):
                         device,
                     )
                 )
+                if traj_emb is not None:
+                    attn_sl = max(model_sl, int(traj_emb.shape[1]))
             else:
                 traj_emb = self._traj_buf.build_traj_emb(end_index, self.seq_len, device)
                 if traj_emb is not None:
@@ -1640,11 +1698,26 @@ class DiffForcingWanModel(nn.Module):
                 else:
                     traj_seq_lens = None
                     traj_token_mask = None
-            t_scaled = noise_level * self.time_embedding_scale
+            text_condition_attn = self._extend_stream_text_context_for_attention(
+                text_condition,
+                self.batch_size,
+                model_sl,
+                attn_sl,
+            )
+            if attn_sl == model_sl:
+                noise_level_for_attn = noise_level
+            else:
+                noise_level_attn_full = self._get_noise_levels(
+                    device,
+                    window_start_token + attn_sl,
+                    time_steps,
+                )
+                noise_level_for_attn = noise_level_attn_full[:, -attn_sl:]
+            t_scaled = noise_level_for_attn * self.time_embedding_scale
             predicted_result = self._denoise_with_cfg(
                 noisy_input, t_scaled,
-                text_condition, text_null_context,
-                traj_emb, traj_seq_lens, model_sl, self.batch_size,
+                text_condition_attn, text_null_context,
+                traj_emb, traj_seq_lens, attn_sl, self.batch_size,
                 traj_token_mask=traj_token_mask,
             )
 

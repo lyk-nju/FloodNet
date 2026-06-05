@@ -102,6 +102,61 @@ def _csv_safe_record(record: dict) -> dict:
     return row
 
 
+_AGGREGATE_METRIC_KEYS = (
+    "ADE",
+    "FDE",
+    "path_arc",
+    "path_chamfer",
+    "heading_path_error_deg",
+    "lateral_velocity_ratio",
+)
+
+
+def _is_finite_number(value) -> bool:
+    try:
+        return bool(np.isfinite(float(value)))
+    except (TypeError, ValueError):
+        return False
+
+
+def _aggregate_record_group(records: list[dict]) -> dict:
+    out = {"num_records": int(len(records))}
+    for key in _AGGREGATE_METRIC_KEYS:
+        vals = [float(rec[key]) for rec in records if _is_finite_number(rec.get(key))]
+        if not vals:
+            continue
+        arr = np.asarray(vals, dtype=np.float64)
+        out[f"{key}_mean"] = float(arr.mean())
+        out[f"{key}_std"] = float(arr.std())
+        out[f"{key}_count"] = int(arr.size)
+    return out
+
+
+def aggregate_runtime_records(records: list[dict]) -> dict:
+    """Aggregate runtime benchmark records for checkpoint selection."""
+    summary = _aggregate_record_group(records)
+    by_suite: dict[str, list[dict]] = {}
+    by_mode: dict[str, list[dict]] = {}
+    by_suite_mode: dict[str, list[dict]] = {}
+    for rec in records:
+        suite = str(rec.get("suite", "unknown"))
+        mode = str(rec.get("mode", "unknown"))
+        by_suite.setdefault(suite, []).append(rec)
+        by_mode.setdefault(mode, []).append(rec)
+        by_suite_mode.setdefault(f"{suite}/{mode}", []).append(rec)
+    summary["by_suite"] = {
+        key: _aggregate_record_group(vals) for key, vals in sorted(by_suite.items())
+    }
+    summary["by_mode"] = {
+        key: _aggregate_record_group(vals) for key, vals in sorted(by_mode.items())
+    }
+    summary["by_suite_mode"] = {
+        key: _aggregate_record_group(vals)
+        for key, vals in sorted(by_suite_mode.items())
+    }
+    return summary
+
+
 def resolve_traj_condition_source(
     condition_path: str,
     root_refiner_runtime=None,
@@ -1236,6 +1291,7 @@ def main():
                    args.traj_condition_path,
                    root_refiner_runtime,
                ),
+               "summary": aggregate_runtime_records(all_recs),
                "records": all_recs}
     sp = os.path.join(out_root, "summary.json")
     write_stream_summary(sp, summary)

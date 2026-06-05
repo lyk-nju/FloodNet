@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 
+import pytest
 import torch
 
 from datasets.humanml3d_refiner import HumanML3DRefinerDataset as RefinerDataset
@@ -22,6 +23,7 @@ from eval.root_refiner.benchmark import (
     resolve_suite_config,
     run_benchmark,
     run_suite_benchmark,
+    validate_ckpt_eval_config_compatible,
     write_report,
 )
 from models.root_refiner import RootRefiner
@@ -256,6 +258,50 @@ def test_build_refiner_dataset_from_clips_uses_sampling_config():
     assert ds.offset_start_max_frames == 13
     assert ds.offset_start_apply_to == ("sparse_path",)
     assert ds.sparse_path_point_range == (2, 4)
+
+
+def test_validate_ckpt_eval_config_compatible_accepts_matching_contract():
+    cfg = {
+        "model": {
+            "params": {
+                "n_hist": 8,
+                "n_path": 16,
+                "max_tokens": 8,
+                "min_tokens": 2,
+                "frames_per_token": 4,
+            }
+        }
+    }
+
+    validate_ckpt_eval_config_compatible(cfg, cfg)
+
+
+def test_validate_ckpt_eval_config_compatible_rejects_contract_mismatch():
+    ckpt_cfg = {
+        "model": {
+            "params": {
+                "n_hist": 8,
+                "n_path": 16,
+                "max_tokens": 8,
+                "min_tokens": 2,
+                "frames_per_token": 4,
+            }
+        }
+    }
+    eval_cfg = {
+        "model": {
+            "params": {
+                "n_hist": 12,
+                "n_path": 16,
+                "max_tokens": 8,
+                "min_tokens": 2,
+                "frames_per_token": 4,
+            }
+        }
+    }
+
+    with pytest.raises(ValueError, match="model.params.n_hist"):
+        validate_ckpt_eval_config_compatible(ckpt_cfg, eval_cfg)
 
 
 def test_build_eval_task_specs_freezes_underlying_tasks_before_path_modes():

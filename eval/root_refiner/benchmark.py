@@ -7,7 +7,8 @@ body model. Computes the metric suite from docs/TODO.md §T_A_10:
     xyz_ADE / xyz_FDE
     heading_error_deg (median)
     fwd_speed_MAE      (per-frame fwd_delta channel; "speed" is the metric label)
-    lateral_speed_MAE  (metric only — perpendicular drift)
+    lateral_speed_MAE  (metric label; per-frame lateral displacement MAE,
+                        not meters/second)
     yaw_rate_MAE       (per-frame yaw_delta channel)
     smoothness_acc_mean
 
@@ -30,6 +31,7 @@ import csv
 import json
 import math
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -299,6 +301,43 @@ def resolve_suite_duration_mode(
             oracle_duration=oracle_duration,
         )
     return normalize_duration_mode(suite_cfg.duration_mode)
+
+
+_CKPT_CONFIG_CONTRACT_KEYS = (
+    ("model", "params", "n_hist"),
+    ("model", "params", "n_path"),
+    ("model", "params", "max_tokens"),
+    ("model", "params", "min_tokens"),
+    ("model", "params", "frames_per_token"),
+)
+
+
+def _nested_get(mapping, path: tuple[str, ...]):
+    cur = mapping
+    for key in path:
+        if not isinstance(cur, Mapping) or key not in cur:
+            return None
+        cur = cur[key]
+    return cur
+
+
+def validate_ckpt_eval_config_compatible(ckpt_cfg: dict, eval_cfg: dict) -> None:
+    """Fail fast when benchmark --config disagrees with checkpoint hparams."""
+    mismatches = []
+    for path in _CKPT_CONFIG_CONTRACT_KEYS:
+        ckpt_value = _nested_get(ckpt_cfg, path)
+        eval_value = _nested_get(eval_cfg, path)
+        if ckpt_value is None or eval_value is None:
+            continue
+        if ckpt_value != eval_value:
+            dotted = ".".join(path)
+            mismatches.append(f"{dotted}: ckpt={ckpt_value!r} eval={eval_value!r}")
+    if mismatches:
+        joined = "; ".join(mismatches)
+        raise ValueError(
+            "RootRefiner benchmark config mismatch between checkpoint hparams "
+            f"and --config: {joined}. Use the training config for this checkpoint."
+        )
 
 
 @torch.no_grad()
@@ -657,7 +696,7 @@ def _load_model_from_ckpt(ckpt_path: str, device: str):
         cfg = ckpt["hyper_parameters"]["cfg"]
         module = RefinerLightningModule(cfg)
         module.load_state_dict(ckpt["state_dict"])
-        return module.refiner, module.text_encoder
+        return module.refiner, module.text_encoder, cfg
     raise ValueError(
         f"checkpoint {ckpt_path} missing hyper_parameters.cfg; "
         "pass a Lightning checkpoint saved by train_refiner.py"
@@ -713,7 +752,8 @@ def main(argv=None):
     # ckpt's saved hparams, which train_refiner already resolved).
     cfg = resolve_cfg_interpolations(cfg)
 
-    model, text_encoder = _load_model_from_ckpt(args.ckpt, args.device)
+    model, text_encoder, ckpt_cfg = _load_model_from_ckpt(args.ckpt, args.device)
+    validate_ckpt_eval_config_compatible(ckpt_cfg, cfg)
 
     data_cfg = cfg.get("data", {})
     split_file = args.split_file or data_cfg.get("val_split_file")

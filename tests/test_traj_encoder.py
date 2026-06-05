@@ -243,16 +243,96 @@ def test_stream_direct_7d_payload_can_encode_future_horizon_tokens():
     assert torch.allclose(token_mask, torch.ones(1, 5))
 
 
-def test_stream_direct_7d_payload_rejects_misaligned_start_token():
+def test_stream_direct_7d_payload_groups_frames_by_absolute_start_token():
     model = _dummy_stream_model()
+    frame_slice = token_range_to_frame_slice(5, 2)
+    feats = torch.zeros(1, frame_slice.stop - frame_slice.start, 7)
+    feats[..., 0] = torch.arange(feats.shape[1], dtype=torch.float32).view(1, -1)
     x = {
-        "traj_cond_7d_frame": torch.zeros(1, 12, 7),
-        "traj_start_token": 6,
+        "traj_cond_7d_frame": feats,
+        "traj_cond_frame_mask": torch.ones(1, feats.shape[1]),
+        "traj_start_token": 0,
+        "traj_abs_start_token": 5,
+        "traj_num_tokens": 2,
     }
-    with pytest.raises(ValueError, match="expected <= 5"):
-        model._build_stream_direct_traj_condition(
-            x, model_sl=3, window_start_token=5, device="cpu",
-        )
+
+    emb, lens, token_mask = model._build_stream_direct_traj_condition(
+        x, model_sl=2, window_start_token=0, device="cpu",
+    )
+
+    expected = torch.tensor(
+        [
+            [
+                [0.0, 1.0, 2.0, 3.0],
+                [4.0, 5.0, 6.0, 7.0],
+            ]
+        ]
+    )
+    assert torch.allclose(emb, expected)
+    assert torch.equal(lens, torch.tensor([2]))
+    assert torch.allclose(token_mask, torch.ones(1, 2))
+
+
+def test_stream_direct_7d_payload_accepts_future_start_inside_latent_window():
+    model = _dummy_stream_model()
+    feats = torch.zeros(1, 12, 7)
+    feats[..., 0] = torch.arange(12, dtype=torch.float32).view(1, 12)
+    x = {
+        "traj_cond_7d_frame": feats,
+        "traj_cond_frame_mask": torch.ones(1, 12),
+        "traj_start_token": 6,
+        "traj_abs_start_token": 16,
+        "traj_num_tokens": 3,
+    }
+
+    emb, lens, token_mask = model._build_stream_direct_traj_condition(
+        x, model_sl=3, window_start_token=5, device="cpu",
+    )
+
+    expected = torch.tensor(
+        [
+            [
+                [0.0, 1.0, 2.0, 3.0],
+                [4.0, 5.0, 6.0, 7.0],
+                [8.0, 9.0, 10.0, 11.0],
+            ]
+        ]
+    )
+    assert torch.allclose(emb, expected)
+    assert torch.equal(lens, torch.tensor([3]))
+    assert torch.allclose(token_mask, torch.ones(1, 3))
+
+
+def test_stream_direct_7d_payload_accepts_runtime_history_plus_horizon_shape():
+    model = _dummy_stream_model()
+    model_sl = 30
+    horizon_tokens = 3
+    traj_start_token = 1
+    traj_abs_start_token = 31
+    traj_num_tokens = model_sl + horizon_tokens
+    frame_slice = token_range_to_frame_slice(traj_abs_start_token, traj_num_tokens)
+    feats = torch.zeros(1, frame_slice.stop - frame_slice.start, 7)
+    feats[..., 0] = torch.arange(feats.shape[1], dtype=torch.float32).view(1, -1)
+    x = {
+        "traj_cond_7d_frame": feats,
+        "traj_cond_frame_mask": torch.ones(1, feats.shape[1]),
+        "traj_start_token": traj_start_token,
+        "traj_abs_start_token": traj_abs_start_token,
+        "traj_num_tokens": traj_num_tokens,
+    }
+
+    emb, lens, token_mask = model._build_stream_direct_traj_condition(
+        x,
+        model_sl=model_sl,
+        window_start_token=traj_start_token,
+        device="cpu",
+    )
+
+    assert emb.shape == (1, traj_num_tokens, 4)
+    assert torch.equal(lens, torch.tensor([traj_num_tokens]))
+    assert torch.allclose(token_mask, torch.ones(1, traj_num_tokens))
+    assert torch.allclose(emb[0, 0], torch.tensor([0.0, 1.0, 2.0, 3.0]))
+    assert torch.allclose(emb[0, -1], torch.tensor([128.0, 129.0, 130.0, 131.0]))
 
 
 def test_stream_direct_7d_payload_slices_from_earlier_payload_start():

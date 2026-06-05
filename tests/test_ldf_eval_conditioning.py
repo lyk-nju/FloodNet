@@ -9,6 +9,7 @@ from eval.ldf.conditioning import (
     build_gt_rootplan_from_batch,
     prepare_ldf_eval_model_batch,
 )
+from metrics.traj import _compute_deterministic_fwd_ctrl_loss_sample
 
 
 def _make_7d_batch() -> dict:
@@ -114,3 +115,38 @@ def test_ldf_eval_stream_conditioner_builds_direct_7d_payload():
     assert "traj" not in payload
     assert payload["traj_cond_7d_frame"].shape[-1] == 7
     assert payload["traj_cond_frame_mask"].any()
+
+
+class _RecordingForwardModel:
+    chunk_size = 1
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, model_batch):
+        self.calls.append(dict(model_batch))
+        return {}
+
+
+def test_forward_control_loss_accepts_eval_model_batch_builder():
+    model = _RecordingForwardModel()
+    sample_batch = {
+        "name": ["sample"],
+        "token_length": torch.tensor([1], dtype=torch.long),
+    }
+
+    def builder(batch, device, model=None):
+        return {"built_by_eval_helper": True}
+
+    _compute_deterministic_fwd_ctrl_loss_sample(
+        model=model,
+        sample_batch=sample_batch,
+        vae=None,
+        device=torch.device("cpu"),
+        train_mode=3,
+        model_batch_builder=builder,
+    )
+
+    assert model.calls
+    assert model.calls[0]["built_by_eval_helper"] is True
+    assert "_time_steps_override" in model.calls[0]

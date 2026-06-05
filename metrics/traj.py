@@ -10,7 +10,7 @@ Shared by:
 """
 import hashlib
 import random
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -501,6 +501,7 @@ def _compute_deterministic_fwd_ctrl_loss_sample(
     train_mode: int,
     chunk_size_tokens: Optional[int] = None,
     window_mode: str = "mean_chunk_windows",
+    model_batch_builder: Optional[Callable[..., Dict]] = None,
 ) -> Dict:
     valid_len = int(sample_batch["token_length"][0].item())
     time_steps = _iter_deterministic_time_steps(valid_len, model.chunk_size, mode=window_mode)
@@ -517,7 +518,10 @@ def _compute_deterministic_fwd_ctrl_loss_sample(
     n_valids = []
     win_lens = []
     for t in time_steps:
-        model_batch = _build_model_batch(sample_batch, device)
+        if model_batch_builder is None:
+            model_batch = _build_model_batch(sample_batch, device)
+        else:
+            model_batch = model_batch_builder(sample_batch, device, model=model)
         model_batch["_time_steps_override"] = torch.tensor(
             [t], device=device, dtype=torch.float32
         )
