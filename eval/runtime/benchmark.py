@@ -1278,6 +1278,7 @@ def main():
                 _render_traj_video(_pr, _gr, os.path.join(vdir, f"{case.name}_traj.mp4"),
                                    case.name, split_tok=_split)
 
+    aggregate = aggregate_runtime_records(all_recs)
     summary = {"run_id": run_id, "config": args.config, "ckpt": args.ckpt,
                "vae_ckpt": args.vae_ckpt, "waypoint_dt": args.waypoint_dt,
                "traj_horizon_tokens": args.traj_horizon_tokens,
@@ -1291,7 +1292,10 @@ def main():
                    args.traj_condition_path,
                    root_refiner_runtime,
                ),
-               "summary": aggregate_runtime_records(all_recs),
+               "aggregate": aggregate,
+               # Backward-compatible alias for scripts that consumed the nested
+               # field added during the eval package refactor.
+               "summary": aggregate,
                "records": all_recs}
     sp = os.path.join(out_root, "summary.json")
     write_stream_summary(sp, summary)

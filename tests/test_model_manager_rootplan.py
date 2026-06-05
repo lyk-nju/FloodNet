@@ -102,8 +102,8 @@ def test_rootplan_stream_payload_uses_body_window_left_commit():
 
     payload = mgr._build_rootplan_stream_traj_input()
 
-    start_token = 6  # commit 10 + chunk 5, history_length 9 -> left edge 6
-    num_tokens = 29
+    start_token = 2  # earliest right token 11, history_length 9 -> left edge 2
+    num_tokens = 33  # final right token 15 + horizon 20 - start 2
     frame_slice = token_range_to_frame_slice(start_token, num_tokens)
     assert payload["traj_start_token"] == start_token
     assert payload["traj_abs_start_token"] == start_token
@@ -126,9 +126,9 @@ def test_rootplan_stream_payload_uses_absolute_commit_after_model_roll():
 
     payload = mgr._build_rootplan_stream_traj_input()
 
-    local_start_token = 26
-    absolute_start_token = 56
-    num_tokens = 29
+    local_start_token = 22
+    absolute_start_token = 52
+    num_tokens = 33
     frame_slice = token_range_to_frame_slice(absolute_start_token, num_tokens)
     assert payload["traj_start_token"] == local_start_token
     assert payload["traj_abs_start_token"] == absolute_start_token
@@ -195,8 +195,8 @@ def test_build_stream_traj_input_prefers_active_rootplan_payload():
     assert payload is not None
     assert "traj_cond_7d_frame" in payload
     assert "traj" not in payload
-    assert payload["traj_start_token"] == 6
-    assert payload["body_anchor_token"] == 6
+    assert payload["traj_start_token"] == 2
+    assert payload["body_anchor_token"] == 2
     assert mgr._trajectory_state == "active_7d"
 
 

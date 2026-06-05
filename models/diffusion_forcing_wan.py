@@ -1447,6 +1447,25 @@ class DiffForcingWanModel(nn.Module):
         helper only validates shape/start-token consistency and routes it
         through the same 7D encoder path used by training.
         """
+        subpayloads = x.get("traj_substep_payloads")
+        if subpayloads:
+            selected = None
+            for subpayload in subpayloads:
+                if int(subpayload.get("traj_start_token", -1)) == int(window_start_token):
+                    selected = subpayload
+                    break
+            if selected is None:
+                starts = [
+                    int(subpayload.get("traj_start_token", -1))
+                    for subpayload in subpayloads
+                ]
+                raise ValueError(
+                    "stream_generate_step 7D payload has no substep payload "
+                    f"for window_start_token={window_start_token}; available "
+                    f"starts={starts}."
+                )
+            x = selected
+
         from utils.token_frame import (
             frame_idx_to_token_idx,
             prefix_len_from_tail_invalid,
@@ -1473,6 +1492,14 @@ class DiffForcingWanModel(nn.Module):
 
         payload_local_start = int(x.get("traj_start_token", window_start_token))
         payload_abs_start = int(x.get("traj_abs_start_token", payload_local_start))
+        if payload_local_start > window_start_token:
+            raise ValueError(
+                "stream_generate_step 7D payload starts after current latent "
+                "window start; got traj_start_token="
+                f"{payload_local_start}, window_start_token={window_start_token}. "
+                "Build direct 7D payloads from the earliest denoise substep "
+                "window start or earlier."
+            )
         payload_num_tokens = x.get("traj_num_tokens", None)
         if payload_num_tokens is not None:
             payload_num_tokens = int(payload_num_tokens)

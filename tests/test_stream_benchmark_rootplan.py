@@ -39,6 +39,25 @@ def _timeline(num_commits: int) -> InferenceGlueTimeline:
     return timeline
 
 
+def _moving_z_timeline(num_commits: int) -> InferenceGlueTimeline:
+    timeline = InferenceGlueTimeline(
+        InferenceGlueState.initial(xz=(0.0, 0.0), yaw=0.0, dtype=torch.float32)
+    )
+    for commit_idx in range(1, num_commits + 1):
+        timeline.append(
+            InferenceGlueState(
+                commit_idx=commit_idx,
+                world_xz=torch.tensor(
+                    [0.0, float(token_start_frame(commit_idx))],
+                    dtype=torch.float32,
+                ),
+                world_yaw=torch.tensor(0.0),
+                source="test",
+            )
+        )
+    return timeline
+
+
 def test_stream_benchmark_builds_7d_rootplan_payload_for_model_step():
     timeline = _timeline(10)
     model = SimpleNamespace(
@@ -84,6 +103,87 @@ def test_stream_benchmark_builds_7d_rootplan_payload_for_model_step():
         token_start_frame(start_token)
     )
     assert payload["traj_cond_frame_mask"].all()
+
+
+def test_rootplan_payload_covers_all_denoise_substep_windows_within_chunk():
+    history_length = 30
+    horizon_tokens = 20
+    timeline = _timeline(100)
+    model = SimpleNamespace(
+        commit_index=40,
+        chunk_size=5,
+        _traj_buf=TrajStreamBuffer(batch_size=1, buf_len=128),
+    )
+    points = torch.zeros(400, 3)
+    points[:, 2] = torch.arange(400, dtype=torch.float32)
+    root_plan = build_eval_root_plan_from_points(
+        points,
+        anchor_state=timeline.at_commit(0),
+        token_dt=0.20,
+        frames_per_token=4,
+        source="test_route",
+    )
+    model._traj_buf.set_root_plan(root_plan)
+
+    payload = build_rootplan_stream_step_payload(
+        model,
+        timeline,
+        history_length=history_length,
+        traj_horizon_tokens=horizon_tokens,
+        absolute_commit_index=40,
+    )
+
+    start_token = 11  # earliest substep right token 41, history 30 -> left edge 11
+    num_tokens = 54  # final right token 45 + horizon 20 - start 11
+    frame_slice = token_range_to_frame_slice(start_token, num_tokens)
+    assert payload["traj_start_token"] == start_token
+    assert payload["traj_abs_start_token"] == start_token
+    assert payload["traj_num_tokens"] == num_tokens
+    assert payload["body_anchor_token"] == start_token
+    assert payload["body_anchor_abs_token"] == start_token
+    assert payload["traj_cond_7d_frame"].shape == (
+        1,
+        frame_slice.stop - frame_slice.start,
+        7,
+    )
+    assert float(payload["traj_cond_7d_frame"][0, 0, 2]) == float(
+        token_start_frame(start_token)
+    )
+
+
+def test_rootplan_payload_canonicalizes_each_substep_with_its_body_anchor():
+    history_length = 30
+    horizon_tokens = 20
+    timeline = _moving_z_timeline(100)
+    model = SimpleNamespace(
+        commit_index=40,
+        chunk_size=5,
+        _traj_buf=TrajStreamBuffer(batch_size=1, buf_len=128),
+    )
+    points = torch.zeros(400, 3)
+    points[:, 2] = torch.arange(400, dtype=torch.float32)
+    root_plan = build_eval_root_plan_from_points(
+        points,
+        anchor_state=timeline.at_commit(0),
+        token_dt=0.20,
+        frames_per_token=4,
+        source="test_route",
+    )
+    model._traj_buf.set_root_plan(root_plan)
+
+    payload = build_rootplan_stream_step_payload(
+        model,
+        timeline,
+        history_length=history_length,
+        traj_horizon_tokens=horizon_tokens,
+        absolute_commit_index=40,
+    )
+
+    subpayloads = payload["traj_substep_payloads"]
+    assert [p["traj_start_token"] for p in subpayloads] == [11, 12, 13, 14, 15]
+    assert [p["body_anchor_token"] for p in subpayloads] == [11, 12, 13, 14, 15]
+    for subpayload in subpayloads:
+        assert abs(float(subpayload["traj_cond_7d_frame"][0, 0, 2])) < 1e-6
 
 
 def test_rootplan_payload_uses_absolute_commit_for_plan_and_local_commit_for_model():
@@ -225,6 +325,50 @@ def test_rootplan_payload_masks_until_future_plan_anchor_after_model_roll():
     assert prefix_frames > 0
     assert not mask[:prefix_frames].any()
     assert mask[prefix_frames:].all()
+
+
+def test_rootplan_substep_payloads_partially_mask_until_replan_anchor_inside_window():
+    history_length = 30
+    horizon_tokens = 20
+    timeline = _timeline(100)
+    model = SimpleNamespace(
+        commit_index=40,
+        chunk_size=5,
+        _traj_buf=TrajStreamBuffer(batch_size=1, buf_len=128),
+    )
+    points = torch.zeros(400, 3)
+    points[:, 2] = torch.arange(400, dtype=torch.float32)
+    root_plan = build_eval_root_plan_from_points(
+        points,
+        anchor_state=timeline.at_commit(40),
+        token_dt=0.20,
+        frames_per_token=4,
+        source="mid_window_replan",
+    )
+    model._traj_buf.set_root_plan(root_plan)
+
+    payload = build_rootplan_stream_step_payload(
+        model,
+        timeline,
+        history_length=history_length,
+        traj_horizon_tokens=horizon_tokens,
+        absolute_commit_index=40,
+    )
+
+    assert [p["traj_abs_start_token"] for p in payload["traj_substep_payloads"]] == [
+        11,
+        12,
+        13,
+        14,
+        15,
+    ]
+    for subpayload in payload["traj_substep_payloads"]:
+        absolute_start = int(subpayload["traj_abs_start_token"])
+        prefix_frames = token_start_frame(40) - token_start_frame(absolute_start)
+        mask = subpayload["traj_cond_frame_mask"][0].bool()
+        assert 0 < prefix_frames < mask.numel()
+        assert not mask[:prefix_frames].any()
+        assert mask[prefix_frames:].all()
 
 
 def test_eval_rootplan_payload_wrapper_matches_shared_runtime_helper():
