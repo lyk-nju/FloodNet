@@ -196,22 +196,30 @@ class RootRefinerLightningModule(pl.LightningModule):
             path = batch["path"].to(out["waypoints"].device).index_select(0, index)
             control = batch["path_control_mask"].to(out["waypoints"].device).index_select(0, index)
             if mode == "dense_path":
-                supervision = batch.get("path_supervision_mask", target_mask)
+                base_supervision = batch.get("path_supervision_mask", target_mask)
+                supervision = (
+                    base_supervision.to(out["waypoints"].device).bool().index_select(0, index)
+                    & target_mask.to(out["waypoints"].device).bool().index_select(0, index)
+                )
                 losses.append(
                     dense_path_control_loss(
                         pred,
                         path,
-                        supervision.to(out["waypoints"].device).index_select(0, index),
+                        supervision,
                     )
                 )
             elif mode == "sparse_path":
-                supervision = batch.get("path_supervision_mask", target_mask)
+                base_supervision = batch.get("path_supervision_mask", target_mask)
+                supervision = (
+                    base_supervision.to(out["waypoints"].device).bool().index_select(0, index)
+                    & target_mask.to(out["waypoints"].device).bool().index_select(0, index)
+                )
                 losses.append(
                     sparse_path_control_loss(
                         pred,
                         path,
                         control,
-                        supervision.to(out["waypoints"].device).index_select(0, index),
+                        supervision,
                         offset_start_frames.index_select(0, index),
                     )
                 )

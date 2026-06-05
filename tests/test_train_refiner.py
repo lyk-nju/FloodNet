@@ -380,6 +380,34 @@ def test_zero_path_control_weight_skips_path_control_loss(monkeypatch):
     assert losses["path_control"].item() == 0.0
 
 
+def test_path_control_supervision_intersects_target_mask(monkeypatch):
+    cfg = _tiny_cfg()
+    cfg["loss_weights"]["path_control"] = 1.0
+    module = RefinerLightningModule(cfg)
+    batch = _make_batch(module, B=2)
+    out = module(batch)
+    batch["path_mode"] = ["dense_path", "dense_path"]
+    batch["path_control_mask"] = torch.ones(2, module.refiner.n_path, dtype=torch.bool)
+    batch["path_supervision_mask"] = torch.zeros(2, module.refiner.max_frames, dtype=torch.bool)
+    batch["path_supervision_mask"][:, :8] = True
+    target_mask = torch.zeros(2, module.refiner.max_frames, dtype=torch.bool)
+    target_mask[:, :5] = True
+    expected = batch["path_supervision_mask"] & target_mask
+
+    def _capture_dense_path_control_loss(pred, path, supervision):
+        assert torch.equal(supervision.cpu(), expected)
+        return pred.new_zeros(())
+
+    monkeypatch.setattr(
+        "utils.refiner.lightning_module.dense_path_control_loss",
+        _capture_dense_path_control_loss,
+    )
+
+    losses = module._compute_loss(out, batch, target_mask=target_mask)
+
+    assert losses["path_control"].item() == 0.0
+
+
 # ---------------------------------------------------------------------------
 # Forward + backward step
 # ---------------------------------------------------------------------------

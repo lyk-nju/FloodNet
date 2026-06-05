@@ -108,11 +108,14 @@ def dense_path_control_loss(pred_waypoints: Tensor, path: Tensor, path_supervisi
         frame_idx = torch.nonzero(path_supervision_mask[b], as_tuple=False).flatten()
         if frame_idx.numel() == 0:
             continue
-        valid_count = int(frame_idx[-1].item()) + 1
-        target = _interpolate_path_at_frame_progress(path[b:b + 1], valid_count)[0]
+        start = int(frame_idx[0].item())
+        end = int(frame_idx[-1].item())
+        local_count = max(1, end - start + 1)
+        target = _interpolate_path_at_frame_progress(path[b:b + 1], local_count)[0]
+        local_idx = frame_idx - start
         diff = F.smooth_l1_loss(
             pred_xz[b, frame_idx],
-            target[frame_idx],
+            target[local_idx],
             reduction="none",
         )
         total = total + diff.sum()

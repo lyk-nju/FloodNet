@@ -110,14 +110,14 @@ def test_ordinal_duration_loss_rejects_nonpositive_sigma():
             ordinal_duration_loss(logits, target, min_tokens=2, sigma=bad_sigma)
 
 
-def test_dense_path_control_loss_ignores_offset_prefix():
+def test_dense_path_control_loss_aligns_offset_window_start_to_path_start():
     pred = torch.zeros(1, 5, 5)
     path = torch.zeros(1, 5, 2)
     path[:, :, 0] = torch.arange(5, dtype=torch.float32)
     supervision = torch.tensor([[False, False, True, True, True]])
     pred[0, 0, 0] = 100.0
     pred[0, 1, 0] = 100.0
-    pred[0, 2:, 0] = torch.tensor([2.0, 3.0, 4.0])
+    pred[0, 2:, 0] = torch.tensor([0.0, 2.0, 4.0])
 
     assert dense_path_control_loss(pred, path, supervision).item() < 1e-6
 
