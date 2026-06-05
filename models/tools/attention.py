@@ -226,6 +226,7 @@ def flextraj_query_valid(
     total_len: int,
     latent_lens: torch.Tensor | None = None,
     traj_lens: torch.Tensor | None = None,
+    traj_token_mask: torch.Tensor | None = None,
     *,
     device: torch.device,
     dtype: torch.dtype = torch.float32,
@@ -243,14 +244,42 @@ def flextraj_query_valid(
         traj_lens=traj_lens,
     )
     idx_i = torch.arange(L, device=device)
-    qv = (
-        (idx_i.view(1, L) < vl.view(b, 1))
-        | (
-            (idx_i.view(1, L) >= n_latent)
-            & (idx_i.view(1, L) < (n_latent + vt.view(b, 1)))
-        )
-    ).to(dtype=dtype)
+    latent_valid = idx_i.view(1, L) < vl.view(b, 1)
+    traj_valid = (
+        (idx_i.view(1, L) >= n_latent)
+        & (idx_i.view(1, L) < (n_latent + vt.view(b, 1)))
+    )
+    if traj_token_mask is not None and n_traj > 0:
+        tm = _normalize_traj_token_mask(traj_token_mask, b, n_traj, device)
+        traj_idx = (idx_i - n_latent).clamp(min=0, max=max(0, n_traj - 1))
+        traj_valid = traj_valid & tm[:, traj_idx]
+    qv = (latent_valid | traj_valid).to(dtype=dtype)
     return qv.unsqueeze(-1)
+
+
+def _normalize_traj_token_mask(
+    traj_token_mask: torch.Tensor,
+    batch_size: int,
+    n_traj: int,
+    device: torch.device,
+) -> torch.Tensor:
+    tm = traj_token_mask.to(device=device)
+    if tm.dim() == 3 and tm.shape[-1] == 1:
+        tm = tm[..., 0]
+    if tm.dim() != 2:
+        raise ValueError(f"traj_token_mask must be [B,T], got {tuple(tm.shape)}")
+    if tm.shape[0] != batch_size:
+        raise ValueError(
+            f"traj_token_mask batch size {tm.shape[0]} does not match {batch_size}"
+        )
+    tm = tm.bool()
+    if tm.shape[1] < n_traj:
+        tm = torch.cat(
+            [tm, tm.new_zeros(batch_size, n_traj - tm.shape[1])], dim=1
+        )
+    elif tm.shape[1] > n_traj:
+        tm = tm[:, :n_traj]
+    return tm
 
 
 def flextraj_self_attn_bias(
@@ -259,6 +288,7 @@ def flextraj_self_attn_bias(
     total_len: int,
     latent_lens: torch.Tensor | None = None,
     traj_lens: torch.Tensor | None = None,
+    traj_token_mask: torch.Tensor | None = None,
     *,
     device: torch.device,
     dtype: torch.dtype = torch.float32,
@@ -303,6 +333,13 @@ def flextraj_self_attn_bias(
     j_grid = idx_j.view(1, 1, L)
     key_invalid_latent_pad = (j_grid >= vl.view(b, 1, 1)) & (j_grid < n_latent)
     key_invalid_traj_pad = j_grid >= (n_latent + vt.view(b, 1, 1))
+    if traj_token_mask is not None and n_traj > 0:
+        tm = _normalize_traj_token_mask(traj_token_mask, b, n_traj, device)
+        traj_j = (idx_j - n_latent).clamp(min=0, max=max(0, n_traj - 1))
+        traj_key_invalid_mask = (idx_j.view(1, 1, L) >= n_latent) & (
+            ~tm[:, None, traj_j]
+        )
+        key_invalid_traj_pad = key_invalid_traj_pad | traj_key_invalid_mask
     traj_segment_query = idx_i.view(1, L, 1) >= n_latent
     latent_key = idx_j.view(1, 1, L) < n_latent
     traj_cannot_see_latent = traj_segment_query & latent_key
@@ -323,6 +360,7 @@ def flextraj_self_attn_bias(
         L,
         latent_lens=latent_lens,
         traj_lens=traj_lens,
+        traj_token_mask=traj_token_mask,
         device=device,
         dtype=dtype,
     )
@@ -337,6 +375,7 @@ def flextraj_sdpa_self_attention(
     n_latent: int,
     latent_lens: torch.Tensor | None = None,
     traj_lens: torch.Tensor | None = None,
+    traj_token_mask: torch.Tensor | None = None,
     causal: bool = False,
     dropout_p: float = 0.0,
 ) -> torch.Tensor:
@@ -354,6 +393,7 @@ def flextraj_sdpa_self_attention(
         lq,
         latent_lens=latent_lens,
         traj_lens=traj_lens,
+        traj_token_mask=traj_token_mask,
         device=q.device,
         dtype=compute_dtype,
         causal=causal,
@@ -393,6 +433,7 @@ def flextraj_flash_split_self_attention(
     n_latent: int,
     latent_lens: torch.Tensor | None = None,
     traj_lens: torch.Tensor | None = None,
+    traj_token_mask: torch.Tensor | None = None,
     dropout_p: float = 0.0,
 ) -> torch.Tensor:
     """
@@ -423,6 +464,11 @@ def flextraj_flash_split_self_attention(
         traj_lens=traj_lens,
     )
     max_vl = int(vl.max().item())
+    traj_mask = (
+        _normalize_traj_token_mask(traj_token_mask, b, n_traj, q.device)
+        if traj_token_mask is not None and n_traj > 0
+        else None
+    )
     max_vt = int(vt.max().item())
 
     out = torch.zeros_like(q)
@@ -434,17 +480,23 @@ def flextraj_flash_split_self_attention(
             vlb, vtb = int(vl[bi].item()), int(vt[bi].item())
             if vlb == 0:
                 continue
+            if traj_mask is None:
+                valid_traj_idx = torch.arange(vtb, device=q.device)
+            else:
+                valid_traj_idx = torch.nonzero(
+                    traj_mask[bi, :vtb], as_tuple=False
+                ).flatten()
             Q1 = q[bi : bi + 1, :vlb]
-            kl_len = vlb + vtb
+            kl_len = vlb + int(valid_traj_idx.numel())
             if kl_len == 0:
                 continue
             K1 = q.new_zeros(1, kl_len, h, d)
             V1 = v.new_zeros(1, kl_len, h, d)
             K1[0, :vlb] = k[bi, :vlb]
             V1[0, :vlb] = v[bi, :vlb]
-            if vtb > 0:
-                K1[0, vlb : vlb + vtb] = k[bi, n : n + vtb]
-                V1[0, vlb : vlb + vtb] = v[bi, n : n + vtb]
+            if valid_traj_idx.numel() > 0:
+                K1[0, vlb:kl_len] = k[bi, n + valid_traj_idx]
+                V1[0, vlb:kl_len] = v[bi, n + valid_traj_idx]
 
             out_l = flash_attention(
                 Q1,
@@ -462,23 +514,30 @@ def flextraj_flash_split_self_attention(
     if max_vt > 0:
         for bi in range(b):
             vtb = int(vt[bi].item())
-            if vtb == 0:
+            if traj_mask is None:
+                valid_traj_idx = torch.arange(vtb, device=q.device)
+            else:
+                valid_traj_idx = torch.nonzero(
+                    traj_mask[bi, :vtb], as_tuple=False
+                ).flatten()
+            if valid_traj_idx.numel() == 0:
                 continue
-            Qt = q[bi : bi + 1, n : n + vtb]
-            Kt = k[bi : bi + 1, n : n + vtb]
-            Vt = v[bi : bi + 1, n : n + vtb]
+            Qt = q[bi : bi + 1, n + valid_traj_idx]
+            Kt = k[bi : bi + 1, n + valid_traj_idx]
+            Vt = v[bi : bi + 1, n + valid_traj_idx]
+            vtb_valid = int(valid_traj_idx.numel())
             out_t = flash_attention(
                 Qt,
                 Kt,
                 Vt,
-                q_lens=torch.tensor([vtb], dtype=torch.int32, device=q.device),
-                k_lens=torch.tensor([vtb], dtype=torch.int32, device=q.device),
+                q_lens=torch.tensor([vtb_valid], dtype=torch.int32, device=q.device),
+                k_lens=torch.tensor([vtb_valid], dtype=torch.int32, device=q.device),
                 dropout_p=dropout_p,
                 causal=False,
                 window_size=(-1, -1),
                 dtype=fa_dtype,
             )
-            out[bi, n : n + vtb] = out_t[0, :vtb]
+            out[bi, n + valid_traj_idx] = out_t[0, :vtb_valid]
 
     qv = flextraj_query_valid(
         seq_lens,
@@ -486,6 +545,7 @@ def flextraj_flash_split_self_attention(
         L,
         latent_lens=latent_lens,
         traj_lens=traj_lens,
+        traj_token_mask=traj_token_mask,
         device=q.device,
         dtype=q.dtype,
     )
@@ -501,6 +561,7 @@ def flextraj_self_attention(
     n_latent: int,
     latent_lens: torch.Tensor | None = None,
     traj_lens: torch.Tensor | None = None,
+    traj_token_mask: torch.Tensor | None = None,
     causal: bool = False,
     dropout_p: float = 0.0,
 ) -> torch.Tensor:
@@ -526,6 +587,7 @@ def flextraj_self_attention(
             n_latent,
             latent_lens=latent_lens,
             traj_lens=traj_lens,
+            traj_token_mask=traj_token_mask,
             causal=causal,
             dropout_p=dropout_p,
         )
@@ -549,6 +611,7 @@ def flextraj_self_attention(
             n_latent,
             latent_lens=latent_lens,
             traj_lens=traj_lens,
+            traj_token_mask=traj_token_mask,
             dropout_p=dropout_p,
         )
 
@@ -567,6 +630,7 @@ def flextraj_self_attention(
             n_latent,
             latent_lens=latent_lens,
             traj_lens=traj_lens,
+            traj_token_mask=traj_token_mask,
             dropout_p=dropout_p,
         )
     return sdpa_fn(
@@ -577,6 +641,7 @@ def flextraj_self_attention(
         n_latent,
         latent_lens=latent_lens,
         traj_lens=traj_lens,
+        traj_token_mask=traj_token_mask,
         causal=causal,
         dropout_p=dropout_p,
     )

@@ -37,6 +37,25 @@ def test_flextraj_bias_allows_traj_segment_longer_than_latent_segment():
     assert bias[0, 0, 3, 0].item() < -1e30       # traj query still cannot see latent
 
 
+def test_flextraj_bias_blocks_arbitrary_invalid_traj_tokens():
+    bias, query_valid = flextraj_self_attn_bias(
+        seq_lens=torch.tensor([3]),
+        n_latent=3,
+        total_len=7,
+        latent_lens=torch.tensor([3]),
+        traj_lens=torch.tensor([4]),
+        traj_token_mask=torch.tensor([[0.0, 0.0, 1.0, 1.0]]),
+        device=torch.device("cpu"),
+    )
+
+    assert query_valid[0, :, 0].tolist() == [1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0]
+    assert bias[0, 0, 0, 3].item() < -1e30
+    assert bias[0, 0, 0, 4].item() < -1e30
+    assert bias[0, 0, 0, 5].item() == 0.0
+    assert bias[0, 0, 5, 5].item() == 0.0
+    assert bias[0, 0, 5, 3].item() < -1e30
+
+
 def test_wan_self_attention_accepts_longer_traj_segment():
     attn = WanSelfAttention(dim=12, num_heads=2).eval()
     x = torch.randn(1, 8, 12)
@@ -52,6 +71,55 @@ def test_wan_self_attention_accepts_longer_traj_segment():
     assert out.shape == (1, 8, 12)
 
 
+def test_wan_self_attention_is_invariant_to_masked_invalid_prefix_traj_tokens():
+    torch.manual_seed(123)
+    attn = WanSelfAttention(dim=12, num_heads=2).eval()
+    x_a = torch.randn(1, 7, 12)
+    x_b = x_a.clone()
+    x_b[:, 3:5] = torch.randn_like(x_b[:, 3:5]) * 1000.0
+    traj_mask = torch.tensor([[0.0, 0.0, 1.0, 1.0]])
+
+    kwargs = dict(
+        seq_lens=torch.tensor([3]),
+        grid_sizes=torch.tensor([[3, 1, 1]]),
+        freqs=_freqs_for_head_dim(6),
+        latent_pad_len=3,
+        traj_pad_len=4,
+        traj_seq_lens=torch.tensor([4]),
+        traj_token_mask=traj_mask,
+    )
+
+    with torch.no_grad():
+        out_a = attn(x_a, **kwargs)
+        out_b = attn(x_b, **kwargs)
+
+    assert torch.allclose(out_a, out_b, atol=1e-5)
+
+
+def test_wan_self_attention_without_mask_sees_invalid_prefix_traj_tokens():
+    torch.manual_seed(123)
+    attn = WanSelfAttention(dim=12, num_heads=2).eval()
+    x_a = torch.randn(1, 7, 12)
+    x_b = x_a.clone()
+    x_b[:, 3:5] = torch.randn_like(x_b[:, 3:5]) * 1000.0
+
+    kwargs = dict(
+        seq_lens=torch.tensor([3]),
+        grid_sizes=torch.tensor([[3, 1, 1]]),
+        freqs=_freqs_for_head_dim(6),
+        latent_pad_len=3,
+        traj_pad_len=4,
+        traj_seq_lens=torch.tensor([4]),
+        traj_token_mask=None,
+    )
+
+    with torch.no_grad():
+        out_a = attn(x_a, **kwargs)
+        out_b = attn(x_b, **kwargs)
+
+    assert (out_a - out_b).abs().max().item() > 1e-4
+
+
 class _CaptureBlock(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -59,12 +127,14 @@ class _CaptureBlock(torch.nn.Module):
         self.seen_latent_pad_len = None
         self.seen_traj_pad_len = None
         self.seen_traj_seq_lens = None
+        self.seen_traj_token_mask = None
 
     def forward(self, x, **kwargs):
         self.seen_len = x.shape[1]
         self.seen_latent_pad_len = kwargs.get("latent_pad_len")
         self.seen_traj_pad_len = kwargs.get("traj_pad_len")
         self.seen_traj_seq_lens = kwargs.get("traj_seq_lens")
+        self.seen_traj_token_mask = kwargs.get("traj_token_mask")
         return x
 
 
@@ -123,6 +193,23 @@ def test_wan_model_defaults_long_traj_lens_to_full_traj_length():
     assert torch.equal(block.seen_traj_seq_lens, torch.tensor([5]))
 
 
+def test_wan_model_threads_arbitrary_traj_token_mask_to_blocks():
+    model = _tiny_wan_model()
+    traj_mask = torch.tensor([[0.0, 1.0, 0.0, 1.0, 1.0]])
+    model(
+        [torch.randn(4, 3, 1, 1)],
+        torch.zeros(1),
+        [torch.randn(1, 32)],
+        seq_len=3,
+        traj_emb=torch.randn(1, 5, 8),
+        traj_seq_lens=torch.tensor([5]),
+        traj_token_mask=traj_mask,
+    )
+
+    block = model.blocks[0]
+    assert torch.equal(block.seen_traj_token_mask, traj_mask.bool())
+
+
 def test_wan_controlnet_keeps_future_traj_tokens_but_returns_latent_residuals():
     cn = WanControlNet(
         model_type="t2v",
@@ -157,3 +244,35 @@ def test_wan_controlnet_keeps_future_traj_tokens_but_returns_latent_residuals():
     assert torch.equal(block.seen_traj_seq_lens, torch.tensor([5]))
     assert len(residuals) == 1
     assert residuals[0].shape == (1, 3, 12)
+
+
+def test_wan_controlnet_threads_arbitrary_traj_token_mask_to_blocks():
+    cn = WanControlNet(
+        model_type="t2v",
+        in_dim=4,
+        dim=12,
+        ffn_dim=24,
+        freq_dim=16,
+        text_dim=32,
+        out_dim=4,
+        num_heads=2,
+        num_layers=1,
+        patch_size=(1, 1, 1),
+        text_len=4,
+        traj_enc_dim=8,
+    ).eval()
+    cn.blocks = torch.nn.ModuleList([_CaptureBlock()])
+    traj_mask = torch.tensor([[0.0, 0.0, 1.0, 1.0, 1.0]])
+
+    cn(
+        [torch.randn(4, 3, 1, 1)],
+        torch.zeros(1),
+        [torch.randn(1, 32)],
+        seq_len=3,
+        traj_emb=torch.randn(1, 5, 8),
+        traj_seq_lens=torch.tensor([5]),
+        traj_token_mask=traj_mask,
+    )
+
+    block = cn.blocks[0]
+    assert torch.equal(block.seen_traj_token_mask, traj_mask.bool())

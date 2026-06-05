@@ -210,6 +210,7 @@ class WanControlNet(nn.Module):
         latent_pad_len = None
         traj_pad_len = None
         traj_seq_lens_attn = None
+        traj_token_mask_attn = None
         if self.traj_in_proj is not None and traj_emb is not None:
             traj_t = self.traj_in_proj(traj_emb.to(dtype=x.dtype, device=x.device))
             traj_t = traj_t + self.traj_type_embed
@@ -231,6 +232,28 @@ class WanControlNet(nn.Module):
                 traj_t = traj_t * tm
             bt, tlen, _ = traj_t.shape
             traj_pad_len = max(seq_len, int(tlen))
+            if traj_token_mask is not None:
+                traj_token_mask_attn = traj_token_mask.to(
+                    device=x.device, dtype=torch.bool
+                )
+                if (
+                    traj_token_mask_attn.dim() == 3
+                    and traj_token_mask_attn.shape[-1] == 1
+                ):
+                    traj_token_mask_attn = traj_token_mask_attn[..., 0]
+                if traj_token_mask_attn.shape[1] < traj_pad_len:
+                    traj_token_mask_attn = torch.cat(
+                        [
+                            traj_token_mask_attn,
+                            traj_token_mask_attn.new_zeros(
+                                traj_token_mask_attn.shape[0],
+                                traj_pad_len - traj_token_mask_attn.shape[1],
+                            ),
+                        ],
+                        dim=1,
+                    )
+                elif traj_token_mask_attn.shape[1] > traj_pad_len:
+                    traj_token_mask_attn = traj_token_mask_attn[:, :traj_pad_len]
             if tlen < traj_pad_len:
                 traj_t = torch.cat(
                     [traj_t, traj_t.new_zeros(bt, traj_pad_len - tlen, traj_t.size(-1))],
@@ -273,6 +296,7 @@ class WanControlNet(nn.Module):
             e=e0,
             seq_lens=seq_lens,
             traj_seq_lens=traj_seq_lens_attn,
+            traj_token_mask=traj_token_mask_attn,
             grid_sizes=grid_sizes,
             freqs=self.freqs,
             context=context,

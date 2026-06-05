@@ -262,6 +262,7 @@ class WanSelfAttention(nn.Module):
         latent_pad_len=None,
         traj_pad_len=None,
         traj_seq_lens=None,
+        traj_token_mask=None,
     ):
         r"""
         Args:
@@ -310,6 +311,7 @@ class WanSelfAttention(nn.Module):
                 n_latent=latent_pad_len,
                 latent_lens=seq_lens,
                 traj_lens=traj_seq_lens,
+                traj_token_mask=traj_token_mask,
                 causal=self.causal,
             )
         else:
@@ -438,6 +440,7 @@ class WanAttentionBlock(nn.Module):
         context_lens,
         latent_pad_len=None,
         traj_pad_len=None,
+        traj_token_mask=None,
     ):
         r"""
         Args:
@@ -463,6 +466,7 @@ class WanAttentionBlock(nn.Module):
             latent_pad_len=latent_pad_len,
             traj_pad_len=traj_pad_len,
             traj_seq_lens=traj_seq_lens,
+            traj_token_mask=traj_token_mask,
         )
         with torch.amp.autocast("cuda", dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
@@ -700,6 +704,7 @@ class WanModel(ModelMixin, ConfigMixin):
         y=None,
         traj_emb=None,
         traj_seq_lens=None,
+        traj_token_mask=None,
         controlnet_residuals=None,
     ):
         r"""
@@ -752,11 +757,34 @@ class WanModel(ModelMixin, ConfigMixin):
         latent_pad_len = None
         traj_pad_len = None
         traj_seq_lens_attn = None
+        traj_token_mask_attn = None
         if self.traj_in_proj is not None and traj_emb is not None:
             traj_t = self.traj_in_proj(traj_emb.to(dtype=x.dtype))
             traj_t = traj_t + self.traj_type_embed
             bt, tlen, _ = traj_t.shape
             traj_pad_len = max(seq_len, int(tlen))
+            if traj_token_mask is not None:
+                traj_token_mask_attn = traj_token_mask.to(
+                    device=x.device, dtype=torch.bool
+                )
+                if (
+                    traj_token_mask_attn.dim() == 3
+                    and traj_token_mask_attn.shape[-1] == 1
+                ):
+                    traj_token_mask_attn = traj_token_mask_attn[..., 0]
+                if traj_token_mask_attn.shape[1] < traj_pad_len:
+                    traj_token_mask_attn = torch.cat(
+                        [
+                            traj_token_mask_attn,
+                            traj_token_mask_attn.new_zeros(
+                                traj_token_mask_attn.shape[0],
+                                traj_pad_len - traj_token_mask_attn.shape[1],
+                            ),
+                        ],
+                        dim=1,
+                    )
+                elif traj_token_mask_attn.shape[1] > traj_pad_len:
+                    traj_token_mask_attn = traj_token_mask_attn[:, :traj_pad_len]
             if tlen < traj_pad_len:
                 traj_t = torch.cat(
                     [traj_t, traj_t.new_zeros(bt, traj_pad_len - tlen, traj_t.size(-1))],
@@ -802,6 +830,7 @@ class WanModel(ModelMixin, ConfigMixin):
             e=e0,
             seq_lens=seq_lens,
             traj_seq_lens=traj_seq_lens_attn,
+            traj_token_mask=traj_token_mask_attn,
             grid_sizes=grid_sizes,
             freqs=self.freqs,
             context=context,
