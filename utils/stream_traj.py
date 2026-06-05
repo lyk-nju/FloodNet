@@ -465,3 +465,37 @@ def sample_plan_future(
         )[0]
         future = root[None, :] + (future - anchor[None, :])
     return future.astype(np.float32)
+
+
+def reanchor_stream_plan_to_xz(
+    plan: StreamTrajectoryPlan,
+    anchor_xz,
+) -> StreamTrajectoryPlan:
+    """Translate a stream plan so its local t=0 point matches ``anchor_xz``.
+
+    Delayed updates are authored at edit time but evaluated from an effective
+    timeline anchor (usually edit + delay). The body/RootRefiner boundary
+    expects plan-local t=0 to live at that effective anchor, so only the XZ
+    translation is adjusted; timestamps and relative path shape are preserved.
+    """
+    points = np.asarray(plan.points_xyz, dtype=np.float32)
+    if points.size == 0:
+        return plan
+    anchor = np.asarray(anchor_xz, dtype=np.float32).reshape(2)
+    plan_zero = sample_plan_by_time(
+        np.asarray(plan.times, dtype=np.float32),
+        points,
+        np.asarray([0.0], dtype=np.float32),
+    )[0]
+    offset = anchor - plan_zero[[0, 2]]
+    if float(np.linalg.norm(offset)) <= 1e-7:
+        return plan
+    shifted = points.copy()
+    shifted[:, [0, 2]] += offset[None, :]
+    return StreamTrajectoryPlan(
+        times=np.asarray(plan.times, dtype=np.float32).copy(),
+        points_xyz=shifted.astype(np.float32),
+        start_commit_index=int(plan.start_commit_index),
+        version=int(plan.version),
+        source=str(plan.source),
+    )

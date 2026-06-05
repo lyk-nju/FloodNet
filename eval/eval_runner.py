@@ -17,10 +17,10 @@ try:
         _slice_single_sample_batch,
         _stable_eval_seed,
     )
+    from FloodNet.eval.ldf.conditioning import prepare_ldf_eval_model_batch
     from FloodNet.utils.traj_batch import root_to_traj_feats
     from FloodNet.utils.training import (
         build_generation_eval_cfg,
-        prepare_model_input,
         ckpt_step_info,
         resolve_test_probe_tag,
     )
@@ -35,10 +35,10 @@ except ImportError:  # pragma: no cover - script entrypoints use top-level impor
         _slice_single_sample_batch,
         _stable_eval_seed,
     )
+    from eval.ldf.conditioning import prepare_ldf_eval_model_batch
     from utils.traj_batch import root_to_traj_feats
     from utils.training import (
         build_generation_eval_cfg,
-        prepare_model_input,
         ckpt_step_info,
         resolve_test_probe_tag,
     )
@@ -242,7 +242,11 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                     with module.ema.average_parameters(
                         [p for p in module.model.parameters() if p.requires_grad]
                     ):
-                        model_batch = prepare_model_input(_cap_batch)
+                        model_batch = prepare_ldf_eval_model_batch(
+                            _cap_batch,
+                            module.device,
+                            model=module.model,
+                        )
                         if _debug and run_idx == 0 and _cap_idx == 0 and sample_idx == 0:
                             _dump_eval_debug(module, model_batch, sample_seed, step_tag)
                         output = module.model.generate(model_batch)

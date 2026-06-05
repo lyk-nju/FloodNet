@@ -120,7 +120,11 @@ class TrajStreamBuffer:
         """
         from utils.local_frame import canonicalize_7d, uncanonicalize_7d
         from utils.root_plan import slice_plan_with_mask
-        from utils.token_frame import token_range_to_frame_slice, token_start_frame
+        from utils.token_frame import (
+            frame_idx_to_token_idx,
+            token_range_to_frame_slice,
+            token_start_frame,
+        )
 
         # no-traj: no active plan
         if self._active_plan is None:
@@ -131,14 +135,47 @@ class TrajStreamBuffer:
         # Step 1: plan-local offset from the HEAD state (not body anchor).
         current_plan_token = head_state.commit_idx - plan.anchor_commit_idx
         if current_plan_token < 0:
-            # plan not yet active → no-traj
             if expected_horizon_frame_slice is None:
                 raise ValueError(
                     "inactive plan / no-traj fallback requires explicit "
                     "expected_horizon_frame_slice (active-plan vs no-traj shape "
                     "consistency)"
                 )
-            return self._return_no_traj(expected_horizon_frame_slice)
+            H_frame = expected_horizon_frame_slice.stop - expected_horizon_frame_slice.start
+            if current_plan_token + int(horizon_tokens) <= 0:
+                return self._return_no_traj(expected_horizon_frame_slice)
+
+            output_start_token = frame_idx_to_token_idx(
+                expected_horizon_frame_slice.start, plan.frames_per_token,
+            )
+            anchor_output_token = output_start_token - current_plan_token
+            anchor_output_frame = token_start_frame(
+                anchor_output_token, plan.frames_per_token,
+            )
+            prefix_frames = max(
+                0,
+                min(H_frame, anchor_output_frame - expected_horizon_frame_slice.start),
+            )
+            suffix_frames = max(0, H_frame - prefix_frames)
+            traj_body_local, traj_mask_frame = self._return_no_traj(
+                expected_horizon_frame_slice,
+            )
+            if suffix_frames <= 0:
+                return traj_body_local, traj_mask_frame
+
+            traj_plan_local, suffix_mask = slice_plan_with_mask(
+                plan,
+                frame_slice=slice(0, suffix_frames),
+                hold_last_on_overflow=True,
+            )
+            traj_world = uncanonicalize_7d(
+                traj_plan_local, plan.anchor_world_xz, plan.anchor_world_yaw)
+            anchor_xz = body_anchor_state.world_xz.to(device=self._device, dtype=self._dtype)
+            anchor_yaw = body_anchor_state.world_yaw.to(device=self._device, dtype=self._dtype)
+            traj_body_local[prefix_frames:] = canonicalize_7d(
+                traj_world, anchor_xz, anchor_yaw)
+            traj_mask_frame[prefix_frames:] = suffix_mask
+            return traj_body_local, traj_mask_frame
 
         # Step 2a: output frame count H_frame (body-window space, shape only).
         # ⚠ fallback uses token_range_to_frame_slice length (= 4*H for an

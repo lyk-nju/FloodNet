@@ -34,6 +34,7 @@ from torch.utils.data import DataLoader
 from torch_ema import ExponentialMovingAverage
 
 from metrics.t2m import T2MMetrics
+from eval.ldf.conditioning import prepare_ldf_eval_model_batch
 from eval.eval_runner import run_inline_generation_eval
 from eval.eval_summary import process_inline_generation_results
 from utils.initialize import (
@@ -436,7 +437,7 @@ class CustomLightningModule(BasicLightningModule):
         cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         try:
             with self.ema.average_parameters([p for p in self.model.parameters() if p.requires_grad]):
-                model_batch = prepare_model_input(batch)
+                model_batch = prepare_ldf_eval_model_batch(batch, self.device, model=self.model)
                 output = self.model.generate(model_batch)
         finally:
             torch.random.set_rng_state(cpu_state)

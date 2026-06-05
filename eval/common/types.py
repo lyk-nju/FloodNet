@@ -76,3 +76,99 @@ class MetricResult:
                 key: str(value) for key, value in self.artifacts.items()
             },
         }
+
+
+@dataclass(frozen=True, slots=True)
+class EvalPathSpec:
+    """Stable description of one eval generation path."""
+
+    name: str
+    description: str = ""
+    enabled_by_default: bool = True
+    tags: tuple[str, ...] = ()
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "name": str(self.name),
+            "description": str(self.description),
+            "enabled_by_default": bool(self.enabled_by_default),
+            "tags": [str(tag) for tag in self.tags],
+            "metadata": dict(self.metadata),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class EvalEvent:
+    """Dataset-independent eval event used by runtime-style suites."""
+
+    event_type: str
+    submit_commit: int
+    effective_commit: int
+    route_version: int | None = None
+    text_version: int | None = None
+    payload: Mapping[str, Any] = field(default_factory=dict)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "event_type": str(self.event_type),
+            "submit_commit": int(self.submit_commit),
+            "effective_commit": int(self.effective_commit),
+            "route_version": (
+                None if self.route_version is None else int(self.route_version)
+            ),
+            "text_version": (
+                None if self.text_version is None else int(self.text_version)
+            ),
+            "payload": dict(self.payload),
+            "metadata": dict(self.metadata),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class EvalCase:
+    """Serializable case boundary shared by RootRefiner, LDF, and runtime eval."""
+
+    suite_name: str
+    case_id: str
+    dataset: str = ""
+    sample_id: str = ""
+    path_names: tuple[str, ...] = ()
+    events: tuple[EvalEvent, ...] = ()
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "suite_name": str(self.suite_name),
+            "case_id": str(self.case_id),
+            "dataset": str(self.dataset),
+            "sample_id": str(self.sample_id),
+            "path_names": [str(name) for name in self.path_names],
+            "events": [event.to_metadata() for event in self.events],
+            "metadata": dict(self.metadata),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class EvalRunResult:
+    """Serializable result boundary for one evaluated case."""
+
+    suite_name: str
+    case_id: str
+    metrics: Mapping[str, Any] = field(default_factory=dict)
+    artifacts: Mapping[str, str | Path] = field(default_factory=dict)
+    events: tuple[EvalEvent, ...] = ()
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return {
+            "suite_name": str(self.suite_name),
+            "case_id": str(self.case_id),
+            "metrics": dict(self.metrics),
+            "artifacts": {
+                key: str(value) for key, value in self.artifacts.items()
+            },
+            "events": [event.to_metadata() for event in self.events],
+            "metadata": dict(self.metadata),
+        }

@@ -9,7 +9,7 @@ import torch
 
 from utils.inference_glue import InferenceGlueState
 from utils.root_plan import RootPlan
-from utils.token_frame import num_frames_for_tokens, token_start_frame
+from utils.token_frame import num_frames_for_tokens, token_range_to_frame_slice, token_start_frame
 from utils.traj_stream_buffer import TrajStreamBuffer
 
 
@@ -206,9 +206,30 @@ def test_B08_inactive_plan_no_traj():
         buf.get_body_traj_cond(head_state=_state(20), body_anchor_state=_state(10),
                                horizon_tokens=20)   # needs expected slice
     cond, mask = buf.get_body_traj_cond(
-        head_state=_state(20), body_anchor_state=_state(10), horizon_tokens=20,
-        expected_horizon_frame_slice=slice(0, 77))
+        head_state=_state(20), body_anchor_state=_state(10), horizon_tokens=5,
+        expected_horizon_frame_slice=token_range_to_frame_slice(20, 5))
     assert not mask.any()
+
+
+def test_B08b_future_anchor_partially_masks_until_plan_anchor():
+    wp = torch.zeros(200, 7)
+    wp[:, 0] = torch.arange(200, dtype=torch.float32)
+    wp[:, 3] = 1.0
+    buf = _buf()
+    buf.set_root_plan(_plan(valid_frames=200, anchor_commit_idx=30, wp=wp))
+
+    cond, mask = buf.get_body_traj_cond(
+        head_state=_state(20),
+        body_anchor_state=_state(20),
+        horizon_tokens=20,
+        expected_horizon_frame_slice=token_range_to_frame_slice(20, 20),
+    )
+
+    prefix_frames = token_start_frame(30) - token_start_frame(20)
+    assert prefix_frames > 0
+    assert not mask[:prefix_frames].any()
+    assert mask[prefix_frames:].all()
+    assert float(cond[prefix_frames, 0]) == 0.0
 
 
 # ---------------------------------------------------------------------------
