@@ -268,8 +268,14 @@ def safe_precision(accelerator: str, precision, *, cuda_available: bool):
     return precision
 
 
-def _build_one_dataset(cfg: dict, split_file: str, *, seed: int | None = None,
-                       randomize_caption: bool = True):
+def _build_one_dataset(
+    cfg: dict,
+    split_file: str,
+    *,
+    seed: int | None = None,
+    randomize_caption: bool = True,
+    validation_dense_full: bool = False,
+):
     """Build one RootRefiner dataset split."""
     from scripts.compute_5d_stats import load_clips_from_dir
 
@@ -305,6 +311,20 @@ def _build_one_dataset(cfg: dict, split_file: str, *, seed: int | None = None,
         "target",
         "datasets.humanml3d_refiner.HumanML3DRefinerDataset",
     )
+    full_plan_ratio = sampling_cfg.get("full_plan_ratio", 0.5)
+    horizon_policy = sampling_cfg.get("horizon_policy", "random")
+    path_condition_policy = path_condition_cfg.get("policy", "dense_path")
+    path_condition_ratios = path_condition_cfg.get("ratios")
+    offset_start_enabled = bool(offset_cfg.get("enabled", False))
+    offset_start_prob = float(offset_cfg.get("prob", 0.0))
+    if validation_dense_full:
+        full_plan_ratio = 1.0
+        horizon_policy = "max"
+        path_condition_policy = "dense_path"
+        path_condition_ratios = None
+        offset_start_enabled = False
+        offset_start_prob = 0.0
+
     return instantiate(
         target=dataset_target,
         cfg=None,
@@ -315,12 +335,12 @@ def _build_one_dataset(cfg: dict, split_file: str, *, seed: int | None = None,
         max_tokens=model_cfg["max_tokens"],
         min_tokens=model_cfg["min_tokens"],
         frames_per_token=model_cfg["frames_per_token"],
-        full_plan_ratio=sampling_cfg.get("full_plan_ratio", 0.5),
-        horizon_policy=sampling_cfg.get("horizon_policy", "random"),
-        path_condition_policy=path_condition_cfg.get("policy", "dense_path"),
-        path_condition_ratios=path_condition_cfg.get("ratios"),
-        offset_start_enabled=bool(offset_cfg.get("enabled", False)),
-        offset_start_prob=float(offset_cfg.get("prob", 0.0)),
+        full_plan_ratio=full_plan_ratio,
+        horizon_policy=horizon_policy,
+        path_condition_policy=path_condition_policy,
+        path_condition_ratios=path_condition_ratios,
+        offset_start_enabled=offset_start_enabled,
+        offset_start_prob=offset_start_prob,
         offset_start_max_frames=int(offset_cfg.get("max_frames", 40)),
         offset_start_apply_to=tuple(
             offset_cfg.get("apply_to", ("dense_path", "sparse_path"))
@@ -342,7 +362,13 @@ def build_datasets(cfg: dict, seed: int | None = None):
     val_split = data_cfg.get("val_split_file")
     train_ds = _build_one_dataset(cfg, train_split, seed=seed)
     val_ds = (
-        _build_one_dataset(cfg, val_split, seed=0, randomize_caption=False)
+        _build_one_dataset(
+            cfg,
+            val_split,
+            seed=0,
+            randomize_caption=False,
+            validation_dense_full=True,
+        )
         if val_split
         else None
     )

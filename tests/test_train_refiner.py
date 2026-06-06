@@ -135,6 +135,52 @@ def test_build_datasets_returns_train_and_val(tmp_path):
     assert val_ds is not None and len(val_ds) == 2
 
 
+def test_build_datasets_forces_validation_dense_full_sequence(tmp_path):
+    from train_refiner import build_datasets
+
+    _make_fake_humanml3d(tmp_path, ["t1"], ["v1"])
+    cfg = _tiny_cfg()
+    cfg["data"] = {
+        "raw_data_dir": str(tmp_path),
+        "dataset": "humanml3d",
+        "train_split_file": "train.txt",
+        "val_split_file": "val.txt",
+        "feature_path": "new_joint_vecs",
+        "text_path": "texts",
+    }
+    cfg["sampling"] = {
+        "full_plan_ratio": 0.0,
+        "horizon_policy": "random",
+        "path_condition": {
+            "policy": "goal_point",
+            "offset_start": {
+                "enabled": True,
+                "prob": 1.0,
+                "max_frames": 8,
+                "apply_to": ["dense_path", "sparse_path", "goal_point"],
+            },
+        },
+    }
+
+    train_ds, val_ds = build_datasets(cfg, seed=0)
+    assert train_ds.path_condition_policy == "goal_point"
+    assert train_ds.full_plan_ratio == 0.0
+    assert train_ds.num_token_policy == "random"
+    assert val_ds is not None
+    assert val_ds.path_condition_policy == "dense_path"
+    assert val_ds.full_plan_ratio == 1.0
+    assert val_ds.num_token_policy == "max"
+    assert val_ds.offset_start_enabled is False
+
+    sample = val_ds[0]
+    assert sample["mode"] == "full"
+    assert sample["path_mode"] == "dense_path"
+    assert sample["offset_start_frames"].item() == 0
+    assert sample["num_tokens"].item() == val_ds.max_tokens
+    assert sample["waypoints_mask"].sum().item() == val_ds.max_frames
+    assert sample["path_supervision_mask"].sum().item() == val_ds.max_frames
+
+
 def test_module_raises_when_no_encoder_and_no_debug_stub():
     """Real-training guard: without an explicit encoder and without
     text_encoder.debug_stub, init must raise (not silently use the stub)."""
