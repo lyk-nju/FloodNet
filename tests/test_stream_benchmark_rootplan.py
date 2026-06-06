@@ -11,6 +11,7 @@ from eval.runtime.benchmark import (
     _csv_safe_record,
     _run_babel,
     _run_turn,
+    _write_runtime_case_visuals,
     aggregate_runtime_records,
     build_eval_root_plan_from_points,
     build_rootplan_stream_step_payload,
@@ -517,6 +518,28 @@ def test_aggregate_runtime_records_groups_checkpoint_selection_metrics():
     assert summary["by_suite"]["humanml3d_control"]["ADE_mean"] == 2.0
     assert summary["by_mode"]["gt_traj"]["FDE_mean"] == 2.0
     assert summary["by_suite_mode"]["route_edit/replace_future"]["ADE_mean"] == 5.0
+
+
+def test_runtime_case_visuals_write_static_path_and_yaw_plots(tmp_path):
+    frames = 8
+    pred_root = np.zeros((frames, 3), dtype=np.float32)
+    target_root = np.zeros((frames, 3), dtype=np.float32)
+    pred_root[:, 2] = np.arange(frames, dtype=np.float32) * 0.12
+    target_root[:, 2] = np.arange(frames, dtype=np.float32) * 0.10
+    motion = np.zeros((frames, 263), dtype=np.float32)
+    motion[:, 2] = pred_root[:, 2]
+
+    _write_runtime_case_visuals(
+        output_dir=tmp_path,
+        case_name="case_a",
+        pred_root=pred_root,
+        target_root=target_root,
+        motion_263=motion,
+        split_tok=1,
+    )
+
+    assert (tmp_path / "case_a_plot_world_xz.png").is_file()
+    assert (tmp_path / "case_a_plot_yaw.png").is_file()
 
 
 class _FakeStreamModel:

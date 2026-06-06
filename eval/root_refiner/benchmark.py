@@ -35,16 +35,25 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from eval.common.artifacts import ensure_dir, write_eval_json  # noqa: E402
+from eval.common.visualization import (  # noqa: E402
+    plot_xz_trajectories,
+    plot_yaw_series,
+    yaw_from_7d,
+)
 from eval.common.json import json_sanitize, write_json_strict  # noqa: E402
 from eval.root_refiner.adapters import (  # noqa: E402
     DURATION_GROUNDTRUTH,
     DURATION_PRED,
+    ROOT_REFINER_ARTIFACT_NAMES,
+    build_root_refiner_sample_metadata,
     normalize_duration_mode,
 )
 from eval.root_refiner.metrics import (  # noqa: E402
@@ -340,6 +349,208 @@ def validate_ckpt_eval_config_compatible(ckpt_cfg: dict, eval_cfg: dict) -> None
         )
 
 
+def _as_cpu_tensor(value) -> torch.Tensor:
+    if torch.is_tensor(value):
+        return value.detach().cpu()
+    return torch.as_tensor(value).detach().cpu()
+
+
+def _valid_rows(value, mask=None) -> np.ndarray:
+    arr = _as_cpu_tensor(value).numpy()
+    if mask is None:
+        return arr
+    m = _as_cpu_tensor(mask).bool().numpy().reshape(-1)
+    if arr.shape[0] != m.shape[0]:
+        return arr
+    return arr[m]
+
+
+def _path_mode_to_artifact_route_mode(path_mode: str | None) -> str:
+    mapping = {
+        "dense_path": "dense_gt",
+        "sparse_path": "sparse_gt",
+        "goal_point": "user_polyline",
+        None: "dense_gt",
+        "mixed": "dense_gt",
+    }
+    return mapping.get(path_mode, "user_polyline")
+
+
+def _denormalize_path_xz(path_xz, wp_mean, wp_std, wp_norm_idx) -> torch.Tensor:
+    out = _as_cpu_tensor(path_xz).float().clone()
+    if wp_mean is None or wp_std is None or wp_norm_idx is None:
+        return out
+    mean = _as_cpu_tensor(wp_mean).float()
+    std = _as_cpu_tensor(wp_std).float().clamp(min=1e-6)
+    idx_set = set(_as_cpu_tensor(wp_norm_idx).long().tolist())
+    if 0 in idx_set and out.shape[-1] >= 1:
+        out[..., 0] = out[..., 0] * std[0] + mean[0]
+    if 2 in idx_set and out.shape[-1] >= 2:
+        out[..., 1] = out[..., 1] * std[2] + mean[2]
+    return out
+
+
+def _sample_anchor_world(sample: dict) -> tuple[list[float], float]:
+    xz = sample.get("anchor_xz_world", None)
+    yaw = sample.get("anchor_yaw_world", None)
+    if xz is None:
+        anchor_xz = [0.0, 0.0]
+    else:
+        anchor_arr = _as_cpu_tensor(xz).float().reshape(-1)
+        anchor_xz = [float(anchor_arr[0].item()), float(anchor_arr[1].item())]
+    anchor_yaw = 0.0 if yaw is None else float(_as_cpu_tensor(yaw).float().item())
+    return anchor_xz, anchor_yaw
+
+
+def _pred_duration_mask(model, used_tokens: int, mask_len: int) -> torch.Tensor:
+    valid_eff = int(model.frames_per_token) * int(used_tokens) - (
+        int(model.frames_per_token) - 1
+    )
+    return torch.arange(mask_len, dtype=torch.long) < max(0, int(valid_eff))
+
+
+def _rootplan_artifact_payload(
+    root_7d,
+    *,
+    duration_mode: str,
+    valid_mask,
+    pred_num_tokens: int,
+    frames_per_token: int,
+    source: str,
+    anchor_world_xz: list[float],
+    anchor_world_yaw: float,
+) -> dict:
+    root = _valid_rows(root_7d, valid_mask)
+    return {
+        "schema_version": "root_refiner_rootplan_artifact.v1",
+        "duration_mode": normalize_duration_mode(duration_mode),
+        "source": str(source),
+        "coordinate_frame": "anchor_local",
+        "frames_per_token": int(frames_per_token),
+        "pred_num_tokens": int(pred_num_tokens),
+        "valid_frames": int(root.shape[0]),
+        "anchor_commit_idx": 0,
+        "anchor_world_xz": [float(anchor_world_xz[0]), float(anchor_world_xz[1])],
+        "anchor_world_yaw": float(anchor_world_yaw),
+        "waypoints_local_7d": root.astype(np.float32).tolist(),
+    }
+
+
+def _write_root_refiner_sample_artifacts(
+    sample_dir: str | Path,
+    *,
+    sample: dict,
+    sample_id: str,
+    metrics: dict,
+    pred_by_duration: dict[str, dict],
+    gt_root_7d: torch.Tensor,
+    gt_mask: torch.Tensor,
+    frames_per_token: int,
+    wp_mean=None,
+    wp_std=None,
+    wp_norm_idx=None,
+) -> None:
+    out = ensure_dir(sample_dir)
+    shared_names = ROOT_REFINER_ARTIFACT_NAMES["shared"]
+
+    path_physical = _denormalize_path_xz(
+        sample.get("path", torch.zeros(0, 2)),
+        wp_mean,
+        wp_std,
+        wp_norm_idx,
+    )
+    path_valid_mask = _as_cpu_tensor(
+        sample.get(
+            "path_valid_mask",
+            torch.ones(path_physical.shape[0], dtype=torch.bool),
+        )
+    ).bool()
+    path_control_mask = _as_cpu_tensor(
+        sample.get(
+            "path_control_mask",
+            torch.zeros(path_physical.shape[0], dtype=torch.bool),
+        )
+    ).bool()
+    route_input = _valid_rows(path_physical, path_valid_mask)
+    route_valid_mask = _valid_rows(path_valid_mask, path_valid_mask).astype(bool)
+    route_control_mask = _valid_rows(path_control_mask, path_valid_mask).astype(bool)
+    np.save(out / "route_input.npy", route_input.astype(np.float32))
+    np.save(out / "route_valid_mask.npy", route_valid_mask)
+    np.save(out / "route_control_mask.npy", route_control_mask)
+    np.save(out / "gt_root_7d.npy", _valid_rows(gt_root_7d, gt_mask).astype(np.float32))
+
+    path_mode = str(sample.get("path_mode", "dense_path"))
+    offset_frame = _to_int(sample.get("offset_start_frames"), default=0)
+    frames_per_token_i = int(frames_per_token)
+    offset_token = offset_frame // max(1, frames_per_token_i)
+    anchor_frame = _to_int(sample.get("anchor_frame"), default=0)
+    gt_slice_start = anchor_frame
+    gt_slice_end = gt_slice_start + int(_as_cpu_tensor(gt_mask).bool().sum().item())
+    anchor_world_xz, anchor_world_yaw = _sample_anchor_world(sample)
+    metadata = build_root_refiner_sample_metadata(
+        sample_id=sample_id,
+        route_mode=_path_mode_to_artifact_route_mode(path_mode),
+        duration_mode=str(metrics.get("duration_mode", DURATION_PRED)),
+        offset_frame=offset_frame,
+        offset_token=offset_token,
+        anchor_world_xz=anchor_world_xz,
+        anchor_world_yaw=anchor_world_yaw,
+        gt_slice_start=gt_slice_start,
+        gt_slice_end=gt_slice_end,
+        extra={
+            "path_mode": path_mode,
+            "mode": sample.get("mode"),
+            "text": sample.get("text"),
+            "gt_num_tokens": int(metrics.get("gt_num_tokens", 0)),
+        },
+    )
+    write_eval_json(out / shared_names["metadata"], metadata)
+    write_eval_json(out / shared_names["metrics"], metrics)
+
+    xz_series: dict[str, object] = {
+        "route_input": route_input,
+        "gt_root": _valid_rows(gt_root_7d, gt_mask),
+    }
+    yaw_series: dict[str, object] = {"gt_yaw": yaw_from_7d(_valid_rows(gt_root_7d, gt_mask))}
+
+    for duration, pred_payload in pred_by_duration.items():
+        names = ROOT_REFINER_ARTIFACT_NAMES[duration]
+        root = _as_cpu_tensor(pred_payload["root_7d"]).float()
+        mask = _as_cpu_tensor(pred_payload["mask"]).bool()
+        pred_num_tokens = int(pred_payload["pred_num_tokens"])
+        valid_root = _valid_rows(root, mask)
+        np.save(out / names["pred_root_7d"], valid_root.astype(np.float32))
+        write_eval_json(
+            out / names["rootplan"],
+            _rootplan_artifact_payload(
+                root,
+                duration_mode=duration,
+                valid_mask=mask,
+                pred_num_tokens=pred_num_tokens,
+                frames_per_token=frames_per_token_i,
+                source="root_refiner_benchmark",
+                anchor_world_xz=anchor_world_xz,
+                anchor_world_yaw=anchor_world_yaw,
+            ),
+        )
+        xz_series[duration] = valid_root
+        yaw_series[f"{duration}_yaw"] = yaw_from_7d(valid_root)
+
+    plot_xz_trajectories(
+        out / shared_names["plot_xz"],
+        xz_series,
+        point_series={
+            "route_control": route_input[route_control_mask],
+        },
+        title=f"RootRefiner {sample_id}",
+    )
+    plot_yaw_series(
+        out / shared_names["plot_yaw"],
+        yaw_series,
+        title=f"RootRefiner {sample_id}",
+    )
+
+
 @torch.no_grad()
 def run_benchmark(
     model,
@@ -352,6 +563,8 @@ def run_benchmark(
     force_path_mode: str | None = None,
     force_no_path_aug: bool = True,
     task_specs: list[dict] | None = None,
+    artifact_dir: str | Path | None = None,
+    artifact_max_samples: int = 0,
 ) -> dict:
     """Run inference over `dataset` and aggregate the metric suite.
 
@@ -391,6 +604,7 @@ def run_benchmark(
         n = len(task_specs)
 
     per_sample = []
+    artifact_count = 0
 
     for spec in task_specs:
         idx = int(spec["idx"])
@@ -408,58 +622,59 @@ def run_benchmark(
             force_anchor_frame=spec.get("anchor_frame"),
         )
         text_emb = text_encoder.encode([sample["text"]], device=device)
-        # groundtruth_duration: teacher-force the GT horizon so trajectory
-        # metrics isolate the waypoint decoder. The model honors num_tokens when
-        # given, regardless of eval mode; see RootRefiner.forward.
-        oracle_nt = (
-            sample["num_tokens"].reshape(1).to(device)
-            if use_groundtruth_duration
-            else None
-        )
-        out = model(
-            text_emb=text_emb,
-            path=sample["path"].unsqueeze(0).to(device),
-            path_valid_mask=sample["path_valid_mask"].unsqueeze(0).to(device),
-            path_control_mask=sample["path_control_mask"].unsqueeze(0).to(device),
-            path_mode=[sample.get("path_mode", "dense_path")],
-            path_features=sample["path_features"].unsqueeze(0).to(device),
-            history_motion=sample["history_motion"].unsqueeze(0).to(device),
-            history_mask=sample["history_mask"].unsqueeze(0).to(device),
-            offset_start_frames=sample.get(
-                "offset_start_frames",
-                torch.tensor(0, dtype=torch.long),
-            ).reshape(1).to(device),
-            num_tokens=oracle_nt,
-        )
-        logits = out["num_token_logits"][0]                  # [K]
-        # Model emits NORMALIZED 5D. Assemble physical 7D at the boundary
-        # (unnormalize xyz → unit heading → append fwd_delta / yaw_delta) so
-        # metrics are computed in physical space. GT `target_waypoints` is
-        # PHYSICAL-then-z-scored, so unnormalize its xyz the same way and
-        # re-derive its deltas (do NOT trust target_wp[..., 5:7] — those are
-        # z-scored physical deltas that would mismatch the freshly-derived
-        # physical pred deltas in scale and offset).
         from utils.motion_process import build_physical_7d_from_normalized_5d
         wp_mean = getattr(dataset, "_wp_mean", None)
         wp_std = getattr(dataset, "_wp_std", None)
         wp_norm_idx = getattr(dataset, "_wp_norm_idx", None)
-        pred_wp = build_physical_7d_from_normalized_5d(
-            out["waypoints"][0].cpu(), wp_mean, wp_std, wp_norm_idx,
-        )                                                    # [max_frames, 7] physical
+
+        def _forward_duration(mode_name: str) -> tuple[dict, torch.Tensor, torch.Tensor]:
+            teacher_num_tokens = (
+                sample["num_tokens"].reshape(1).to(device)
+                if mode_name == DURATION_GROUNDTRUTH
+                else None
+            )
+            output = model(
+                text_emb=text_emb,
+                path=sample["path"].unsqueeze(0).to(device),
+                path_valid_mask=sample["path_valid_mask"].unsqueeze(0).to(device),
+                path_control_mask=sample["path_control_mask"].unsqueeze(0).to(device),
+                path_mode=[sample.get("path_mode", "dense_path")],
+                path_features=sample["path_features"].unsqueeze(0).to(device),
+                history_motion=sample["history_motion"].unsqueeze(0).to(device),
+                history_mask=sample["history_mask"].unsqueeze(0).to(device),
+                offset_start_frames=sample.get(
+                    "offset_start_frames",
+                    torch.tensor(0, dtype=torch.long),
+                ).reshape(1).to(device),
+                num_tokens=teacher_num_tokens,
+            )
+            # Model emits NORMALIZED 5D. Assemble physical 7D at the boundary
+            # (unnormalize xyz → unit heading → append fwd_delta / yaw_delta) so
+            # metrics are computed in physical space.
+            pred_root = build_physical_7d_from_normalized_5d(
+                output["waypoints"][0].cpu(), wp_mean, wp_std, wp_norm_idx,
+            )
+            used_tokens = int(output["used_num_tokens"][0].detach().cpu().item())
+            valid_mask = (
+                _as_cpu_tensor(sample.get("target_mask", sample.get("waypoints_mask"))).bool()
+                if mode_name == DURATION_GROUNDTRUTH
+                else _pred_duration_mask(model, used_tokens, pred_root.shape[0])
+            )
+            return output, pred_root, valid_mask
+
+        out, pred_wp, duration_mask = _forward_duration(duration_mode_resolved)
+        logits = out["num_token_logits"][0]                  # [K]
+        # GT `target_waypoints` is PHYSICAL-then-z-scored, so unnormalize its xyz
+        # the same way and re-derive its deltas.
         gt_source = sample.get("target_waypoints", sample.get("waypoints"))
         gt5_norm = gt_source[..., :5]
         gt_wp = build_physical_7d_from_normalized_5d(
             gt5_norm, wp_mean, wp_std, wp_norm_idx,
         )                                                    # [max_frames, 7] physical
-        mask = sample.get("target_mask", sample.get("waypoints_mask"))
+        gt_mask = _as_cpu_tensor(sample.get("target_mask", sample.get("waypoints_mask"))).bool()
+        mask = duration_mask
         if not use_groundtruth_duration:
-            used_tokens = int(out["used_num_tokens"][0].detach().cpu().item())
-            valid_eff = (
-                model.frames_per_token * used_tokens
-                - (model.frames_per_token - 1)
-            )
-            common = torch.arange(mask.shape[0]) < int(valid_eff)
-            mask = mask.bool() & common
+            mask = gt_mask & duration_mask.bool()
 
         # num_token metrics.
         gt_class = int(sample["num_tokens"].item()) - min_tokens
@@ -481,7 +696,51 @@ def run_benchmark(
         m["pred_num_tokens"] = pred_num_tokens
         m["argmax_num_tokens"] = pred_class + min_tokens
         m["gt_num_tokens"] = gt_class + min_tokens
+        m["duration_mode"] = duration_mode_resolved
         per_sample.append(m)
+
+        if artifact_dir is not None and (
+            int(artifact_max_samples) <= 0 or artifact_count < int(artifact_max_samples)
+        ):
+            used_num_tokens = int(out["used_num_tokens"][0].detach().cpu().item())
+            pred_by_duration = {
+                duration_mode_resolved: {
+                    "root_7d": pred_wp,
+                    "mask": (
+                        duration_mask
+                        if duration_mode_resolved == DURATION_PRED
+                        else gt_mask
+                    ),
+                    "pred_num_tokens": used_num_tokens,
+                }
+            }
+            for extra_duration in (DURATION_PRED, DURATION_GROUNDTRUTH):
+                if extra_duration in pred_by_duration:
+                    continue
+                extra_out, extra_wp, extra_mask = _forward_duration(extra_duration)
+                extra_pred_num_tokens = int(
+                    extra_out["used_num_tokens"][0].detach().cpu().item()
+                )
+                pred_by_duration[extra_duration] = {
+                    "root_7d": extra_wp,
+                    "mask": extra_mask,
+                    "pred_num_tokens": extra_pred_num_tokens,
+                }
+            sample_id = f"sample_{artifact_count:06d}"
+            _write_root_refiner_sample_artifacts(
+                Path(artifact_dir) / sample_id,
+                sample=sample,
+                sample_id=sample_id,
+                metrics=m,
+                pred_by_duration=pred_by_duration,
+                gt_root_7d=gt_wp,
+                gt_mask=gt_mask,
+                frames_per_token=int(model.frames_per_token),
+                wp_mean=wp_mean,
+                wp_std=wp_std,
+                wp_norm_idx=wp_norm_idx,
+            )
+            artifact_count += 1
 
     summary = summarize_per_sample(
         per_sample,
@@ -596,6 +855,8 @@ def run_suite_benchmark(
     max_samples: int = -1,
     duration_mode: str | None = None,
     oracle_duration: bool = False,
+    artifact_dir: str | Path | None = None,
+    artifact_max_samples: int = 0,
 ) -> dict:
     suite_cfg = resolve_suite_config(suite)
     duration_mode_resolved = resolve_suite_duration_mode(
@@ -620,6 +881,10 @@ def run_suite_benchmark(
             force_path_mode=path_mode,
             force_no_path_aug=suite_cfg.force_no_path_aug,
             task_specs=task_specs,
+            artifact_dir=(
+                Path(artifact_dir) / label if artifact_dir is not None else None
+            ),
+            artifact_max_samples=artifact_max_samples,
         )
         run_samples = []
         for sample in run["per_sample"]:
@@ -739,6 +1004,18 @@ def main(argv=None):
         default=None,
         help="Optional layered eval suite. Omit to preserve legacy single-pass behavior.",
     )
+    parser.add_argument(
+        "--save_artifacts",
+        action="store_true",
+        default=False,
+        help="Save per-sample RootRefiner route/root/plot artifacts under output_dir/samples.",
+    )
+    parser.add_argument(
+        "--artifact_max_samples",
+        type=int,
+        default=20,
+        help="Maximum per-run artifact samples when --save_artifacts is set; <=0 means all.",
+    )
     args = parser.parse_args(argv)
 
     from datasets.humanml3d_refiner import HumanML3DRefinerDataset as RefinerDataset
@@ -781,12 +1058,19 @@ def main(argv=None):
             max_samples=args.max_samples,
             duration_mode=args.duration_mode,
             oracle_duration=args.oracle_duration,
+            artifact_dir=Path(args.output_dir) / "samples" if args.save_artifacts else None,
+            artifact_max_samples=args.artifact_max_samples,
         )
     else:
         result = run_benchmark(model, dataset, text_encoder, device=args.device,
                                 max_samples=args.max_samples,
                                 oracle_duration=args.oracle_duration,
-                                duration_mode=args.duration_mode)
+                                duration_mode=args.duration_mode,
+                                artifact_dir=(
+                                    Path(args.output_dir) / "samples"
+                                    if args.save_artifacts else None
+                                ),
+                                artifact_max_samples=args.artifact_max_samples)
     write_report(result, args.output_dir)
     print(json.dumps(result["summary"], indent=2))
 

@@ -12,11 +12,13 @@ from __future__ import annotations
 import json
 import math
 
+import numpy as np
 import pytest
 import torch
 
 from datasets.humanml3d_refiner import HumanML3DRefinerDataset as RefinerDataset
 from eval.root_refiner.benchmark import (
+    _write_root_refiner_sample_artifacts,
     build_eval_task_specs,
     build_refiner_dataset_from_clips,
     compute_sample_metrics,
@@ -25,6 +27,11 @@ from eval.root_refiner.benchmark import (
     run_suite_benchmark,
     validate_ckpt_eval_config_compatible,
     write_report,
+)
+from eval.root_refiner.adapters import (
+    DURATION_GROUNDTRUTH,
+    DURATION_PRED,
+    ROOT_REFINER_ARTIFACT_NAMES,
 )
 from models.root_refiner import RootRefiner
 from train_refiner import FrozenStubTextEncoder
@@ -111,6 +118,21 @@ def _make_clip(T: int):
     return {"motion_263": motion, "text": "walk forward"}
 
 
+def _save_refiner_stats(tmp_path):
+    cm_mean = np.zeros(5, dtype=np.float32)
+    cm_std = np.ones(5, dtype=np.float32)
+    cm_idx = np.array([0, 1, 2], dtype=np.int64)
+    wp_mean = np.array([1.25, 0.0, -2.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    wp_std = np.array([2.0, 1.0, 4.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+    wp_idx = np.array([0, 1, 2], dtype=np.int64)
+    np.save(tmp_path / "current_motion_mean.npy", cm_mean)
+    np.save(tmp_path / "current_motion_std.npy", cm_std)
+    np.save(tmp_path / "current_motion_norm_indices.npy", cm_idx)
+    np.save(tmp_path / "waypoint_mean.npy", wp_mean)
+    np.save(tmp_path / "waypoint_std.npy", wp_std)
+    np.save(tmp_path / "waypoint_norm_indices.npy", wp_idx)
+
+
 def test_run_benchmark_smoke_finite_metrics_and_report(tmp_path):
     clips = [_make_clip(50) for _ in range(6)]
     ds = RefinerDataset(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
@@ -148,6 +170,226 @@ def test_run_benchmark_smoke_finite_metrics_and_report(tmp_path):
     with (tmp_path / "summary.json").open() as f:
         loaded = json.load(f)
     assert loaded["n_samples"] == 6
+
+
+def test_run_benchmark_writes_root_refiner_sample_artifacts(tmp_path):
+    clips = [_make_clip(50) for _ in range(3)]
+    ds = RefinerDataset(
+        clips,
+        n_hist=8,
+        n_path=16,
+        max_tokens=8,
+        min_tokens=2,
+        full_plan_ratio=1.0,
+        seed=0,
+    )
+    model = RootRefiner(
+        d_model=32,
+        n_layers=2,
+        n_heads=4,
+        ff_dim=64,
+        max_tokens=8,
+        min_tokens=2,
+        n_hist=8,
+        n_path=16,
+        text_emb_dim=16,
+        dropout=0.0,
+        path_features_dim=5,
+    )
+    text_encoder = FrozenStubTextEncoder(emb_dim=16)
+    artifact_dir = tmp_path / "samples"
+
+    result = run_benchmark(
+        model,
+        ds,
+        text_encoder,
+        device="cpu",
+        max_samples=2,
+        artifact_dir=artifact_dir,
+        artifact_max_samples=1,
+    )
+
+    assert result["summary"]["n_samples"] == 2
+    sample_dir = artifact_dir / "sample_000000"
+    shared = ROOT_REFINER_ARTIFACT_NAMES["shared"]
+    assert (sample_dir / "route_input.npy").is_file()
+    assert (sample_dir / "gt_root_7d.npy").is_file()
+    assert (sample_dir / shared["metadata"]).is_file()
+    assert (sample_dir / shared["metrics"]).is_file()
+    assert (sample_dir / shared["plot_xz"]).is_file()
+    assert (sample_dir / shared["plot_yaw"]).is_file()
+    assert (
+        sample_dir
+        / ROOT_REFINER_ARTIFACT_NAMES[DURATION_PRED]["pred_root_7d"]
+    ).is_file()
+    assert (
+        sample_dir
+        / ROOT_REFINER_ARTIFACT_NAMES[DURATION_GROUNDTRUTH]["pred_root_7d"]
+    ).is_file()
+    assert (
+        sample_dir / ROOT_REFINER_ARTIFACT_NAMES[DURATION_PRED]["rootplan"]
+    ).is_file()
+    assert (
+        sample_dir
+        / ROOT_REFINER_ARTIFACT_NAMES[DURATION_GROUNDTRUTH]["rootplan"]
+    ).is_file()
+    assert (sample_dir / "route_valid_mask.npy").is_file()
+    assert (sample_dir / "route_control_mask.npy").is_file()
+
+
+def test_root_refiner_artifacts_use_physical_path_and_real_anchor(tmp_path):
+    _save_refiner_stats(tmp_path)
+    clips = [_make_clip(80)]
+    common = dict(
+        n_hist=8,
+        n_path=16,
+        max_tokens=8,
+        min_tokens=2,
+        full_plan_ratio=1.0,
+        seed=0,
+    )
+    ds_raw = RefinerDataset(clips, normalize=False, **common)
+    ds_norm = RefinerDataset(clips, normalize=True, stats_dir=tmp_path, **common)
+    task_specs = [
+        {
+            "idx": 0,
+            "mode": "full",
+            "num_tokens": 5,
+            "anchor_frame": 5,
+            "task_key": "sample-anchor-5",
+        }
+    ]
+    raw_sample = ds_raw.get_sample(
+        0,
+        force_mode="full",
+        force_num_tokens=5,
+        force_anchor_frame=5,
+        force_path_mode="dense_path",
+        force_no_path_aug=True,
+    )
+    norm_sample = ds_norm.get_sample(
+        0,
+        force_mode="full",
+        force_num_tokens=5,
+        force_anchor_frame=5,
+        force_path_mode="dense_path",
+        force_no_path_aug=True,
+    )
+    model = RootRefiner(
+        d_model=32,
+        n_layers=2,
+        n_heads=4,
+        ff_dim=64,
+        max_tokens=8,
+        min_tokens=2,
+        n_hist=8,
+        n_path=16,
+        text_emb_dim=16,
+        dropout=0.0,
+        path_features_dim=5,
+    )
+    text_encoder = FrozenStubTextEncoder(emb_dim=16)
+
+    run_benchmark(
+        model,
+        ds_norm,
+        text_encoder,
+        device="cpu",
+        force_path_mode="dense_path",
+        force_no_path_aug=True,
+        task_specs=task_specs,
+        artifact_dir=tmp_path / "samples",
+        artifact_max_samples=1,
+    )
+
+    sample_dir = tmp_path / "samples" / "sample_000000"
+    route_input = np.load(sample_dir / "route_input.npy")
+    expected_physical_route = raw_sample["path"][
+        raw_sample["path_valid_mask"].bool()
+    ].numpy()
+    normalized_route = norm_sample["path"][
+        norm_sample["path_valid_mask"].bool()
+    ].numpy()
+    np.testing.assert_allclose(route_input, expected_physical_route, atol=1e-5)
+    assert not np.allclose(route_input, normalized_route, atol=1e-3)
+
+    metadata = json.loads(
+        (sample_dir / ROOT_REFINER_ARTIFACT_NAMES["shared"]["metadata"]).read_text()
+    )
+    expected_anchor_xz = raw_sample["anchor_xz_world"].numpy()
+    expected_anchor_yaw = float(raw_sample["anchor_yaw_world"].item())
+    np.testing.assert_allclose(metadata["anchor_world_xz"], expected_anchor_xz)
+    assert abs(metadata["anchor_world_yaw"] - expected_anchor_yaw) < 1e-6
+    assert metadata["gt_slice"] == {"start": 5, "end": 5 + int(raw_sample["target_mask"].sum())}
+
+    rootplan = json.loads(
+        (
+            sample_dir / ROOT_REFINER_ARTIFACT_NAMES[DURATION_PRED]["rootplan"]
+        ).read_text()
+    )
+    assert rootplan["coordinate_frame"] == "anchor_local"
+    np.testing.assert_allclose(rootplan["anchor_world_xz"], expected_anchor_xz)
+    assert abs(rootplan["anchor_world_yaw"] - expected_anchor_yaw) < 1e-6
+
+
+def test_root_refiner_pred_duration_artifact_is_not_clipped_to_gt_mask(tmp_path):
+    sample = {
+        "path": torch.arange(12, dtype=torch.float32).reshape(6, 2),
+        "path_valid_mask": torch.tensor([1, 1, 1, 1, 0, 0], dtype=torch.bool),
+        "path_control_mask": torch.tensor([1, 0, 1, 0, 0, 0], dtype=torch.bool),
+        "path_mode": "sparse_path",
+        "offset_start_frames": torch.tensor(0),
+        "anchor_frame": 3,
+        "anchor_xz_world": torch.tensor([1.0, 2.0]),
+        "anchor_yaw_world": torch.tensor(0.25),
+        "mode": "full",
+        "text": "walk",
+    }
+    gt_root = torch.zeros(12, 7)
+    gt_root[:, 3] = 1.0
+    gt_mask = torch.zeros(12, dtype=torch.bool)
+    gt_mask[:5] = True
+    pred_root = torch.zeros(12, 7)
+    pred_root[:, 0] = torch.arange(12, dtype=torch.float32)
+    pred_root[:, 3] = 1.0
+    pred_mask = torch.zeros(12, dtype=torch.bool)
+    pred_mask[:9] = True
+
+    _write_root_refiner_sample_artifacts(
+        tmp_path,
+        sample=sample,
+        sample_id="sample",
+        metrics={"duration_mode": DURATION_PRED, "gt_num_tokens": 2},
+        pred_by_duration={
+            DURATION_PRED: {
+                "root_7d": pred_root,
+                "mask": pred_mask,
+                "pred_num_tokens": 3,
+            },
+            DURATION_GROUNDTRUTH: {
+                "root_7d": gt_root,
+                "mask": gt_mask,
+                "pred_num_tokens": 2,
+            },
+        },
+        gt_root_7d=gt_root,
+        gt_mask=gt_mask,
+        frames_per_token=4,
+    )
+
+    pred_artifact = np.load(
+        tmp_path / ROOT_REFINER_ARTIFACT_NAMES[DURATION_PRED]["pred_root_7d"]
+    )
+    rootplan = json.loads(
+        (tmp_path / ROOT_REFINER_ARTIFACT_NAMES[DURATION_PRED]["rootplan"]).read_text()
+    )
+    route_valid = np.load(tmp_path / "route_valid_mask.npy")
+    route_control = np.load(tmp_path / "route_control_mask.npy")
+
+    assert pred_artifact.shape[0] == 9
+    assert rootplan["valid_frames"] == 9
+    assert route_valid.tolist() == [True, True, True, True]
+    assert route_control.tolist() == [True, False, True, False]
 
 
 def test_run_benchmark_oracle_duration_mode():

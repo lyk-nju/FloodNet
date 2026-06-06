@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import math
+import sys
 
 import numpy as np
 import torch
 
+from eval.ldf.stream_metrics import _save_sample_outputs
 from eval.runtime.metrics import (
     build_stream_eval_summary,
     compute_heading_path_error_deg,
@@ -199,3 +201,63 @@ def test_ldf_stream_generate_step_separates_local_and_absolute_commit_after_roll
     assert model.payloads[-1]["traj_abs_start_token"] == 2
     assert model.payloads[-1]["body_anchor_token"] == 0
     assert model.payloads[-1]["body_anchor_abs_token"] == 2
+
+
+def test_ldf_stream_sample_outputs_include_plots_and_path_roots(tmp_path):
+    frames = 8
+    gt_feature = torch.zeros(frames, 263)
+    stream_feature = torch.zeros(frames, 263)
+    offline_feature = torch.zeros(frames, 263)
+    no_traj_feature = torch.zeros(frames, 263)
+    gt_feature[:, 2] = torch.arange(frames, dtype=torch.float32) * 0.1
+    stream_feature[:, 2] = torch.arange(frames, dtype=torch.float32) * 0.12
+    offline_feature[:, 2] = torch.arange(frames, dtype=torch.float32) * 0.11
+    no_traj_feature[:, 2] = torch.arange(frames, dtype=torch.float32) * 0.04
+    traj7 = torch.zeros(1, frames, 7)
+    traj7[0, :, 2] = torch.arange(frames, dtype=torch.float32) * 0.1
+    traj7[0, :, 3] = 1.0
+    sample_batch = {
+        "name": ["sample"],
+        "dataset": ["HumanML3D"],
+        "text": ["walk forward"],
+        "traj_cond_7d": traj7,
+    }
+
+    _save_sample_outputs(
+        sample_dir=tmp_path,
+        sample_batch=sample_batch,
+        sample_record={"name": "sample"},
+        stream_feature=stream_feature,
+        gt_feature=gt_feature,
+        offline_feature=offline_feature,
+        stream_no_traj_feature=no_traj_feature,
+        stream_latent=None,
+        offline_latent=None,
+        save_feature_npy=True,
+        save_latent_npy=False,
+        save_plots=True,
+        render_video=False,
+    )
+
+    assert (tmp_path / "plot_xz.png").is_file()
+    assert (tmp_path / "plot_yaw.png").is_file()
+    assert (tmp_path / "gt_root.npy").is_file()
+    assert (tmp_path / "condition_root.npy").is_file()
+    assert (tmp_path / "stream_gt_root.npy").is_file()
+    assert (tmp_path / "offline_gt_root.npy").is_file()
+    assert (tmp_path / "stream_no_traj_root.npy").is_file()
+    assert (tmp_path / "stream_no_traj_feature.npy").is_file()
+
+
+def test_ldf_stream_metrics_cli_can_disable_no_traj_baseline(monkeypatch):
+    from eval.ldf import stream_metrics
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["stream_metrics", "--no_compute_no_traj_baseline"],
+    )
+
+    args = stream_metrics.parse_args()
+
+    assert args.no_compute_no_traj_baseline is True

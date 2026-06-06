@@ -38,8 +38,18 @@ try:
         LdfEvalStreamConditioner,
         prepare_ldf_eval_model_batch,
     )
+    from FloodNet.eval.common.visualization import (
+        plot_xz_trajectories,
+        plot_yaw_series,
+        render_motion_video,
+        yaw_from_7d,
+        yaw_from_root_path,
+    )
     from FloodNet.utils.initialize import get_function, instantiate, load_config
-    from FloodNet.utils.motion_process import StreamJointRecovery263
+    from FloodNet.utils.motion_process import (
+        StreamJointRecovery263,
+        extract_root_trajectory_263_torch,
+    )
     from FloodNet.utils.stream_rollout import (
         StreamTextRolloutController,
         build_stream_step_model_input,
@@ -63,8 +73,18 @@ except ImportError:  # pragma: no cover - script entrypoints use top-level impor
         _stable_eval_seed,
     )
     from eval.ldf.conditioning import LdfEvalStreamConditioner, prepare_ldf_eval_model_batch
+    from eval.common.visualization import (
+        plot_xz_trajectories,
+        plot_yaw_series,
+        render_motion_video,
+        yaw_from_7d,
+        yaw_from_root_path,
+    )
     from utils.initialize import get_function, instantiate, load_config
-    from utils.motion_process import StreamJointRecovery263
+    from utils.motion_process import (
+        StreamJointRecovery263,
+        extract_root_trajectory_263_torch,
+    )
     from utils.stream_rollout import (
         StreamTextRolloutController,
         build_stream_step_model_input,
@@ -105,8 +125,15 @@ def parse_args():
     )
     parser.add_argument("--num_denoise_steps", type=int, default=None)
     parser.add_argument("--compute_offline_baseline", action="store_true")
+    parser.add_argument("--compute_no_traj_baseline", action="store_true")
+    parser.add_argument("--no_compute_no_traj_baseline", action="store_true")
     parser.add_argument("--save_feature_npy", action="store_true")
     parser.add_argument("--save_latent_npy", action="store_true")
+    parser.add_argument("--save_plots", action="store_true")
+    parser.add_argument("--no_save_plots", action="store_true")
+    parser.add_argument("--render_video", action="store_true")
+    parser.add_argument("--render_offline_video", action="store_true")
+    parser.add_argument("--render_no_traj_video", action="store_true")
     parser.add_argument("--out_dir", type=str, default=None)
     parser.add_argument("--probe_tag", type=str, default=None)
     parser.add_argument("--meta_paths", nargs="+", default=None)
@@ -443,6 +470,59 @@ def _format_text(sample_batch: Dict) -> str:
     return "\n".join(lines)
 
 
+_TRAJECTORY_BATCH_KEYS = {
+    "traj_cond_7d",
+    "traj_cond",
+    "traj",
+    "traj_features",
+    "traj_length",
+    "traj_cond_mask",
+    "traj_mask",
+    "traj_loss_mask",
+    "token_mask",
+}
+
+
+def _remove_trajectory_conditioning(sample_batch: Dict) -> Dict:
+    return {
+        key: value
+        for key, value in sample_batch.items()
+        if key not in _TRAJECTORY_BATCH_KEYS
+    }
+
+
+def _root_numpy(feature: Optional[torch.Tensor]) -> Optional[np.ndarray]:
+    if feature is None:
+        return None
+    with torch.no_grad():
+        return extract_root_trajectory_263_torch(feature[None, :])[0].cpu().numpy()
+
+
+def _condition_root_numpy(sample_batch: Dict) -> Optional[np.ndarray]:
+    traj7 = sample_batch.get("traj_cond_7d")
+    if traj7 is not None:
+        value = traj7[0] if torch.is_tensor(traj7) and traj7.ndim == 3 else traj7
+        arr = value.detach().cpu().numpy() if torch.is_tensor(value) else np.asarray(value)
+        if arr.ndim == 2 and arr.shape[-1] >= 3:
+            return arr[:, :3].astype(np.float32)
+    traj = sample_batch.get("traj")
+    if traj is not None:
+        value = traj[0] if torch.is_tensor(traj) and traj.ndim == 3 else traj
+        arr = value.detach().cpu().numpy() if torch.is_tensor(value) else np.asarray(value)
+        if arr.ndim == 2 and arr.shape[-1] >= 3:
+            return arr[:, :3].astype(np.float32)
+    return None
+
+
+def _condition_yaw_numpy(sample_batch: Dict) -> Optional[np.ndarray]:
+    traj7 = sample_batch.get("traj_cond_7d")
+    if traj7 is None:
+        return None
+    value = traj7[0] if torch.is_tensor(traj7) and traj7.ndim == 3 else traj7
+    yaw = yaw_from_7d(value)
+    return yaw if yaw.shape[0] > 0 else None
+
+
 def _save_sample_outputs(
     sample_dir: Path,
     sample_batch: Dict,
@@ -450,10 +530,15 @@ def _save_sample_outputs(
     stream_feature: torch.Tensor,
     gt_feature: Optional[torch.Tensor],
     offline_feature: Optional[torch.Tensor],
-    stream_latent: Optional[torch.Tensor],
-    offline_latent: Optional[torch.Tensor],
-    save_feature_npy: bool,
-    save_latent_npy: bool,
+    stream_no_traj_feature: Optional[torch.Tensor] = None,
+    stream_latent: Optional[torch.Tensor] = None,
+    offline_latent: Optional[torch.Tensor] = None,
+    save_feature_npy: bool = True,
+    save_latent_npy: bool = False,
+    save_plots: bool = True,
+    render_video: bool = False,
+    render_offline_video: bool = False,
+    render_no_traj_video: bool = False,
 ):
     sample_dir.mkdir(parents=True, exist_ok=True)
     with open(sample_dir / "text.txt", "w") as f:
@@ -461,17 +546,85 @@ def _save_sample_outputs(
     with open(sample_dir / "metrics.json", "w") as f:
         json.dump(sample_record, f, indent=2)
 
+    gt_root = _root_numpy(gt_feature)
+    stream_root = _root_numpy(stream_feature)
+    offline_root = _root_numpy(offline_feature)
+    no_traj_root = _root_numpy(stream_no_traj_feature)
+    condition_root = _condition_root_numpy(sample_batch)
+
+    if gt_root is not None:
+        np.save(sample_dir / "gt_root.npy", gt_root.astype(np.float32))
+    if condition_root is not None:
+        np.save(sample_dir / "condition_root.npy", condition_root.astype(np.float32))
+    if stream_root is not None:
+        np.save(sample_dir / "stream_gt_root.npy", stream_root.astype(np.float32))
+    if offline_root is not None:
+        np.save(sample_dir / "offline_gt_root.npy", offline_root.astype(np.float32))
+    if no_traj_root is not None:
+        np.save(sample_dir / "stream_no_traj_root.npy", no_traj_root.astype(np.float32))
+
+    if save_plots:
+        plot_xz_trajectories(
+            sample_dir / "plot_xz.png",
+            {
+                "gt_root": gt_root,
+                "condition_root": condition_root,
+                "stream_gt": stream_root,
+                "offline_gt": offline_root,
+                "stream_no_traj": no_traj_root,
+            },
+            title=str(sample_batch.get("name", ["sample"])[0]),
+        )
+        plot_yaw_series(
+            sample_dir / "plot_yaw.png",
+            {
+                "gt_yaw": yaw_from_root_path(gt_root),
+                "condition_yaw": _condition_yaw_numpy(sample_batch),
+                "stream_gt_yaw": yaw_from_root_path(stream_root),
+                "offline_gt_yaw": yaw_from_root_path(offline_root),
+                "stream_no_traj_yaw": yaw_from_root_path(no_traj_root),
+            },
+            title=str(sample_batch.get("name", ["sample"])[0]),
+        )
+
     if save_feature_npy:
         np.save(sample_dir / "stream_feature.npy", stream_feature.cpu().numpy())
         if gt_feature is not None:
             np.save(sample_dir / "gt_feature.npy", gt_feature.cpu().numpy())
         if offline_feature is not None:
             np.save(sample_dir / "offline_feature.npy", offline_feature.cpu().numpy())
+        if stream_no_traj_feature is not None:
+            np.save(
+                sample_dir / "stream_no_traj_feature.npy",
+                stream_no_traj_feature.cpu().numpy(),
+            )
 
     if save_latent_npy and stream_latent is not None:
         np.save(sample_dir / "stream_latent.npy", stream_latent.cpu().numpy())
         if offline_latent is not None:
             np.save(sample_dir / "offline_latent.npy", offline_latent.cpu().numpy())
+
+    if render_video:
+        render_motion_video(
+            stream_feature,
+            sample_dir / "video_stream_gt.mp4",
+            dim=263,
+            traj_xz=condition_root[:, [0, 2]] if condition_root is not None else None,
+        )
+    if render_offline_video and offline_feature is not None:
+        render_motion_video(
+            offline_feature,
+            sample_dir / "video_offline_gt.mp4",
+            dim=263,
+            traj_xz=condition_root[:, [0, 2]] if condition_root is not None else None,
+        )
+    if render_no_traj_video and stream_no_traj_feature is not None:
+        render_motion_video(
+            stream_no_traj_feature,
+            sample_dir / "video_stream_no_traj.mp4",
+            dim=263,
+            traj_xz=condition_root[:, [0, 2]] if condition_root is not None else None,
+        )
 
 
 def _build_run_name(ckpt_path: str, probe_tag: str, stream_mode: str) -> str:
@@ -521,8 +674,24 @@ def main():
         args.compute_offline_baseline
         or cfg.get("eval.compute_offline_baseline", False)
     )
+    compute_no_traj_baseline = bool(
+        args.compute_no_traj_baseline
+        or cfg.get("eval.compute_no_traj_baseline", True)
+    )
+    if args.no_compute_no_traj_baseline:
+        compute_no_traj_baseline = False
     save_feature_npy = bool(args.save_feature_npy or cfg.get("eval.save_feature_npy", True))
     save_latent_npy = bool(args.save_latent_npy or cfg.get("eval.save_latent_npy", False))
+    save_plots = bool(cfg.get("eval.save_plots", True) or args.save_plots)
+    if args.no_save_plots:
+        save_plots = False
+    render_video = bool(args.render_video or cfg.get("eval.render_video", False))
+    render_offline_video = bool(
+        args.render_offline_video or cfg.get("eval.render_offline_video", False)
+    )
+    render_no_traj_video = bool(
+        args.render_no_traj_video or cfg.get("eval.render_no_traj_video", False)
+    )
     max_batches = args.max_batches or int(cfg.get("eval.max_batches", 0))
     max_samples = args.max_samples or int(cfg.get("eval.max_samples", 0))
     text_device = str(cfg.get("eval.text_device", "cpu")).lower()
@@ -579,6 +748,8 @@ def main():
         stream_latent_run0 = None
         offline_feature_run0 = None
         offline_latent_run0 = None
+        no_traj_runs = []
+        stream_no_traj_feature_run0 = None
 
         for run_idx in range(num_runs):
             sample_seed = _stable_eval_seed(args.seed, probe_tag, sample_name, run_idx)
@@ -645,6 +816,43 @@ def main():
                     offline_feature_run0 = offline_out["decoded_feature"]
                     offline_latent_run0 = offline_out["latent"]
 
+            if compute_no_traj_baseline:
+                no_traj_batch = _remove_trajectory_conditioning(sample_batch)
+                _seed_eval_locally(sample_seed)
+                with torch.no_grad():
+                    if stream_mode == "stream_generate":
+                        no_traj_out = run_stream_generate_sample(
+                            model=model,
+                            vae=vae,
+                            sample_batch=no_traj_batch,
+                            device=device,
+                            num_denoise_steps=num_denoise_steps,
+                        )
+                    elif stream_mode == "stream_generate_step":
+                        no_traj_out = run_stream_generate_step_sample(
+                            model=model,
+                            vae=vae,
+                            sample_batch=no_traj_batch,
+                            device=device,
+                            history_length=history_length,
+                            num_denoise_steps=num_denoise_steps,
+                            traj_horizon_tokens=traj_horizon_tokens,
+                            token_dt=token_dt,
+                            frames_per_token=frames_per_token,
+                        )
+                    else:
+                        raise ValueError(f"Unsupported stream_mode: {stream_mode}")
+                no_traj_decoded = no_traj_out["decoded_feature"]
+                no_traj_metrics = _compute_traj_metrics(
+                    no_traj_decoded,
+                    sample_batch,
+                    0,
+                    seg_size=seg_size,
+                )
+                no_traj_runs.append(no_traj_metrics)
+                if run_idx == 0:
+                    stream_no_traj_feature_run0 = no_traj_decoded
+
             if run_idx == 0:
                 stream_feature_run0 = decoded_stream
                 stream_latent_run0 = stream_out["latent_stream"]
@@ -670,9 +878,15 @@ def main():
             sample_record["stream_offline_feature_l2_max"] = _average_scalar_metric(stream_runs, "stream_offline_feature_l2_max")
             sample_record["stream_offline_root_ade"] = _average_scalar_metric(stream_runs, "stream_offline_root_ade")
             sample_record["stream_offline_length_delta"] = _average_scalar_metric(stream_runs, "stream_offline_length_delta")
+        if compute_no_traj_baseline and no_traj_runs:
+            no_traj_avg = _average_traj_metrics(no_traj_runs)
+            for key, value in no_traj_avg.items():
+                sample_record[f"stream_no_traj/{key}"] = value
         sample_record["_traj_runs"] = traj_runs
         sample_record["_control_runs"] = control_runs
         sample_record["_stream_runs"] = stream_runs
+        if compute_no_traj_baseline:
+            sample_record["_stream_no_traj_runs"] = no_traj_runs
         sample_records.append(sample_record)
 
         gt_feature = sample_batch["feature"][0].float().cpu() if "feature" in sample_batch else None
@@ -683,10 +897,15 @@ def main():
             stream_feature=stream_feature_run0,
             gt_feature=gt_feature,
             offline_feature=offline_feature_run0,
+            stream_no_traj_feature=stream_no_traj_feature_run0,
             stream_latent=stream_latent_run0,
             offline_latent=offline_latent_run0,
             save_feature_npy=save_feature_npy,
             save_latent_npy=save_latent_npy,
+            save_plots=save_plots,
+            render_video=render_video,
+            render_offline_video=render_offline_video,
+            render_no_traj_video=render_no_traj_video,
         )
 
         seen_samples += 1

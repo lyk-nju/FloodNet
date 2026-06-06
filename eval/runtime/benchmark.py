@@ -41,6 +41,12 @@ from torch_ema import ExponentialMovingAverage
 from omegaconf import OmegaConf
 
 from eval.common.json import json_sanitize, write_json_strict
+from eval.common.artifacts import ensure_dir
+from eval.common.visualization import (
+    plot_xz_trajectories,
+    plot_yaw_series,
+    yaw_from_root_path,
+)
 from utils.initialize import check_state_dict, instantiate, load_config
 from utils.inference_glue import InferenceGlueState, InferenceGlueTimeline
 from utils.local_frame import canonicalize_7d
@@ -73,7 +79,7 @@ from utils.token_frame import (
 )
 from utils.visualize import render_single_video
 from eval.runtime.cases import get_cases
-from eval.runtime.metrics import build_plan_metrics
+from eval.runtime.metrics import build_plan_metrics, estimate_body_yaw
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -1098,6 +1104,45 @@ def _render_traj_video(pred_root, target_root, out_path, title, *, split_tok=Non
     plt.close(_f2)
 
 
+def _write_runtime_case_visuals(
+    output_dir,
+    *,
+    case_name: str,
+    pred_root,
+    target_root,
+    motion_263=None,
+    split_tok: int | None = None,
+) -> None:
+    out = ensure_dir(output_dir)
+    split_frame = None if split_tok is None else int(token_start_frame(int(split_tok)))
+    boundary_frames = [] if split_frame is None else [split_frame]
+    plot_xz_trajectories(
+        out / f"{case_name}_plot_world_xz.png",
+        {
+            "target": target_root,
+            "pred": pred_root,
+        },
+        title=str(case_name),
+        boundary_frames=boundary_frames,
+    )
+    if motion_263 is not None:
+        try:
+            pred_yaw = estimate_body_yaw(np.asarray(motion_263))
+        except Exception:
+            pred_yaw = yaw_from_root_path(pred_root)
+    else:
+        pred_yaw = yaw_from_root_path(pred_root)
+    plot_yaw_series(
+        out / f"{case_name}_plot_yaw.png",
+        {
+            "target_yaw": yaw_from_root_path(target_root),
+            "pred_yaw": pred_yaw,
+        },
+        title=str(case_name),
+        boundary_frames=boundary_frames,
+    )
+
+
 # ── main ───────────────────────────────────────────────────────────────
 
 def main():
@@ -1110,6 +1155,7 @@ def main():
     p.add_argument("--preset", default="smoke")
     p.add_argument("--suites", default=None)
     p.add_argument("--render_video", action="store_true", default=False)
+    p.add_argument("--no_save_plots", action="store_true", default=False)
     p.add_argument("--history_length", type=int, default=30)
     p.add_argument("--traj_horizon_tokens", type=int, default=20)
     p.add_argument("--num_denoise_steps", type=int, default=10)
@@ -1164,8 +1210,10 @@ def main():
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_root = os.path.join(args.output_dir, run_id)
     vdir = os.path.join(out_root, "videos") if args.render_video else None
+    pdir = os.path.join(out_root, "plots") if not args.no_save_plots else None
     os.makedirs(out_root, exist_ok=True)
     if vdir: os.makedirs(vdir, exist_ok=True)
+    if pdir: os.makedirs(pdir, exist_ok=True)
 
     suites_list = [s.strip() for s in args.suites.split(",")] if args.suites else None
     cases = get_cases(suites=suites_list, preset=args.preset)
@@ -1267,8 +1315,17 @@ def main():
         print(f"  ADE={rec.get('ADE', float('nan')):.4f}  FDE={rec.get('FDE', float('nan')):.4f}")
 
         _pm, _pr, _gr = pm, pr, gr
-        if case.suite == "turn":
-            _split = 15
+        _split = 15 if case.suite == "turn" else None
+
+        if pdir and _pr is not None and _gr is not None:
+            _write_runtime_case_visuals(
+                pdir,
+                case_name=case.name,
+                pred_root=_pr,
+                target_root=_gr,
+                motion_263=_pm,
+                split_tok=_split,
+            )
 
         if args.render_video and _pm is not None and _pm.size > 0:
             mp4 = os.path.join(vdir, f"{case.name}.mp4")
