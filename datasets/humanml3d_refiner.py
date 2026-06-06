@@ -381,6 +381,12 @@ class RefinerDataset(Dataset):
             "anchor_frame": anchor_frame,
             "anchor_xz_world": anchor_xz.detach().clone(),
             "anchor_yaw_world": anchor_yaw.detach().clone(),
+            "clip_idx": clip_idx,
+            "raw_id": clip.get("raw_id", clip.get("name", str(clip_idx))),
+            "name": clip.get("name", clip.get("raw_id", str(clip_idx))),
+            "split_index": clip.get("split_index", clip_idx),
+            "split_file": clip.get("split_file"),
+            "dataset": clip.get("dataset"),
         }
 
 

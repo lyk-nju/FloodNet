@@ -123,6 +123,13 @@ _ROOT_REFINER_SUITES = {
         default_max_samples=None,
         force_no_path_aug=False,
     ),
+    "full_route": RootRefinerEvalSuite(
+        name="full_route",
+        path_modes=("dense_path",),
+        default_max_samples=None,
+        force_no_path_aug=True,
+        duration_mode=DURATION_GROUNDTRUTH,
+    ),
 }
 
 
@@ -185,6 +192,30 @@ def _to_int(value, default: int = 0) -> int:
     return int(value)
 
 
+def _dataset_clip_for_eval_index(dataset, idx: int):
+    if not hasattr(dataset, "_clips"):
+        return None
+    clip_idx = (
+        int(dataset.valid_indices[idx]) if hasattr(dataset, "valid_indices") else int(idx)
+    )
+    return dataset._clips[clip_idx]
+
+
+def _clip_metadata_for_eval_index(dataset, idx: int) -> dict:
+    clip = _dataset_clip_for_eval_index(dataset, idx)
+    if not isinstance(clip, Mapping):
+        return {}
+    meta = {}
+    raw_id = clip.get("raw_id", clip.get("name"))
+    if raw_id is not None:
+        meta["raw_id"] = raw_id
+    for key in ("split_index", "split_file", "dataset"):
+        value = clip.get(key)
+        if value is not None:
+            meta[key] = value
+    return meta
+
+
 def build_eval_task_specs(dataset, max_samples: int = -1) -> list[dict]:
     """Freeze underlying RootRefiner tasks before path-mode bucketing.
 
@@ -210,6 +241,7 @@ def build_eval_task_specs(dataset, max_samples: int = -1) -> list[dict]:
         specs.append(
             {
                 "idx": idx,
+                **_clip_metadata_for_eval_index(dataset, idx),
                 "mode": mode,
                 "num_tokens": num_tokens,
                 "anchor_frame": anchor_frame,
@@ -217,6 +249,86 @@ def build_eval_task_specs(dataset, max_samples: int = -1) -> list[dict]:
             }
         )
     return specs
+
+
+def _max_tokens_for_full_route(dataset, idx: int, anchor_frame: int = 0) -> int:
+    clip = _dataset_clip_for_eval_index(dataset, idx)
+    if clip is None:
+        sample = _get_eval_sample(
+            dataset,
+            idx,
+            force_path_mode="dense_path",
+            force_no_path_aug=True,
+            force_mode="full",
+            force_anchor_frame=anchor_frame,
+        )
+        return _to_int(sample.get("num_tokens"), default=0)
+    motion = clip["motion_263"]
+    T = int(motion.shape[0])
+    remaining = max(0, T - int(anchor_frame))
+    frames_per_token = int(getattr(dataset, "frames_per_token", 4))
+    max_tokens = int(getattr(dataset, "max_tokens", 49))
+    return min(max_tokens, (remaining + frames_per_token - 1) // frames_per_token)
+
+
+def build_full_route_task_specs(
+    dataset,
+    *,
+    max_samples: int = -1,
+    raw_ids: list[str] | tuple[str, ...] | None = None,
+) -> list[dict]:
+    """Build deterministic full-clip RootRefiner tasks.
+
+    These specs answer the full-route diagnostic question: given a complete GT
+    route from clip start, can RootRefiner reproduce the whole future root plan?
+    `sample_XXXXXX` artifact names remain eval-order IDs; raw dataset identity
+    is carried by `raw_id` / `split_index` in the spec and metadata.
+    """
+    wanted = None if raw_ids is None else {str(raw_id) for raw_id in raw_ids}
+    specs = []
+    max_n = None if int(max_samples) < 0 else int(max_samples)
+    for idx in range(len(dataset)):
+        meta = _clip_metadata_for_eval_index(dataset, idx)
+        raw_id = str(meta.get("raw_id", meta.get("name", idx)))
+        if wanted is not None and raw_id not in wanted:
+            continue
+        num_tokens = _max_tokens_for_full_route(dataset, idx, anchor_frame=0)
+        spec = {
+            "idx": idx,
+            **meta,
+            "mode": "full",
+            "num_tokens": num_tokens,
+            "anchor_frame": 0,
+            "task_key": f"{raw_id}:full:{num_tokens}:0",
+        }
+        specs.append(spec)
+        if wanted is None and max_n is not None and len(specs) >= max_n:
+            break
+    if wanted is not None:
+        found = {str(spec.get("raw_id", spec.get("name", spec["idx"]))) for spec in specs}
+        missing = sorted(wanted - found)
+        if missing:
+            raise ValueError(f"raw_id(s) not found in eval split: {missing}")
+        if max_n is not None:
+            specs = specs[:max_n]
+    return specs
+
+
+def _resolve_cli_force_path_mode(
+    *,
+    task_specs: list[dict] | None,
+    suite: str | None,
+) -> str | None:
+    """Return CLI-only forced path mode for direct full-route runs.
+
+    `--suite full_route` already applies the suite's dense_path mode through
+    `run_suite_benchmark()`. Direct `--full_route` / `--raw_id` invocations
+    bypass suite path modes, so they must force dense_path here to preserve the
+    full-route diagnostic contract.
+    """
+    if task_specs is not None and suite is None:
+        return "dense_path"
+    return None
 
 
 def _nanmean_from_samples(per_sample: list[dict], key: str) -> float:
@@ -498,6 +610,11 @@ def _write_root_refiner_sample_artifacts(
         gt_slice_start=gt_slice_start,
         gt_slice_end=gt_slice_end,
         extra={
+            "raw_id": sample.get("raw_id", metrics.get("raw_id")),
+            "split_index": sample.get("split_index", metrics.get("split_index")),
+            "split_file": sample.get("split_file", metrics.get("split_file")),
+            "dataset": sample.get("dataset", metrics.get("dataset")),
+            "task_key": metrics.get("task_key"),
             "path_mode": path_mode,
             "mode": sample.get("mode"),
             "text": sample.get("text"),
@@ -691,6 +808,10 @@ def run_benchmark(
         m["mode"] = sample.get("mode", spec.get("mode"))
         m["anchor_frame"] = _to_int(sample.get("anchor_frame"), default=0)
         m["path_mode"] = sample.get("path_mode", force_path_mode or "mixed")
+        for meta_key in ("raw_id", "split_index", "split_file", "dataset"):
+            value = sample.get(meta_key, spec.get(meta_key))
+            if value is not None:
+                m[meta_key] = value
         m["num_token_top1_hit"] = top1_hit
         m["num_token_top3_hit"] = top3_hit
         m["pred_num_tokens"] = pred_num_tokens
@@ -857,6 +978,7 @@ def run_suite_benchmark(
     oracle_duration: bool = False,
     artifact_dir: str | Path | None = None,
     artifact_max_samples: int = 0,
+    task_specs: list[dict] | None = None,
 ) -> dict:
     suite_cfg = resolve_suite_config(suite)
     duration_mode_resolved = resolve_suite_duration_mode(
@@ -865,7 +987,8 @@ def run_suite_benchmark(
         oracle_duration=oracle_duration,
     )
     sample_limit = _suite_sample_limit(suite_cfg, max_samples)
-    task_specs = build_eval_task_specs(dataset, max_samples=sample_limit)
+    if task_specs is None:
+        task_specs = build_eval_task_specs(dataset, max_samples=sample_limit)
     runs: list[dict] = []
     per_sample: list[dict] = []
 
@@ -1016,6 +1139,24 @@ def main(argv=None):
         default=20,
         help="Maximum per-run artifact samples when --save_artifacts is set; <=0 means all.",
     )
+    parser.add_argument(
+        "--full_route",
+        action="store_true",
+        default=False,
+        help=(
+            "Evaluate full-clip routes: force mode=full, anchor_frame=0, "
+            "and num_tokens=max valid tokens for each selected clip."
+        ),
+    )
+    parser.add_argument(
+        "--raw_id",
+        action="append",
+        default=None,
+        help=(
+            "Restrict full-route eval to a raw dataset id, e.g. --raw_id 000021. "
+            "May be repeated. Implies --full_route."
+        ),
+    )
     args = parser.parse_args(argv)
 
     from datasets.humanml3d_refiner import HumanML3DRefinerDataset as RefinerDataset
@@ -1047,6 +1188,25 @@ def main(argv=None):
         dataset_cls=RefinerDataset,
         seed=0,
     )
+    task_specs = None
+    if args.full_route or args.raw_id or args.suite == "full_route":
+        task_specs = build_full_route_task_specs(
+            dataset,
+            max_samples=args.max_samples,
+            raw_ids=args.raw_id,
+        )
+    run_duration_mode = args.duration_mode
+    if (
+        task_specs is not None
+        and args.suite is None
+        and run_duration_mode is None
+        and not args.oracle_duration
+    ):
+        run_duration_mode = DURATION_GROUNDTRUTH
+    cli_force_path_mode = _resolve_cli_force_path_mode(
+        task_specs=task_specs,
+        suite=args.suite,
+    )
 
     if args.suite:
         result = run_suite_benchmark(
@@ -1060,12 +1220,15 @@ def main(argv=None):
             oracle_duration=args.oracle_duration,
             artifact_dir=Path(args.output_dir) / "samples" if args.save_artifacts else None,
             artifact_max_samples=args.artifact_max_samples,
+            task_specs=task_specs,
         )
     else:
         result = run_benchmark(model, dataset, text_encoder, device=args.device,
                                 max_samples=args.max_samples,
                                 oracle_duration=args.oracle_duration,
-                                duration_mode=args.duration_mode,
+                                duration_mode=run_duration_mode,
+                                force_path_mode=cli_force_path_mode,
+                                task_specs=task_specs,
                                 artifact_dir=(
                                     Path(args.output_dir) / "samples"
                                     if args.save_artifacts else None

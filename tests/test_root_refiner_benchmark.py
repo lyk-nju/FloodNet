@@ -19,7 +19,9 @@ import torch
 from datasets.humanml3d_refiner import HumanML3DRefinerDataset as RefinerDataset
 from eval.root_refiner.benchmark import (
     _write_root_refiner_sample_artifacts,
+    _resolve_cli_force_path_mode,
     build_eval_task_specs,
+    build_full_route_task_specs,
     build_refiner_dataset_from_clips,
     compute_sample_metrics,
     resolve_suite_config,
@@ -111,11 +113,22 @@ def test_empty_valid_returns_nan_metrics():
 # ---------------------------------------------------------------------------
 
 
-def _make_clip(T: int):
+def _make_clip(T: int, *, raw_id: str | None = None, split_index: int | None = None):
     motion = torch.zeros(T, 263, dtype=torch.float32)
     motion[:, 2] = 0.05   # +Z velocity
     motion[:, 3] = 1.0
-    return {"motion_263": motion, "text": "walk forward"}
+    clip = {"motion_263": motion, "text": "walk forward"}
+    if raw_id is not None:
+        clip.update(
+            {
+                "name": raw_id,
+                "raw_id": raw_id,
+                "split_index": split_index if split_index is not None else 0,
+                "split_file": "test.txt",
+                "dataset": "humanml3d",
+            }
+        )
+    return clip
 
 
 def _save_refiner_stats(tmp_path):
@@ -235,6 +248,72 @@ def test_run_benchmark_writes_root_refiner_sample_artifacts(tmp_path):
     ).is_file()
     assert (sample_dir / "route_valid_mask.npy").is_file()
     assert (sample_dir / "route_control_mask.npy").is_file()
+
+
+def test_root_refiner_artifact_metadata_includes_raw_id_and_split(tmp_path):
+    clips = [
+        _make_clip(60, raw_id="000021", split_index=25),
+        _make_clip(60, raw_id="004792", split_index=21),
+    ]
+    ds = RefinerDataset(
+        clips,
+        n_hist=8,
+        n_path=16,
+        max_tokens=8,
+        min_tokens=2,
+        full_plan_ratio=1.0,
+        seed=0,
+    )
+    model = RootRefiner(
+        d_model=32,
+        n_layers=2,
+        n_heads=4,
+        ff_dim=64,
+        max_tokens=8,
+        min_tokens=2,
+        n_hist=8,
+        n_path=16,
+        text_emb_dim=16,
+        dropout=0.0,
+        path_features_dim=5,
+    )
+    text_encoder = FrozenStubTextEncoder(emb_dim=16)
+
+    run_benchmark(
+        model,
+        ds,
+        text_encoder,
+        device="cpu",
+        task_specs=[
+            {
+                "idx": 0,
+                "raw_id": "000021",
+                "split_index": 25,
+                "split_file": "test.txt",
+                "mode": "full",
+                "num_tokens": 8,
+                "anchor_frame": 0,
+                "task_key": "000021:full:8:0",
+            }
+        ],
+        artifact_dir=tmp_path / "samples",
+        artifact_max_samples=1,
+    )
+
+    metadata = json.loads(
+        (
+            tmp_path
+            / "samples"
+            / "sample_000000"
+            / ROOT_REFINER_ARTIFACT_NAMES["shared"]["metadata"]
+        ).read_text()
+    )
+    assert metadata["sample_id"] == "sample_000000"
+    assert metadata["raw_id"] == "000021"
+    assert metadata["split_index"] == 25
+    assert metadata["split_file"] == "test.txt"
+    assert metadata["dataset"] == "humanml3d"
+    assert metadata["task_key"] == "000021:full:8:0"
 
 
 def test_root_refiner_artifacts_use_physical_path_and_real_anchor(tmp_path):
@@ -440,6 +519,7 @@ def test_resolve_suite_config_defines_root_refiner_eval_layers():
     standard_oracle = resolve_suite_config("standard_oracle")
     standard_groundtruth = resolve_suite_config("standard_groundtruth")
     stress = resolve_suite_config("stress")
+    full_route = resolve_suite_config("full_route")
 
     assert smoke.default_max_samples == 50
     assert smoke.path_modes == (None,)
@@ -449,6 +529,9 @@ def test_resolve_suite_config_defines_root_refiner_eval_layers():
     assert standard_groundtruth.duration_mode == "groundtruth_duration"
     assert stress.path_modes == ("sparse_path", "goal_point")
     assert stress.force_no_path_aug is False
+    assert full_route.path_modes == ("dense_path",)
+    assert full_route.duration_mode == "groundtruth_duration"
+    assert full_route.force_no_path_aug is True
 
 
 def test_build_refiner_dataset_from_clips_uses_sampling_config():
@@ -566,6 +649,44 @@ def test_build_eval_task_specs_freezes_underlying_tasks_before_path_modes():
     assert all("num_tokens" in spec for spec in specs)
     assert all("anchor_frame" in spec for spec in specs)
     assert all("task_key" in spec for spec in specs)
+
+
+def test_build_full_route_task_specs_selects_raw_id_and_max_horizon():
+    clips = [
+        _make_clip(50, raw_id="004792", split_index=21),
+        _make_clip(179, raw_id="000021", split_index=25),
+    ]
+    ds = RefinerDataset(
+        clips,
+        n_hist=8,
+        n_path=16,
+        max_tokens=49,
+        min_tokens=2,
+        full_plan_ratio=0.0,
+        seed=0,
+    )
+
+    specs = build_full_route_task_specs(ds, raw_ids=["000021"])
+
+    assert specs == [
+        {
+            "idx": 1,
+            "raw_id": "000021",
+            "split_index": 25,
+            "split_file": "test.txt",
+            "dataset": "humanml3d",
+            "mode": "full",
+            "num_tokens": 45,
+            "anchor_frame": 0,
+            "task_key": "000021:full:45:0",
+        }
+    ]
+
+
+def test_cli_full_route_without_suite_forces_dense_path():
+    assert _resolve_cli_force_path_mode(task_specs=[{"idx": 0}], suite=None) == "dense_path"
+    assert _resolve_cli_force_path_mode(task_specs=[{"idx": 0}], suite="full_route") is None
+    assert _resolve_cli_force_path_mode(task_specs=None, suite=None) is None
 
 
 def test_run_suite_benchmark_standard_emits_schema_and_path_mode_buckets(tmp_path):

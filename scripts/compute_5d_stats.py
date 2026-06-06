@@ -272,7 +272,7 @@ def load_clips_from_dir(raw_data_dir: str | Path,
     clips: list[dict] = []
     n_missing_motion = 0
     n_bad_shape = 0
-    for name in names:
+    for split_index, name in enumerate(names):
         if max_samples > 0 and len(clips) >= max_samples:
             break
         motion_file = feature_dir / f"{name}.npy"
@@ -291,6 +291,11 @@ def load_clips_from_dir(raw_data_dir: str | Path,
             "motion_263": torch.from_numpy(motion),
             "text": texts[0] if texts else "",   # first caption (backward compat)
             "texts": texts,                       # all captions (RefinerDataset random pick)
+            "name": name,
+            "raw_id": name,
+            "split_index": split_index,
+            "split_file": split_file,
+            "dataset": dataset,
         })
 
     if not clips:
