@@ -150,3 +150,22 @@ def test_eval_watcher_builds_stream_eval_command_and_summary_path(tmp_path):
     summary.parent.mkdir(parents=True)
     summary.write_text("{}")
     assert _stream_summary_exists(payload) is True
+
+
+def test_eval_watcher_passes_stream_eval_devices_when_configured(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("ok")
+    payload = {
+        "ckpt_path": str(tmp_path / "step_000500.ckpt"),
+        "stream_eval": {
+            "enabled": True,
+            "out_dir": str(tmp_path / "stream_eval"),
+            "run_name": "step_000500",
+            "probe_tag": "test",
+            "devices": 8,
+        },
+    }
+
+    cmd = _build_stream_eval_cmd(config_path, payload)
+
+    assert cmd[-2:] == ["--devices", "8"]

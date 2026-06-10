@@ -149,6 +149,23 @@ def parse_args(argv=None):
     )
     parser.add_argument("--probe_tag", type=str, default=None)
     parser.add_argument("--meta_paths", nargs="+", default=None)
+    parser.add_argument(
+        "--devices",
+        type=str,
+        default="1",
+        help=(
+            "Number of GPU worker processes to launch, or a comma-separated "
+            "visible device list such as 0,1,2,3. Stream eval shards samples "
+            "across workers; each worker still runs batch_size=1."
+        ),
+    )
+    parser.add_argument(
+        "--accelerator",
+        type=str,
+        choices=["gpu", "cpu"],
+        default=None,
+        help="Execution device type. Defaults to gpu when CUDA is available.",
+    )
     parser.add_argument("--no_ema", action="store_true")
     parser.add_argument(
         "--set",
@@ -740,13 +757,106 @@ def _average_scalar_metric(run_metrics: List[Dict], key: str) -> float:
     return float(np.mean(vals)) if vals else float("nan")
 
 
-def main():
-    args = parse_args()
+def _parse_devices_arg(devices_arg) -> list[int]:
+    if devices_arg is None:
+        return [0]
+    if isinstance(devices_arg, int):
+        return list(range(devices_arg)) if devices_arg > 0 else []
+    if isinstance(devices_arg, (list, tuple)):
+        return [int(device) for device in devices_arg]
+
+    text = str(devices_arg).strip()
+    if text in {"", "none", "None"}:
+        return [0]
+    if text in {"auto", "-1"}:
+        count = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        return list(range(max(count, 1)))
+    if text.startswith("[") and text.endswith("]"):
+        values = json.loads(text)
+        return [int(device) for device in values]
+    if "," in text:
+        return [int(part.strip()) for part in text.split(",") if part.strip()]
+
+    count = int(text)
+    return list(range(count)) if count > 0 else []
+
+
+def _resolve_accelerator(args, device_ids: list[int]) -> str:
+    if args.accelerator is not None:
+        return args.accelerator
+    return "gpu" if torch.cuda.is_available() and len(device_ids) > 0 else "cpu"
+
+
+def _select_eval_device(accelerator: str, device_index: int | None) -> torch.device:
+    if accelerator != "gpu" or not torch.cuda.is_available():
+        return torch.device("cpu")
+    device_index = 0 if device_index is None else int(device_index)
+    torch.cuda.set_device(device_index)
+    return torch.device(f"cuda:{device_index}")
+
+
+def _should_process_batch_on_rank(
+    batch_idx: int,
+    *,
+    rank: int,
+    world_size: int,
+    max_batches: int,
+    max_samples: int,
+) -> bool:
+    if max_batches > 0 and batch_idx >= max_batches:
+        return False
+    if max_samples > 0 and batch_idx >= max_samples:
+        return False
+    return batch_idx % max(world_size, 1) == rank
+
+
+def _rank_payload_path(run_dir: Path, rank: int) -> Path:
+    return run_dir / "_rank_records" / f"rank_{rank}.json"
+
+
+def _write_summary_payload(run_dir: Path, payload: Dict) -> None:
+    with open(run_dir / "summary.json", "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def _aggregate_rank_payloads(
+    *,
+    run_dir: Path,
+    world_size: int,
+    probe_tag: str,
+    ckpt_path: str,
+    vae_ckpt_path: str,
+    stream_mode: str,
+    num_runs: int,
+) -> Dict:
+    sample_records = []
+    for rank in range(world_size):
+        rank_path = _rank_payload_path(run_dir, rank)
+        if not rank_path.is_file():
+            raise FileNotFoundError(f"Missing stream eval rank payload: {rank_path}")
+        with open(rank_path) as f:
+            rank_payload = json.load(f)
+        sample_records.extend(rank_payload.get("samples", []))
+
+    sample_records.sort(key=lambda record: int(record.get("_sample_index", 0)))
+    summary = summarize_stream_records(sample_records)
+    payload = {
+        "probe_tag": probe_tag,
+        "ckpt": ckpt_path,
+        "vae_ckpt": vae_ckpt_path,
+        "stream_mode": stream_mode,
+        "num_samples": len(sample_records),
+        "num_runs": num_runs,
+        "summary": summary,
+        "samples": sample_records,
+    }
+    _write_summary_payload(run_dir, payload)
+    return payload
+
+
+def _resolve_launch_context(args) -> Dict:
     overrides = _parse_overrides(args.set)
     cfg = load_config(config_path=args.config, override_args=overrides)
-    _set_seed(args.seed)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt_path = args.ckpt or cfg.get("test_ckpt", None) or cfg.get("resume_ckpt", None)
     vae_ckpt_path = args.vae_ckpt or cfg.get("test_vae_ckpt", None)
     if ckpt_path is None:
@@ -756,6 +866,54 @@ def main():
 
     meta_paths, probe_tag = _resolve_meta_paths_and_probe_tag(args, cfg)
     stream_mode = args.stream_mode or cfg.get("eval.stream_mode", "stream_generate")
+    num_runs = args.num_runs or int(cfg.get("eval.num_runs", 1))
+    out_root = Path(args.out_dir or cfg.get("eval.out_dir", "./outputs_stream_eval"))
+    run_name = _resolve_run_name(
+        ckpt_path=ckpt_path,
+        probe_tag=probe_tag,
+        stream_mode=stream_mode,
+        requested_run_name=args.run_name,
+    )
+    return {
+        "cfg": cfg,
+        "ckpt_path": ckpt_path,
+        "vae_ckpt_path": vae_ckpt_path,
+        "meta_paths": meta_paths,
+        "probe_tag": probe_tag,
+        "stream_mode": stream_mode,
+        "num_runs": num_runs,
+        "out_root": out_root,
+        "run_name": run_name,
+        "run_dir": out_root / run_name,
+    }
+
+
+def _run_stream_eval(
+    args,
+    *,
+    rank: int = 0,
+    world_size: int = 1,
+    accelerator: str | None = None,
+    device_index: int | None = None,
+    write_summary: bool = True,
+) -> Dict:
+    context = _resolve_launch_context(args)
+    cfg = context["cfg"]
+    ckpt_path = context["ckpt_path"]
+    vae_ckpt_path = context["vae_ckpt_path"]
+    meta_paths = context["meta_paths"]
+    probe_tag = context["probe_tag"]
+    stream_mode = context["stream_mode"]
+    num_runs = context["num_runs"]
+    run_dir = context["run_dir"]
+
+    _set_seed(args.seed + rank)
+    if accelerator is None:
+        accelerator = _resolve_accelerator(
+            args,
+            [device_index] if device_index is not None else [0],
+        )
+    device = _select_eval_device(accelerator, device_index)
 
     batch_size = args.batch_size or int(cfg.data.test_bs)
     if batch_size != 1:
@@ -764,7 +922,6 @@ def main():
         )
 
     num_workers = args.num_workers if args.num_workers is not None else int(cfg.data.num_workers)
-    num_runs = args.num_runs or int(cfg.get("eval.num_runs", 1))
     seg_size = int(cfg.get("eval.seg_size", 20))
     num_denoise_steps = (
         args.num_denoise_steps
@@ -796,16 +953,10 @@ def main():
     token_dt = float(cfg.get("eval.token_dt", cfg.get("stream.token_dt", 0.20)))
     frames_per_token = int(cfg.get("eval.frames_per_token", cfg.get("data.frames_per_token", 4)))
 
-    out_root = Path(args.out_dir or cfg.get("eval.out_dir", "./outputs_stream_eval"))
-    run_dir = out_root / _resolve_run_name(
-        ckpt_path=ckpt_path,
-        probe_tag=probe_tag,
-        stream_mode=stream_mode,
-        requested_run_name=args.run_name,
-    )
     sample_root = run_dir / "samples"
     sample_root.mkdir(parents=True, exist_ok=True)
-    OmegaConf.save(cfg.config, run_dir / "config.yaml")
+    if rank == 0:
+        OmegaConf.save(cfg.config, run_dir / "config.yaml")
 
     model, vae = load_eval_model_and_vae(
         cfg,
@@ -825,17 +976,27 @@ def main():
     )
 
     print(
-        f"[stream-eval] ckpt={ckpt_path} probe={probe_tag} stream_mode={stream_mode} "
+        f"[stream-eval][rank {rank}/{world_size}] ckpt={ckpt_path} "
+        f"probe={probe_tag} stream_mode={stream_mode} device={device} "
         f"num_runs={num_runs} batch_size={batch_size} text_device={text_device} "
         f"group_present_segments={int(group_present_segments)} history_length={history_length} "
         f"traj_horizon_tokens={traj_horizon_tokens} out_dir={run_dir}"
     )
 
     sample_records = []
-    seen_samples = 0
     for batch_idx, batch in enumerate(dataloader):
         if max_batches > 0 and batch_idx >= max_batches:
             break
+        if max_samples > 0 and batch_idx >= max_samples:
+            break
+        if not _should_process_batch_on_rank(
+            batch_idx,
+            rank=rank,
+            world_size=world_size,
+            max_batches=max_batches,
+            max_samples=max_samples,
+        ):
+            continue
         sample_batch = _slice_single_sample_batch(batch, 0)
         sample_name = sample_batch["name"][0]
         sample_dataset = sample_batch["dataset"][0]
@@ -962,6 +1123,7 @@ def main():
             stream_runs.append(stream_metric)
 
         sample_record = {
+            "_sample_index": batch_idx,
             "name": sample_name,
             "dataset": sample_dataset,
             "stream_mode": stream_mode,
@@ -1012,10 +1174,6 @@ def main():
             render_no_traj_video=render_no_traj_video,
         )
 
-        seen_samples += 1
-        if max_samples > 0 and seen_samples >= max_samples:
-            break
-
     summary = summarize_stream_records(sample_records)
     payload = {
         "probe_tag": probe_tag,
@@ -1027,14 +1185,74 @@ def main():
         "summary": summary,
         "samples": sample_records,
     }
-    with open(run_dir / "summary.json", "w") as f:
-        json.dump(payload, f, indent=2)
+    if world_size > 1:
+        rank_path = _rank_payload_path(run_dir, rank)
+        rank_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(rank_path, "w") as f:
+            json.dump(payload, f, indent=2)
+    elif write_summary:
+        _write_summary_payload(run_dir, payload)
 
     print(
-        f"[stream-eval] finished {len(sample_records)} samples | "
+        f"[stream-eval][rank {rank}/{world_size}] finished {len(sample_records)} samples | "
         f"ADE={summary.get('traj/ADE_mean', float('nan')):.4f} "
         f"FDE={summary.get('traj/FDE_mean', float('nan')):.4f} "
         f"RootJump={summary.get('stream_boundary/root_jump_mean', float('nan')):.4f}"
+    )
+    return payload
+
+
+def _distributed_worker(rank: int, args, device_ids: list[int]) -> None:
+    _run_stream_eval(
+        args,
+        rank=rank,
+        world_size=len(device_ids),
+        accelerator="gpu",
+        device_index=device_ids[rank],
+        write_summary=False,
+    )
+
+
+def main():
+    args = parse_args()
+    device_ids = _parse_devices_arg(args.devices)
+    accelerator = _resolve_accelerator(args, device_ids)
+    if accelerator == "gpu" and len(device_ids) > 1:
+        context = _resolve_launch_context(args)
+        args.run_name = context["run_name"]
+        context["run_dir"].mkdir(parents=True, exist_ok=True)
+        torch.multiprocessing.spawn(
+            _distributed_worker,
+            args=(args, device_ids),
+            nprocs=len(device_ids),
+            join=True,
+        )
+        payload = _aggregate_rank_payloads(
+            run_dir=context["run_dir"],
+            world_size=len(device_ids),
+            probe_tag=context["probe_tag"],
+            ckpt_path=context["ckpt_path"],
+            vae_ckpt_path=context["vae_ckpt_path"],
+            stream_mode=context["stream_mode"],
+            num_runs=context["num_runs"],
+        )
+        summary = payload["summary"]
+        print(
+            f"[stream-eval] merged {payload['num_samples']} samples from "
+            f"{len(device_ids)} ranks | "
+            f"ADE={summary.get('traj/ADE_mean', float('nan')):.4f} "
+            f"FDE={summary.get('traj/FDE_mean', float('nan')):.4f} "
+            f"RootJump={summary.get('stream_boundary/root_jump_mean', float('nan')):.4f}"
+        )
+        return
+
+    device_index = device_ids[0] if accelerator == "gpu" and device_ids else None
+    _run_stream_eval(
+        args,
+        rank=0,
+        world_size=1,
+        accelerator=accelerator,
+        device_index=device_index,
     )
 
 

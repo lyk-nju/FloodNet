@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import sys
 
@@ -386,3 +387,96 @@ def test_ldf_stream_metrics_resolves_test_probe_meta_paths_when_test_meta_missin
 
     assert meta_paths == ["/data/HumanML3D/test_min.txt"]
     assert probe_tag == "test"
+
+
+def test_ldf_stream_metrics_shards_batches_across_ranks():
+    from eval.ldf import stream_metrics
+
+    assert stream_metrics._parse_devices_arg("8") == list(range(8))
+    assert stream_metrics._parse_devices_arg("0,1,2,3") == [0, 1, 2, 3]
+
+    rank0 = [
+        idx
+        for idx in range(8)
+        if stream_metrics._should_process_batch_on_rank(
+            idx, rank=0, world_size=2, max_batches=0, max_samples=0
+        )
+    ]
+    rank1 = [
+        idx
+        for idx in range(8)
+        if stream_metrics._should_process_batch_on_rank(
+            idx, rank=1, world_size=2, max_batches=0, max_samples=0
+        )
+    ]
+
+    assert rank0 == [0, 2, 4, 6]
+    assert rank1 == [1, 3, 5, 7]
+    assert [
+        idx
+        for idx in range(8)
+        if stream_metrics._should_process_batch_on_rank(
+            idx, rank=1, world_size=2, max_batches=0, max_samples=5
+        )
+    ] == [1, 3]
+    assert [
+        idx
+        for idx in range(8)
+        if stream_metrics._should_process_batch_on_rank(
+            idx, rank=0, world_size=2, max_batches=3, max_samples=0
+        )
+    ] == [0, 2]
+
+
+def test_ldf_stream_metrics_aggregates_rank_payloads(tmp_path):
+    from eval.ldf import stream_metrics
+
+    rank_dir = tmp_path / "_rank_records"
+    rank_dir.mkdir()
+    (rank_dir / "rank_0.json").write_text(
+        json.dumps(
+            {
+                "samples": [
+                    {
+                        "_sample_index": 2,
+                        "name": "sample_2",
+                        "ade": 0.30,
+                        "fde": 0.50,
+                        "mse": 0.03,
+                        "traj_jitter": 0.003,
+                    }
+                ]
+            }
+        )
+    )
+    (rank_dir / "rank_1.json").write_text(
+        json.dumps(
+            {
+                "samples": [
+                    {
+                        "_sample_index": 1,
+                        "name": "sample_1",
+                        "ade": 0.10,
+                        "fde": 0.20,
+                        "mse": 0.01,
+                        "traj_jitter": 0.001,
+                    }
+                ]
+            }
+        )
+    )
+
+    payload = stream_metrics._aggregate_rank_payloads(
+        run_dir=tmp_path,
+        world_size=2,
+        probe_tag="test",
+        ckpt_path="/ckpts/step_1.ckpt",
+        vae_ckpt_path="/ckpts/vae.ckpt",
+        stream_mode="stream_generate_step",
+        num_runs=1,
+    )
+
+    assert payload["num_samples"] == 2
+    assert [sample["name"] for sample in payload["samples"]] == ["sample_1", "sample_2"]
+    assert payload["summary"]["stream_gt/root_ADE"] == 0.20
+    assert (tmp_path / "summary.json").is_file()

@@ -202,6 +202,9 @@ def _build_stream_eval_cmd(
         cmd.append("--compute_no_traj_baseline")
     else:
         cmd.append("--no_compute_no_traj_baseline")
+    devices = stream_eval.get("devices")
+    if devices is not None:
+        cmd.extend(["--devices", str(devices)])
     return cmd
 
 
