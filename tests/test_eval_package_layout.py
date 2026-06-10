@@ -53,6 +53,26 @@ def test_eval_common_types_have_stable_payloads(tmp_path):
     }
 
 
+def test_standard_eval_artifact_dirs_match_run_eval_style(tmp_path):
+    from eval.common.artifacts import standard_eval_artifact_dirs
+
+    dirs = standard_eval_artifact_dirs(
+        tmp_path,
+        evaluator="RootRefiner",
+        probe_tag="standard",
+        run_id="step_000500",
+        artifact_kinds=("metrics", "per_sample", "samples"),
+    )
+
+    assert dirs["metrics"] == (
+        tmp_path / "RootRefiner" / "metrics" / "standard" / "step_000500"
+    )
+    assert dirs["per_sample"] == (
+        tmp_path / "RootRefiner" / "per_sample" / "standard" / "step_000500"
+    )
+    assert dirs["samples"].is_dir()
+
+
 def test_layered_eval_packages_import():
     module_names = [
         "eval.common",

@@ -16,6 +16,7 @@ from eval.runtime.benchmark import (
     build_eval_root_plan_from_points,
     build_rootplan_stream_step_payload,
     resolve_traj_condition_source,
+    write_runtime_report,
     write_stream_summary,
 )
 from utils.inference_glue import InferenceGlueState, InferenceGlueTimeline
@@ -452,6 +453,43 @@ def test_write_stream_summary_sanitizes_numpy_and_torch_scalars(tmp_path):
     assert payload["np_ok"] == 7
     assert payload["torch_bad"] is None
     assert payload["torch_ok"] == [1.0, 2.0]
+
+
+def test_write_runtime_report_mirrors_standard_eval_layout(tmp_path):
+    payload = {
+        "run_id": "step_000500",
+        "summary": {"ADE_mean": 0.2},
+        "aggregate": {"ADE_mean": 0.2},
+        "records": [
+            {
+                "suite": "humanml3d_control",
+                "mode": "gt_traj",
+                "sample_id": "000021",
+                "ADE": 0.2,
+                "FDE": 0.3,
+            }
+        ],
+    }
+
+    write_runtime_report(
+        output_dir=tmp_path,
+        run_id="step_000500",
+        suite_tag="smoke",
+        payload=payload,
+        records=payload["records"],
+    )
+
+    legacy_root = tmp_path / "step_000500"
+    metrics_dir = tmp_path / "Runtime" / "metrics" / "smoke" / "step_000500"
+
+    assert (legacy_root / "summary.json").is_file()
+    assert (legacy_root / "summary.csv").is_file()
+    assert (metrics_dir / "summary.json").is_file()
+    assert (metrics_dir / "records.csv").is_file()
+
+    standard_payload = json.loads((metrics_dir / "summary.json").read_text())
+    assert standard_payload["run_id"] == "step_000500"
+    assert standard_payload["summary"]["ADE_mean"] == 0.2
 
 
 def test_resolve_traj_condition_source_makes_root_refiner_mode_explicit():

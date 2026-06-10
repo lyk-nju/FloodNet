@@ -780,3 +780,29 @@ def test_write_report_sanitizes_nan_for_strict_json(tmp_path):
     payload = json.loads(text)
     assert payload["summary"]["xyz_ADE"] is None
     assert payload["per_sample"][0]["xyz_ADE"] is None
+
+
+def test_write_report_mirrors_standard_eval_layout(tmp_path):
+    result = {
+        "summary": {"n_samples": 1, "xyz_ADE": 0.25},
+        "per_sample": [{"idx": 0, "xyz_ADE": 0.25}],
+    }
+
+    write_report(result, tmp_path, suite="standard", run_id="step_000500")
+
+    metrics_dir = tmp_path / "RootRefiner" / "metrics" / "standard" / "step_000500"
+    per_sample_dir = (
+        tmp_path / "RootRefiner" / "per_sample" / "standard" / "step_000500"
+    )
+
+    assert (tmp_path / "metrics.json").is_file()
+    assert (tmp_path / "summary.json").is_file()
+    assert (tmp_path / "per_sample.csv").is_file()
+    assert (metrics_dir / "metrics.json").is_file()
+    assert (metrics_dir / "summary.json").is_file()
+    assert (per_sample_dir / "per_sample.csv").is_file()
+
+    payload = json.loads((metrics_dir / "metrics.json").read_text())
+    assert payload["evaluator"] == "root_refiner"
+    assert payload["suite"] == "standard"
+    assert payload["summary"]["xyz_ADE"] == 0.25

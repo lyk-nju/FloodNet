@@ -30,6 +30,7 @@ import argparse
 import csv
 import json
 import math
+import shutil
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -42,7 +43,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from eval.common.artifacts import ensure_dir, write_eval_json  # noqa: E402
+from eval.common.artifacts import (  # noqa: E402
+    ensure_dir,
+    standard_eval_artifact_dirs,
+    write_eval_json,
+)
 from eval.common.visualization import (  # noqa: E402
     plot_xz_trajectories,
     plot_yaw_series,
@@ -1054,20 +1059,52 @@ def run_suite_benchmark(
     )
 
 
-def write_report(result: dict, output_dir: str | Path) -> None:
-    """Write metrics.json plus legacy summary.json + per_sample.csv."""
+def _write_per_sample_csv(path: str | Path, per_sample: list[dict]) -> None:
+    if not per_sample:
+        return
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    keys = sorted({key for sample in per_sample for key in sample.keys()})
+    with out.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(per_sample)
+
+
+def write_report(
+    result: dict,
+    output_dir: str | Path,
+    *,
+    suite: str | None = None,
+    run_id: str | None = None,
+    write_standard_layout: bool = True,
+) -> None:
+    """Write legacy files plus run_eval-style RootRefiner artifacts."""
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    payload = _json_sanitize(build_eval_payload(result))
+    suite_tag = str(suite or result.get("suite", "single"))
+    payload = _json_sanitize(build_eval_payload(result, suite=suite_tag))
+    if suite is not None:
+        payload["suite"] = str(suite)
+    if run_id is not None:
+        payload["run_id"] = str(run_id)
     write_json_strict(out / "metrics.json", payload)
     write_json_strict(out / "summary.json", payload["summary"])
     per_sample = payload["per_sample"]
-    if per_sample:
-        keys = sorted({key for sample in per_sample for key in sample.keys()})
-        with (out / "per_sample.csv").open("w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=keys)
-            writer.writeheader()
-            writer.writerows(per_sample)
+    _write_per_sample_csv(out / "per_sample.csv", per_sample)
+
+    if write_standard_layout:
+        run_tag = str(run_id or payload.get("run_id") or "latest")
+        dirs = standard_eval_artifact_dirs(
+            out,
+            evaluator="RootRefiner",
+            probe_tag=str(payload.get("suite", suite_tag)),
+            run_id=run_tag,
+            artifact_kinds=("metrics", "per_sample"),
+        )
+        write_json_strict(dirs["metrics"] / "metrics.json", payload)
+        write_json_strict(dirs["metrics"] / "summary.json", payload["summary"])
+        _write_per_sample_csv(dirs["per_sample"] / "per_sample.csv", per_sample)
 
 
 # ---------------------------------------------------------------------------
@@ -1207,6 +1244,20 @@ def main(argv=None):
         task_specs=task_specs,
         suite=args.suite,
     )
+    run_id = Path(args.ckpt).stem.replace("=", "_")
+    suite_tag = args.suite or (
+        "full_route" if args.full_route or args.raw_id or task_specs is not None else "single"
+    )
+    legacy_sample_dir = Path(args.output_dir) / "samples"
+    standard_sample_dir = None
+    if args.save_artifacts:
+        standard_sample_dir = standard_eval_artifact_dirs(
+            args.output_dir,
+            evaluator="RootRefiner",
+            probe_tag=suite_tag,
+            run_id=run_id,
+            artifact_kinds=("samples",),
+        )["samples"]
 
     if args.suite:
         result = run_suite_benchmark(
@@ -1218,7 +1269,7 @@ def main(argv=None):
             max_samples=args.max_samples,
             duration_mode=args.duration_mode,
             oracle_duration=args.oracle_duration,
-            artifact_dir=Path(args.output_dir) / "samples" if args.save_artifacts else None,
+            artifact_dir=standard_sample_dir,
             artifact_max_samples=args.artifact_max_samples,
             task_specs=task_specs,
         )
@@ -1230,11 +1281,18 @@ def main(argv=None):
                                 force_path_mode=cli_force_path_mode,
                                 task_specs=task_specs,
                                 artifact_dir=(
-                                    Path(args.output_dir) / "samples"
+                                    standard_sample_dir
                                     if args.save_artifacts else None
                                 ),
                                 artifact_max_samples=args.artifact_max_samples)
-    write_report(result, args.output_dir)
+    if (
+        args.save_artifacts
+        and standard_sample_dir is not None
+        and standard_sample_dir.exists()
+        and standard_sample_dir != legacy_sample_dir
+    ):
+        shutil.copytree(standard_sample_dir, legacy_sample_dir, dirs_exist_ok=True)
+    write_report(result, args.output_dir, suite=suite_tag, run_id=run_id)
     print(json.dumps(result["summary"], indent=2))
 
 

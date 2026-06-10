@@ -17,8 +17,10 @@ import argparse
 import csv
 import json
 import os
+import shutil
 import sys
 from datetime import datetime
+from pathlib import Path
 
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 _project_root = os.path.dirname(os.path.dirname(_script_dir))
@@ -41,7 +43,7 @@ from torch_ema import ExponentialMovingAverage
 from omegaconf import OmegaConf
 
 from eval.common.json import json_sanitize, write_json_strict
-from eval.common.artifacts import ensure_dir
+from eval.common.artifacts import ensure_dir, standard_eval_artifact_dirs
 from eval.common.visualization import (
     plot_xz_trajectories,
     plot_yaw_series,
@@ -117,6 +119,34 @@ _AGGREGATE_METRIC_KEYS = (
     "lateral_velocity_ratio",
 )
 
+_RUNTIME_RECORD_FIELDS = (
+    "suite",
+    "mode",
+    "sample_id",
+    "ADE",
+    "FDE",
+    "path_arc",
+    "path_chamfer",
+    "chamfer_type",
+    "lateral_velocity_ratio",
+    "heading_path_error_deg",
+    "target_source",
+    "ADE_vs_original_gt",
+    "FDE_vs_original_gt",
+    "traj_condition_path",
+    "condition_source",
+    "root_refiner_enabled",
+    "rootplan_replan_count",
+    "rootplan_replan_commits",
+    "rootplan_replan_sources",
+    "turn_edit_commit",
+    "turn_delay_tokens",
+    "turn_blend_tokens",
+    "turn_effective_commit",
+    "turn_activation_commit",
+    "turn_target_source",
+)
+
 
 def _is_finite_number(value) -> bool:
     try:
@@ -161,6 +191,47 @@ def aggregate_runtime_records(records: list[dict]) -> dict:
         for key, vals in sorted(by_suite_mode.items())
     }
     return summary
+
+
+def _write_runtime_records_csv(path, records: list[dict]) -> None:
+    if not records:
+        return
+    out = Path(path)
+    ensure_dir(out.parent)
+    with out.open("w", newline="") as fc:
+        writer = csv.DictWriter(
+            fc,
+            fieldnames=list(_RUNTIME_RECORD_FIELDS),
+            extrasaction="ignore",
+        )
+        writer.writeheader()
+        for rec in records:
+            writer.writerow(_csv_safe_record(rec))
+
+
+def write_runtime_report(
+    *,
+    output_dir,
+    run_id: str,
+    suite_tag: str,
+    payload: dict,
+    records: list[dict],
+) -> dict:
+    """Write legacy runtime summary plus run_eval-style metric artifacts."""
+    legacy_root = ensure_dir(Path(output_dir) / str(run_id))
+    write_stream_summary(legacy_root / "summary.json", payload)
+    _write_runtime_records_csv(legacy_root / "summary.csv", records)
+
+    dirs = standard_eval_artifact_dirs(
+        output_dir,
+        evaluator="Runtime",
+        probe_tag=str(suite_tag),
+        run_id=str(run_id),
+        artifact_kinds=("metrics",),
+    )
+    write_stream_summary(dirs["metrics"] / "summary.json", payload)
+    _write_runtime_records_csv(dirs["metrics"] / "records.csv", records)
+    return {"legacy_root": legacy_root, **dirs}
 
 
 def resolve_traj_condition_source(
@@ -1209,8 +1280,24 @@ def main():
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_root = os.path.join(args.output_dir, run_id)
+    standard_media_dirs = standard_eval_artifact_dirs(
+        args.output_dir,
+        evaluator="Runtime",
+        probe_tag=args.preset,
+        run_id=run_id,
+        artifact_kinds=("plot", "video"),
+        create=False,
+    )
     vdir = os.path.join(out_root, "videos") if args.render_video else None
     pdir = os.path.join(out_root, "plots") if not args.no_save_plots else None
+    standard_vdir = (
+        str(ensure_dir(standard_media_dirs["video"])) if args.render_video else None
+    )
+    standard_pdir = (
+        str(ensure_dir(standard_media_dirs["plot"]))
+        if not args.no_save_plots
+        else None
+    )
     os.makedirs(out_root, exist_ok=True)
     if vdir: os.makedirs(vdir, exist_ok=True)
     if pdir: os.makedirs(pdir, exist_ok=True)
@@ -1326,14 +1413,29 @@ def main():
                 motion_263=_pm,
                 split_tok=_split,
             )
+            if standard_pdir:
+                for name in (
+                    f"{case.name}_plot_world_xz.png",
+                    f"{case.name}_plot_yaw.png",
+                ):
+                    src = os.path.join(pdir, name)
+                    if os.path.exists(src):
+                        shutil.copy2(src, os.path.join(standard_pdir, name))
 
         if args.render_video and _pm is not None and _pm.size > 0:
             mp4 = os.path.join(vdir, f"{case.name}.mp4")
             render_single_video(motion=_pm, save_path=mp4, dim=263, render_setting={})
             print(f"    video: {mp4}")
+            if standard_vdir:
+                shutil.copy2(mp4, os.path.join(standard_vdir, f"{case.name}.mp4"))
             if _pr is not None and _gr is not None:
-                _render_traj_video(_pr, _gr, os.path.join(vdir, f"{case.name}_traj.mp4"),
-                                   case.name, split_tok=_split)
+                traj_mp4 = os.path.join(vdir, f"{case.name}_traj.mp4")
+                _render_traj_video(_pr, _gr, traj_mp4, case.name, split_tok=_split)
+                if standard_vdir:
+                    shutil.copy2(
+                        traj_mp4,
+                        os.path.join(standard_vdir, f"{case.name}_traj.mp4"),
+                    )
 
     aggregate = aggregate_runtime_records(all_recs)
     summary = {"run_id": run_id, "config": args.config, "ckpt": args.ckpt,
@@ -1354,28 +1456,17 @@ def main():
                # field added during the eval package refactor.
                "summary": aggregate,
                "records": all_recs}
-    sp = os.path.join(out_root, "summary.json")
-    write_stream_summary(sp, summary)
-    print(f"\nSummary: {sp}")
-
+    report_dirs = write_runtime_report(
+        output_dir=args.output_dir,
+        run_id=run_id,
+        suite_tag=args.preset,
+        payload=summary,
+        records=all_recs,
+    )
+    print(f"\nSummary: {report_dirs['legacy_root'] / 'summary.json'}")
     if all_recs:
-        cp = os.path.join(out_root, "summary.csv")
-        fields = ["suite", "mode", "sample_id", "ADE", "FDE", "path_arc",
-                  "path_chamfer", "chamfer_type", "lateral_velocity_ratio",
-                  "heading_path_error_deg", "target_source",
-                  "ADE_vs_original_gt", "FDE_vs_original_gt",
-                  "traj_condition_path", "condition_source",
-                  "root_refiner_enabled", "rootplan_replan_count",
-                  "rootplan_replan_commits", "rootplan_replan_sources",
-                  "turn_edit_commit", "turn_delay_tokens", "turn_blend_tokens",
-                  "turn_effective_commit", "turn_activation_commit",
-                  "turn_target_source"]
-        with open(cp, "w", newline="") as fc:
-            w = csv.DictWriter(fc, fieldnames=fields, extrasaction="ignore")
-            w.writeheader()
-            for rec in all_recs:
-                w.writerow(_csv_safe_record(rec))
-        print(f"CSV: {cp}")
+        print(f"CSV: {report_dirs['legacy_root'] / 'summary.csv'}")
+        print(f"Runtime metrics: {report_dirs['metrics'] / 'summary.json'}")
 
 
 if __name__ == "__main__":
