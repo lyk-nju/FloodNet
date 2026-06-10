@@ -688,7 +688,12 @@ class SelfForcingTrainer:
 
 
 _DEFAULT_BODY_AUX_WEIGHTS = {
-    "root_xz": 1.0, "root_y": 0.3, "heading": 0.5, "fwd_delta": 0.1, "yaw_delta": 0.1,
+    "root_xz": 1.0,
+    "root_y": 0.3,
+    "heading": 0.5,
+    "fwd_delta": 0.1,
+    "yaw_delta": 0.1,
+    "end_xz": 0.0,
 }
 
 

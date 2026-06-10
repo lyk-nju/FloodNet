@@ -31,6 +31,34 @@ def masked_smooth_l1(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor,
     return masked_mean(diff, mask)
 
 
+def last_valid_smooth_l1(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor,
+                         beta: float = 1.0) -> torch.Tensor:
+    """SmoothL1 on the last valid frame of each sample.
+
+    `mask` is expected to be frame-level [B, T]. Samples with no valid frames do
+    not contribute. Feature dimensions are summed before averaging over samples.
+    """
+    if mask.dim() != 2:
+        raise ValueError(f"last_valid_smooth_l1 expects a [B,T] mask, got {tuple(mask.shape)}")
+    valid = mask > 0
+    valid_counts = valid.long().sum(dim=1)
+    has_valid = valid_counts > 0
+    if not bool(has_valid.any()):
+        return pred.new_zeros(())
+    last_idx = (valid_counts.clamp(min=1) - 1).view(-1, 1, 1)
+    if pred.dim() == mask.dim():
+        last_idx = last_idx.squeeze(-1)
+    gather_shape = list(pred.shape)
+    gather_shape[1] = 1
+    last_idx = last_idx.expand(*gather_shape)
+    pred_last = pred.gather(dim=1, index=last_idx)[has_valid]
+    gt_last = gt.gather(dim=1, index=last_idx)[has_valid]
+    diff = F.smooth_l1_loss(pred_last, gt_last, reduction="none", beta=beta)
+    if diff.dim() > 1:
+        diff = diff.reshape(diff.shape[0], -1).sum(-1)
+    return diff.mean()
+
+
 def derive_fwd_yaw_delta(xyz: torch.Tensor, yaw: torch.Tensor):
     """Per-frame forward displacement + yaw change from (xyz, physical yaw).
 
@@ -78,7 +106,7 @@ def canonicalize_pose_to_anchor(
 def body_aux_loss_terms(pred_xyz, pred_yaw, gt_xyz, gt_yaw, active_mask,
                         weights: dict, heading_form: str = "cosine",
                         sample_loss_mask=None):
-    """Five body-aux loss terms (design §2.4) over the active frames.
+    """Body-aux loss terms over the active frames.
 
     pred_xyz/gt_xyz: [B, T, 3]; pred_yaw/gt_yaw: [B, T] (physical yaw);
     active_mask: [B, T] (bool/float); sample_loss_mask: optional [B] (0 zeroes a
@@ -96,6 +124,9 @@ def body_aux_loss_terms(pred_xyz, pred_yaw, gt_xyz, gt_yaw, active_mask,
         mask = mask * sample_loss_mask.to(mask.dtype).view(-1, *([1] * (mask.dim() - 1)))
 
     l_root_xz = masked_smooth_l1(pred_xyz[..., [0, 2]], gt_xyz[..., [0, 2]], mask)
+    l_end_xz = last_valid_smooth_l1(
+        pred_xyz[..., [0, 2]], gt_xyz[..., [0, 2]], mask
+    )
     l_root_y = masked_smooth_l1(pred_xyz[..., 1:2], gt_xyz[..., 1:2], mask)
 
     pred_h = torch.stack([torch.cos(pred_yaw), torch.sin(pred_yaw)], -1)
@@ -117,10 +148,11 @@ def body_aux_loss_terms(pred_xyz, pred_yaw, gt_xyz, gt_yaw, active_mask,
         + weights["heading"] * l_heading
         + weights["fwd_delta"] * l_fwd
         + weights["yaw_delta"] * l_yawd
+        + weights.get("end_xz", 0.0) * l_end_xz
     )
     terms = {
         "root_xz": l_root_xz, "root_y": l_root_y, "heading": l_heading,
-        "fwd_delta": l_fwd, "yaw_delta": l_yawd,
+        "fwd_delta": l_fwd, "yaw_delta": l_yawd, "end_xz": l_end_xz,
     }
     return total, terms
 
@@ -150,7 +182,10 @@ def compute_body_aux_loss(
     from utils.motion_process import recover_root_rot_pos
 
     weighted_losses = []
-    term_sums = {k: 0.0 for k in ("root_xz", "root_y", "heading", "fwd_delta", "yaw_delta")}
+    term_sums = {
+        k: 0.0
+        for k in ("root_xz", "root_y", "heading", "fwd_delta", "yaw_delta", "end_xz")
+    }
     total_n = 0.0
     for i in range(len(pred_list)):
         pred_latent = pred_list[i].to(device)

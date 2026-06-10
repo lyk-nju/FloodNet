@@ -192,6 +192,7 @@ body_aux_loss:
         heading: 0.5            # do not disable — wastes the new 7D heading channel
         fwd_delta: 0.1         # delta channels are noisy; conservative in v1
         yaw_delta: 0.1
+        end_xz: 1.0            # final active-frame XZ, FDE-like endpoint control
 
 
 anchor_canonicalize:

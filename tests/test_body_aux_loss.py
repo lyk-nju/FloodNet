@@ -20,7 +20,14 @@ from utils.training.control_loss import (
 )
 from utils.token_frame import num_frames_for_tokens
 
-_W = {"root_xz": 1.0, "root_y": 0.3, "heading": 0.5, "fwd_delta": 0.1, "yaw_delta": 0.1}
+_W = {
+    "root_xz": 1.0,
+    "root_y": 0.3,
+    "heading": 0.5,
+    "fwd_delta": 0.1,
+    "yaw_delta": 0.1,
+    "end_xz": 2.0,
+}
 
 
 def _poses(B=1, T=8, seed=0):
@@ -68,6 +75,30 @@ def test_root_xz_offset():
     pred[..., 2] += 2.0   # both xz axes off by 2 → smooth_l1(2)=1.5 each, sum 3.0
     _, terms = body_aux_loss_terms(pred, yaw, xyz, yaw, _full_mask(*xyz.shape[:2]), _W)
     assert abs(float(terms["root_xz"]) - 3.0) < 1e-6
+
+
+def test_end_xz_uses_last_active_frame_only():
+    B, T = 1, 6
+    gt_xyz = torch.zeros(B, T, 3, dtype=torch.float64)
+    pred_xyz = gt_xyz.clone()
+    pred_xyz[0, :5, 0] = 10.0
+    pred_xyz[0, :5, 2] = 10.0
+    pred_xyz[0, 5, 0] = 2.0
+    pred_xyz[0, 5, 2] = 2.0
+    yaw = torch.zeros(B, T, dtype=torch.float64)
+
+    total, terms = body_aux_loss_terms(
+        pred_xyz,
+        yaw,
+        gt_xyz,
+        yaw,
+        _full_mask(B, T),
+        {**_W, "root_xz": 0.0, "root_y": 0.0, "heading": 0.0, "fwd_delta": 0.0, "yaw_delta": 0.0},
+    )
+
+    # Only the final active x/z frame contributes: smooth_l1(2)=1.5 per axis.
+    assert abs(float(terms["end_xz"]) - 3.0) < 1e-6
+    assert abs(float(total) - 2.0 * 3.0) < 1e-6
 
 
 # 4. pred y off by 1 → L_root_y = smooth_l1(1)=0.5; weighted 0.3

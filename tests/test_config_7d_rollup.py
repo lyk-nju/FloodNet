@@ -41,7 +41,7 @@ def test_all_new_sections_present_and_readable():
     # T_B_06 (body_aux_loss subsumes the design's older heading_loss section)
     assert cfg.body_aux_loss.enabled is True
     assert cfg.body_aux_loss.heading_form in ("cosine", "smooth_l1")
-    for k in ("root_xz", "root_y", "heading", "fwd_delta", "yaw_delta"):
+    for k in ("root_xz", "root_y", "heading", "fwd_delta", "yaw_delta", "end_xz"):
         assert k in cfg.body_aux_loss.weights
     # T_B_07 / T_B_09 flags — shipped ldf.yaml is now on the 7D path.
     assert cfg.data.traj_feat_dim == 7
