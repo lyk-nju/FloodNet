@@ -746,6 +746,115 @@ def _save_sample_outputs(
         )
 
 
+def _stream_eval_artifact_dirs(out_root: Path, dataset_id: str, probe_tag: str, step_tag: str) -> Dict[str, Path]:
+    base_dir = Path(out_root) / dataset_id
+    return {
+        "text": base_dir / "text" / probe_tag / step_tag,
+        "token": base_dir / "token" / probe_tag / step_tag,
+        "feature": base_dir / "feature" / probe_tag / step_tag,
+        "traj_xz": base_dir / "traj_xz" / probe_tag / step_tag,
+        "traj_mask": base_dir / "traj_mask" / probe_tag / step_tag,
+        "frames": base_dir / "frames" / probe_tag / step_tag,
+        "metrics": base_dir / "metrics" / probe_tag / step_tag,
+        "video": base_dir / "video" / probe_tag / step_tag,
+        "composite": base_dir / "composite" / probe_tag / step_tag,
+        "condition_compare": base_dir / "condition_compare" / probe_tag / step_tag,
+    }
+
+
+def _to_numpy(value) -> np.ndarray:
+    if value is None:
+        return np.asarray([])
+    if torch.is_tensor(value):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
+def _frames_numpy(sample_batch: Dict) -> Optional[np.ndarray]:
+    frames = sample_batch.get("feature_text_end")
+    if frames is None:
+        return None
+    value = frames[0] if isinstance(frames, list) and len(frames) > 0 else frames
+    arr = _to_numpy(value).reshape(-1)
+    return arr.astype(np.int64) if arr.size > 0 else None
+
+
+def _traj_mask_numpy(sample_batch: Dict, feat_len: int) -> Optional[np.ndarray]:
+    mask = sample_batch.get("traj_mask")
+    if mask is None:
+        return None
+    value = mask[0] if torch.is_tensor(mask) and mask.ndim >= 2 else mask
+    arr = _to_numpy(value).reshape(-1)
+    if feat_len > 0:
+        arr = arr[:feat_len]
+    return arr.astype(np.float32)
+
+
+def _save_eval_style_sample_outputs(
+    *,
+    out_root: Path,
+    dataset_id: str,
+    probe_tag: str,
+    step_tag: str,
+    sample_name: str,
+    sample_batch: Dict,
+    sample_record: Dict,
+    stream_feature: Optional[torch.Tensor],
+    stream_latent: Optional[torch.Tensor] = None,
+    gt_feature: Optional[torch.Tensor] = None,
+    offline_feature: Optional[torch.Tensor] = None,
+    stream_no_traj_feature: Optional[torch.Tensor] = None,
+) -> None:
+    dirs = _stream_eval_artifact_dirs(Path(out_root), dataset_id, probe_tag, step_tag)
+    for out_dir in dirs.values():
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(dirs["text"] / f"{sample_name}.txt", "w") as f:
+        f.write(_format_text(sample_batch))
+
+    with open(dirs["metrics"] / f"{sample_name}.json", "w") as f:
+        json.dump(sample_record, f, indent=2)
+
+    feat_len = 0
+    if stream_feature is not None:
+        stream_np = _to_numpy(stream_feature).astype(np.float32)
+        feat_len = int(stream_np.shape[0]) if stream_np.ndim > 0 else 0
+        np.save(dirs["feature"] / f"{sample_name}.npy", stream_np)
+
+    if stream_latent is not None:
+        np.save(
+            dirs["token"] / f"{sample_name}.npy",
+            _to_numpy(stream_latent).astype(np.float32),
+        )
+
+    condition_root = _condition_root_numpy(sample_batch)
+    if condition_root is not None:
+        cond_xz = condition_root[:, [0, 2]].astype(np.float32)
+        if feat_len > 0:
+            cond_xz = cond_xz[:feat_len]
+        np.save(dirs["traj_xz"] / f"{sample_name}.npy", cond_xz)
+
+    traj_mask = _traj_mask_numpy(sample_batch, feat_len)
+    if traj_mask is not None:
+        np.save(dirs["traj_mask"] / f"{sample_name}.npy", traj_mask)
+
+    frames = _frames_numpy(sample_batch)
+    if frames is not None:
+        np.save(dirs["frames"] / f"{sample_name}.npy", frames)
+
+    plot_xz_trajectories(
+        dirs["condition_compare"] / f"{sample_name}.png",
+        {
+            "gt_root": _root_numpy(gt_feature),
+            "condition_root": condition_root,
+            "stream_gt": _root_numpy(stream_feature),
+            "offline_gt": _root_numpy(offline_feature),
+            "stream_no_traj": _root_numpy(stream_no_traj_feature),
+        },
+        title=str(sample_name),
+    )
+
+
 def _build_run_name(ckpt_path: str, probe_tag: str, stream_mode: str) -> str:
     ckpt_tag = Path(ckpt_path).stem.replace("=", "_")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -831,6 +940,90 @@ def _write_summary_payload(run_dir: Path, payload: Dict) -> None:
         json.dump(payload, f, indent=2)
 
 
+def _write_eval_style_summaries(
+    *,
+    out_root: Path,
+    payload: Dict,
+    probe_tag: str,
+    step_tag: str,
+) -> None:
+    records_by_dataset: Dict[str, List[Dict]] = {}
+    for record in payload.get("samples", []):
+        dataset_id = record.get("dataset") or record.get("dataset_id")
+        if dataset_id is None:
+            continue
+        records_by_dataset.setdefault(str(dataset_id), []).append(record)
+
+    for dataset_id, records in records_by_dataset.items():
+        dirs = _stream_eval_artifact_dirs(Path(out_root), dataset_id, probe_tag, step_tag)
+        dirs["metrics"].mkdir(parents=True, exist_ok=True)
+        summary = summarize_stream_records(records)
+        with open(dirs["metrics"] / "summary.json", "w") as f:
+            json.dump({"summary": summary, "samples": records}, f, indent=2)
+
+
+def _render_eval_style_outputs(
+    *,
+    cfg,
+    out_root: Path,
+    sample_records: List[Dict],
+    probe_tag: str,
+    step_tag: str,
+    enabled: bool,
+) -> None:
+    if not enabled:
+        return
+    try:
+        from utils.visualize import (
+            make_composite_compare_videos,
+            render_video as render_eval_video,
+        )
+    except Exception as exc:
+        print(f"[stream-eval render] imports failed: {exc}")
+        return
+
+    render_setting = cfg.get("test_setting", {}) or {}
+    try:
+        render_setting = OmegaConf.to_container(render_setting, resolve=True)
+    except Exception:
+        render_setting = dict(render_setting)
+    render_setting.setdefault("recover_dim", 263)
+
+    dataset_ids = sorted(
+        {
+            str(record.get("dataset") or record.get("dataset_id"))
+            for record in sample_records
+            if record.get("dataset") or record.get("dataset_id")
+        }
+    )
+    for dataset_id in dataset_ids:
+        dirs = _stream_eval_artifact_dirs(Path(out_root), dataset_id, probe_tag, step_tag)
+        if not dirs["feature"].exists():
+            continue
+        try:
+            render_eval_video(
+                motion_dir=str(dirs["feature"]),
+                save_dir=str(dirs["video"]),
+                render_setting=render_setting,
+                frames_dir=str(dirs["frames"]),
+                traj_mask_dir=str(dirs["traj_mask"]),
+                cond_traj_dir=str(dirs["traj_xz"]),
+            )
+            make_composite_compare_videos(
+                result_folder=str(dirs["video"]),
+                compare_folders=render_setting.get(dataset_id, {}).get(
+                    "compare_folders", None
+                ),
+                compare_names=render_setting.get(dataset_id, {}).get(
+                    "compare_names", None
+                ),
+                text_folder=str(dirs["text"]),
+                save_dir=str(dirs["composite"]),
+            )
+        except Exception as exc:
+            print(f"[stream-eval render] dataset={dataset_id} failed: {exc}")
+
+
 def _aggregate_rank_payloads(
     *,
     run_dir: Path,
@@ -840,6 +1033,8 @@ def _aggregate_rank_payloads(
     vae_ckpt_path: str,
     stream_mode: str,
     num_runs: int,
+    out_root: Optional[Path] = None,
+    step_tag: Optional[str] = None,
 ) -> Dict:
     sample_records = []
     for rank in range(world_size):
@@ -863,6 +1058,13 @@ def _aggregate_rank_payloads(
         "samples": sample_records,
     }
     _write_summary_payload(run_dir, payload)
+    if out_root is not None and step_tag is not None:
+        _write_eval_style_summaries(
+            out_root=Path(out_root),
+            payload=payload,
+            probe_tag=probe_tag,
+            step_tag=step_tag,
+        )
     return payload
 
 
@@ -886,6 +1088,7 @@ def _resolve_launch_context(args) -> Dict:
         stream_mode=stream_mode,
         requested_run_name=args.run_name,
     )
+    step_tag = Path(str(ckpt_path)).stem.replace("=", "_")
     return {
         "cfg": cfg,
         "ckpt_path": ckpt_path,
@@ -896,6 +1099,7 @@ def _resolve_launch_context(args) -> Dict:
         "num_runs": num_runs,
         "out_root": out_root,
         "run_name": run_name,
+        "step_tag": step_tag,
         "run_dir": out_root / run_name,
     }
 
@@ -917,6 +1121,8 @@ def _run_stream_eval(
     probe_tag = context["probe_tag"]
     stream_mode = context["stream_mode"]
     num_runs = context["num_runs"]
+    out_root = context["out_root"]
+    step_tag = context["step_tag"]
     run_dir = context["run_dir"]
 
     _set_seed(args.seed + rank)
@@ -1185,6 +1391,20 @@ def _run_stream_eval(
             render_offline_video=render_offline_video,
             render_no_traj_video=render_no_traj_video,
         )
+        _save_eval_style_sample_outputs(
+            out_root=out_root,
+            dataset_id=sample_dataset,
+            probe_tag=probe_tag,
+            step_tag=step_tag,
+            sample_name=sample_name,
+            sample_batch=sample_batch,
+            sample_record=sample_record,
+            stream_feature=stream_feature_run0,
+            stream_latent=stream_latent_run0,
+            gt_feature=gt_feature,
+            offline_feature=offline_feature_run0,
+            stream_no_traj_feature=stream_no_traj_feature_run0,
+        )
 
     summary = summarize_stream_records(sample_records)
     payload = {
@@ -1204,6 +1424,20 @@ def _run_stream_eval(
             json.dump(payload, f, indent=2)
     elif write_summary:
         _write_summary_payload(run_dir, payload)
+        _write_eval_style_summaries(
+            out_root=out_root,
+            payload=payload,
+            probe_tag=probe_tag,
+            step_tag=step_tag,
+        )
+        _render_eval_style_outputs(
+            cfg=cfg,
+            out_root=out_root,
+            sample_records=sample_records,
+            probe_tag=probe_tag,
+            step_tag=step_tag,
+            enabled=render_video,
+        )
 
     print(
         f"[stream-eval][rank {rank}/{world_size}] finished {len(sample_records)} samples | "
@@ -1247,6 +1481,20 @@ def main():
             vae_ckpt_path=context["vae_ckpt_path"],
             stream_mode=context["stream_mode"],
             num_runs=context["num_runs"],
+            out_root=context["out_root"],
+            step_tag=context["step_tag"],
+        )
+        render_video = bool(
+            args.render_video
+            or context["cfg"].get("eval.render_video", False)
+        )
+        _render_eval_style_outputs(
+            cfg=context["cfg"],
+            out_root=context["out_root"],
+            sample_records=payload["samples"],
+            probe_tag=context["probe_tag"],
+            step_tag=context["step_tag"],
+            enabled=render_video,
         )
         summary = payload["summary"]
         print(

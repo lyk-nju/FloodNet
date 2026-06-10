@@ -304,6 +304,50 @@ def test_ldf_stream_sample_outputs_include_plots_and_path_roots(tmp_path):
     assert (tmp_path / "stream_no_traj_feature.npy").is_file()
 
 
+def test_ldf_stream_eval_writes_standard_eval_artifacts(tmp_path):
+    from eval.ldf import stream_metrics
+
+    frames = 6
+    stream_feature = torch.zeros(frames, 263)
+    stream_latent = torch.ones(3, 4)
+    stream_feature[:, 2] = torch.arange(frames, dtype=torch.float32) * 0.2
+    traj7 = torch.zeros(1, frames, 7)
+    traj7[0, :, 2] = torch.arange(frames, dtype=torch.float32) * 0.1
+    traj7[0, :, 3] = 1.0
+    sample_batch = {
+        "name": ["001439"],
+        "dataset": ["HumanML3D"],
+        "text": ["walk forward"],
+        "traj_cond_7d": traj7,
+        "traj_mask": torch.ones(1, frames, dtype=torch.float32),
+        "feature_text_end": [torch.tensor([frames], dtype=torch.long)],
+    }
+    sample_record = {"name": "001439", "dataset": "HumanML3D", "ade": 0.1}
+
+    stream_metrics._save_eval_style_sample_outputs(
+        out_root=tmp_path,
+        dataset_id="HumanML3D",
+        probe_tag="test",
+        step_tag="step_485000",
+        sample_name="001439",
+        sample_batch=sample_batch,
+        sample_record=sample_record,
+        stream_feature=stream_feature,
+        stream_latent=stream_latent,
+    )
+
+    base = tmp_path / "HumanML3D"
+    assert np.load(base / "feature/test/step_485000/001439.npy").shape == (frames, 263)
+    assert np.load(base / "token/test/step_485000/001439.npy").shape == (3, 4)
+    assert (base / "text/test/step_485000/001439.txt").read_text() == "walk forward"
+    assert np.load(base / "traj_xz/test/step_485000/001439.npy").shape == (frames, 2)
+    assert np.load(base / "traj_mask/test/step_485000/001439.npy").shape == (frames,)
+    assert np.load(base / "frames/test/step_485000/001439.npy").tolist() == [frames]
+    with open(base / "metrics/test/step_485000/001439.json") as f:
+        assert json.load(f)["ade"] == 0.1
+    assert (base / "condition_compare/test/step_485000/001439.png").is_file()
+
+
 def test_ldf_stream_metrics_cli_can_disable_no_traj_baseline(monkeypatch):
     from eval.ldf import stream_metrics
 
@@ -442,6 +486,7 @@ def test_ldf_stream_metrics_aggregates_rank_payloads(tmp_path):
                     {
                         "_sample_index": 2,
                         "name": "sample_2",
+                        "dataset": "HumanML3D",
                         "ade": 0.30,
                         "fde": 0.50,
                         "mse": 0.03,
@@ -458,6 +503,7 @@ def test_ldf_stream_metrics_aggregates_rank_payloads(tmp_path):
                     {
                         "_sample_index": 1,
                         "name": "sample_1",
+                        "dataset": "HumanML3D",
                         "ade": 0.10,
                         "fde": 0.20,
                         "mse": 0.01,
@@ -476,12 +522,15 @@ def test_ldf_stream_metrics_aggregates_rank_payloads(tmp_path):
         vae_ckpt_path="/ckpts/vae.ckpt",
         stream_mode="stream_generate_step",
         num_runs=1,
+        out_root=tmp_path,
+        step_tag="step_1",
     )
 
     assert payload["num_samples"] == 2
     assert [sample["name"] for sample in payload["samples"]] == ["sample_1", "sample_2"]
     assert payload["summary"]["stream_gt/root_ADE"] == 0.20
     assert (tmp_path / "summary.json").is_file()
+    assert (tmp_path / "HumanML3D/metrics/test/step_1/summary.json").is_file()
 
 
 def test_ldf_stream_metrics_caps_blas_threads_before_numpy_import():
