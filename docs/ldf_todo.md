@@ -261,10 +261,13 @@ traj_num_tokens   = latent_valid_len + horizon_tokens
 The implementation reconstructs 7D trajectory conditioning from raw 263D motion
 instead of directly cropping full-clip `traj_cond_7d`, supports per-sample
 `traj_start_token`, and preserves global horizon coordinates by adding `S` to
-the local active end token. It also crops segmented text endpoints from global
-token coordinates to the local window, supports both `variable_history` and
-`fixed_window` sampling policies, and keeps history corruption as a fixed input
-view over a clean committed latent state.
+the local active end token. `stream_training.horizon_tokens` is now the visible
+horizon bound even when `horizon_sim.enabled` is false; if horizon simulation
+samples a larger value, it is clamped to the stream-training horizon. It also
+crops segmented text endpoints from global token coordinates to the local
+window, supports both `variable_history` and `fixed_window` sampling policies,
+and keeps history corruption as a fixed input view over a clean committed latent
+state.
 
 **Remaining work**
 

@@ -220,6 +220,85 @@ def test_run_rollout_adds_window_start_to_horizon_active_end():
     assert kwargs["horizon_active_end"].tolist() == [8]
 
 
+def test_run_rollout_uses_stream_training_horizon_when_horizon_sim_disabled():
+    trainer, model, model_batch, _ = _make_trainer()
+
+    cfg = SimpleNamespace()
+    cfg.get = lambda key, default=None: {
+        "stream_training": {
+            "enabled": True,
+            "horizon_tokens": 2,
+        },
+        "anchor_canonicalize": {"enabled": False},
+        "horizon_sim": {"enabled": False},
+        "history_corruption": {},
+        "self_forcing_disable_replace": True,
+    }.get(key, default)
+    trainer._module.cfg = cfg
+    trainer.plan_rollout = MagicMock(
+        return_value=RolloutPlan(
+            effective_k=2,
+            start_end_indices=torch.tensor([2], dtype=torch.long),
+            phase_offset=torch.tensor([0.0]),
+        )
+    )
+    model_batch = {
+        **model_batch,
+        "feature": torch.zeros(_BATCH, 8, _HIDDEN),
+        "feature_length": torch.tensor([4], dtype=torch.long),
+        "traj_start_token": torch.tensor([5], dtype=torch.long),
+    }
+
+    trainer._run_rollout(model_batch, progress=1.0)
+
+    kwargs = model._prepare_traj_condition.call_args.kwargs
+    assert kwargs["horizon_tokens"] == 2
+    assert kwargs["horizon_active_end"].tolist() == [8]
+    assert trainer._last_horizon_tokens == 2.0
+
+
+def test_run_rollout_clamps_sampled_horizon_to_stream_training_horizon():
+    trainer, model, model_batch, _ = _make_trainer()
+
+    cfg = SimpleNamespace()
+    cfg.get = lambda key, default=None: {
+        "stream_training": {
+            "enabled": True,
+            "horizon_tokens": 2,
+        },
+        "anchor_canonicalize": {"enabled": False},
+        "horizon_sim": {
+            "enabled": True,
+            "warmup_ratio": 0.0,
+            "p_exact_inference_horizon": 1.0,
+            "inference_horizon_tokens": 50,
+        },
+        "history_corruption": {},
+        "self_forcing_disable_replace": True,
+    }.get(key, default)
+    trainer._module.cfg = cfg
+    trainer.plan_rollout = MagicMock(
+        return_value=RolloutPlan(
+            effective_k=2,
+            start_end_indices=torch.tensor([2], dtype=torch.long),
+            phase_offset=torch.tensor([0.0]),
+        )
+    )
+    model_batch = {
+        **model_batch,
+        "feature": torch.zeros(_BATCH, 8, _HIDDEN),
+        "feature_length": torch.tensor([4], dtype=torch.long),
+        "traj_start_token": torch.tensor([5], dtype=torch.long),
+    }
+
+    trainer._run_rollout(model_batch, progress=1.0)
+
+    kwargs = model._prepare_traj_condition.call_args.kwargs
+    assert kwargs["horizon_tokens"] == 2
+    assert kwargs["horizon_active_end"].tolist() == [8]
+    assert trainer._last_horizon_tokens == 2.0
+
+
 def test_run_rollout_records_window_local_active_history_metrics():
     trainer, _, model_batch, _ = _make_trainer()
     model_batch = {

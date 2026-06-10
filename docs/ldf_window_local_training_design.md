@@ -146,6 +146,20 @@ require final_E <= valid_tokens
 require min_history_tokens >= chunk_size
 ```
 
+The v1 implementation realizes this as a two-stage sample:
+
+```text
+1. build the maximum valid local window from S:
+   latent_valid_len = min(context_tokens, valid_tokens - S)
+2. let plan_rollout() sample the active local end E0-S inside:
+   [min_history_tokens, latent_valid_len - K + 1]
+```
+
+This is equivalent to sampling `E0` after `S` while keeping a fixed local window
+for the rollout. The future latent padding beyond the sampled active end is not
+fed to the model input or loss; it only gives the trajectory side enough length
+to expose the visible horizon.
+
 For `fixed_window`, v1 samples the final right boundary first and right-aligns
 the rollout plan:
 
@@ -488,7 +502,7 @@ If:
 ```text
 traj_start_token = S
 active_end_token = E
-horizon_tokens = H
+stream_training.horizon_tokens = H
 ```
 
 then visible trajectory ends at:
@@ -496,6 +510,14 @@ then visible trajectory ends at:
 ```text
 token_start_frame(E + H) - token_start_frame(S)
 ```
+
+`stream_training.horizon_tokens` is the visible horizon contract, not only the
+constructed trajectory-buffer length. Therefore it must be applied even when
+`horizon_sim.enabled` is false. If `horizon_sim.enabled` is true and samples a
+larger horizon than `stream_training.horizon_tokens`, the sampled value is
+clamped to `stream_training.horizon_tokens` for window-local training. This
+keeps the model from seeing beyond `[S:E+H]` while still allowing horizon
+curriculum inside that bound.
 
 Do not mix local `E-S` with global `S` in the same horizon calculation.
 
