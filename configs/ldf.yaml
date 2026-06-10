@@ -56,6 +56,14 @@ validation:
     eval_forward_control_loss: false
     eval_forward_control_loss_window_mode: mean_chunk_windows
     eval_all_captions: true
+    stream_eval:
+        enabled: false
+        stream_mode: stream_generate_step
+        max_samples: 5
+        num_runs: 1
+        max_batches: 0
+        compute_offline_baseline: true
+        compute_no_traj_baseline: true
 metrics:
     dim: 263
     t2m:
@@ -154,6 +162,16 @@ model:
         # Thresholds are phase progress over [resume_ckpt.global_step, trainer.max_steps].
         self_forcing_k_schedule:
             - [0.0, 5]
+
+stream_training:
+    enabled: false
+    context_tokens: 30
+    min_history_tokens: 8
+    horizon_tokens: 20
+    sample_policy: variable_history
+    anchor_move_in_rollout: false
+    latent_source: precomputed_slice
+    motion_aux_loss: latent_only
 
 # control_loss_train_mode selects gradient strategy for the XZ control loss:
 #   1 — active window, absolute coords, no detach   (gradient → ALL tokens via cumsum)

@@ -60,6 +60,7 @@ def test_layered_eval_packages_import():
         "eval.ldf.generation_metrics",
         "eval.ldf.cases",
         "eval.ldf.conditioning",
+        "eval.ldf.report",
         "eval.ldf.stream_metrics",
         "eval.ldf.sweep_cfg",
         "eval.ldf.t2m_metrics",
@@ -107,6 +108,7 @@ def test_layered_eval_modules_are_real_implementations_not_import_star_wrappers(
         Path("eval/ldf/generation_metrics.py"),
         Path("eval/ldf/cases.py"),
         Path("eval/ldf/conditioning.py"),
+        Path("eval/ldf/report.py"),
         Path("eval/ldf/stream_metrics.py"),
         Path("eval/ldf/sweep_cfg.py"),
         Path("eval/ldf/t2m_metrics.py"),
@@ -171,11 +173,12 @@ def test_layered_ldf_defaults_preserve_legacy_eval_artifact_dirs():
 
 
 def test_new_cli_wrappers_expose_main_functions():
-    from eval.ldf import generation_metrics, stream_metrics, t2m_metrics
+    from eval.ldf import generation_metrics, report, stream_metrics, t2m_metrics
     from eval.root_refiner import benchmark as root_refiner_benchmark
     from eval.runtime import benchmark, diagnose_control
 
     assert callable(generation_metrics.main)
+    assert callable(report.main)
     assert callable(stream_metrics.main)
     assert callable(t2m_metrics.main)
     assert callable(root_refiner_benchmark.main)
@@ -187,6 +190,7 @@ def test_new_cli_wrappers_expose_main_functions():
     "script_path",
     [
         "eval/ldf/generation_metrics.py",
+        "eval/ldf/report.py",
         "eval/ldf/stream_metrics.py",
         "eval/ldf/sweep_cfg.py",
         "eval/ldf/t2m_metrics.py",

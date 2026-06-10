@@ -107,6 +107,22 @@ def test_seq_lens_no_horizon_no_mask_is_base(model):
     assert sl.tolist() == [6]   # full length when nothing masks
 
 
+def test_seq_lens_prefers_explicit_traj_num_tokens_over_feature_length(model):
+    """Window-local training uses feature_length for latent length only."""
+    seq_len = 6
+    latent_valid_len = 4
+    T_frame = num_frames_for_tokens(seq_len)
+    x = {
+        "traj_features": torch.randn(1, T_frame, 7),
+        "feature_length": torch.tensor([latent_valid_len]),
+        "traj_num_tokens": torch.tensor([seq_len]),
+    }
+
+    sl = model._get_traj_seq_lens(x, seq_len, "cpu")
+
+    assert sl.tolist() == [seq_len]
+
+
 def test_prepare_traj_condition_returns_truncated_seq_lens(model):
     """Wiring: _prepare_traj_condition threads horizon into _get_traj_seq_lens."""
     seq_len = 6

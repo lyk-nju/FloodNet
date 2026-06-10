@@ -35,6 +35,34 @@ def _eval_request_path(save_dir: str | Path, step: int) -> Path:
     return _eval_root(save_dir) / "requests" / f"step_{step:06d}.json"
 
 
+def build_stream_eval_request(cfg, save_dir: str | Path, step_tag: str) -> dict | None:
+    stream_cfg = cfg.get("validation", {}).get("stream_eval", {}) or {}
+    if not bool(stream_cfg.get("enabled", False)):
+        return None
+
+    request = {
+        "enabled": True,
+        "stream_mode": str(stream_cfg.get("stream_mode", "stream_generate_step")),
+        "out_dir": str(
+            stream_cfg.get("out_dir")
+            or (_eval_root(save_dir) / "stream_eval")
+        ),
+        "run_name": str(stream_cfg.get("run_name") or step_tag),
+        "probe_tag": str(stream_cfg.get("probe_tag") or step_tag),
+        "max_samples": int(stream_cfg.get("max_samples", 5)),
+        "num_runs": int(stream_cfg.get("num_runs", 1)),
+        "max_batches": int(stream_cfg.get("max_batches", 0)),
+        "vae_ckpt": str(stream_cfg.get("vae_ckpt") or cfg.get("test_vae_ckpt", "")),
+        "compute_offline_baseline": bool(
+            stream_cfg.get("compute_offline_baseline", True)
+        ),
+        "compute_no_traj_baseline": bool(
+            stream_cfg.get("compute_no_traj_baseline", True)
+        ),
+    }
+    return request
+
+
 def emit_eval_request(module):
     trainer = getattr(module, "trainer", None)
     if trainer is None:
@@ -74,6 +102,13 @@ def emit_eval_request(module):
             "created_at": time.time(),
             "test_mode": "async",
         }
+        stream_eval_request = build_stream_eval_request(
+            module.cfg,
+            module.cfg.save_dir,
+            step_info.step_tag,
+        )
+        if stream_eval_request is not None:
+            payload["stream_eval"] = stream_eval_request
         tmp_path = request_path.with_suffix(".json.tmp")
         with open(tmp_path, "w") as f:
             json.dump(payload, f, indent=2)
@@ -195,6 +230,13 @@ def emit_resume_eval(cfg, save_dir: str, resume_ckpt: str):
         "created_at": time.time(),
         "test_mode": "async",
     }
+    stream_eval_request = build_stream_eval_request(
+        cfg,
+        save_dir,
+        payload["step_tag"],
+    )
+    if stream_eval_request is not None:
+        payload["stream_eval"] = stream_eval_request
     tmp_path = request_path.with_suffix(".json.tmp")
     with open(tmp_path, "w") as f:
         json.dump(payload, f, indent=2)

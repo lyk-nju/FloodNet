@@ -50,6 +50,31 @@ def derive_fwd_yaw_delta(xyz: torch.Tensor, yaw: torch.Tensor):
     return fwd_delta, yaw_delta
 
 
+def canonicalize_pose_to_anchor(
+    xyz: torch.Tensor,
+    yaw: torch.Tensor,
+    anchor_xyz: torch.Tensor,
+    anchor_yaw: torch.Tensor,
+):
+    """Convert root pose tensors to an anchor-local frame.
+
+    Only ground-plane x/z and heading yaw are anchored. Physical y is preserved,
+    matching the project-wide 5D/7D local-frame convention.
+    """
+    from utils.local_frame import transform_xz_world_to_local, wrap_angle
+
+    local_xz = transform_xz_world_to_local(
+        xyz[..., [0, 2]],
+        anchor_xyz[..., [0, 2]],
+        anchor_yaw,
+    )
+    local_xyz = xyz.clone()
+    local_xyz[..., 0] = local_xz[..., 0]
+    local_xyz[..., 2] = local_xz[..., 1]
+    local_yaw = wrap_angle(yaw - anchor_yaw)
+    return local_xyz, local_yaw
+
+
 def body_aux_loss_terms(pred_xyz, pred_yaw, gt_xyz, gt_yaw, active_mask,
                         weights: dict, heading_form: str = "cosine",
                         sample_loss_mask=None):
@@ -111,6 +136,7 @@ def compute_body_aux_loss(
     heading_form: str = "cosine",
     sample_loss_mask=None,     # [B] from T_B_05 (0 = invalid sample)
     token_to_frame: int = 4,
+    window_start_tokens=None,
 ):
     """Body aux loss over the active window (design §2.4).
 
@@ -150,6 +176,33 @@ def compute_body_aux_loss(
         gt_yaw = torch.atan2(gt7[..., 4], gt7[..., 3])
         pred_xyz = xyz[:, sl, :]
         pred_yaw = yaw[:, sl]
+        if window_start_tokens is not None:
+            from utils.token_frame import token_start_frame
+
+            if not torch.is_tensor(window_start_tokens):
+                starts = torch.as_tensor(window_start_tokens, device=device, dtype=torch.long)
+            else:
+                starts = window_start_tokens.to(device=device, dtype=torch.long)
+            if starts.ndim == 0:
+                starts = starts.repeat(len(pred_list))
+            anchor_f = token_start_frame(int(starts[i].item()), token_to_frame)
+            if anchor_f >= gt_len:
+                raise ValueError(
+                    "window_start_tokens must reference a valid GT anchor frame; "
+                    f"sample={i}, start_token={int(starts[i].item())}, "
+                    f"anchor_frame={anchor_f}, traj_length={gt_len}"
+                )
+            anchor7 = gt_traj_7d[i:i + 1, anchor_f:anchor_f + 1, :].to(
+                device=device, dtype=xyz.dtype
+            )
+            anchor_xyz = anchor7[..., :3]
+            anchor_yaw = torch.atan2(anchor7[..., 4], anchor7[..., 3])
+            pred_xyz, pred_yaw = canonicalize_pose_to_anchor(
+                pred_xyz, pred_yaw, anchor_xyz, anchor_yaw
+            )
+            gt_xyz, gt_yaw = canonicalize_pose_to_anchor(
+                gt_xyz, gt_yaw, anchor_xyz, anchor_yaw
+            )
 
         n_frames = end_f - start_f
         slm_i = None
@@ -168,7 +221,7 @@ def compute_body_aux_loss(
             continue
         weighted_losses.append(total_i * n_eff)
         for k in term_sums:
-            term_sums[k] += float(terms_i[k]) * n_eff
+            term_sums[k] += float(terms_i[k].detach()) * n_eff
         total_n += n_eff
 
     if total_n <= 0 or not weighted_losses:

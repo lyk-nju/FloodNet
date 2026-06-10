@@ -23,6 +23,7 @@ from lightning.pytorch.utilities import rank_zero_info
 
 from .control_loss import compute_body_aux_loss, compute_control_loss_xz
 from .model_batch import prepare_model_input
+from .window_local import build_window_local_model_batch
 from .module_step import compute_step_semantics
 
 if TYPE_CHECKING:
@@ -34,6 +35,40 @@ class RolloutPlan:
     effective_k: int
     start_end_indices: torch.Tensor  # (B,) long
     phase_offset: torch.Tensor       # (B,) float32
+
+
+def shifted_local_time_steps(
+    local_end_indices: torch.Tensor,
+    *,
+    start_tokens: torch.Tensor | int | None = None,
+    chunk_size: int,
+    phase_offset: torch.Tensor,
+) -> torch.Tensor:
+    """Return window-local diffusion times equivalent to global prefix time.
+
+    For a global window ``[S, E)``, the global time for active right boundary
+    ``E`` is shifted by ``S / chunk_size`` before calling the local-window noise
+    schedule. This keeps beta values identical to slicing the full-prefix
+    schedule at ``[S:E]``.
+    """
+    local_end = local_end_indices.to(dtype=torch.float32)
+    if start_tokens is None:
+        start = torch.zeros_like(local_end)
+    elif torch.is_tensor(start_tokens):
+        start = start_tokens.to(
+            device=local_end_indices.device,
+            dtype=torch.float32,
+        )
+        if start.ndim == 0:
+            start = start.expand_as(local_end)
+    else:
+        start = torch.full_like(local_end, float(start_tokens))
+    phase = phase_offset.to(device=local_end_indices.device, dtype=torch.float32)
+    if phase.ndim == 0:
+        phase = phase.expand_as(local_end)
+    global_end = start + local_end
+    global_time = (global_end - 1.0) / float(chunk_size) + phase
+    return global_time - start / float(chunk_size)
 
 
 class SelfForcingTrainer:
@@ -80,6 +115,50 @@ class SelfForcingTrainer:
         """
         self._check_preconditions()
 
+        st_cfg = self._module.cfg.get("stream_training", {}) or {}
+        if bool(st_cfg.get("enabled", False)):
+            module_model = getattr(self._module, "model", None)
+            default_context = getattr(module_model, "seq_len", batch["token"].shape[1])
+            context_tokens = int(
+                st_cfg.get(
+                    "context_tokens",
+                    default_context,
+                )
+            )
+            horizon_tokens = int(st_cfg.get("horizon_tokens", 0))
+            min_history_tokens = int(
+                st_cfg.get("min_history_tokens", getattr(module_model, "chunk_size", 1))
+            )
+            model_batch = build_window_local_model_batch(
+                batch,
+                context_tokens=context_tokens,
+                horizon_tokens=horizon_tokens,
+                sample_policy=st_cfg.get("sample_policy", "variable_history"),
+                min_history_tokens=min_history_tokens,
+            )
+            loss_batch = batch.copy()
+            for key in (
+                "_window_local_latent_start_token",
+                "_window_local_latent_valid_len",
+                "_window_local_traj",
+            ):
+                if key in model_batch:
+                    loss_batch[key] = model_batch[key]
+            motion_aux_mode = st_cfg.get("motion_aux_loss", "latent_only")
+            if motion_aux_mode in (False, None, "latent_only", "disabled"):
+                for key in (
+                    "traj", "traj_cond", "traj_cond_7d", "traj_mask",
+                    "traj_cond_mask", "traj_loss_mask", "traj_features",
+                    "traj_loss_gt",
+                ):
+                    loss_batch.pop(key, None)
+            elif motion_aux_mode not in ("full_prefix",):
+                raise ValueError(
+                    "stream_training.motion_aux_loss must be 'latent_only', "
+                    f"'disabled', or 'full_prefix'; got {motion_aux_mode!r}"
+                )
+            return self._self_forcing_step(loss_batch, model_batch)
+
         model_batch = prepare_model_input(batch)
         return self._self_forcing_step(batch, model_batch)
 
@@ -93,6 +172,7 @@ class SelfForcingTrainer:
         module = self._module
         net_start_time = time.time()
         semantics, runtime_metrics = self._build_runtime_metrics()
+        runtime_metrics.update(_collect_window_local_metrics(model_batch))
         optimizer = module.optimizers()
         lr_scheduler = module.lr_schedulers()
         lr_for_step = float(optimizer.param_groups[0]["lr"])
@@ -103,6 +183,10 @@ class SelfForcingTrainer:
             model_batch, semantics.progress
         )
         runtime_metrics["self_forcing/k"] = float(effective_k)
+        rollout_metrics = getattr(self, "_last_window_local_rollout_metrics", None)
+        if rollout_metrics:
+            runtime_metrics.update(rollout_metrics)
+            self._last_window_local_rollout_metrics = None
         # T_B_03: per-step corruption indicator (0/1); averaged by the logger it
         # reports the effective corruption rate as the curriculum ramps.
         runtime_metrics["history_corruption/applied"] = getattr(
@@ -218,9 +302,22 @@ class SelfForcingTrainer:
         """
         model = self._module.model
         target_k = self.resolve_k(progress)
+        st_cfg = self._module.cfg.get("stream_training", {}) or {}
+        stream_training_enabled = bool(st_cfg.get("enabled", False))
+        min_history_tokens = 1
+        if stream_training_enabled:
+            min_history_tokens = int(
+                st_cfg.get("min_history_tokens", getattr(model, "chunk_size", 1))
+            )
+            if min_history_tokens < int(model.chunk_size):
+                raise ValueError(
+                    "stream_training.min_history_tokens must be >= chunk_size; "
+                    f"got min_history_tokens={min_history_tokens}, "
+                    f"chunk_size={int(model.chunk_size)}"
+                )
 
         # Cross-rank consensus: shortest valid sequence wins.
-        min_k_local = int(feature_length.min().item()) - model.chunk_size + 1
+        min_k_local = int(feature_length.min().item()) - min_history_tokens + 1
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             tmp = torch.tensor([min_k_local], device=device, dtype=torch.long)
             torch.distributed.all_reduce(tmp, op=torch.distributed.ReduceOp.MIN)
@@ -238,8 +335,9 @@ class SelfForcingTrainer:
             feature_length.to(device=device, dtype=torch.long) - effective_k + 1
         )
         start_end_indices = []
+        sample_policy = str(st_cfg.get("sample_policy", "variable_history"))
         for b in range(feature_length.shape[0]):
-            low = 1
+            low = min_history_tokens
             high = int(max_start[b].item())
             if high < low:
                 raise ValueError(
@@ -248,7 +346,9 @@ class SelfForcingTrainer:
                     f"valid_len={int(feature_length[b].item())}, "
                     f"effective_k={effective_k}"
                 )
-            if high == low:
+            if sample_policy == "fixed_window":
+                start_end_indices.append(high)
+            elif high == low:
                 start_end_indices.append(low)
             else:
                 start_end_indices.append(
@@ -286,6 +386,9 @@ class SelfForcingTrainer:
         all_text_context = model._prepare_text_context(model_batch, seq_len, device, text_dropped_flags)
         traj_dropped = model._decide_traj_dropout(device)
         plan = self.plan_rollout(feature_length, device, progress)
+        self._last_window_local_rollout_metrics = _collect_window_local_rollout_metrics(
+            model_batch, plan
+        )
 
         # T_B_05: canonicalize the 7D world-frame traj_cond into the body-window-
         # local frame (anchor = body window leftmost = history0) so training
@@ -299,6 +402,7 @@ class SelfForcingTrainer:
         ac_cfg = self._module.cfg.get("anchor_canonicalize", {}) or {}
         traj_feats = model_batch.get("traj_features")
         if (ac_cfg.get("enabled", False)
+                and not bool(model_batch.get("_window_local_traj", False))
                 and torch.is_tensor(traj_feats)
                 and traj_feats.shape[-1] == 7):
             feats7 = traj_feats.to(device)
@@ -329,7 +433,20 @@ class SelfForcingTrainer:
             horizon_tokens = sample_random_horizon_tokens(
                 progress, 1.0, seq_len, hs_cfg,
             )
-            horizon_active_end = (plan.start_end_indices + (plan.effective_k - 1)).to(device)
+            local_active_end = (plan.start_end_indices + (plan.effective_k - 1)).to(device)
+            traj_start_token = model_batch.get("traj_start_token")
+            if traj_start_token is not None:
+                if not torch.is_tensor(traj_start_token):
+                    traj_start_token = torch.as_tensor(
+                        traj_start_token, device=device, dtype=torch.long
+                    )
+                else:
+                    traj_start_token = traj_start_token.to(device=device, dtype=torch.long)
+                if traj_start_token.ndim == 0:
+                    traj_start_token = traj_start_token.repeat(local_active_end.shape[0])
+                horizon_active_end = traj_start_token + local_active_end
+            else:
+                horizon_active_end = local_active_end
         self._last_horizon_tokens = float(horizon_tokens) if horizon_tokens is not None else -1.0
 
         traj_emb, traj_seq_lens, _, traj_token_mask = model._prepare_traj_condition(
@@ -337,7 +454,9 @@ class SelfForcingTrainer:
             horizon_tokens=horizon_tokens, horizon_active_end=horizon_active_end,
         )
 
-        current_feature = feature.clone()
+        clean_feature_state = feature.clone()
+        corruption_mask = None
+        corrupted_feature_values = None
         # T_B_03 §2.1.5: optionally corrupt the history region ONCE at rollout
         # start, kept fixed across the K steps (so all steps see a consistent
         # "fake history"). Gated by the history_corruption cfg; `progress` is the
@@ -347,8 +466,8 @@ class SelfForcingTrainer:
         hc_cfg = self._module.cfg.get("history_corruption", {}) or {}
         corruption_applied = False
         if should_apply_corruption(progress, 1.0, hc_cfg):
-            current_feature = apply_history_corruption(
-                current_feature,
+            corrupted_initial = apply_history_corruption(
+                clean_feature_state,
                 plan.start_end_indices,
                 mask_emb=model.model.mask_emb,
                 z_std=model.model.z_std,
@@ -357,15 +476,25 @@ class SelfForcingTrainer:
                 alpha_noisy=hc_cfg.get("alpha_noisy", 0.3),
                 noise_sigma_factor=hc_cfg.get("noise_sigma_factor", 0.05),
             )
+            corruption_mask = (corrupted_initial != clean_feature_state).any(
+                dim=-1, keepdim=True
+            )
+            corrupted_feature_values = corrupted_initial
             corruption_applied = True
         self._last_corruption_applied = float(corruption_applied)
 
         final_step_result = None
+        window_start_tokens = model_batch.get("_window_local_latent_start_token")
         for step_idx in range(plan.effective_k):
+            current_feature = _apply_fixed_history_corruption_view(
+                clean_feature_state, corruption_mask, corrupted_feature_values
+            )
             end_indices = plan.start_end_indices + step_idx
-            time_steps = (
-                (end_indices.to(dtype=torch.float32) - 1.0) / model.chunk_size
-                + plan.phase_offset
+            time_steps = shifted_local_time_steps(
+                end_indices,
+                start_tokens=window_start_tokens,
+                chunk_size=int(model.chunk_size),
+                phase_offset=plan.phase_offset,
             )
             is_final_step = step_idx == plan.effective_k - 1
             if is_final_step:
@@ -398,7 +527,7 @@ class SelfForcingTrainer:
             disable_replace = bool(
                 self._module.cfg.get("self_forcing_disable_replace", False)
             )
-            next_feature = current_feature.clone()
+            next_feature = clean_feature_state.clone()
             replace_diffs = []
             if not disable_replace:
                 for b in range(feature.shape[0]):
@@ -411,14 +540,17 @@ class SelfForcingTrainer:
                     if replace_idx >= pred_seq.shape[0]:
                         continue
                     replacement = pred_seq[replace_idx].detach().to(
-                        device=current_feature.device, dtype=current_feature.dtype
+                        device=clean_feature_state.device, dtype=clean_feature_state.dtype
                     )
-                    gt_token = current_feature[b, replace_idx, :]
+                    gt_token = clean_feature_state[b, replace_idx, :]
                     replace_diffs.append(
                         (replacement - gt_token).abs().mean().item()
                     )
                     next_feature[b, replace_idx, :] = replacement
-            current_feature = next_feature
+                    if corruption_mask is not None:
+                        corruption_mask = corruption_mask.clone()
+                        corruption_mask[b, replace_idx, :] = False
+            clean_feature_state = next_feature
             if replace_diffs:
                 self._last_replace_diff = float(
                     sum(replace_diffs) / len(replace_diffs)
@@ -550,6 +682,13 @@ def _compute_body_aux_loss(pred_list, batch, module, sample_loss_mask, ba_cfg):
     frame as the decoded pred (both clip-local recovery). Returns (loss, terms)."""
     if pred_list is None or "traj_cond_7d" not in batch:
         return None, {}
+    if "_window_local_latent_start_token" in batch:
+        window_start_tokens = batch["_window_local_latent_start_token"]
+        pred_list = _splice_window_local_pred_to_prefix(
+            pred_list, batch, module.device
+        )
+    else:
+        window_start_tokens = None
     weights = {**_DEFAULT_BODY_AUX_WEIGHTS, **(ba_cfg.get("weights", {}) or {})}
     return compute_body_aux_loss(
         pred_list,
@@ -561,7 +700,174 @@ def _compute_body_aux_loss(pred_list, batch, module, sample_loss_mask, ba_cfg):
         chunk_size_tokens=getattr(module.model, "chunk_size", None),
         heading_form=ba_cfg.get("heading_form", "cosine"),
         sample_loss_mask=sample_loss_mask,
+        window_start_tokens=window_start_tokens,
     )
+
+
+def _collect_window_local_metrics(model_batch: dict) -> dict[str, float]:
+    """Summarize window-local sampling state for training logs."""
+    if not bool(model_batch.get("_window_local_traj", False)):
+        return {}
+
+    metrics: dict[str, float] = {"stream_training/enabled": 1.0}
+    sample_policy = str(model_batch.get("_window_local_sample_policy", "variable_history"))
+    metrics["stream_training/sample_policy_fixed_window"] = (
+        1.0 if sample_policy == "fixed_window" else 0.0
+    )
+
+    starts = model_batch.get("_window_local_latent_start_token")
+    if starts is not None:
+        starts_t = torch.as_tensor(starts, dtype=torch.float32)
+        metrics["stream_training/window_start_mean"] = float(starts_t.mean().item())
+    lengths = model_batch.get("_window_local_latent_valid_len")
+    if lengths is not None:
+        lengths_t = torch.as_tensor(lengths, dtype=torch.float32)
+        metrics["stream_training/window_len_mean"] = float(lengths_t.mean().item())
+        metrics["stream_training/window_len_min"] = float(lengths_t.min().item())
+        metrics["stream_training/window_len_max"] = float(lengths_t.max().item())
+    traj_tokens = model_batch.get("traj_num_tokens")
+    if traj_tokens is not None:
+        traj_tokens_t = torch.as_tensor(traj_tokens, dtype=torch.float32)
+        metrics["stream_training/traj_tokens_mean"] = float(traj_tokens_t.mean().item())
+    return metrics
+
+
+def _collect_window_local_rollout_metrics(
+    model_batch: dict,
+    plan: RolloutPlan,
+) -> dict[str, float]:
+    """Summarize the actual final active history selected by plan_rollout()."""
+    if not bool(model_batch.get("_window_local_traj", False)):
+        return {}
+    final_active_end = (
+        plan.start_end_indices.to(dtype=torch.long) + int(plan.effective_k) - 1
+    )
+    active_len = final_active_end.to(dtype=torch.float32)
+    metrics = {
+        "stream_training/active_history_len_mean": float(active_len.mean().item()),
+        "stream_training/active_history_len_min": float(active_len.min().item()),
+        "stream_training/active_history_len_max": float(active_len.max().item()),
+    }
+    starts = model_batch.get("_window_local_latent_start_token")
+    if starts is not None:
+        starts_t = torch.as_tensor(
+            starts, device=final_active_end.device, dtype=torch.long
+        ).view(-1)
+        if starts_t.numel() == 1 and final_active_end.numel() > 1:
+            starts_t = starts_t.expand_as(final_active_end)
+        if starts_t.numel() == final_active_end.numel():
+            abs_end = starts_t + final_active_end
+            metrics["stream_training/active_abs_end_mean"] = float(
+                abs_end.to(dtype=torch.float32).mean().item()
+            )
+    return metrics
+
+
+def _apply_fixed_history_corruption_view(
+    clean_feature_state: torch.Tensor,
+    corruption_mask: torch.Tensor | None,
+    corrupted_feature_values: torch.Tensor | None,
+) -> torch.Tensor:
+    """Overlay the fixed history-corruption view onto the clean latent state."""
+    if corruption_mask is None or corrupted_feature_values is None:
+        return clean_feature_state
+    return torch.where(corruption_mask, corrupted_feature_values, clean_feature_state)
+
+
+def _splice_window_local_pred_to_prefix(pred_list, batch, device):
+    """Splice local predicted latents ``[S:E]`` back into full prefix ``[0:E]``.
+
+    Motion-space auxiliary loss must decode with causal VAE prefix context. This
+    helper preserves the original pre-window latent prefix and keeps gradients
+    through the predicted local segment.
+    """
+    starts = batch["_window_local_latent_start_token"]
+    if not torch.is_tensor(starts):
+        starts = torch.as_tensor(starts, device=device, dtype=torch.long)
+    else:
+        starts = starts.to(device=device, dtype=torch.long)
+    if starts.ndim == 0:
+        starts = starts.repeat(len(pred_list))
+    else:
+        starts = starts.view(-1)
+    if starts.numel() != len(pred_list):
+        raise ValueError(
+            "_window_local_latent_start_token must provide one value per pred "
+            f"latent; got {starts.numel()} starts for {len(pred_list)} predictions"
+        )
+    token = batch["token"].to(device)
+    if token.ndim != 3:
+        raise ValueError(f"batch['token'] must be [B,T,D], got {tuple(token.shape)}")
+    if token.shape[0] < len(pred_list):
+        raise ValueError(
+            "batch['token'] batch size must cover every prediction; "
+            f"got token batch={token.shape[0]}, predictions={len(pred_list)}"
+        )
+    token_lengths = batch.get("token_length")
+    if token_lengths is None:
+        token_lengths = torch.full(
+            (token.shape[0],), token.shape[1], device=device, dtype=torch.long
+        )
+    elif not torch.is_tensor(token_lengths):
+        token_lengths = torch.as_tensor(token_lengths, device=device, dtype=torch.long)
+    else:
+        token_lengths = token_lengths.to(device=device, dtype=torch.long)
+    token_lengths = token_lengths.view(-1)
+    if token_lengths.numel() == 1 and len(pred_list) > 1:
+        token_lengths = token_lengths.expand(len(pred_list))
+    if token_lengths.numel() < len(pred_list):
+        raise ValueError(
+            "batch['token_length'] must cover every prediction; "
+            f"got {token_lengths.numel()} lengths for {len(pred_list)} predictions"
+        )
+    valid_lengths = batch.get("_window_local_latent_valid_len")
+    if valid_lengths is not None:
+        if not torch.is_tensor(valid_lengths):
+            valid_lengths = torch.as_tensor(
+                valid_lengths, device=device, dtype=torch.long
+            )
+        else:
+            valid_lengths = valid_lengths.to(device=device, dtype=torch.long)
+        valid_lengths = valid_lengths.view(-1)
+        if valid_lengths.numel() == 1 and len(pred_list) > 1:
+            valid_lengths = valid_lengths.expand(len(pred_list))
+        if valid_lengths.numel() != len(pred_list):
+            raise ValueError(
+                "_window_local_latent_valid_len must provide one value per pred "
+                f"latent; got {valid_lengths.numel()} lengths for "
+                f"{len(pred_list)} predictions"
+            )
+    out = []
+    for i, pred_latent in enumerate(pred_list):
+        start = int(starts[i].item())
+        pred_latent = pred_latent.to(device=device, dtype=token.dtype)
+        if start < 0:
+            raise ValueError(f"window-local start token must be >= 0, got {start}")
+        original_len = int(token_lengths[i].item())
+        if start > original_len:
+            raise ValueError(
+                "window-local start token exceeds original token length; "
+                f"sample={i}, start={start}, token_length={original_len}"
+            )
+        pred_len = int(pred_latent.shape[0])
+        if valid_lengths is not None and pred_len > int(valid_lengths[i].item()):
+            raise ValueError(
+                "window-local prediction length exceeds window-local valid length; "
+                f"sample={i}, pred_len={pred_len}, "
+                f"valid_len={int(valid_lengths[i].item())}"
+            )
+        if start + pred_len > original_len:
+            raise ValueError(
+                "window-local prediction extends past original token length; "
+                f"sample={i}, start={start}, pred_len={pred_len}, "
+                f"token_length={original_len}"
+            )
+        if start == 0:
+            out.append(pred_latent)
+            continue
+        prefix = token[i, :start, :].detach()
+        out.append(torch.cat([prefix, pred_latent], dim=0))
+    return out
 
 
 def _compute_control_loss(pred_list, batch, module):

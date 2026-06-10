@@ -63,6 +63,8 @@ from utils.training import (
 from utils.training.ckpt_compat import strip_legacy_traj_encoder_weights
 from utils.training.config_validate import (
     validate_7d_requires_self_forcing,
+    validate_stream_eval_config,
+    validate_stream_training_config,
     validate_traj_dim_consistency,
 )
 
@@ -83,6 +85,8 @@ class CustomLightningModule(BasicLightningModule):
         # channels and canonicalizes the traj cond — see validate_7d_requires_*).
         validate_traj_dim_consistency(cfg)
         validate_7d_requires_self_forcing(cfg)
+        validate_stream_training_config(cfg)
+        validate_stream_eval_config(cfg)
         self._inline_eval_dedup = {}
         self._resume_step_offset = 0
         super().__init__(cfg)

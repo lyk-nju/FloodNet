@@ -150,6 +150,74 @@ def _build_cmd(
     return cmd
 
 
+def _is_stream_eval_request(request_payload: dict[str, Any]) -> bool:
+    stream_eval = request_payload.get("stream_eval")
+    return isinstance(stream_eval, dict) and bool(stream_eval.get("enabled", False))
+
+
+def _build_stream_eval_cmd(
+    config_path: Path,
+    request_payload: dict[str, Any],
+    *,
+    python_executable: str | None = None,
+) -> list[str]:
+    stream_eval = request_payload.get("stream_eval") or {}
+    python = python_executable or "python"
+    cmd = [
+        python,
+        "-m",
+        "eval.ldf.stream_metrics",
+        "--config",
+        str(config_path),
+        "--ckpt",
+        str(request_payload["ckpt_path"]),
+    ]
+    vae_ckpt = stream_eval.get("vae_ckpt")
+    if vae_ckpt:
+        cmd.extend(["--vae_ckpt", str(vae_ckpt)])
+    cmd.extend(
+        [
+            "--stream_mode",
+            str(stream_eval.get("stream_mode", "stream_generate_step")),
+            "--out_dir",
+            str(stream_eval["out_dir"]),
+            "--run_name",
+            str(stream_eval["run_name"]),
+            "--probe_tag",
+            str(stream_eval["probe_tag"]),
+            "--max_samples",
+            str(int(stream_eval.get("max_samples", 5))),
+            "--num_runs",
+            str(int(stream_eval.get("num_runs", 1))),
+        ]
+    )
+    max_batches = int(stream_eval.get("max_batches", 0))
+    if max_batches > 0:
+        cmd.extend(["--max_batches", str(max_batches)])
+    if bool(stream_eval.get("compute_offline_baseline", True)):
+        cmd.append("--compute_offline_baseline")
+    else:
+        cmd.append("--no_compute_offline_baseline")
+    if bool(stream_eval.get("compute_no_traj_baseline", True)):
+        cmd.append("--compute_no_traj_baseline")
+    else:
+        cmd.append("--no_compute_no_traj_baseline")
+    return cmd
+
+
+def _stream_summary_exists(request_payload: dict[str, Any]) -> bool:
+    stream_eval = request_payload.get("stream_eval") or {}
+    out_dir = stream_eval.get("out_dir")
+    run_name = stream_eval.get("run_name")
+    if not out_dir or not run_name:
+        return False
+    return (Path(out_dir) / str(run_name) / "summary.json").is_file()
+
+
+def _should_mark_completed_without_summary(request_payload: dict[str, Any]) -> bool:
+    return not _is_stream_eval_request(request_payload)
+
+
 def _run_inline_mode(args, run_dir: Path, config_path: Path, project_root: Path):
     runner_script = (project_root / "eval" / "run_eval.py").resolve()
     async_root = run_dir / "async_eval"
@@ -217,14 +285,21 @@ def _run_inline_mode(args, run_dir: Path, config_path: Path, project_root: Path)
             step_tag = str(payload.get("step_tag") or f"step_{step:06d}")
             probe_tags = [str(tag) for tag in payload.get("probe_tags", [])]
 
-            cmd = _build_cmd(
-                runner_script=runner_script,
-                config_path=config_path_for_request,
-                request_payload=payload,
-                artifact_root=artifact_root,
-                default_root_dir=async_root,
-                args=args,
-            )
+            if _is_stream_eval_request(payload):
+                cmd = _build_stream_eval_cmd(
+                    config_path_for_request,
+                    payload,
+                    python_executable=sys.executable,
+                )
+            else:
+                cmd = _build_cmd(
+                    runner_script=runner_script,
+                    config_path=config_path_for_request,
+                    request_payload=payload,
+                    artifact_root=artifact_root,
+                    default_root_dir=async_root,
+                    args=args,
+                )
             print(
                 f"[eval-watcher|inline] evaluating step={step} "
                 f"ckpt={Path(payload['ckpt_path']).name}"
@@ -245,18 +320,34 @@ def _run_inline_mode(args, run_dir: Path, config_path: Path, project_root: Path)
                     raise SystemExit(result.returncode)
                 break
 
-            if _summaries_exist(artifact_root, step_tag, probe_tags):
+            if (
+                _stream_summary_exists(payload)
+                if _is_stream_eval_request(payload)
+                else _summaries_exist(artifact_root, step_tag, probe_tags)
+            ):
                 state.setdefault("completed", []).append(request_key)
                 state.setdefault("failed", {}).pop(request_key, None)
                 _save_state(state_path, state)
                 print(f"[eval-watcher|inline] finished step={step}")
             else:
-                _mark_completed_without_summary(state, request_key)
-                _save_state(state_path, state)
-                print(
-                    f"[eval-watcher|inline] step={step} completed without summary; "
-                    f"mark completed_without_summary."
-                )
+                if _should_mark_completed_without_summary(payload):
+                    _mark_completed_without_summary(state, request_key)
+                    _save_state(state_path, state)
+                    print(
+                        f"[eval-watcher|inline] step={step} completed without summary; "
+                        f"mark completed_without_summary."
+                    )
+                else:
+                    failed = state.setdefault("failed", {})
+                    failed[request_key] = int(failed.get(request_key, 0)) + 1
+                    _save_state(state_path, state)
+                    print(
+                        f"[eval-watcher|inline] stream eval step={step} exited "
+                        "without summary.json; keep request retryable."
+                    )
+                    if args.once:
+                        raise SystemExit(1)
+                    break
 
         if args.once:
             return

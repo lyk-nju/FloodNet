@@ -21,6 +21,7 @@ from unittest.mock import MagicMock
 
 import torch
 
+import utils.training.self_forcing as sf_mod
 from utils.training.self_forcing import RolloutPlan, SelfForcingTrainer
 
 
@@ -130,3 +131,155 @@ def test_run_rollout_unpacks_four_tuple_from_prepare_traj_condition():
     trainer._run_rollout(model_batch, progress=1.0)
 
     assert model._prepare_traj_condition.call_count == 1
+
+
+def test_plan_rollout_respects_stream_training_min_history_tokens():
+    model = MagicMock(name="model")
+    model.chunk_size = 1
+    model.self_forcing_k_schedule = [(0.0, 1)]
+    cfg = SimpleNamespace()
+    cfg.get = lambda key, default=None: {
+        "stream_training": {
+            "enabled": True,
+            "min_history_tokens": 4,
+        },
+    }.get(key, default)
+    module = SimpleNamespace(model=model, cfg=cfg)
+    trainer = SelfForcingTrainer.__new__(SelfForcingTrainer)
+    trainer._module = module
+
+    for _ in range(20):
+        plan = trainer.plan_rollout(
+            torch.tensor([8], dtype=torch.long),
+            torch.device("cpu"),
+            progress=1.0,
+        )
+        assert int(plan.start_end_indices[0].item()) >= 4
+
+
+def test_plan_rollout_right_aligns_fixed_window_policy():
+    model = MagicMock(name="model")
+    model.chunk_size = 1
+    model.self_forcing_k_schedule = [(0.0, 3)]
+    cfg = SimpleNamespace()
+    cfg.get = lambda key, default=None: {
+        "stream_training": {
+            "enabled": True,
+            "sample_policy": "fixed_window",
+            "min_history_tokens": 4,
+        },
+    }.get(key, default)
+    module = SimpleNamespace(model=model, cfg=cfg)
+    trainer = SelfForcingTrainer.__new__(SelfForcingTrainer)
+    trainer._module = module
+
+    plan = trainer.plan_rollout(
+        torch.tensor([8], dtype=torch.long),
+        torch.device("cpu"),
+        progress=1.0,
+    )
+
+    assert plan.effective_k == 3
+    assert plan.start_end_indices.tolist() == [6]
+
+
+def test_run_rollout_adds_window_start_to_horizon_active_end():
+    trainer, model, model_batch, _ = _make_trainer()
+
+    cfg = SimpleNamespace()
+    cfg.get = lambda key, default=None: {
+        "anchor_canonicalize": {"enabled": False},
+        "horizon_sim": {
+            "enabled": True,
+            "warmup_ratio": 0.0,
+            "p_exact_inference_horizon": 1.0,
+            "inference_horizon_tokens": 2,
+        },
+        "history_corruption": {},
+        "self_forcing_disable_replace": True,
+    }.get(key, default)
+    trainer._module.cfg = cfg
+    trainer.plan_rollout = MagicMock(
+        return_value=RolloutPlan(
+            effective_k=2,
+            start_end_indices=torch.tensor([2], dtype=torch.long),
+            phase_offset=torch.tensor([0.0]),
+        )
+    )
+    model_batch = {
+        **model_batch,
+        "feature": torch.zeros(_BATCH, 8, _HIDDEN),
+        "feature_length": torch.tensor([4], dtype=torch.long),
+        "traj_start_token": torch.tensor([5], dtype=torch.long),
+    }
+
+    trainer._run_rollout(model_batch, progress=1.0)
+
+    kwargs = model._prepare_traj_condition.call_args.kwargs
+    assert kwargs["horizon_tokens"] == 2
+    assert kwargs["horizon_active_end"].tolist() == [8]
+
+
+def test_run_rollout_records_window_local_active_history_metrics():
+    trainer, _, model_batch, _ = _make_trainer()
+    model_batch = {
+        **model_batch,
+        "_window_local_traj": True,
+        "_window_local_latent_start_token": torch.tensor([5], dtype=torch.long),
+        "_window_local_latent_valid_len": torch.tensor([4], dtype=torch.long),
+    }
+
+    trainer._run_rollout(model_batch, progress=1.0)
+
+    metrics = trainer._last_window_local_rollout_metrics
+    assert metrics["stream_training/active_history_len_mean"] == 3.0
+    assert metrics["stream_training/active_history_len_min"] == 3.0
+    assert metrics["stream_training/active_history_len_max"] == 3.0
+    assert metrics["stream_training/active_abs_end_mean"] == 8.0
+
+
+def test_run_rollout_replacement_diff_uses_clean_state_under_corruption(monkeypatch):
+    """History corruption is an input view, not the committed latent state.
+
+    If replacement diff is measured against the corrupted view, a masked/noisy
+    history token can make self-forcing diagnostics depend on the corruption
+    overlay instead of the clean committed latent it replaces.
+    """
+    trainer, model, model_batch, _ = _make_trainer()
+    trainer.plan_rollout = MagicMock(
+        return_value=RolloutPlan(
+            effective_k=2,
+            start_end_indices=torch.tensor([1], dtype=torch.long),
+            phase_offset=torch.tensor([0.0]),
+        )
+    )
+    cfg = SimpleNamespace()
+    cfg.get = lambda key, default=None: {
+        "anchor_canonicalize": {"enabled": False},
+        "horizon_sim": {"enabled": False},
+        "history_corruption": {
+            "enabled": True,
+            "apply_prob": 1.0,
+        },
+        "self_forcing_disable_replace": False,
+    }.get(key, default)
+    trainer._module.cfg = cfg
+
+    monkeypatch.setattr(sf_mod, "should_apply_corruption", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        sf_mod,
+        "apply_history_corruption",
+        lambda clean_feature, *args, **kwargs: clean_feature + 10.0,
+    )
+
+    first_pred = [torch.zeros(_SEQ_LEN, _HIDDEN) for _ in range(_BATCH)]
+    first_pred[0][0, :] = 2.0
+    final_pred = [torch.zeros(_SEQ_LEN, _HIDDEN) for _ in range(_BATCH)]
+    model._forward_single_window.side_effect = [
+        {"loss": torch.tensor(0.0), "x0_latent_list": first_pred},
+        {"loss": torch.tensor(0.0), "x0_latent_list": final_pred},
+    ]
+
+    trainer._run_rollout(model_batch, progress=1.0)
+
+    assert trainer._last_replace_diff == 2.0

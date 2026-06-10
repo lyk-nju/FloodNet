@@ -153,6 +153,37 @@ def compute_stream_vs_offline_metrics(
     return result
 
 
+def _yaw_from_root_path(root_xyz: np.ndarray) -> np.ndarray:
+    root = np.asarray(root_xyz, dtype=np.float32)
+    if root.ndim != 2 or root.shape[0] == 0:
+        return np.zeros((0,), dtype=np.float32)
+    xz = root[:, [0, 2]] if root.shape[1] >= 3 else root
+    if xz.shape[0] < 2:
+        return np.zeros((xz.shape[0],), dtype=np.float32)
+    vel = np.gradient(xz, axis=0)
+    yaw = np.arctan2(vel[:, 0], vel[:, 1])
+    if yaw.shape[0] > 1:
+        yaw[0] = yaw[1]
+    return yaw.astype(np.float32)
+
+
+def compute_root_path_yaw_error(
+    pred_root_xyz: torch.Tensor | np.ndarray,
+    target_root_xyz: torch.Tensor | np.ndarray,
+) -> float:
+    """Mean wrapped yaw error from XZ root-path heading."""
+    pred = pred_root_xyz.detach().cpu().numpy() if torch.is_tensor(pred_root_xyz) else np.asarray(pred_root_xyz)
+    target = target_root_xyz.detach().cpu().numpy() if torch.is_tensor(target_root_xyz) else np.asarray(target_root_xyz)
+    pred_yaw = _yaw_from_root_path(pred)
+    target_yaw = _yaw_from_root_path(target)
+    n = min(int(pred_yaw.shape[0]), int(target_yaw.shape[0]))
+    if n == 0:
+        return float("nan")
+    diff = pred_yaw[:n] - target_yaw[:n]
+    wrapped = np.arctan2(np.sin(diff), np.cos(diff))
+    return float(np.mean(np.abs(wrapped)))
+
+
 def summarize_stream_records(records: Sequence[Dict]) -> Dict:
     if not records:
         return {}
@@ -161,8 +192,25 @@ def summarize_stream_records(records: Sequence[Dict]) -> Dict:
     def _append_stats(record_key: str, summary_prefix: str):
         vals = [record[record_key] for record in records if record_key in record and record[record_key] == record[record_key]]
         if vals:
-            summary[f"{summary_prefix}_mean"] = float(np.mean(vals))
-            summary[f"{summary_prefix}_std"] = float(np.std(vals))
+            summary[f"{summary_prefix}_mean"] = round(float(np.mean(vals)), 10)
+            summary[f"{summary_prefix}_std"] = round(float(np.std(vals)), 10)
+
+    def _append_delta_stats(
+        base_key: str,
+        ablation_key: str,
+        summary_prefix: str,
+    ):
+        vals = []
+        for record in records:
+            if base_key not in record or ablation_key not in record:
+                continue
+            base = record[base_key]
+            ablation = record[ablation_key]
+            if base == base and ablation == ablation:
+                vals.append(float(ablation) - float(base))
+        if vals:
+            summary[f"{summary_prefix}_mean"] = round(float(np.mean(vals)), 10)
+            summary[f"{summary_prefix}_std"] = round(float(np.std(vals)), 10)
 
     _append_stats("stream_root_jump_mean", "stream_boundary/root_jump")
     _append_stats("stream_root_jump_max", "stream_boundary/root_jump_max")
@@ -172,4 +220,36 @@ def summarize_stream_records(records: Sequence[Dict]) -> Dict:
     _append_stats("stream_offline_feature_l2_max", "stream_vs_offline/feature_l2_max")
     _append_stats("stream_offline_root_ade", "stream_vs_offline/root_ade")
     _append_stats("stream_offline_length_delta", "stream_vs_offline/length_delta")
+    _append_stats("stream_yaw_error", "stream_gt/yaw_error")
+    _append_stats("stream_no_traj/ade", "stream_no_traj/root_ADE")
+    _append_stats("stream_no_traj/fde", "stream_no_traj/root_FDE")
+    _append_stats("stream_no_traj/path_arc_ade", "stream_no_traj/path_arc_ADE")
+    _append_delta_stats("ade", "stream_no_traj/ade", "control_gain/root_ADE_delta")
+    _append_delta_stats("fde", "stream_no_traj/fde", "control_gain/root_FDE_delta")
+
+    def _copy_alias(src: str, dst: str):
+        value = summary.get(src)
+        if value is None:
+            return
+        if value == value:
+            summary[dst] = round(float(value), 10)
+
+    for src, dst in (
+        ("traj/ADE_mean", "stream_gt/root_ADE"),
+        ("traj/FDE_mean", "stream_gt/root_FDE"),
+        ("path/arc_ADE_mean", "stream_gt/path_arc_ADE"),
+        ("traj/jitter_mean", "stream_gt/jitter"),
+        ("stream_gt/yaw_error_mean", "stream_gt/yaw_error"),
+        ("control/Control_L2_dist_mean", "stream_gt/control_L2"),
+        ("control/Skating_Ratio_mean", "stream_gt/foot_skating"),
+        ("stream_boundary/root_jump_mean", "stream_gt/chunk_boundary_root_jump"),
+        ("stream_vs_offline/root_ade_mean", "stream_vs_offline/root_ADE"),
+        ("stream_vs_offline/feature_l2_mean", "stream_vs_offline/feature_L2"),
+        ("stream_no_traj/root_ADE_mean", "stream_no_traj/root_ADE"),
+        ("stream_no_traj/root_FDE_mean", "stream_no_traj/root_FDE"),
+        ("stream_no_traj/path_arc_ADE_mean", "stream_no_traj/path_arc_ADE"),
+        ("control_gain/root_ADE_delta_mean", "control_gain/root_ADE_delta"),
+        ("control_gain/root_FDE_delta_mean", "control_gain/root_FDE_delta"),
+    ):
+        _copy_alias(src, dst)
     return summary

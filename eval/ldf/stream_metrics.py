@@ -21,6 +21,7 @@ if PROJECT_ROOT not in sys.path:
 try:
     from FloodNet.metrics.stream import (
         compute_stream_boundary_metrics,
+        compute_root_path_yaw_error,
         compute_stream_vs_offline_metrics,
         decode_stream_chunks,
         summarize_stream_records,
@@ -59,6 +60,7 @@ try:
 except ImportError:  # pragma: no cover - script entrypoints use top-level imports
     from metrics.stream import (
         compute_stream_boundary_metrics,
+        compute_root_path_yaw_error,
         compute_stream_vs_offline_metrics,
         decode_stream_chunks,
         summarize_stream_records,
@@ -104,7 +106,7 @@ class InMemorySampleDataset(Dataset):
         return self.samples[idx]
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Evaluate BABEL long-horizon streaming generation via stream_generate()."
     )
@@ -125,6 +127,7 @@ def parse_args():
     )
     parser.add_argument("--num_denoise_steps", type=int, default=None)
     parser.add_argument("--compute_offline_baseline", action="store_true")
+    parser.add_argument("--no_compute_offline_baseline", action="store_true")
     parser.add_argument("--compute_no_traj_baseline", action="store_true")
     parser.add_argument("--no_compute_no_traj_baseline", action="store_true")
     parser.add_argument("--save_feature_npy", action="store_true")
@@ -135,6 +138,15 @@ def parse_args():
     parser.add_argument("--render_offline_video", action="store_true")
     parser.add_argument("--render_no_traj_video", action="store_true")
     parser.add_argument("--out_dir", type=str, default=None)
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        default=None,
+        help=(
+            "Optional deterministic run directory name under --out_dir. "
+            "Defaults to a timestamped ckpt/probe tag."
+        ),
+    )
     parser.add_argument("--probe_tag", type=str, default=None)
     parser.add_argument("--meta_paths", nargs="+", default=None)
     parser.add_argument("--no_ema", action="store_true")
@@ -145,7 +157,32 @@ def parse_args():
         default=[],
         help="OmegaConf dot-path overrides, e.g. --set model.params.cfg_scale_traj=3.0",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def parse_args_from_list(argv):
+    return parse_args(argv)
+
+
+def resolve_eval_path_flags(args, cfg) -> tuple[bool, bool]:
+    """Resolve LDF stream eval diagnostic paths.
+
+    The design-default LDF suite runs stream GT, offline GT, and stream no-traj.
+    CLI disable flags are explicit opt-outs.
+    """
+    compute_offline_baseline = bool(
+        args.compute_offline_baseline
+        or cfg.get("eval.compute_offline_baseline", True)
+    )
+    compute_no_traj_baseline = bool(
+        args.compute_no_traj_baseline
+        or cfg.get("eval.compute_no_traj_baseline", True)
+    )
+    if getattr(args, "no_compute_offline_baseline", False):
+        compute_offline_baseline = False
+    if args.no_compute_no_traj_baseline:
+        compute_no_traj_baseline = False
+    return compute_offline_baseline, compute_no_traj_baseline
 
 
 def _parse_overrides(set_args: List[str]) -> Dict[str, str]:
@@ -498,6 +535,21 @@ def _root_numpy(feature: Optional[torch.Tensor]) -> Optional[np.ndarray]:
         return extract_root_trajectory_263_torch(feature[None, :])[0].cpu().numpy()
 
 
+def _root_path_yaw_error(
+    pred_feature: torch.Tensor,
+    sample_batch: Dict,
+) -> float:
+    gt_feature = sample_batch.get("feature")
+    if gt_feature is None:
+        return float("nan")
+    gt_single = gt_feature[0].float().cpu() if torch.is_tensor(gt_feature) and gt_feature.ndim == 3 else gt_feature
+    pred_root = _root_numpy(pred_feature)
+    gt_root = _root_numpy(gt_single)
+    if pred_root is None or gt_root is None:
+        return float("nan")
+    return compute_root_path_yaw_error(pred_root, gt_root)
+
+
 def _condition_root_numpy(sample_batch: Dict) -> Optional[np.ndarray]:
     traj7 = sample_batch.get("traj_cond_7d")
     if traj7 is not None:
@@ -633,6 +685,18 @@ def _build_run_name(ckpt_path: str, probe_tag: str, stream_mode: str) -> str:
     return f"{timestamp}_{probe_tag}_{stream_mode}_{ckpt_tag}"
 
 
+def _resolve_run_name(
+    *,
+    ckpt_path: str,
+    probe_tag: str,
+    stream_mode: str,
+    requested_run_name: str | None,
+) -> str:
+    if requested_run_name:
+        return requested_run_name
+    return _build_run_name(ckpt_path, probe_tag, stream_mode)
+
+
 def _average_scalar_metric(run_metrics: List[Dict], key: str) -> float:
     vals = [metric[key] for metric in run_metrics if key in metric and metric[key] == metric[key]]
     return float(np.mean(vals)) if vals else float("nan")
@@ -670,16 +734,9 @@ def main():
         if args.num_denoise_steps is not None
         else cfg.get("eval.num_denoise_steps", None)
     )
-    compute_offline_baseline = bool(
-        args.compute_offline_baseline
-        or cfg.get("eval.compute_offline_baseline", False)
+    compute_offline_baseline, compute_no_traj_baseline = resolve_eval_path_flags(
+        args, cfg
     )
-    compute_no_traj_baseline = bool(
-        args.compute_no_traj_baseline
-        or cfg.get("eval.compute_no_traj_baseline", True)
-    )
-    if args.no_compute_no_traj_baseline:
-        compute_no_traj_baseline = False
     save_feature_npy = bool(args.save_feature_npy or cfg.get("eval.save_feature_npy", True))
     save_latent_npy = bool(args.save_latent_npy or cfg.get("eval.save_latent_npy", False))
     save_plots = bool(cfg.get("eval.save_plots", True) or args.save_plots)
@@ -703,7 +760,12 @@ def main():
     frames_per_token = int(cfg.get("eval.frames_per_token", cfg.get("data.frames_per_token", 4)))
 
     out_root = Path(args.out_dir or cfg.get("eval.out_dir", "./outputs_stream_eval"))
-    run_dir = out_root / _build_run_name(ckpt_path, probe_tag, stream_mode)
+    run_dir = out_root / _resolve_run_name(
+        ckpt_path=ckpt_path,
+        probe_tag=probe_tag,
+        stream_mode=stream_mode,
+        requested_run_name=args.run_name,
+    )
     sample_root = run_dir / "samples"
     sample_root.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(cfg.config, run_dir / "config.yaml")
@@ -792,6 +854,10 @@ def main():
                 "stream_root_jump_max": boundary_metrics["root_jump_max"],
                 "stream_joint_jump_mean": boundary_metrics["joint_jump_mean"],
                 "stream_num_boundaries": boundary_metrics["n_boundaries"],
+                "stream_yaw_error": _root_path_yaw_error(
+                    decoded_stream,
+                    sample_batch,
+                ),
             }
 
             if compute_offline_baseline:
@@ -873,6 +939,7 @@ def main():
         sample_record["stream_root_jump_max"] = _average_scalar_metric(stream_runs, "stream_root_jump_max")
         sample_record["stream_joint_jump_mean"] = _average_scalar_metric(stream_runs, "stream_joint_jump_mean")
         sample_record["stream_num_boundaries"] = _average_scalar_metric(stream_runs, "stream_num_boundaries")
+        sample_record["stream_yaw_error"] = _average_scalar_metric(stream_runs, "stream_yaw_error")
         if compute_offline_baseline:
             sample_record["stream_offline_feature_l2_mean"] = _average_scalar_metric(stream_runs, "stream_offline_feature_l2_mean")
             sample_record["stream_offline_feature_l2_max"] = _average_scalar_metric(stream_runs, "stream_offline_feature_l2_max")

@@ -27,6 +27,7 @@ from utils.token_frame import (
     token_start_frame,
 )
 from utils.traj_batch import (
+    build_traj_token_mask,
     encode_traj_batch,
     frames_to_token_mask_range,
     frames_to_tokens,
@@ -154,6 +155,50 @@ def test_frames_to_token_mask_range_non_prefix_uses_local_window_origin():
     mask[:, 6] = 1.0
     tok = frames_to_token_mask_range(mask, 2, start_token_idx=10)
     assert torch.allclose(tok, torch.tensor([[0.0, 1.0]]))
+
+
+def test_encode_traj_batch_supports_per_sample_start_token():
+    seq_len = 2
+    feats = torch.zeros(2, 8, 1)
+    feats[0, :, 0] = torch.arange(8, dtype=torch.float32)
+    feats[1, :, 0] = 100.0 + torch.arange(8, dtype=torch.float32)
+    x = {
+        "traj_features": feats,
+        "traj_start_token": torch.tensor([0, 5]),
+    }
+
+    out = encode_traj_batch(
+        x,
+        seq_len,
+        "cpu",
+        _KeepFourFrames(),
+        torch.nn.Identity(),
+    )
+
+    expected = torch.tensor(
+        [
+            [[0.0, 0.0, 0.0, 0.0], [1.0, 2.0, 3.0, 4.0]],
+            [[100.0, 101.0, 102.0, 103.0], [104.0, 105.0, 106.0, 107.0]],
+        ]
+    )
+    assert torch.allclose(out, expected)
+
+
+def test_build_traj_token_mask_supports_per_sample_start_token():
+    seq_len = 2
+    feats = torch.zeros(2, 8, 7)
+    mask = torch.zeros(2, 8)
+    mask[0, 0] = 1.0
+    mask[1, 6] = 1.0
+    x = {
+        "traj_features": feats,
+        "traj_cond_mask": mask,
+        "traj_start_token": torch.tensor([0, 5]),
+    }
+
+    token_mask = build_traj_token_mask(x, seq_len, "cpu")
+
+    assert torch.allclose(token_mask, torch.tensor([[1.0, 0.0], [0.0, 1.0]]))
 
 
 def test_encode_traj_batch_threads_traj_start_token_into_grouping():

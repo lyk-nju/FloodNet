@@ -6,7 +6,8 @@ import sys
 import numpy as np
 import torch
 
-from eval.ldf.stream_metrics import _save_sample_outputs
+from eval.ldf.stream_metrics import _resolve_run_name, _save_sample_outputs
+from metrics.stream import compute_root_path_yaw_error, summarize_stream_records
 from eval.runtime.metrics import (
     build_stream_eval_summary,
     compute_heading_path_error_deg,
@@ -89,6 +90,57 @@ def test_build_stream_eval_summary_uses_stream_metric_keys():
     assert summary["stream/yaw_error"] == 0.0
     assert "stream/jitter" in summary
     assert summary["stream/num_frames"] == 4
+
+
+def test_compute_root_path_yaw_error_wraps_path_heading():
+    pred = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+    target = np.array(
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 2.0]],
+        dtype=np.float32,
+    )
+
+    err = compute_root_path_yaw_error(pred, target)
+
+    assert abs(err - math.pi / 2.0) < 1e-5
+
+
+def test_summarize_stream_records_includes_no_traj_gain_metrics():
+    records = [
+        {
+            "ade": 0.20,
+            "fde": 0.30,
+            "mse": 0.01,
+            "traj_jitter": 0.001,
+            "stream_yaw_error": 0.10,
+            "stream_no_traj/ade": 0.35,
+            "stream_no_traj/fde": 0.50,
+        },
+        {
+            "ade": 0.30,
+            "fde": 0.40,
+            "mse": 0.02,
+            "traj_jitter": 0.003,
+            "stream_yaw_error": 0.20,
+            "stream_no_traj/ade": 0.55,
+            "stream_no_traj/fde": 0.70,
+        },
+    ]
+
+    summary = summarize_stream_records(records)
+
+    assert summary["stream_no_traj/root_ADE_mean"] == 0.45
+    assert summary["stream_no_traj/root_FDE_mean"] == 0.60
+    assert summary["control_gain/root_ADE_delta_mean"] == 0.20
+    assert summary["control_gain/root_FDE_delta_mean"] == 0.25
+    assert summary["stream_gt/root_ADE"] == 0.25
+    assert summary["stream_gt/root_FDE"] == 0.35
+    assert summary["stream_gt/jitter"] == 0.002
+    assert summary["stream_gt/yaw_error"] == 0.15
+    assert summary["stream_no_traj/root_ADE"] == 0.45
+    assert summary["control_gain/root_ADE_delta"] == 0.20
 
 
 class _FakeStepModel:
@@ -261,3 +313,52 @@ def test_ldf_stream_metrics_cli_can_disable_no_traj_baseline(monkeypatch):
     args = stream_metrics.parse_args()
 
     assert args.no_compute_no_traj_baseline is True
+
+
+def test_ldf_stream_metrics_defaults_run_three_design_paths():
+    from eval.ldf import stream_metrics
+
+    args = stream_metrics.parse_args_from_list([])
+    offline, no_traj = stream_metrics.resolve_eval_path_flags(args, {})
+
+    assert offline is True
+    assert no_traj is True
+
+
+def test_ldf_stream_metrics_can_disable_diagnostic_paths():
+    from eval.ldf import stream_metrics
+
+    args = stream_metrics.parse_args_from_list([
+        "--no_compute_offline_baseline",
+        "--no_compute_no_traj_baseline",
+    ])
+    offline, no_traj = stream_metrics.resolve_eval_path_flags(
+        args,
+        {
+            "eval.compute_offline_baseline": True,
+            "eval.compute_no_traj_baseline": True,
+        },
+    )
+
+    assert offline is False
+    assert no_traj is False
+
+
+def test_ldf_stream_metrics_run_name_override_stabilizes_output_dir():
+    assert (
+        _resolve_run_name(
+            ckpt_path="/ckpts/step=425000.ckpt",
+            probe_tag="window_local",
+            stream_mode="stream_generate_step",
+            requested_run_name="03_overfit_full_prefix",
+        )
+        == "03_overfit_full_prefix"
+    )
+
+    generated = _resolve_run_name(
+        ckpt_path="/ckpts/step=425000.ckpt",
+        probe_tag="window_local",
+        stream_mode="stream_generate_step",
+        requested_run_name=None,
+    )
+    assert generated.endswith("_window_local_stream_generate_step_step_425000")

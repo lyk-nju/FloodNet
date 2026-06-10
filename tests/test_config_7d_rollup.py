@@ -9,6 +9,8 @@ from omegaconf import OmegaConf
 
 from utils.training.config_validate import (
     validate_7d_requires_self_forcing,
+    validate_stream_eval_config,
+    validate_stream_training_config,
     validate_traj_dim_consistency,
 )
 
@@ -137,3 +139,145 @@ def test_shipped_ldf_passes_sf_guard():
     """Shipped ldf.yaml is 7D with self_forcing_enabled=true, so the guard passes."""
     cfg = OmegaConf.load(_LDF)
     validate_7d_requires_self_forcing(cfg)   # no raise
+
+
+def test_shipped_stream_training_config_valid():
+    cfg = OmegaConf.load(_LDF)
+    validate_stream_training_config(cfg)
+
+
+def test_shipped_ldf_declares_stream_eval_gate_default_off():
+    cfg = OmegaConf.load(_LDF)
+    assert cfg.validation.stream_eval.enabled is False
+    assert cfg.validation.stream_eval.stream_mode == "stream_generate_step"
+    validate_stream_eval_config(cfg)
+
+
+def test_stream_eval_rejects_unknown_stream_mode():
+    cfg = OmegaConf.create({
+        "validation": {
+            "stream_eval": {
+                "enabled": True,
+                "stream_mode": "direct_suffix",
+            }
+        }
+    })
+    with pytest.raises(ValueError, match="stream_mode"):
+        validate_stream_eval_config(cfg)
+
+
+def test_stream_eval_rejects_non_positive_num_runs():
+    cfg = OmegaConf.create({
+        "validation": {"stream_eval": {"enabled": True, "num_runs": 0}}
+    })
+    with pytest.raises(ValueError, match="num_runs"):
+        validate_stream_eval_config(cfg)
+
+
+def test_stream_eval_rejects_negative_sample_limits():
+    cfg = OmegaConf.create({
+        "validation": {
+            "stream_eval": {
+                "enabled": True,
+                "max_samples": -1,
+                "max_batches": -1,
+            }
+        }
+    })
+    with pytest.raises(ValueError, match="max_samples"):
+        validate_stream_eval_config(cfg)
+
+
+def test_stream_training_rejects_min_history_below_chunk_size():
+    cfg = OmegaConf.create({
+        "model": {"params": {"chunk_size": 5}},
+        "stream_training": {
+            "enabled": True,
+            "context_tokens": 30,
+            "min_history_tokens": 4,
+        },
+    })
+    with pytest.raises(ValueError, match="min_history_tokens"):
+        validate_stream_training_config(cfg)
+
+
+def test_stream_training_rejects_context_below_min_history():
+    cfg = OmegaConf.create({
+        "model": {"params": {"chunk_size": 5}},
+        "stream_training": {
+            "enabled": True,
+            "context_tokens": 6,
+            "min_history_tokens": 8,
+        },
+    })
+    with pytest.raises(ValueError, match="context_tokens"):
+        validate_stream_training_config(cfg)
+
+
+def test_stream_training_accepts_fixed_window_sample_policy():
+    cfg = OmegaConf.create({
+        "model": {"params": {"chunk_size": 5}},
+        "stream_training": {
+            "enabled": True,
+            "context_tokens": 30,
+            "min_history_tokens": 8,
+            "sample_policy": "fixed_window",
+        },
+    })
+    validate_stream_training_config(cfg)
+
+
+def test_stream_training_rejects_unknown_sample_policy():
+    cfg = OmegaConf.create({
+        "model": {"params": {"chunk_size": 5}},
+        "stream_training": {
+            "enabled": True,
+            "context_tokens": 30,
+            "min_history_tokens": 8,
+            "sample_policy": "middle_window",
+        },
+    })
+    with pytest.raises(ValueError, match="sample_policy"):
+        validate_stream_training_config(cfg)
+
+
+def test_stream_training_rejects_unknown_motion_aux_loss():
+    cfg = OmegaConf.create({
+        "model": {"params": {"chunk_size": 5}},
+        "stream_training": {
+            "enabled": True,
+            "context_tokens": 30,
+            "min_history_tokens": 8,
+            "motion_aux_loss": "decode_suffix",
+        },
+    })
+    with pytest.raises(ValueError, match="motion_aux_loss"):
+        validate_stream_training_config(cfg)
+
+
+def test_stream_training_rejects_non_precomputed_latent_source():
+    cfg = OmegaConf.create({
+        "model": {"params": {"chunk_size": 5}},
+        "stream_training": {
+            "enabled": True,
+            "context_tokens": 30,
+            "min_history_tokens": 8,
+            "latent_source": "vae_reencode",
+        },
+    })
+    with pytest.raises(ValueError, match="latent_source"):
+        validate_stream_training_config(cfg)
+
+
+def test_stream_training_rejects_anchor_move_in_rollout_until_supported():
+    cfg = OmegaConf.create({
+        "model": {"params": {"chunk_size": 5}},
+        "stream_training": {
+            "enabled": True,
+            "context_tokens": 30,
+            "min_history_tokens": 8,
+            "anchor_move_in_rollout": True,
+        },
+    })
+    with pytest.raises(ValueError, match="anchor_move_in_rollout"):
+        validate_stream_training_config(cfg)

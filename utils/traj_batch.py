@@ -105,9 +105,31 @@ def frames_to_tokens(feats_frame: torch.Tensor, seq_len: int) -> torch.Tensor:
     return tok0                                                         # (B, 1, 4, C)
 
 
+def _per_sample_start_tokens(start_token_idx, batch_size: int) -> list[int] | None:
+    if torch.is_tensor(start_token_idx):
+        if start_token_idx.numel() == 1:
+            return None
+        values = start_token_idx.detach().cpu().view(-1).tolist()
+    elif isinstance(start_token_idx, (list, tuple)):
+        if len(start_token_idx) == 1:
+            return None
+        values = list(start_token_idx)
+    else:
+        return None
+    if len(values) != batch_size:
+        raise ValueError(
+            "per-sample traj_start_token must have one value per batch item; "
+            f"got {len(values)} values for batch size {batch_size}"
+        )
+    out = [int(v) for v in values]
+    if any(v < 0 for v in out):
+        raise ValueError(f"traj_start_token must be >= 0, got {out}")
+    return out
+
+
 def frames_to_tokens_range(
     feats_frame: torch.Tensor,
-    start_token_idx: int,
+    start_token_idx: int | torch.Tensor,
     num_tokens: int,
     *,
     frames_per_token: int = 4,
@@ -120,6 +142,26 @@ def frames_to_tokens_range(
     frame 0 corresponds to ``token_start_frame(S)``.
     """
     from utils.token_frame import token_end_frame, token_start_frame
+
+    per_sample_starts = _per_sample_start_tokens(start_token_idx, feats_frame.shape[0])
+    if per_sample_starts is not None:
+        return torch.cat(
+            [
+                frames_to_tokens_range(
+                    feats_frame[b : b + 1],
+                    start,
+                    num_tokens,
+                    frames_per_token=frames_per_token,
+                )
+                for b, start in enumerate(per_sample_starts)
+            ],
+            dim=0,
+        )
+
+    if torch.is_tensor(start_token_idx):
+        start_token_idx = int(start_token_idx.item())
+    elif isinstance(start_token_idx, (list, tuple)):
+        start_token_idx = int(start_token_idx[0])
 
     if start_token_idx < 0:
         raise ValueError(f"start_token_idx must be >= 0, got {start_token_idx}")
@@ -151,7 +193,7 @@ def frames_to_token_mask_range(
     mask_frame: torch.Tensor,
     num_tokens: int,
     *,
-    start_token_idx: int = 0,
+    start_token_idx: int | torch.Tensor = 0,
     frames_per_token: int = 4,
 ) -> torch.Tensor:
     """Aggregate a window-relative frame mask to token mask by OR."""
@@ -172,15 +214,24 @@ def _traj_source(x: dict):
     return None
 
 
-def _resolve_traj_start_token(x: dict, explicit: int | None = None) -> int:
+def _resolve_traj_start_token(x: dict, explicit: int | torch.Tensor | None = None):
     value = x.get("traj_start_token", 0) if explicit is None else explicit
     if torch.is_tensor(value):
-        if value.numel() != 1:
-            raise ValueError(
-                "traj_start_token currently expects one scalar shared by the batch; "
-                f"got tensor shape {tuple(value.shape)}"
-            )
-        value = int(value.item())
+        if value.numel() == 1:
+            value = int(value.item())
+        else:
+            value = value.to(dtype=torch.long).view(-1)
+            if bool((value < 0).any()):
+                raise ValueError(f"traj_start_token must be >= 0, got {value.tolist()}")
+            return value
+    elif isinstance(value, (list, tuple)):
+        if len(value) == 1:
+            value = int(value[0])
+        else:
+            out = torch.tensor([int(v) for v in value], dtype=torch.long)
+            if bool((out < 0).any()):
+                raise ValueError(f"traj_start_token must be >= 0, got {out.tolist()}")
+            return out
     value = int(value)
     if value < 0:
         raise ValueError(f"traj_start_token must be >= 0, got {value}")
@@ -200,8 +251,6 @@ def build_traj_frame_mask(
     is present. Single source for the frame-mask derivation (no second copy)."""
     from utils.token_frame import token_end_frame, token_start_frame
 
-    start_token_idx = _resolve_traj_start_token(x, traj_start_token)
-    origin_frame = token_start_frame(start_token_idx, frames_per_token)
     _cond_mask = x.get("traj_cond_mask", x.get("traj_mask"))
     if _cond_mask is not None:
         mf = _cond_mask.to(device=device, dtype=torch.float32)
@@ -209,14 +258,31 @@ def build_traj_frame_mask(
         tm = x["token_mask"].to(device=device, dtype=torch.float32)
         B_tm, N_tm = tm.shape
         mf = tm.new_zeros(B_tm, tf)
-        for local_k in range(N_tm):
-            global_k = start_token_idx + local_k
-            sf = token_start_frame(global_k, frames_per_token) - origin_frame
-            ef = min(token_end_frame(global_k, frames_per_token) + 1 - origin_frame, tf)
-            if sf < tf:
-                sf = max(0, sf)
-                if sf < ef:
-                    mf[:, sf:ef] = tm[:, local_k:local_k + 1].expand(-1, ef - sf)
+        start_token_idx = _resolve_traj_start_token(x, traj_start_token)
+        per_sample_starts = _per_sample_start_tokens(start_token_idx, B_tm)
+        if per_sample_starts is None:
+            if torch.is_tensor(start_token_idx):
+                start_token_idx = int(start_token_idx.item())
+            origin_frame = token_start_frame(start_token_idx, frames_per_token)
+            for local_k in range(N_tm):
+                global_k = start_token_idx + local_k
+                sf = token_start_frame(global_k, frames_per_token) - origin_frame
+                ef = min(token_end_frame(global_k, frames_per_token) + 1 - origin_frame, tf)
+                if sf < tf:
+                    sf = max(0, sf)
+                    if sf < ef:
+                        mf[:, sf:ef] = tm[:, local_k:local_k + 1].expand(-1, ef - sf)
+        else:
+            for b, start in enumerate(per_sample_starts):
+                origin_frame = token_start_frame(start, frames_per_token)
+                for local_k in range(N_tm):
+                    global_k = start + local_k
+                    sf = token_start_frame(global_k, frames_per_token) - origin_frame
+                    ef = min(token_end_frame(global_k, frames_per_token) + 1 - origin_frame, tf)
+                    if sf < tf:
+                        sf = max(0, sf)
+                        if sf < ef:
+                            mf[b, sf:ef] = tm[b, local_k]
     else:
         return None
     if mf.shape[1] < tf:
@@ -269,17 +335,30 @@ def _apply_horizon_mask_tokens_range(
     active_end_token,
     horizon_tokens: int,
     *,
-    start_token_idx: int,
+    start_token_idx: int | torch.Tensor,
     frames_per_token: int,
 ) -> torch.Tensor:
     """Zero a window-relative frame mask at global cutoff ``E + H``."""
     from utils.token_frame import token_start_frame
 
-    origin_frame = token_start_frame(start_token_idx, frames_per_token)
-    if torch.is_tensor(active_end_token) and active_end_token.dim() > 0:
-        for b in range(active_end_token.shape[0]):
+    per_sample_starts = _per_sample_start_tokens(start_token_idx, mask_frame.shape[0])
+    active_is_batch = torch.is_tensor(active_end_token) and active_end_token.dim() > 0
+    if per_sample_starts is not None or active_is_batch:
+        if per_sample_starts is None:
+            if torch.is_tensor(start_token_idx):
+                start = int(start_token_idx.item())
+            else:
+                start = int(start_token_idx)
+            per_sample_starts = [start] * mask_frame.shape[0]
+        for b, start in enumerate(per_sample_starts):
+            active_end = (
+                int(active_end_token[b])
+                if active_is_batch
+                else int(active_end_token)
+            )
+            origin_frame = token_start_frame(start, frames_per_token)
             cutoff = (
-                token_start_frame(int(active_end_token[b]) + horizon_tokens, frames_per_token)
+                token_start_frame(active_end + horizon_tokens, frames_per_token)
                 - origin_frame
             )
             if cutoff <= 0:
@@ -287,6 +366,9 @@ def _apply_horizon_mask_tokens_range(
             elif cutoff < mask_frame.shape[-1]:
                 mask_frame[b, cutoff:] = 0
         return mask_frame
+    if torch.is_tensor(start_token_idx):
+        start_token_idx = int(start_token_idx.item())
+    origin_frame = token_start_frame(start_token_idx, frames_per_token)
     cutoff = (
         token_start_frame(int(active_end_token) + horizon_tokens, frames_per_token)
         - origin_frame

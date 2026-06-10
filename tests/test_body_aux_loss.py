@@ -13,9 +13,12 @@ import torch
 
 from utils.training.control_loss import (
     body_aux_loss_terms,
+    canonicalize_pose_to_anchor,
+    compute_body_aux_loss,
     derive_fwd_yaw_delta,
     masked_smooth_l1,
 )
+from utils.token_frame import num_frames_for_tokens
 
 _W = {"root_xz": 1.0, "root_y": 0.3, "heading": 0.5, "fwd_delta": 0.1, "yaw_delta": 0.1}
 
@@ -29,6 +32,14 @@ def _poses(B=1, T=8, seed=0):
 
 def _full_mask(B, T):
     return torch.ones(B, T, dtype=torch.bool)
+
+
+def _motion263_from_xz(xz: torch.Tensor) -> torch.Tensor:
+    motion = torch.zeros(xz.shape[0], 263, dtype=xz.dtype)
+    motion[:, 3] = 1.0
+    motion[:-1, 1] = xz[1:, 0] - xz[:-1, 0]
+    motion[:-1, 2] = xz[1:, 1] - xz[:-1, 1]
+    return motion
 
 
 # 1. pred == gt → all 5 terms 0
@@ -146,3 +157,59 @@ def test_masked_smooth_l1_basic():
     # smooth_l1: 0.5, 1.5 (diff 1→0.5, diff2→1.5); masked-mean over 2 = 1.0
     out = masked_smooth_l1(pred.unsqueeze(-1), gt.unsqueeze(-1), mask)
     assert abs(float(out) - 1.0) < 1e-6
+
+
+def test_canonicalize_pose_to_anchor_uses_same_window_anchor_for_xyz_and_yaw():
+    xyz = torch.tensor([[[10.0, 1.0, 5.0], [11.0, 2.0, 5.0]]])
+    yaw = torch.tensor([[math.pi / 2, math.pi]])
+    anchor_xyz = torch.tensor([[[10.0, 99.0, 5.0]]])
+    anchor_yaw = torch.tensor([[math.pi / 2]])
+
+    local_xyz, local_yaw = canonicalize_pose_to_anchor(
+        xyz, yaw, anchor_xyz, anchor_yaw
+    )
+
+    assert torch.allclose(local_xyz[0, 0, [0, 2]], torch.zeros(2), atol=1e-6)
+    assert torch.allclose(local_xyz[0, 1, [0, 2]], torch.tensor([0.0, 1.0]), atol=1e-6)
+    # y is physical root height and is not anchored.
+    assert torch.allclose(local_xyz[0, :, 1], xyz[0, :, 1])
+    assert torch.allclose(local_yaw, torch.tensor([[0.0, math.pi / 2]]), atol=1e-6)
+
+
+def test_compute_body_aux_loss_uses_global_active_frame_slice_after_prefix_splice():
+    class FakeVAE:
+        def __init__(self, decoded_motion):
+            self.decoded_motion = decoded_motion
+
+        def decode(self, latents):
+            return self.decoded_motion.unsqueeze(0) + latents.sum() * 0.0
+
+    t_tok = 5
+    total_frames = num_frames_for_tokens(t_tok)
+    active_start_f = 9  # token_start_frame(t_tok - chunk_size_tokens=2)
+    gt_xz = torch.zeros(total_frames, 2)
+    pred_xz = torch.zeros(total_frames, 2)
+    pred_xz[1:active_start_f] = 100.0
+    pred_xz[active_start_f:] = gt_xz[active_start_f:]
+
+    gt_motion = _motion263_from_xz(gt_xz)
+    pred_motion = _motion263_from_xz(pred_xz)
+    gt_traj = torch.zeros(1, total_frames, 7)
+    gt_traj[0, :, 0] = gt_xz[:, 0]
+    gt_traj[0, :, 2] = gt_xz[:, 1]
+    gt_traj[0, :, 3] = 1.0
+
+    weights = {"root_xz": 1.0, "root_y": 0.0, "heading": 0.0, "fwd_delta": 0.0, "yaw_delta": 0.0}
+    loss, terms = compute_body_aux_loss(
+        [torch.zeros(t_tok, 2)],
+        gt_traj,
+        torch.tensor([total_frames]),
+        FakeVAE(pred_motion),
+        torch.device("cpu"),
+        weights,
+        chunk_size_tokens=2,
+    )
+
+    assert loss is not None
+    assert abs(float(loss)) < 1e-6
+    assert abs(float(terms["root_xz"])) < 1e-6

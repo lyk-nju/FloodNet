@@ -10,6 +10,7 @@ from .inline_eval_runtime import (
     resolve_test_probe_tag,
 )
 from .model_batch import prepare_model_input, _copy_trajectory_fields
+from .window_local import build_window_local_model_batch, build_window_local_traj_batch
 from .module_step import (
     ckpt_step_info,
     compute_step_semantics,
@@ -47,6 +48,8 @@ __all__ = [
     "StepSemantics",
     "is_async_eval",
     "build_generation_eval_cfg",
+    "build_window_local_model_batch",
+    "build_window_local_traj_batch",
     "_make_step_info",
     "prepare_model_input",
     "build_step_semantics",

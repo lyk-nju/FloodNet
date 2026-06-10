@@ -464,13 +464,37 @@ class DiffForcingWanModel(nn.Module):
 
     def _get_traj_seq_lens(self, x, seq_len, device, horizon_tokens=None,
                            horizon_active_end=0):
-        # Base token length from feature_length / traj_length (exact).
-        base = None
-        if "feature_length" in x and x["feature_length"] is not None:
-            base = x["feature_length"].to(device=device, dtype=torch.long).clamp(min=0, max=seq_len)
-        elif "traj_features_length" in x and x["traj_features_length"] is not None:
-            base = x["traj_features_length"].to(device=device, dtype=torch.long).clamp(min=0, max=seq_len)
-        elif "traj_length" in x and x["traj_length"] is not None:
+        def _infer_batch_size():
+            for key in ("traj_features", "traj_cond_7d_frame", "traj_cond", "traj", "feature"):
+                value = x.get(key)
+                if torch.is_tensor(value) and value.ndim > 0:
+                    return int(value.shape[0])
+            value = x.get("feature_length")
+            if torch.is_tensor(value) and value.ndim > 0:
+                return int(value.numel())
+            return None
+
+        batch_size = _infer_batch_size()
+
+        def _length_tensor(value):
+            if value is None:
+                return None
+            if torch.is_tensor(value):
+                out = value.to(device=device, dtype=torch.long)
+            else:
+                out = torch.tensor([int(value)], device=device, dtype=torch.long)
+            if out.ndim == 0:
+                out = out.view(1)
+            if batch_size is not None and out.numel() == 1 and batch_size > 1:
+                out = out.expand(batch_size)
+            return out.clamp(min=0, max=seq_len)
+
+        # Base token length. Window-local training uses feature_length for latent
+        # validity only, so explicit trajectory lengths must take precedence.
+        base = _length_tensor(x.get("traj_num_tokens"))
+        if base is None:
+            base = _length_tensor(x.get("traj_features_length"))
+        if base is None and x.get("traj_length") is not None:
             tl = x["traj_length"].to(device=device, dtype=torch.long)
             # Vectorized mirror of token_frame.num_tokens_for_frame_len
             # (= frame_idx_to_token_idx(tl-1)+1): 0 for tl<=0, 1 for tl==1,
@@ -479,6 +503,8 @@ class DiffForcingWanModel(nn.Module):
                 tl <= 1, tl.clamp(min=0, max=1), (tl - 2) // 4 + 2,
             )
             base = tokens.clamp(min=0, max=seq_len)
+        if base is None:
+            base = _length_tensor(x.get("feature_length"))
         if base is None:
             return None
 
@@ -757,7 +783,12 @@ class DiffForcingWanModel(nn.Module):
         loss = loss / batch_size
 
         pred_x0_latent_list = None
-        if ("traj" in x) and (self.prediction_type in ("vel", "x0")) and not traj_dropped:
+        has_traj_condition = (
+            ("traj" in x and x.get("traj") is not None)
+            or ("traj_features" in x and x.get("traj_features") is not None)
+            or bool(x.get("_window_local_traj", False))
+        )
+        if has_traj_condition and (self.prediction_type in ("vel", "x0")) and not traj_dropped:
             pred_x0_latent_list = loss_x0_list
 
         return {
