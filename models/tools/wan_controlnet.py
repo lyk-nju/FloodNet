@@ -50,6 +50,7 @@ class WanControlNet(nn.Module):
         eps: float = 1e-6,
         causal: bool = False,
         traj_enc_dim: int = 0,
+        use_traj_token_mask_in_attention: bool = False,
     ):
         super().__init__()
         self.model_type = model_type
@@ -69,6 +70,7 @@ class WanControlNet(nn.Module):
         self.eps = eps
         self.causal = causal
         self.traj_enc_dim = traj_enc_dim
+        self.use_traj_token_mask_in_attention = bool(use_traj_token_mask_in_attention)
 
         # Match WanModel embeddings.
         self.patch_embedding = nn.Conv3d(
@@ -232,7 +234,7 @@ class WanControlNet(nn.Module):
                 traj_t = traj_t * tm
             bt, tlen, _ = traj_t.shape
             traj_pad_len = max(seq_len, int(tlen))
-            if traj_token_mask is not None:
+            if self.use_traj_token_mask_in_attention and traj_token_mask is not None:
                 traj_token_mask_attn = traj_token_mask.to(
                     device=x.device, dtype=torch.bool
                 )

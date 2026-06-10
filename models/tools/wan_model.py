@@ -570,6 +570,7 @@ class WanModel(ModelMixin, ConfigMixin):
         eps=1e-6,
         causal=False,
         traj_enc_dim=0,
+        use_traj_token_mask_in_attention=False,
     ):
         r"""
         Initialize the diffusion model backbone.
@@ -630,6 +631,7 @@ class WanModel(ModelMixin, ConfigMixin):
         self.eps = eps
         self.causal = causal
         self.traj_enc_dim = traj_enc_dim
+        self.use_traj_token_mask_in_attention = bool(use_traj_token_mask_in_attention)
         # embeddings
         self.patch_embedding = nn.Conv3d(
             in_dim, dim, kernel_size=patch_size, stride=patch_size
@@ -792,7 +794,7 @@ class WanModel(ModelMixin, ConfigMixin):
                 traj_t = traj_t * tm
             bt, tlen, _ = traj_t.shape
             traj_pad_len = max(seq_len, int(tlen))
-            if traj_token_mask is not None:
+            if self.use_traj_token_mask_in_attention and traj_token_mask is not None:
                 traj_token_mask_attn = traj_token_mask.to(
                     device=x.device, dtype=torch.bool
                 )

@@ -146,7 +146,7 @@ class _CaptureBlock(torch.nn.Module):
         return x
 
 
-def _tiny_wan_model() -> WanModel:
+def _tiny_wan_model(*, use_traj_token_mask_in_attention: bool = False) -> WanModel:
     model = WanModel(
         model_type="t2v",
         in_dim=4,
@@ -160,6 +160,7 @@ def _tiny_wan_model() -> WanModel:
         patch_size=(1, 1, 1),
         text_len=4,
         traj_enc_dim=8,
+        use_traj_token_mask_in_attention=use_traj_token_mask_in_attention,
     ).eval()
     model.blocks = torch.nn.ModuleList([_CaptureBlock()])
     return model
@@ -201,8 +202,25 @@ def test_wan_model_defaults_long_traj_lens_to_full_traj_length():
     assert torch.equal(block.seen_traj_seq_lens, torch.tensor([5]))
 
 
-def test_wan_model_threads_arbitrary_traj_token_mask_to_blocks():
+def test_wan_model_defaults_to_projection_only_traj_token_mask():
     model = _tiny_wan_model()
+    traj_mask = torch.tensor([[0.0, 1.0, 0.0, 1.0, 1.0]])
+    model(
+        [torch.randn(4, 3, 1, 1)],
+        torch.zeros(1),
+        [torch.randn(1, 32)],
+        seq_len=3,
+        traj_emb=torch.randn(1, 5, 8),
+        traj_seq_lens=torch.tensor([5]),
+        traj_token_mask=traj_mask,
+    )
+
+    block = model.blocks[0]
+    assert block.seen_traj_token_mask is None
+
+
+def test_wan_model_opt_in_threads_arbitrary_traj_token_mask_to_blocks():
+    model = _tiny_wan_model(use_traj_token_mask_in_attention=True)
     traj_mask = torch.tensor([[0.0, 1.0, 0.0, 1.0, 1.0]])
     model(
         [torch.randn(4, 3, 1, 1)],
@@ -288,7 +306,7 @@ def test_wan_controlnet_keeps_future_traj_tokens_but_returns_latent_residuals():
     assert residuals[0].shape == (1, 3, 12)
 
 
-def test_wan_controlnet_threads_arbitrary_traj_token_mask_to_blocks():
+def test_wan_controlnet_defaults_to_projection_only_traj_token_mask():
     cn = WanControlNet(
         model_type="t2v",
         in_dim=4,
@@ -302,6 +320,39 @@ def test_wan_controlnet_threads_arbitrary_traj_token_mask_to_blocks():
         patch_size=(1, 1, 1),
         text_len=4,
         traj_enc_dim=8,
+    ).eval()
+    cn.blocks = torch.nn.ModuleList([_CaptureBlock()])
+    traj_mask = torch.tensor([[0.0, 0.0, 1.0, 1.0, 1.0]])
+
+    cn(
+        [torch.randn(4, 3, 1, 1)],
+        torch.zeros(1),
+        [torch.randn(1, 32)],
+        seq_len=3,
+        traj_emb=torch.randn(1, 5, 8),
+        traj_seq_lens=torch.tensor([5]),
+        traj_token_mask=traj_mask,
+    )
+
+    block = cn.blocks[0]
+    assert block.seen_traj_token_mask is None
+
+
+def test_wan_controlnet_opt_in_threads_arbitrary_traj_token_mask_to_blocks():
+    cn = WanControlNet(
+        model_type="t2v",
+        in_dim=4,
+        dim=12,
+        ffn_dim=24,
+        freq_dim=16,
+        text_dim=32,
+        out_dim=4,
+        num_heads=2,
+        num_layers=1,
+        patch_size=(1, 1, 1),
+        text_len=4,
+        traj_enc_dim=8,
+        use_traj_token_mask_in_attention=True,
     ).eval()
     cn.blocks = torch.nn.ModuleList([_CaptureBlock()])
     traj_mask = torch.tensor([[0.0, 0.0, 1.0, 1.0, 1.0]])

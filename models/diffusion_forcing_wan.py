@@ -136,6 +136,7 @@ class DiffForcingWanModel(nn.Module):
         self_forcing_detach_between_steps=True,
         self_forcing_k_schedule=((0.0, 2), (0.4, 3), (0.7, 5)),
         self_forcing_start_step=None,
+        use_traj_token_mask_in_attention=False,
     ):
         super().__init__()
         if traj_encoder_in_dim is not None:
@@ -160,6 +161,9 @@ class DiffForcingWanModel(nn.Module):
         self.traj_in_dim = traj_in_dim
         self.traj_dropout = traj_dropout
         self.freeze_backbone = bool(freeze_backbone)
+        self.use_traj_token_mask_in_attention = bool(
+            use_traj_token_mask_in_attention
+        )
         if use_traj_kv_cache is not None:
             warnings.warn(
                 "`use_traj_kv_cache` is deprecated; use `use_traj_emb_cache`.",
@@ -259,6 +263,7 @@ class DiffForcingWanModel(nn.Module):
             eps=1e-6,
             causal=self.causal,
             traj_enc_dim=traj_enc_dim_backbone,
+            use_traj_token_mask_in_attention=self.use_traj_token_mask_in_attention,
         )
 
         self.controlnet = WanControlNet(
@@ -279,6 +284,7 @@ class DiffForcingWanModel(nn.Module):
             eps=1e-6,
             causal=self.causal,
             traj_enc_dim=traj_enc_dim_controlnet,
+            use_traj_token_mask_in_attention=self.use_traj_token_mask_in_attention,
         )
         self.controlnet.init_from_backbone(self.model)
 
