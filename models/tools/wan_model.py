@@ -571,6 +571,7 @@ class WanModel(ModelMixin, ConfigMixin):
         causal=False,
         traj_enc_dim=0,
         use_traj_token_mask_in_attention=False,
+        use_future_traj_attention=False,
     ):
         r"""
         Initialize the diffusion model backbone.
@@ -632,6 +633,7 @@ class WanModel(ModelMixin, ConfigMixin):
         self.causal = causal
         self.traj_enc_dim = traj_enc_dim
         self.use_traj_token_mask_in_attention = bool(use_traj_token_mask_in_attention)
+        self.use_future_traj_attention = bool(use_future_traj_attention)
         # embeddings
         self.patch_embedding = nn.Conv3d(
             in_dim, dim, kernel_size=patch_size, stride=patch_size
@@ -793,7 +795,11 @@ class WanModel(ModelMixin, ConfigMixin):
                     tm = tm[:, :proj_len, :]
                 traj_t = traj_t * tm
             bt, tlen, _ = traj_t.shape
-            traj_pad_len = max(seq_len, int(tlen))
+            traj_pad_len = (
+                max(seq_len, int(tlen))
+                if self.use_future_traj_attention
+                else seq_len
+            )
             if self.use_traj_token_mask_in_attention and traj_token_mask is not None:
                 traj_token_mask_attn = traj_token_mask.to(
                     device=x.device, dtype=torch.bool
@@ -821,9 +827,15 @@ class WanModel(ModelMixin, ConfigMixin):
                     [traj_t, traj_t.new_zeros(bt, traj_pad_len - tlen, traj_t.size(-1))],
                     dim=1,
                 )
+            elif tlen > traj_pad_len:
+                traj_t = traj_t[:, :traj_pad_len, :]
             x = torch.cat([x, traj_t], dim=1)
             if traj_seq_lens is None:
-                traj_seq_lens_attn = torch.full_like(seq_lens, int(tlen))
+                traj_seq_lens_attn = (
+                    torch.full_like(seq_lens, int(tlen))
+                    if self.use_future_traj_attention
+                    else seq_lens
+                )
             else:
                 traj_seq_lens_attn = (
                     traj_seq_lens.to(device=seq_lens.device, dtype=torch.long)
@@ -867,7 +879,9 @@ class WanModel(ModelMixin, ConfigMixin):
             context=context,
             context_lens=context_lens,
             latent_pad_len=latent_pad_len,
-            traj_pad_len=traj_pad_len,
+            traj_pad_len=(
+                traj_pad_len if self.use_future_traj_attention else None
+            ),
         )
 
         if controlnet_residuals is not None and len(controlnet_residuals) != len(

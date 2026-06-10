@@ -146,8 +146,12 @@ class _CaptureBlock(torch.nn.Module):
         return x
 
 
-def _tiny_wan_model(*, use_traj_token_mask_in_attention: bool = False) -> WanModel:
-    model = WanModel(
+def _tiny_wan_model(
+    *,
+    use_traj_token_mask_in_attention: bool = False,
+    use_future_traj_attention: bool = False,
+) -> WanModel:
+    kwargs = dict(
         model_type="t2v",
         in_dim=4,
         dim=12,
@@ -161,13 +165,36 @@ def _tiny_wan_model(*, use_traj_token_mask_in_attention: bool = False) -> WanMod
         text_len=4,
         traj_enc_dim=8,
         use_traj_token_mask_in_attention=use_traj_token_mask_in_attention,
-    ).eval()
+    )
+    if use_future_traj_attention:
+        kwargs["use_future_traj_attention"] = True
+    model = WanModel(**kwargs).eval()
     model.blocks = torch.nn.ModuleList([_CaptureBlock()])
     return model
 
 
-def test_wan_model_does_not_truncate_streaming_future_traj_tokens():
+def test_wan_model_defaults_to_legacy_traj_pad_len():
     model = _tiny_wan_model()
+    out = model(
+        [torch.randn(4, 3, 1, 1)],
+        torch.zeros(1),
+        [torch.randn(1, 32)],
+        seq_len=3,
+        traj_emb=torch.randn(1, 5, 8),
+        traj_seq_lens=torch.tensor([5]),
+    )
+
+    block = model.blocks[0]
+    assert block.seen_len == 6
+    assert block.seen_latent_pad_len == 3
+    assert block.seen_traj_pad_len is None
+    assert torch.equal(block.seen_traj_seq_lens, torch.tensor([3]))
+    assert len(out) == 1
+    assert out[0].shape == (4, 3, 1, 1)
+
+
+def test_wan_model_opt_in_does_not_truncate_streaming_future_traj_tokens():
+    model = _tiny_wan_model(use_future_traj_attention=True)
     traj_emb = torch.randn(1, 5, 8)
     out = model(
         [torch.randn(4, 3, 1, 1)],
@@ -187,7 +214,7 @@ def test_wan_model_does_not_truncate_streaming_future_traj_tokens():
     assert out[0].shape == (4, 3, 1, 1)
 
 
-def test_wan_model_defaults_long_traj_lens_to_full_traj_length():
+def test_wan_model_defaults_missing_traj_lens_to_legacy_seq_lens():
     model = _tiny_wan_model()
     model(
         [torch.randn(4, 3, 1, 1)],
@@ -199,7 +226,7 @@ def test_wan_model_defaults_long_traj_lens_to_full_traj_length():
     )
 
     block = model.blocks[0]
-    assert torch.equal(block.seen_traj_seq_lens, torch.tensor([5]))
+    assert torch.equal(block.seen_traj_seq_lens, torch.tensor([3]))
 
 
 def test_wan_model_defaults_to_projection_only_traj_token_mask():
@@ -220,7 +247,10 @@ def test_wan_model_defaults_to_projection_only_traj_token_mask():
 
 
 def test_wan_model_opt_in_threads_arbitrary_traj_token_mask_to_blocks():
-    model = _tiny_wan_model(use_traj_token_mask_in_attention=True)
+    model = _tiny_wan_model(
+        use_traj_token_mask_in_attention=True,
+        use_future_traj_attention=True,
+    )
     traj_mask = torch.tensor([[0.0, 1.0, 0.0, 1.0, 1.0]])
     model(
         [torch.randn(4, 3, 1, 1)],
@@ -256,8 +286,8 @@ def test_wan_model_masks_projected_traj_tokens_before_blocks():
 
     block = model.blocks[0]
     traj_seen = block.seen_x[:, block.seen_latent_pad_len:]
-    assert torch.count_nonzero(traj_seen[:, [1, 3]]) == 0
-    assert torch.count_nonzero(traj_seen[:, [0, 2, 4]]) > 0
+    assert torch.count_nonzero(traj_seen[:, [1]]) == 0
+    assert torch.count_nonzero(traj_seen[:, [0, 2]]) > 0
 
 
 def test_wan_cross_attention_rejects_frame_aligned_flextraj_length_mismatch():
@@ -270,7 +300,7 @@ def test_wan_cross_attention_rejects_frame_aligned_flextraj_length_mismatch():
         cross(x, context, context_lens)
 
 
-def test_wan_controlnet_keeps_future_traj_tokens_but_returns_latent_residuals():
+def test_wan_controlnet_defaults_to_legacy_traj_pad_len():
     cn = WanControlNet(
         model_type="t2v",
         in_dim=4,
@@ -284,6 +314,43 @@ def test_wan_controlnet_keeps_future_traj_tokens_but_returns_latent_residuals():
         patch_size=(1, 1, 1),
         text_len=4,
         traj_enc_dim=8,
+    ).eval()
+    cn.blocks = torch.nn.ModuleList([_CaptureBlock()])
+
+    residuals = cn(
+        [torch.randn(4, 3, 1, 1)],
+        torch.zeros(1),
+        [torch.randn(1, 32)],
+        seq_len=3,
+        traj_emb=torch.randn(1, 5, 8),
+        traj_seq_lens=torch.tensor([5]),
+        traj_token_mask=torch.ones(1, 5),
+    )
+
+    block = cn.blocks[0]
+    assert block.seen_len == 6
+    assert block.seen_latent_pad_len == 3
+    assert block.seen_traj_pad_len is None
+    assert torch.equal(block.seen_traj_seq_lens, torch.tensor([3]))
+    assert len(residuals) == 1
+    assert residuals[0].shape == (1, 3, 12)
+
+
+def test_wan_controlnet_opt_in_keeps_future_traj_tokens_but_returns_latent_residuals():
+    cn = WanControlNet(
+        model_type="t2v",
+        in_dim=4,
+        dim=12,
+        ffn_dim=24,
+        freq_dim=16,
+        text_dim=32,
+        out_dim=4,
+        num_heads=2,
+        num_layers=1,
+        patch_size=(1, 1, 1),
+        text_len=4,
+        traj_enc_dim=8,
+        use_future_traj_attention=True,
     ).eval()
     cn.blocks = torch.nn.ModuleList([_CaptureBlock()])
 
@@ -352,6 +419,7 @@ def test_wan_controlnet_opt_in_threads_arbitrary_traj_token_mask_to_blocks():
         patch_size=(1, 1, 1),
         text_len=4,
         traj_enc_dim=8,
+        use_future_traj_attention=True,
         use_traj_token_mask_in_attention=True,
     ).eval()
     cn.blocks = torch.nn.ModuleList([_CaptureBlock()])
