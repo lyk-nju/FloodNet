@@ -362,3 +362,27 @@ def test_ldf_stream_metrics_run_name_override_stabilizes_output_dir():
         requested_run_name=None,
     )
     assert generated.endswith("_window_local_stream_generate_step_step_425000")
+
+
+def test_ldf_stream_metrics_resolves_test_probe_meta_paths_when_test_meta_missing():
+    from eval.ldf import stream_metrics
+    from omegaconf import OmegaConf
+
+    cfg = OmegaConf.create(
+        {
+            "data": {
+                "test_probe_meta_paths": {
+                    "test": ["/data/HumanML3D/test_min.txt"],
+                    "train": ["/data/HumanML3D/train_min.txt"],
+                }
+            }
+        }
+    )
+    args = stream_metrics.parse_args_from_list([])
+
+    meta_paths, probe_tag = stream_metrics._resolve_meta_paths_and_probe_tag(
+        args, cfg
+    )
+
+    assert meta_paths == ["/data/HumanML3D/test_min.txt"]
+    assert probe_tag == "test"

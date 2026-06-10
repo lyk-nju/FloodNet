@@ -212,6 +212,44 @@ def _infer_meta_tag(meta_paths) -> str:
     return stem[:-4] if stem.endswith("_min") else stem
 
 
+def _resolve_meta_paths_and_probe_tag(args, cfg) -> tuple[list[str], str]:
+    """Resolve stream-eval meta paths.
+
+    Supports the standalone legacy `data.test_meta_paths` shape and the LDF
+    probe layout `data.test_probe_meta_paths` used by run_eval/eval_watcher.
+    CLI `--meta_paths` remains the highest-priority override.
+    """
+    if args.meta_paths:
+        meta_paths = list(args.meta_paths)
+        probe_tag = (
+            args.probe_tag
+            or cfg.get("eval.probe_tag", None)
+            or _infer_meta_tag(meta_paths)
+        )
+        return meta_paths, str(probe_tag)
+
+    requested_probe = args.probe_tag or cfg.get("eval.probe_tag", None)
+    data_cfg = cfg.get("data", {}) or {}
+    probe_cfg = data_cfg.get("test_probe_meta_paths", None)
+    if probe_cfg:
+        probe_items = list(probe_cfg.items())
+        if requested_probe is not None and str(requested_probe) in probe_cfg:
+            return list(probe_cfg[str(requested_probe)]), str(requested_probe)
+        first_tag, first_paths = probe_items[0]
+        return list(first_paths), str(requested_probe or first_tag)
+
+    test_meta_paths = data_cfg.get("test_meta_paths", None)
+    if test_meta_paths is not None:
+        meta_paths = list(test_meta_paths)
+        probe_tag = requested_probe or _infer_meta_tag(meta_paths)
+        return meta_paths, str(probe_tag)
+
+    raise ValueError(
+        "Stream eval requires either --meta_paths, data.test_meta_paths, or "
+        "data.test_probe_meta_paths in the config."
+    )
+
+
 def _resolve_ema_params(model, checkpoint, cfg):
     n_shadow = len(checkpoint["ema_state"]["shadow_params"])
     all_params = list(model.parameters())
@@ -716,8 +754,7 @@ def main():
     if vae_ckpt_path is None:
         raise ValueError("No VAE checkpoint provided via --vae_ckpt / cfg.test_vae_ckpt")
 
-    meta_paths = args.meta_paths or list(cfg.data.test_meta_paths)
-    probe_tag = args.probe_tag or cfg.get("eval.probe_tag", None) or _infer_meta_tag(meta_paths)
+    meta_paths, probe_tag = _resolve_meta_paths_and_probe_tag(args, cfg)
     stream_mode = args.stream_mode or cfg.get("eval.stream_mode", "stream_generate")
 
     batch_size = args.batch_size or int(cfg.data.test_bs)
