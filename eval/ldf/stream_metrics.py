@@ -8,6 +8,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
+# Multi-GPU stream eval spawns one Python process per device. Cap BLAS/OpenMP
+# thread pools before importing numpy/torch so workers do not exhaust RLIMIT_NPROC.
+for _thread_env_key in (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "BLIS_NUM_THREADS",
+):
+    os.environ.setdefault(_thread_env_key, "1")
+
 import numpy as np
 import torch
 from omegaconf import OmegaConf

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import subprocess
 import sys
 
 import numpy as np
@@ -480,3 +482,36 @@ def test_ldf_stream_metrics_aggregates_rank_payloads(tmp_path):
     assert [sample["name"] for sample in payload["samples"]] == ["sample_1", "sample_2"]
     assert payload["summary"]["stream_gt/root_ADE"] == 0.20
     assert (tmp_path / "summary.json").is_file()
+
+
+def test_ldf_stream_metrics_caps_blas_threads_before_numpy_import():
+    thread_env_keys = [
+        "OPENBLAS_NUM_THREADS",
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "BLIS_NUM_THREADS",
+    ]
+    env = os.environ.copy()
+    for key in thread_env_keys:
+        env.pop(key, None)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os; "
+                "import eval.ldf.stream_metrics; "
+                f"print([os.environ.get(k) for k in {thread_env_keys!r}])"
+            ),
+        ],
+        cwd=os.getcwd(),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert result.stdout.strip() == str(["1"] * len(thread_env_keys))
