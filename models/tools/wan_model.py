@@ -153,9 +153,11 @@ def rope_apply_concat_latent_traj(x, grid_sizes, freqs, latent_pad_len, traj_pad
     """
     RoPE for sequences [latent_0..L || traj_0..T].
 
-    In the standard training path T == L. Streaming can pass T > L so latent
-    tokens attend to a future trajectory horizon. For the body model's 1D token
-    grid (H=W=1), future traj tokens receive the next temporal RoPE positions.
+    Default T == L keeps the legacy checkpoint contract: each segment only
+    rotates the real grid prefix and leaves padded tail tokens untouched.
+    Streaming can opt into T > L so latent tokens attend to a future trajectory
+    horizon. For the body model's 1D token grid (H=W=1), future traj tokens
+    receive the next temporal RoPE positions.
     """
     n, c = x.size(2), x.size(3) // 2
     freqs_split = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
@@ -190,7 +192,10 @@ def rope_apply_concat_latent_traj(x, grid_sizes, freqs, latent_pad_len, traj_pad
             return torch.cat([x_rot, x_prefix[prefix_len:]], dim=0)
 
         x_lat = apply_rope_prefix(x[i, :L], freqs_i)
-        traj_freqs = freqs_for_grid(T) if h == 1 and w == 1 else freqs_i
+        if T == L:
+            traj_freqs = freqs_i
+        else:
+            traj_freqs = freqs_for_grid(T) if h == 1 and w == 1 else freqs_i
         x_traj = apply_rope_prefix(x[i, L : L + T], traj_freqs)
         output.append(torch.cat([x_lat, x_traj], dim=0))
     return torch.stack(output).float()
@@ -286,8 +291,10 @@ class WanSelfAttention(nn.Module):
         q, k, v = qkv_fn(x)
 
         if latent_pad_len is not None:
-            traj_pad_len = latent_pad_len if traj_pad_len is None else int(traj_pad_len)
-            assert s == latent_pad_len + traj_pad_len
+            effective_traj_pad_len = (
+                latent_pad_len if traj_pad_len is None else int(traj_pad_len)
+            )
+            assert s == latent_pad_len + effective_traj_pad_len
             q = rope_apply_concat_latent_traj(
                 q, grid_sizes, freqs, latent_pad_len, traj_pad_len
             )

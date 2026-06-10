@@ -11,6 +11,7 @@ from models.tools.wan_model import (
     WanCrossAttention,
     WanModel,
     WanSelfAttention,
+    rope_apply_concat_latent_traj,
     rope_params,
 )
 
@@ -24,6 +25,26 @@ def _freqs_for_head_dim(head_dim: int) -> torch.Tensor:
         ],
         dim=1,
     )
+
+
+def test_rope_concat_default_keeps_legacy_padded_traj_tail_unchanged():
+    torch.manual_seed(123)
+    latent_pad_len = 5
+    grid_len = 3
+    x = torch.randn(1, 2 * latent_pad_len, 2, 6)
+
+    out = rope_apply_concat_latent_traj(
+        x,
+        grid_sizes=torch.tensor([[grid_len, 1, 1]]),
+        freqs=_freqs_for_head_dim(6),
+        latent_pad_len=latent_pad_len,
+        traj_pad_len=None,
+    )
+
+    assert out.shape == x.shape
+    assert torch.allclose(out[:, grid_len:latent_pad_len], x[:, grid_len:latent_pad_len])
+    traj_tail = slice(latent_pad_len + grid_len, 2 * latent_pad_len)
+    assert torch.allclose(out[:, traj_tail], x[:, traj_tail])
 
 
 def test_flextraj_bias_allows_traj_segment_longer_than_latent_segment():
