@@ -7,8 +7,10 @@ import numpy as np
 import torch
 
 from eval.runtime.benchmark import (
+    DEFAULT_RUNTIME_OUTPUT_DIR,
     _build_turn_metric_target,
     _csv_safe_record,
+    _motion_video_overlay_kwargs,
     _run_babel,
     _run_turn,
     _visual_target_root_from_plan,
@@ -60,6 +62,26 @@ def _moving_z_timeline(num_commits: int) -> InferenceGlueTimeline:
             )
         )
     return timeline
+
+
+def test_runtime_default_output_dir_is_eval_output_eval():
+    assert DEFAULT_RUNTIME_OUTPUT_DIR.endswith("/eval/output_eval")
+
+
+def test_motion_video_overlay_kwargs_uses_target_root_xz():
+    target_root = np.array(
+        [
+            [1.0, 0.0, 2.0, 1.0, 0.0],
+            [3.0, 0.0, 4.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+    kwargs = _motion_video_overlay_kwargs(target_root)
+
+    assert kwargs["render_setting"]["cond_traj_show_full"] is True
+    np.testing.assert_allclose(kwargs["traj_xz"], target_root[:, [0, 2]])
+    np.testing.assert_allclose(kwargs["traj_mask"], np.ones(2, dtype=np.float32))
 
 
 def test_stream_benchmark_builds_7d_rootplan_payload_for_model_step():

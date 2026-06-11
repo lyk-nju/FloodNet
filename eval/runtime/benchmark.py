@@ -28,6 +28,8 @@ _project_root = os.path.dirname(os.path.dirname(_script_dir))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+DEFAULT_RUNTIME_OUTPUT_DIR = os.path.join(_project_root, "eval", "output_eval")
+
 import numpy as np
 import torch
 import random
@@ -1266,6 +1268,24 @@ def _run_babel(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode,
     return pm, pr, gr, plan_t, plan_pts
 
 
+def _motion_video_overlay_kwargs(target_root):
+    """Build trajectory overlay kwargs for the skeleton action video."""
+    render_setting = {
+        "cond_traj_show_full": True,
+        "traj_mask_point_radius": 3,
+        "cond_traj_point_radius": 4,
+    }
+    kwargs = {"render_setting": render_setting}
+    if target_root is None:
+        return kwargs
+    target_root = np.asarray(target_root, dtype=np.float32)
+    if target_root.ndim != 2 or target_root.shape[0] == 0 or target_root.shape[1] < 3:
+        return kwargs
+    kwargs["traj_xz"] = target_root[:, [0, 2]]
+    kwargs["traj_mask"] = np.ones((target_root.shape[0],), dtype=np.float32)
+    return kwargs
+
+
 def _render_traj_video(pred_root, target_root, out_path, title, *, split_tok=None):
     """Render animated XZ trajectory comparison video."""
     _n = min(len(pred_root), len(target_root))
@@ -1273,6 +1293,12 @@ def _render_traj_video(pred_root, target_root, out_path, title, *, split_tok=Non
         return
     import matplotlib
     matplotlib.use("Agg")
+    if shutil.which("ffmpeg") is None:
+        try:
+            import imageio_ffmpeg
+            matplotlib.rcParams["animation.ffmpeg_path"] = imageio_ffmpeg.get_ffmpeg_exe()
+        except ImportError:
+            pass
     import matplotlib.pyplot as plt
     from matplotlib.animation import FFMpegWriter
     _f2, _a2 = plt.subplots(figsize=(7, 7))
@@ -1350,7 +1376,7 @@ def main():
     p.add_argument("--ckpt", required=True)
     p.add_argument("--vae_ckpt", required=True)
     p.add_argument("--raw_data_dir", required=True)
-    p.add_argument("--output_dir", default="outputs/stream_benchmark")
+    p.add_argument("--output_dir", default=DEFAULT_RUNTIME_OUTPUT_DIR)
     p.add_argument("--preset", default="smoke")
     p.add_argument("--suites", default=None)
     p.add_argument("--render_video", action="store_true", default=False)
@@ -1623,7 +1649,12 @@ def main():
 
             if args.render_video and _pm is not None and _pm.size > 0:
                 mp4 = os.path.join(vdir, f"{display_case_name}.mp4")
-                render_single_video(motion=_pm, save_path=mp4, dim=263, render_setting={})
+                render_single_video(
+                    motion=_pm,
+                    save_path=mp4,
+                    dim=263,
+                    **_motion_video_overlay_kwargs(_gr),
+                )
                 print(f"    video: {mp4}")
                 if standard_vdir:
                     shutil.copy2(mp4, os.path.join(standard_vdir, f"{display_case_name}.mp4"))
