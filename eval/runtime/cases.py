@@ -36,8 +36,8 @@ SMOKE_CASES: list[StreamBenchmarkCase] = [
         sample_id="001168", dataset="humanml3d", mode="step_gtroot",
     ),
     StreamBenchmarkCase(
-        name="real_metric_001168", suite="real",
-        sample_id="001168", dataset="humanml3d", mode="real_predroot",
+        name="real_route_metric_001168", suite="real",
+        sample_id="001168", dataset="humanml3d", mode="real_route",
     ),
     StreamBenchmarkCase(
         name="turn_metric_001168_rot30", suite="turn",
@@ -70,20 +70,12 @@ STEP_CASES = [
 
 REAL_CASES = [
     StreamBenchmarkCase(
-        name="real_gtroot_001168", suite="real",
-        sample_id="001168", dataset="humanml3d", mode="real_gtroot",
+        name="real_route_001168", suite="real",
+        sample_id="001168", dataset="humanml3d", mode="real_route",
     ),
     StreamBenchmarkCase(
-        name="real_predroot_001168", suite="real",
-        sample_id="001168", dataset="humanml3d", mode="real_predroot",
-    ),
-    StreamBenchmarkCase(
-        name="real_no_traj_001168", suite="real",
-        sample_id="001168", dataset="humanml3d", mode="real_no_traj",
-    ),
-    StreamBenchmarkCase(
-        name="real_predroot_rot90_001168", suite="real",
-        sample_id="001168", dataset="humanml3d", mode="real_predroot",
+        name="real_route_rot90_001168", suite="real",
+        sample_id="001168", dataset="humanml3d", mode="real_route",
         mode_kwargs={"rotate_plan_deg": 90.0},
     ),
 ]

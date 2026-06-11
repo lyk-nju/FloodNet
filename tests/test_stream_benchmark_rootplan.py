@@ -23,6 +23,7 @@ from eval.runtime.benchmark import (
     write_runtime_report,
     write_stream_summary,
 )
+from eval.runtime.cases import REAL_CASES, get_cases
 from utils.inference_glue import InferenceGlueState, InferenceGlueTimeline
 from utils.runtime_rootplan import build_rootplan_stream_payload_from_buffer
 from utils.token_frame import token_range_to_frame_slice, token_start_frame
@@ -66,6 +67,20 @@ def _moving_z_timeline(num_commits: int) -> InferenceGlueTimeline:
 
 def test_runtime_default_output_dir_is_eval_output_eval():
     assert DEFAULT_RUNTIME_OUTPUT_DIR.endswith("/eval/output_eval")
+
+
+def test_real_suite_uses_route_cases_instead_of_legacy_gt_pred_root_modes():
+    assert [(case.name, case.mode) for case in REAL_CASES] == [
+        ("real_route_001168", "real_route"),
+        ("real_route_rot90_001168", "real_route"),
+    ]
+
+
+def test_real_suite_selector_returns_route_cases_only():
+    assert [(case.name, case.mode) for case in get_cases(suites=["real"])] == [
+        ("real_route_001168", "real_route"),
+        ("real_route_rot90_001168", "real_route"),
+    ]
 
 
 def test_motion_video_overlay_kwargs_uses_target_root_xz():
@@ -524,8 +539,8 @@ def test_write_runtime_report_exposes_standard_media_dirs(tmp_path):
         "records": [
             {
                 "suite": "real",
-                "mode": "real_predroot",
-                "case_name": "real_predroot_rot90_001168",
+                "mode": "real_route",
+                "case_name": "real_route_rot90_001168",
                 "condition_variant": "gt_7d_ldf",
                 "ADE": 0.2,
                 "FDE": 0.3,
@@ -572,21 +587,21 @@ def test_aggregate_runtime_records_groups_condition_variants():
         [
             {
                 "suite": "real",
-                "mode": "real_predroot",
+                "mode": "real_route",
                 "condition_variant": "gt_7d_ldf",
                 "ADE": 1.0,
                 "FDE": 2.0,
             },
             {
                 "suite": "real",
-                "mode": "real_predroot",
+                "mode": "real_route",
                 "condition_variant": "rootrefiner_7d_ldf",
                 "ADE": 3.0,
                 "FDE": 4.0,
             },
             {
                 "suite": "real",
-                "mode": "real_no_traj",
+                "mode": "real_route",
                 "condition_variant": "no_traj_ldf",
                 "ADE": 5.0,
                 "FDE": 6.0,
