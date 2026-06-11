@@ -19,6 +19,7 @@ import json
 import os
 import shutil
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -123,6 +124,9 @@ _RUNTIME_RECORD_FIELDS = (
     "suite",
     "mode",
     "sample_id",
+    "base_case_name",
+    "case_name",
+    "condition_variant",
     "ADE",
     "FDE",
     "path_arc",
@@ -146,6 +150,85 @@ _RUNTIME_RECORD_FIELDS = (
     "turn_activation_commit",
     "turn_target_source",
 )
+
+
+@dataclass(frozen=True)
+class ConditionVariant:
+    name: str
+    condition_path: str
+    use_root_refiner: bool = False
+    force_no_traj: bool = False
+
+
+_CONDITION_VARIANT_ALIASES = {
+    "gt_7d": "gt_7d_ldf",
+    "route_7d": "gt_7d_ldf",
+    "gt_7d_ldf": "gt_7d_ldf",
+    "rootrefiner_7d": "rootrefiner_7d_ldf",
+    "root_refiner_7d": "rootrefiner_7d_ldf",
+    "rootrefiner_7d_ldf": "rootrefiner_7d_ldf",
+    "root_refiner_7d_ldf": "rootrefiner_7d_ldf",
+    "no_traj": "no_traj_ldf",
+    "no_traj_ldf": "no_traj_ldf",
+    "legacy_xyz": "legacy_xyz_ldf",
+    "legacy_xyz_ldf": "legacy_xyz_ldf",
+}
+
+
+def _condition_variant_from_name(name: str) -> ConditionVariant:
+    key = _CONDITION_VARIANT_ALIASES.get(str(name).strip())
+    if key is None:
+        valid = ", ".join(sorted(set(_CONDITION_VARIANT_ALIASES)))
+        raise ValueError(f"unknown condition variant {name!r}; expected one of: {valid}")
+    if key == "gt_7d_ldf":
+        return ConditionVariant(name=key, condition_path="rootplan_7d")
+    if key == "rootrefiner_7d_ldf":
+        return ConditionVariant(
+            name=key,
+            condition_path="rootplan_7d",
+            use_root_refiner=True,
+        )
+    if key == "no_traj_ldf":
+        return ConditionVariant(
+            name=key,
+            condition_path="rootplan_7d",
+            force_no_traj=True,
+        )
+    if key == "legacy_xyz_ldf":
+        return ConditionVariant(name=key, condition_path="legacy_xyz")
+    raise AssertionError(key)
+
+
+def parse_condition_variants(
+    spec: str | None,
+    *,
+    include_root_refiner: bool = True,
+) -> list[ConditionVariant]:
+    """Parse runtime benchmark condition variants."""
+    raw = "auto" if spec is None else str(spec).strip()
+    if raw in {"", "auto"}:
+        names = ["gt_7d_ldf", "no_traj_ldf"]
+        if include_root_refiner:
+            names.insert(1, "rootrefiner_7d_ldf")
+    else:
+        names = [item.strip() for item in raw.split(",") if item.strip()]
+    variants = [_condition_variant_from_name(name) for name in names]
+    seen = set()
+    out = []
+    for variant in variants:
+        if variant.name in seen:
+            continue
+        seen.add(variant.name)
+        out.append(variant)
+    return out
+
+
+def _variant_case_name(case_name: str, variant: ConditionVariant) -> str:
+    return f"{case_name}__{variant.name}"
+
+
+def _is_legacy_no_traj_case(case) -> bool:
+    return str(getattr(case, "mode", "")).endswith("_no_traj")
 
 
 def _is_finite_number(value) -> bool:
@@ -174,12 +257,17 @@ def aggregate_runtime_records(records: list[dict]) -> dict:
     by_suite: dict[str, list[dict]] = {}
     by_mode: dict[str, list[dict]] = {}
     by_suite_mode: dict[str, list[dict]] = {}
+    by_condition_variant: dict[str, list[dict]] = {}
+    by_suite_variant: dict[str, list[dict]] = {}
     for rec in records:
         suite = str(rec.get("suite", "unknown"))
         mode = str(rec.get("mode", "unknown"))
+        variant = str(rec.get("condition_variant", "default"))
         by_suite.setdefault(suite, []).append(rec)
         by_mode.setdefault(mode, []).append(rec)
         by_suite_mode.setdefault(f"{suite}/{mode}", []).append(rec)
+        by_condition_variant.setdefault(variant, []).append(rec)
+        by_suite_variant.setdefault(f"{suite}/{variant}", []).append(rec)
     summary["by_suite"] = {
         key: _aggregate_record_group(vals) for key, vals in sorted(by_suite.items())
     }
@@ -189,6 +277,14 @@ def aggregate_runtime_records(records: list[dict]) -> dict:
     summary["by_suite_mode"] = {
         key: _aggregate_record_group(vals)
         for key, vals in sorted(by_suite_mode.items())
+    }
+    summary["by_condition_variant"] = {
+        key: _aggregate_record_group(vals)
+        for key, vals in sorted(by_condition_variant.items())
+    }
+    summary["by_suite_variant"] = {
+        key: _aggregate_record_group(vals)
+        for key, vals in sorted(by_suite_variant.items())
     }
     return summary
 
@@ -216,6 +312,7 @@ def write_runtime_report(
     suite_tag: str,
     payload: dict,
     records: list[dict],
+    artifact_kinds=("metrics",),
 ) -> dict:
     """Write legacy runtime summary plus run_eval-style metric artifacts."""
     legacy_root = ensure_dir(Path(output_dir) / str(run_id))
@@ -227,7 +324,7 @@ def write_runtime_report(
         evaluator="Runtime",
         probe_tag=str(suite_tag),
         run_id=str(run_id),
-        artifact_kinds=("metrics",),
+        artifact_kinds=artifact_kinds,
     )
     write_stream_summary(dirs["metrics"] / "summary.json", payload)
     _write_runtime_records_csv(dirs["metrics"] / "records.csv", records)
@@ -685,6 +782,7 @@ def _run_step(model, vae, sample, device, *, hl, nds, mode, **_kw):
     condition_path = str(_kw.get("condition_path", "rootplan_7d"))
     root_refiner_runtime = _kw.get("root_refiner_runtime")
     replan_events = _kw.get("replan_events")
+    force_no_traj = bool(_kw.get("force_no_traj", False))
     text = sample["text"] if isinstance(sample["text"], str) else sample["text"][0]
     timeline = _new_eval_timeline()
     vae.clear_cache()
@@ -699,7 +797,7 @@ def _run_step(model, vae, sample, device, *, hl, nds, mode, **_kw):
         "token_mask": sample["token_mask"].unsqueeze(0),
         "traj_mask": sample["traj_mask"].unsqueeze(0),
     }
-    if condition_path == "rootplan_7d" and mode != "step_no_traj":
+    if condition_path == "rootplan_7d" and mode != "step_no_traj" and not force_no_traj:
         plan = StreamTrajectoryPlan(
             times=np.arange(len(sample["traj"]), dtype=np.float32) / fps,
             points_xyz=sample["traj"].numpy().astype(np.float32),
@@ -721,7 +819,7 @@ def _run_step(model, vae, sample, device, *, hl, nds, mode, **_kw):
     decs, _roots = [], []
     fc = True
     for ci in range(tl):
-        if mode == "step_no_traj":
+        if mode == "step_no_traj" or force_no_traj:
             ti = None
         elif condition_path == "rootplan_7d":
             ti = build_rootplan_stream_step_payload(
@@ -770,7 +868,7 @@ def _run_step(model, vae, sample, device, *, hl, nds, mode, **_kw):
 
 def _run_real(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode,
               rotate_plan_deg=0.0, condition_path="rootplan_7d",
-              root_refiner_runtime=None, replan_events=None):
+              root_refiner_runtime=None, replan_events=None, force_no_traj=False):
     tl = sample["token_length"]
     tfs = 1 + 4 * (tl - 1) if tl > 1 else 1
     gr_arr = sample["traj"].numpy()
@@ -788,7 +886,7 @@ def _run_real(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode,
     model.generated = model.generated.to(device)
     _clear_model_traj_state(model)
     root_5d_history, frame_idx = [], 0
-    if condition_path == "rootplan_7d" and mode != "real_no_traj":
+    if condition_path == "rootplan_7d" and mode != "real_no_traj" and not force_no_traj:
         _set_eval_root_plan(
             model,
             timeline,
@@ -808,7 +906,7 @@ def _run_real(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode,
     sr = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
     decs, _roots, fc = [], [], True
     for ci in range(tl):
-        if mode == "real_no_traj":
+        if mode == "real_no_traj" or force_no_traj:
             ti = None
         elif condition_path == "rootplan_7d":
             ti = build_rootplan_stream_step_payload(
@@ -863,7 +961,7 @@ def _rotate_xz(points, anchor, deg):
 
 def _run_turn(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode, angle,
               delay_tokens=20, blend_tokens=4, condition_path="rootplan_7d",
-              root_refiner_runtime=None, replan_events=None):
+              root_refiner_runtime=None, replan_events=None, force_no_traj=False):
     tl = sample["token_length"]
     tfs = 1 + 4 * (tl - 1) if tl > 1 else 1
     gr_arr = sample["traj"].numpy()
@@ -922,7 +1020,7 @@ def _run_turn(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode, 
         version=1,
         source="bench_new",
     )
-    if condition_path == "rootplan_7d":
+    if condition_path == "rootplan_7d" and not force_no_traj:
         _set_eval_root_plan(
             model,
             timeline,
@@ -938,7 +1036,9 @@ def _run_turn(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode, 
     decs, _roots, fc = [], [], True
     for ci in range(total_tl):
         offset = ci - edit_commit
-        if condition_path == "rootplan_7d":
+        if force_no_traj:
+            ti = None
+        elif condition_path == "rootplan_7d":
             if (
                 not new_root_plan_active
                 and offset >= ed + eb
@@ -1022,7 +1122,7 @@ def _run_turn(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode, 
 
 def _run_babel(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode,
                condition_path="rootplan_7d", root_refiner_runtime=None,
-               replan_events=None):
+               replan_events=None, force_no_traj=False):
     tl = sample["token_length"]
     tfs = 1 + 4 * (tl - 1) if tl > 1 else 1
     gr_arr = sample["traj"].numpy()
@@ -1041,7 +1141,7 @@ def _run_babel(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode,
     _clear_model_traj_state(model)
     root_5d_history, frame_idx = [], 0
     active_root_refiner_text = None
-    if condition_path == "rootplan_7d" and mode != "babel_no_traj":
+    if condition_path == "rootplan_7d" and mode != "babel_no_traj" and not force_no_traj:
         initial_text = sample["text"][0] if sample["text"] else ""
         if _set_eval_root_plan(
             model,
@@ -1066,7 +1166,7 @@ def _run_babel(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode,
     decs, _roots, fc = [], [], True
     for ci in range(tl):
         txt = tc.get_text_for_commit_index(ci)
-        if mode == "babel_no_traj":
+        if mode == "babel_no_traj" or force_no_traj:
             ti = None
         elif condition_path == "rootplan_7d":
             if (
@@ -1243,6 +1343,16 @@ def main():
     p.add_argument("--root_refiner_ckpt", default=None)
     p.add_argument("--root_refiner_path_mode", default="dense_path")
     p.add_argument("--root_refiner_non_strict", action="store_true", default=False)
+    p.add_argument(
+        "--condition_variants",
+        default="auto",
+        help=(
+            "Comma-separated runtime condition variants: gt_7d_ldf, "
+            "rootrefiner_7d_ldf, no_traj_ldf, legacy_xyz_ldf, or auto. "
+            "auto runs gt_7d_ldf/no_traj_ldf and includes rootrefiner_7d_ldf "
+            "when --root_refiner_config/--root_refiner_ckpt are provided."
+        ),
+    )
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--precomputed_text_emb_path", default=None)
     args = p.parse_args()
@@ -1278,12 +1388,24 @@ def main():
             path_mode=args.root_refiner_path_mode,
         )
 
+    condition_variants = parse_condition_variants(
+        args.condition_variants,
+        include_root_refiner=root_refiner_runtime is not None,
+    )
+    if any(variant.use_root_refiner for variant in condition_variants) and root_refiner_runtime is None:
+        p.error(
+            "condition variant rootrefiner_7d_ldf requires "
+            "--root_refiner_config and --root_refiner_ckpt"
+        )
+
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_root = os.path.join(args.output_dir, run_id)
+    suites_list = [s.strip() for s in args.suites.split(",")] if args.suites else None
+    suite_tag = "_".join(suites_list) if suites_list else args.preset
     standard_media_dirs = standard_eval_artifact_dirs(
         args.output_dir,
         evaluator="Runtime",
-        probe_tag=args.preset,
+        probe_tag=suite_tag,
         run_id=run_id,
         artifact_kinds=("plot", "video"),
         create=False,
@@ -1302,16 +1424,17 @@ def main():
     if vdir: os.makedirs(vdir, exist_ok=True)
     if pdir: os.makedirs(pdir, exist_ok=True)
 
-    suites_list = [s.strip() for s in args.suites.split(",")] if args.suites else None
     cases = get_cases(suites=suites_list, preset=args.preset)
-    print(f"{len(cases)} case(s)  preset={args.preset}  suites={suites_list}")
+    if any(variant.force_no_traj for variant in condition_variants):
+        cases = [case for case in cases if not _is_legacy_no_traj_case(case)]
+    print(
+        f"{len(cases)} case(s)  preset={args.preset}  suites={suites_list} "
+        f"condition_variants={[variant.name for variant in condition_variants]}"
+    )
 
     all_recs = []
     _pm = _pr = _gr = _split = None
     for case in cases:
-        print(f"\n--- {case.name} ({case.suite}/{case.mode}) ---")
-        seed_everything(args.seed)
-
         if case.dataset == "babel" and case.sample_ids:
             sample = _merge_babel(args.raw_data_dir, case.sample_ids)
         elif case.dataset == "babel":
@@ -1320,122 +1443,141 @@ def main():
             sample = _load_humanml3d_sample(args.raw_data_dir, case.sample_id)
         gr_base = extract_root_trajectory_263(sample["feature"].numpy())
 
-        replan_events: list[dict] = []
-        kw = dict(hl=args.history_length, nds=args.num_denoise_steps,
-                  hz=args.traj_horizon_tokens, tdt=args.token_dt,
-                  wpdt=args.waypoint_dt, fps=args.motion_fps,
-                  condition_path=args.traj_condition_path,
-                  root_refiner_runtime=root_refiner_runtime,
-                  replan_events=replan_events)
-
-        if case.suite == "step":
-            pm, pr, gr = _run_step(model, vae, sample, dev, mode=case.mode, **kw)
-            rec = build_plan_metrics(
-                pr, original_gt_root=gr,
-                plan_times=np.arange(len(gr), dtype=np.float32) / 20.0,
-                plan_points_xyz=gr,
-                target_frames=sample["feature_length"], motion_fps=args.motion_fps,
-                motion_263=pm, target_source="original_gt_root",
+        for variant in condition_variants:
+            display_case_name = _variant_case_name(case.name, variant)
+            print(
+                f"\n--- {display_case_name} "
+                f"({case.suite}/{case.mode}/{variant.name}) ---"
             )
-        elif case.suite == "real":
-            _rot = case.mode_kwargs.get("rotate_plan_deg", 0.0)
-            pm, pr, gr, pt, pp = _run_real(model, vae, sample, dev, mode=case.mode,
-                                           rotate_plan_deg=float(_rot), **kw)
-            rec = build_plan_metrics(
-                pr, original_gt_root=gr, plan_times=pt, plan_points_xyz=pp,
-                target_frames=sample["feature_length"], motion_fps=args.motion_fps,
-                motion_263=pm,
-            )
-        elif case.suite == "turn":
-            ang = case.mode_kwargs.get("update_angle", 30.0)
-            dt_val = case.mode_kwargs.get("mid_update_delay_tokens", 20)
-            db_val = case.mode_kwargs.get("mid_update_blend_tokens", 4)
-            if isinstance(dt_val, str):
-                dt_val = int(dt_val.split(",")[0])
-            turn_delay_tokens = int(dt_val)
-            turn_blend_tokens = int(db_val)
-            turn_edit_commit = 15
-            turn_effective_commit = turn_edit_commit + turn_delay_tokens
-            turn_activation_commit = turn_effective_commit + turn_blend_tokens
-            pm, pr, gr, pt, pp, ttfs = _run_turn(model, vae, sample, dev, mode=case.mode,
-                                                   angle=ang, delay_tokens=int(dt_val),
-                                                   blend_tokens=int(db_val), **kw)
-            rec = build_plan_metrics(
-                pr, original_gt_root=gr, plan_times=pt, plan_points_xyz=pp,
-                target_frames=ttfs, motion_fps=args.motion_fps,
-                motion_263=pm, target_source="scheduled_turn_target",
-            )
-            rec["turn_edit_commit"] = turn_edit_commit
-            rec["turn_delay_tokens"] = turn_delay_tokens
-            rec["turn_blend_tokens"] = turn_blend_tokens
-            rec["turn_effective_commit"] = turn_effective_commit
-            rec["turn_activation_commit"] = turn_activation_commit
-            rec["turn_target_source"] = "scheduled_turn_target"
-        elif case.suite == "babel":
-            pm, pr, gr, pt, pp = _run_babel(model, vae, sample, dev, mode=case.mode, **kw)
-            rec = build_plan_metrics(
-                pr, original_gt_root=gr, plan_times=pt, plan_points_xyz=pp,
-                target_frames=sample["feature_length"], motion_fps=args.motion_fps,
-                motion_263=pm,
-            )
-        else:
-            print(f"  SKIP: unknown suite {case.suite}")
-            continue
+            seed_everything(args.seed)
 
-        rec["suite"] = case.suite; rec["mode"] = case.mode
-        rec["sample_id"] = case.sample_id; rec["case_name"] = case.name
-        rec["traj_condition_path"] = args.traj_condition_path
-        rec["root_refiner_enabled"] = root_refiner_runtime is not None
-        rec["condition_source"] = resolve_traj_condition_source(
-            args.traj_condition_path,
-            root_refiner_runtime,
-            no_traj=str(case.mode).endswith("_no_traj"),
-        )
-        rec["rootplan_replan_count"] = len(replan_events)
-        rec["rootplan_replan_commits"] = [
-            int(event.get("commit", 0)) for event in replan_events
-        ]
-        rec["rootplan_replan_sources"] = [
-            str(event.get("source", "")) for event in replan_events
-        ]
-        all_recs.append(rec)
-        print(f"  ADE={rec.get('ADE', float('nan')):.4f}  FDE={rec.get('FDE', float('nan')):.4f}")
-
-        _pm, _pr, _gr = pm, pr, gr
-        _split = 15 if case.suite == "turn" else None
-
-        if pdir and _pr is not None and _gr is not None:
-            _write_runtime_case_visuals(
-                pdir,
-                case_name=case.name,
-                pred_root=_pr,
-                target_root=_gr,
-                motion_263=_pm,
-                split_tok=_split,
+            variant_root_refiner = (
+                root_refiner_runtime if variant.use_root_refiner else None
             )
-            if standard_pdir:
-                for name in (
-                    f"{case.name}_plot_world_xz.png",
-                    f"{case.name}_plot_yaw.png",
-                ):
-                    src = os.path.join(pdir, name)
-                    if os.path.exists(src):
-                        shutil.copy2(src, os.path.join(standard_pdir, name))
+            replan_events: list[dict] = []
+            kw = dict(hl=args.history_length, nds=args.num_denoise_steps,
+                      hz=args.traj_horizon_tokens, tdt=args.token_dt,
+                      wpdt=args.waypoint_dt, fps=args.motion_fps,
+                      condition_path=variant.condition_path,
+                      root_refiner_runtime=variant_root_refiner,
+                      replan_events=replan_events,
+                      force_no_traj=variant.force_no_traj)
 
-        if args.render_video and _pm is not None and _pm.size > 0:
-            mp4 = os.path.join(vdir, f"{case.name}.mp4")
-            render_single_video(motion=_pm, save_path=mp4, dim=263, render_setting={})
-            print(f"    video: {mp4}")
-            if standard_vdir:
-                shutil.copy2(mp4, os.path.join(standard_vdir, f"{case.name}.mp4"))
-            if _pr is not None and _gr is not None:
-                traj_mp4 = os.path.join(vdir, f"{case.name}_traj.mp4")
-                _render_traj_video(_pr, _gr, traj_mp4, case.name, split_tok=_split)
+            if case.suite == "step":
+                pm, pr, gr = _run_step(model, vae, sample, dev, mode=case.mode, **kw)
+                rec = build_plan_metrics(
+                    pr, original_gt_root=gr,
+                    plan_times=np.arange(len(gr), dtype=np.float32) / 20.0,
+                    plan_points_xyz=gr,
+                    target_frames=sample["feature_length"], motion_fps=args.motion_fps,
+                    motion_263=pm, target_source="original_gt_root",
+                )
+            elif case.suite == "real":
+                _rot = case.mode_kwargs.get("rotate_plan_deg", 0.0)
+                pm, pr, gr, pt, pp = _run_real(
+                    model, vae, sample, dev, mode=case.mode,
+                    rotate_plan_deg=float(_rot), **kw)
+                rec = build_plan_metrics(
+                    pr, original_gt_root=gr, plan_times=pt, plan_points_xyz=pp,
+                    target_frames=sample["feature_length"], motion_fps=args.motion_fps,
+                    motion_263=pm,
+                )
+            elif case.suite == "turn":
+                ang = case.mode_kwargs.get("update_angle", 30.0)
+                dt_val = case.mode_kwargs.get("mid_update_delay_tokens", 20)
+                db_val = case.mode_kwargs.get("mid_update_blend_tokens", 4)
+                if isinstance(dt_val, str):
+                    dt_val = int(dt_val.split(",")[0])
+                turn_delay_tokens = int(dt_val)
+                turn_blend_tokens = int(db_val)
+                turn_edit_commit = 15
+                turn_effective_commit = turn_edit_commit + turn_delay_tokens
+                turn_activation_commit = turn_effective_commit + turn_blend_tokens
+                pm, pr, gr, pt, pp, ttfs = _run_turn(
+                    model, vae, sample, dev, mode=case.mode,
+                    angle=ang, delay_tokens=int(dt_val),
+                    blend_tokens=int(db_val), **kw)
+                rec = build_plan_metrics(
+                    pr, original_gt_root=gr, plan_times=pt, plan_points_xyz=pp,
+                    target_frames=ttfs, motion_fps=args.motion_fps,
+                    motion_263=pm, target_source="scheduled_turn_target",
+                )
+                rec["turn_edit_commit"] = turn_edit_commit
+                rec["turn_delay_tokens"] = turn_delay_tokens
+                rec["turn_blend_tokens"] = turn_blend_tokens
+                rec["turn_effective_commit"] = turn_effective_commit
+                rec["turn_activation_commit"] = turn_activation_commit
+                rec["turn_target_source"] = "scheduled_turn_target"
+            elif case.suite == "babel":
+                pm, pr, gr, pt, pp = _run_babel(
+                    model, vae, sample, dev, mode=case.mode, **kw)
+                rec = build_plan_metrics(
+                    pr, original_gt_root=gr, plan_times=pt, plan_points_xyz=pp,
+                    target_frames=sample["feature_length"], motion_fps=args.motion_fps,
+                    motion_263=pm,
+                )
+            else:
+                print(f"  SKIP: unknown suite {case.suite}")
+                continue
+
+            rec["suite"] = case.suite; rec["mode"] = case.mode
+            rec["sample_id"] = case.sample_id
+            rec["base_case_name"] = case.name
+            rec["case_name"] = display_case_name
+            rec["condition_variant"] = variant.name
+            rec["traj_condition_path"] = variant.condition_path
+            rec["root_refiner_enabled"] = variant_root_refiner is not None
+            rec["condition_source"] = resolve_traj_condition_source(
+                variant.condition_path,
+                variant_root_refiner,
+                no_traj=variant.force_no_traj or str(case.mode).endswith("_no_traj"),
+            )
+            rec["rootplan_replan_count"] = len(replan_events)
+            rec["rootplan_replan_commits"] = [
+                int(event.get("commit", 0)) for event in replan_events
+            ]
+            rec["rootplan_replan_sources"] = [
+                str(event.get("source", "")) for event in replan_events
+            ]
+            all_recs.append(rec)
+            print(f"  ADE={rec.get('ADE', float('nan')):.4f}  FDE={rec.get('FDE', float('nan')):.4f}")
+
+            _pm, _pr, _gr = pm, pr, gr
+            _split = 15 if case.suite == "turn" else None
+
+            if pdir and _pr is not None and _gr is not None:
+                _write_runtime_case_visuals(
+                    pdir,
+                    case_name=display_case_name,
+                    pred_root=_pr,
+                    target_root=_gr,
+                    motion_263=_pm,
+                    split_tok=_split,
+                )
+                if standard_pdir:
+                    for name in (
+                        f"{display_case_name}_plot_world_xz.png",
+                        f"{display_case_name}_plot_yaw.png",
+                    ):
+                        src = os.path.join(pdir, name)
+                        if os.path.exists(src):
+                            shutil.copy2(src, os.path.join(standard_pdir, name))
+
+            if args.render_video and _pm is not None and _pm.size > 0:
+                mp4 = os.path.join(vdir, f"{display_case_name}.mp4")
+                render_single_video(motion=_pm, save_path=mp4, dim=263, render_setting={})
+                print(f"    video: {mp4}")
                 if standard_vdir:
-                    shutil.copy2(
-                        traj_mp4,
-                        os.path.join(standard_vdir, f"{case.name}_traj.mp4"),
-                    )
+                    shutil.copy2(mp4, os.path.join(standard_vdir, f"{display_case_name}.mp4"))
+                if _pr is not None and _gr is not None:
+                    traj_mp4 = os.path.join(vdir, f"{display_case_name}_traj.mp4")
+                    _render_traj_video(
+                        _pr, _gr, traj_mp4, display_case_name, split_tok=_split)
+                    if standard_vdir:
+                        shutil.copy2(
+                            traj_mp4,
+                            os.path.join(standard_vdir, f"{display_case_name}_traj.mp4"),
+                        )
 
     aggregate = aggregate_runtime_records(all_recs)
     summary = {"run_id": run_id, "config": args.config, "ckpt": args.ckpt,
@@ -1446,10 +1588,10 @@ def main():
                "root_refiner_config": args.root_refiner_config,
                "root_refiner_ckpt": args.root_refiner_ckpt,
                "root_refiner_path_mode": args.root_refiner_path_mode,
-               "root_refiner_enabled": root_refiner_runtime is not None,
-               "condition_source": resolve_traj_condition_source(
-                   args.traj_condition_path,
-                   root_refiner_runtime,
+               "root_refiner_available": root_refiner_runtime is not None,
+               "condition_variants": [variant.name for variant in condition_variants],
+               "condition_sources": sorted(
+                   {str(rec.get("condition_source", "")) for rec in all_recs}
                ),
                "aggregate": aggregate,
                # Backward-compatible alias for scripts that consumed the nested
@@ -1459,9 +1601,10 @@ def main():
     report_dirs = write_runtime_report(
         output_dir=args.output_dir,
         run_id=run_id,
-        suite_tag=args.preset,
+        suite_tag=suite_tag,
         payload=summary,
         records=all_recs,
+        artifact_kinds=("metrics", "plot", "video"),
     )
     print(f"\nSummary: {report_dirs['legacy_root'] / 'summary.json'}")
     if all_recs:

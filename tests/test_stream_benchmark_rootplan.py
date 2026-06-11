@@ -15,6 +15,7 @@ from eval.runtime.benchmark import (
     aggregate_runtime_records,
     build_eval_root_plan_from_points,
     build_rootplan_stream_step_payload,
+    parse_condition_variants,
     resolve_traj_condition_source,
     write_runtime_report,
     write_stream_summary,
@@ -492,6 +493,91 @@ def test_write_runtime_report_mirrors_standard_eval_layout(tmp_path):
     assert standard_payload["summary"]["ADE_mean"] == 0.2
 
 
+def test_write_runtime_report_exposes_standard_media_dirs(tmp_path):
+    payload = {
+        "run_id": "step_000500",
+        "summary": {"ADE_mean": 0.2},
+        "aggregate": {"ADE_mean": 0.2},
+        "records": [
+            {
+                "suite": "real",
+                "mode": "real_predroot",
+                "case_name": "real_predroot_rot90_001168",
+                "condition_variant": "gt_7d_ldf",
+                "ADE": 0.2,
+                "FDE": 0.3,
+            }
+        ],
+    }
+
+    dirs = write_runtime_report(
+        output_dir=tmp_path,
+        run_id="step_000500",
+        suite_tag="control",
+        payload=payload,
+        records=payload["records"],
+        artifact_kinds=("metrics", "plot", "video"),
+    )
+
+    assert dirs["metrics"] == tmp_path / "Runtime/metrics/control/step_000500"
+    assert dirs["plot"] == tmp_path / "Runtime/plot/control/step_000500"
+    assert dirs["video"] == tmp_path / "Runtime/video/control/step_000500"
+    assert (dirs["metrics"] / "records.csv").is_file()
+
+
+def test_parse_condition_variants_expands_runtime_control_paths():
+    variants = parse_condition_variants("gt_7d_ldf,rootrefiner_7d_ldf,no_traj_ldf")
+
+    assert [variant.name for variant in variants] == [
+        "gt_7d_ldf",
+        "rootrefiner_7d_ldf",
+        "no_traj_ldf",
+    ]
+    assert variants[0].condition_path == "rootplan_7d"
+    assert variants[0].use_root_refiner is False
+    assert variants[0].force_no_traj is False
+    assert variants[1].condition_path == "rootplan_7d"
+    assert variants[1].use_root_refiner is True
+    assert variants[1].force_no_traj is False
+    assert variants[2].condition_path == "rootplan_7d"
+    assert variants[2].use_root_refiner is False
+    assert variants[2].force_no_traj is True
+
+
+def test_aggregate_runtime_records_groups_condition_variants():
+    summary = aggregate_runtime_records(
+        [
+            {
+                "suite": "real",
+                "mode": "real_predroot",
+                "condition_variant": "gt_7d_ldf",
+                "ADE": 1.0,
+                "FDE": 2.0,
+            },
+            {
+                "suite": "real",
+                "mode": "real_predroot",
+                "condition_variant": "rootrefiner_7d_ldf",
+                "ADE": 3.0,
+                "FDE": 4.0,
+            },
+            {
+                "suite": "real",
+                "mode": "real_no_traj",
+                "condition_variant": "no_traj_ldf",
+                "ADE": 5.0,
+                "FDE": 6.0,
+            },
+        ]
+    )
+
+    assert summary["by_condition_variant"]["gt_7d_ldf"]["ADE_mean"] == 1.0
+    assert (
+        summary["by_condition_variant"]["rootrefiner_7d_ldf"]["FDE_mean"] == 4.0
+    )
+    assert summary["by_suite_variant"]["real/no_traj_ldf"]["ADE_mean"] == 5.0
+
+
 def test_resolve_traj_condition_source_makes_root_refiner_mode_explicit():
     assert resolve_traj_condition_source("rootplan_7d", None) == "route_7d"
     assert (
@@ -743,6 +829,43 @@ def test_turn_rootplan_matches_web_delayed_replace_semantics():
     assert sources == ["bench_old", "bench_new"]
     assert "bench_blend" not in sources
     assert not hasattr(model, "_stream_eval_replan_events")
+
+
+def test_turn_force_no_traj_skips_rootplan_setup():
+    feature = torch.zeros(81, 263)
+    sample = {
+        "token_length": 20,
+        "feature_length": 81,
+        "feature": feature,
+        "traj": torch.zeros(81, 3),
+        "text": "walk forward",
+    }
+    model = _FakeStreamModel()
+    replan_events = []
+
+    _run_turn(
+        model,
+        _FakeVae(),
+        sample,
+        torch.device("cpu"),
+        hl=4,
+        nds=1,
+        hz=2,
+        tdt=0.20,
+        wpdt=0.05,
+        fps=20.0,
+        mode="turn_mid_update",
+        angle=45.0,
+        delay_tokens=0,
+        blend_tokens=2,
+        condition_path="rootplan_7d",
+        root_refiner_runtime=None,
+        replan_events=replan_events,
+        force_no_traj=True,
+    )
+
+    assert replan_events == []
+    assert not model._traj_buf.has_active_plan()
 
 
 def test_turn_root_refiner_does_not_rebuild_every_blend_token():
