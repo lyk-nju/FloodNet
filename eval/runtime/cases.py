@@ -74,9 +74,19 @@ REAL_CASES = [
         sample_id="001168", dataset="humanml3d", mode="real_route",
     ),
     StreamBenchmarkCase(
+        name="real_gtroot_001168", suite="real",
+        sample_id="001168", dataset="humanml3d", mode="real_gtroot",
+        mode_kwargs={"gt_motion_7d": True},
+    ),
+    StreamBenchmarkCase(
         name="real_route_rot90_001168", suite="real",
         sample_id="001168", dataset="humanml3d", mode="real_route",
         mode_kwargs={"rotate_plan_deg": 90.0},
+    ),
+    StreamBenchmarkCase(
+        name="real_gtroot_rot90_001168", suite="real",
+        sample_id="001168", dataset="humanml3d", mode="real_gtroot_rot90",
+        mode_kwargs={"rotate_plan_deg": 90.0, "gt_motion_7d": True},
     ),
 ]
 

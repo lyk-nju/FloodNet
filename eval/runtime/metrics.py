@@ -128,6 +128,112 @@ def compute_path_chamfer(
     return float(np.mean(d_pt))
 
 
+def _as_root_7d(name: str, value: np.ndarray) -> np.ndarray:
+    arr = np.asarray(value, dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[-1] != 7:
+        raise ValueError(f"{name} must have shape [T,7], got {arr.shape}")
+    return arr
+
+
+def _heading_yaw_from_7d(root_7d: np.ndarray) -> np.ndarray:
+    if len(root_7d) == 0:
+        return np.zeros(0, dtype=np.float32)
+    return np.arctan2(root_7d[:, 4], root_7d[:, 3]).astype(np.float32)
+
+
+def _cross_track_distances(pred_xz: np.ndarray, target_xz: np.ndarray) -> np.ndarray:
+    if len(pred_xz) == 0 or len(target_xz) == 0:
+        return np.zeros(0, dtype=np.float32)
+    if len(target_xz) == 1:
+        return np.linalg.norm(pred_xz - target_xz[0:1], axis=1).astype(np.float32)
+    dists = []
+    seg_start = target_xz[:-1]
+    seg_end = target_xz[1:]
+    seg_vec = seg_end - seg_start
+    seg_len_sq = np.sum(seg_vec * seg_vec, axis=1)
+    for point in pred_xz:
+        rel = point[None, :] - seg_start
+        t = np.sum(rel * seg_vec, axis=1) / np.maximum(seg_len_sq, 1e-8)
+        t = np.clip(t, 0.0, 1.0)
+        proj = seg_start + t[:, None] * seg_vec
+        dists.append(float(np.min(np.linalg.norm(proj - point[None, :], axis=1))))
+    return np.asarray(dists, dtype=np.float32)
+
+
+def compute_root_condition_diagnostics(
+    gt_root_7d: np.ndarray,
+    pred_root_7d: np.ndarray,
+    *,
+    gt_num_tokens: int,
+    pred_num_tokens: int,
+    frames_per_token: int = 4,
+) -> dict:
+    """Compare GT and RootRefiner 7D root conditions before LDF generation."""
+
+    gt = _as_root_7d("gt_root_7d", gt_root_7d)
+    pred = _as_root_7d("pred_root_7d", pred_root_7d)
+    n = min(len(gt), len(pred))
+
+    metrics = {
+        "num_token_gt": int(gt_num_tokens),
+        "num_token_pred": int(pred_num_tokens),
+        "num_token_abs_error": int(abs(int(pred_num_tokens) - int(gt_num_tokens))),
+        "duration_frame_abs_error": int(
+            abs(int(pred_num_tokens) - int(gt_num_tokens)) * int(frames_per_token)
+        ),
+        "num_frames_gt": int(len(gt)),
+        "num_frames_pred": int(len(pred)),
+        "num_frames_compared": int(n),
+    }
+    if n == 0:
+        metrics.update(
+            {
+                "xyz_ADE": float("nan"),
+                "xyz_FDE": float("nan"),
+                "x_AE_mean": float("nan"),
+                "z_AE_mean": float("nan"),
+                "endpoint_xz_error": float("nan"),
+                "heading_mae_deg": float("nan"),
+                "yaw_delta_mae": float("nan"),
+                "fwd_delta_mae": float("nan"),
+                "path_arc_ADE": float("nan"),
+                "path_chamfer": float("nan"),
+                "cross_track_mean": float("nan"),
+                "cross_track_max": float("nan"),
+            }
+        )
+        return metrics
+
+    gt_cmp = gt[:n]
+    pred_cmp = pred[:n]
+    gt_xz = gt_cmp[:, [0, 2]]
+    pred_xz = pred_cmp[:, [0, 2]]
+    xz_dist = np.linalg.norm(pred_xz - gt_xz, axis=1)
+    heading_err = np.arctan2(
+        np.sin(_heading_yaw_from_7d(pred_cmp) - _heading_yaw_from_7d(gt_cmp)),
+        np.cos(_heading_yaw_from_7d(pred_cmp) - _heading_yaw_from_7d(gt_cmp)),
+    )
+    cross_track = _cross_track_distances(pred_xz, gt_xz)
+
+    metrics.update(
+        {
+            "xyz_ADE": float(np.mean(xz_dist)),
+            "xyz_FDE": float(xz_dist[-1]),
+            "x_AE_mean": float(np.mean(np.abs(pred_cmp[:, 0] - gt_cmp[:, 0]))),
+            "z_AE_mean": float(np.mean(np.abs(pred_cmp[:, 2] - gt_cmp[:, 2]))),
+            "endpoint_xz_error": float(xz_dist[-1]),
+            "heading_mae_deg": float(np.mean(np.abs(heading_err)) * 180.0 / np.pi),
+            "fwd_delta_mae": float(np.mean(np.abs(pred_cmp[:, 5] - gt_cmp[:, 5]))),
+            "yaw_delta_mae": float(np.mean(np.abs(pred_cmp[:, 6] - gt_cmp[:, 6]))),
+            "path_arc_ADE": compute_path_arc(pred_cmp[:, :3], gt_cmp[:, :3]),
+            "path_chamfer": compute_path_chamfer(pred_cmp[:, :3], gt_cmp[:, :3]),
+            "cross_track_mean": float(np.mean(cross_track)) if len(cross_track) else float("nan"),
+            "cross_track_max": float(np.max(cross_track)) if len(cross_track) else float("nan"),
+        }
+    )
+    return metrics
+
+
 # ── motion quality metrics ─────────────────────────────────────────────
 
 
@@ -167,13 +273,16 @@ def compute_lateral_velocity_ratio(motion_263: np.ndarray) -> float:
 
 
 def compute_heading_path_error_deg(
-    motion_263: np.ndarray, target_root_xyz: np.ndarray,
+    motion_263: np.ndarray,
+    target_root_xyz: np.ndarray,
+    *,
+    pred_yaw_offset: float = 0.0,
 ) -> float:
     """Mean |body-yaw - path-direction| in degrees."""
     n = min(len(motion_263), len(target_root_xyz))
     if n < 3:
         return float("nan")
-    yaw = estimate_body_yaw(motion_263[:n])
+    yaw = estimate_body_yaw(motion_263[:n]) + float(pred_yaw_offset)
     tvel = np.diff(target_root_xyz[:n, [0, 2]], axis=0)
     path_yaw = np.arctan2(tvel[:, 0], tvel[:, 1])
     yaw_mid = _angle_midpoints(yaw[:-1], yaw[1:])
@@ -229,6 +338,7 @@ def build_plan_metrics(
     target_frames: int,
     motion_fps: float = 20.0,
     motion_263: np.ndarray | None = None,
+    motion_yaw_offset: float = 0.0,
     chamfer_type: str = "symmetric",
     target_source: str = "sampled_plan_target",
 ) -> dict:
@@ -258,6 +368,8 @@ def build_plan_metrics(
             motion_263[:n],
         )
         metrics["heading_path_error_deg"] = compute_heading_path_error_deg(
-            motion_263[:n], tt,
+            motion_263[:n],
+            tt,
+            pred_yaw_offset=float(motion_yaw_offset),
         )
     return metrics

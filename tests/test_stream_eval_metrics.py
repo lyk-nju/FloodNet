@@ -12,6 +12,7 @@ import torch
 from eval.ldf.stream_metrics import _resolve_run_name, _save_sample_outputs
 from metrics.stream import compute_root_path_yaw_error, summarize_stream_records
 from eval.runtime.metrics import (
+    build_plan_metrics,
     build_stream_eval_summary,
     compute_heading_path_error_deg,
     compute_lateral_velocity_ratio,
@@ -68,6 +69,37 @@ def test_heading_path_error_uses_project_yaw_convention_for_plus_z_path():
     target[:, 2] = np.arange(6, dtype=np.float32)
 
     assert compute_heading_path_error_deg(motion, target) < 1e-5
+
+
+def test_build_plan_metrics_applies_motion_yaw_offset_for_world_heading():
+    motion = np.zeros((6, 263), dtype=np.float32)
+    motion[:, 2] = 1.0
+    target = np.zeros((6, 3), dtype=np.float32)
+    target[:, 0] = -np.arange(6, dtype=np.float32)
+    plan_times = np.arange(6, dtype=np.float32) / 20.0
+
+    without_offset = build_plan_metrics(
+        target,
+        original_gt_root=None,
+        plan_times=plan_times,
+        plan_points_xyz=target,
+        target_frames=6,
+        motion_fps=20.0,
+        motion_263=motion,
+    )
+    with_offset = build_plan_metrics(
+        target,
+        original_gt_root=None,
+        plan_times=plan_times,
+        plan_points_xyz=target,
+        target_frames=6,
+        motion_fps=20.0,
+        motion_263=motion,
+        motion_yaw_offset=-math.pi / 2.0,
+    )
+
+    assert without_offset["heading_path_error_deg"] > 80.0
+    assert with_offset["heading_path_error_deg"] < 1e-5
 
 
 def test_build_stream_eval_summary_uses_stream_metric_keys():

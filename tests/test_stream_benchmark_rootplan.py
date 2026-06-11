@@ -8,24 +8,44 @@ import torch
 
 from eval.runtime.benchmark import (
     DEFAULT_RUNTIME_OUTPUT_DIR,
-    _build_turn_metric_target,
     _csv_safe_record,
     _motion_video_overlay_kwargs,
-    _run_babel,
-    _run_turn,
+    _transform_joints_to_runtime_world,
     _visual_target_root_from_plan,
     _write_runtime_case_visuals,
     aggregate_runtime_records,
-    build_eval_root_plan_from_points,
-    build_rootplan_stream_step_payload,
     parse_condition_variants,
     resolve_traj_condition_source,
     write_runtime_report,
     write_stream_summary,
 )
 from eval.runtime.cases import REAL_CASES, get_cases
+from eval.runtime.runners import (
+    append_eval_root_history,
+    append_eval_timeline_state,
+    build_turn_metric_target,
+    build_rootplan_stream_step_payload,
+    clear_model_traj_state,
+    new_eval_timeline,
+    root_plan_events_to_diagnostic_arrays,
+    run_babel_case as _run_babel,
+    run_real_case as _run_real,
+    run_step_case as _run_step,
+    run_turn_case as _run_turn,
+    set_eval_root_plan,
+    set_eval_root_plan_from_world_7d,
+)
+from eval.runtime.transforms import (
+    build_eval_root_plan_from_points,
+    build_eval_root_plan_from_world_7d,
+    recovery_root_state_to_world,
+    root_plan_to_world_7d,
+    rotate_xz_points,
+    rotate_world_7d_about_anchor,
+)
 from utils.inference_glue import InferenceGlueState, InferenceGlueTimeline
 from utils.runtime_rootplan import build_rootplan_stream_payload_from_buffer
+from utils.stream_traj import StreamTrajectoryPlan
 from utils.token_frame import token_range_to_frame_slice, token_start_frame
 from utils.traj_stream_buffer import TrajStreamBuffer
 
@@ -69,18 +89,330 @@ def test_runtime_default_output_dir_is_eval_output_eval():
     assert DEFAULT_RUNTIME_OUTPUT_DIR.endswith("/eval/output_eval")
 
 
-def test_real_suite_uses_route_cases_instead_of_legacy_gt_pred_root_modes():
+def test_real_suite_uses_route_and_motion7d_gtroot_cases():
     assert [(case.name, case.mode) for case in REAL_CASES] == [
         ("real_route_001168", "real_route"),
+        ("real_gtroot_001168", "real_gtroot"),
         ("real_route_rot90_001168", "real_route"),
+        ("real_gtroot_rot90_001168", "real_gtroot_rot90"),
     ]
+    gtroot_case = REAL_CASES[1]
+    oracle_rot_case = REAL_CASES[3]
+    assert gtroot_case.mode_kwargs["gt_motion_7d"] is True
+    assert gtroot_case.mode_kwargs.get("rotate_plan_deg", 0.0) == 0.0
+    assert oracle_rot_case.mode_kwargs["gt_motion_7d"] is True
+    assert oracle_rot_case.mode_kwargs["rotate_plan_deg"] == 90.0
 
 
-def test_real_suite_selector_returns_route_cases_only():
+def test_real_suite_selector_returns_route_and_oracle_cases():
     assert [(case.name, case.mode) for case in get_cases(suites=["real"])] == [
         ("real_route_001168", "real_route"),
+        ("real_gtroot_001168", "real_gtroot"),
         ("real_route_rot90_001168", "real_route"),
+        ("real_gtroot_rot90_001168", "real_gtroot_rot90"),
     ]
+
+
+def test_rotate_world_7d_about_anchor_rotates_xyz_and_heading_only():
+    traj_7d = torch.tensor(
+        [
+            [0.0, 0.2, 0.0, 1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.2, 1.0, 1.0, 0.0, 0.4, 0.1],
+        ],
+        dtype=torch.float32,
+    )
+    rotated = rotate_world_7d_about_anchor(
+        traj_7d,
+        anchor_xyz=torch.tensor([0.0, 0.2, 0.0]),
+        degrees=90.0,
+    )
+
+    np.testing.assert_allclose(
+        rotated.numpy(),
+        np.asarray(
+            [
+                [0.0, 0.2, 0.0, 0.0, -1.0, 0.0, 0.0],
+                [-1.0, 0.2, 0.0, 0.0, -1.0, 0.4, 0.1],
+            ],
+            dtype=np.float32,
+        ),
+        atol=1e-6,
+    )
+
+
+def test_rotate_xz_points_rotates_route_about_anchor():
+    points = np.asarray(
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+
+    rotated = rotate_xz_points(points, anchor=np.asarray([0.0, 0.0, 0.0]), degrees=90.0)
+
+    np.testing.assert_allclose(
+        rotated,
+        np.asarray([[0.0, 0.0, 0.0], [-1.0, 0.0, 0.0]], dtype=np.float32),
+        atol=1e-6,
+    )
+
+
+def test_build_eval_root_plan_from_world_7d_preserves_oracle_channels():
+    traj_7d = torch.tensor(
+        [
+            [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 1.0, 0.0, 0.4, 0.1],
+        ],
+        dtype=torch.float32,
+    )
+
+    root_plan = build_eval_root_plan_from_world_7d(
+        traj_7d,
+        anchor_state=InferenceGlueState.initial(
+            xz=(0.0, 0.0),
+            yaw=0.0,
+            dtype=torch.float32,
+        ),
+        token_dt=0.20,
+        frames_per_token=4,
+        source="test_gt_motion_7d",
+    )
+
+    np.testing.assert_allclose(
+        root_plan.waypoints_local_7d.numpy(),
+        traj_7d.numpy(),
+        atol=1e-6,
+    )
+    assert root_plan.source == "test_gt_motion_7d"
+
+
+def test_root_plan_to_world_7d_inverts_plan_anchor_canonicalization():
+    traj_7d = torch.tensor(
+        [
+            [2.0, 0.0, 3.0, 0.0, -1.0, 0.2, 0.1],
+            [1.0, 0.0, 3.0, 0.0, -1.0, 0.3, 0.2],
+        ],
+        dtype=torch.float32,
+    )
+    root_plan = build_eval_root_plan_from_world_7d(
+        traj_7d,
+        anchor_state=InferenceGlueState.initial(
+            xz=(2.0, 3.0),
+            yaw=-np.pi / 2.0,
+            dtype=torch.float32,
+        ),
+        token_dt=0.20,
+    )
+
+    world = root_plan_to_world_7d(root_plan)
+
+    np.testing.assert_allclose(world.numpy(), traj_7d.numpy(), atol=1e-6)
+
+
+def test_root_plan_events_to_diagnostic_arrays_concatenates_world_plans():
+    traj_a = torch.tensor(
+        [[0.0, 0.0, 0.0, 1.0, 0.0, 0.1, 0.0]],
+        dtype=torch.float32,
+    )
+    traj_b = torch.tensor(
+        [[0.0, 0.0, 1.0, 1.0, 0.0, 0.2, 0.1]],
+        dtype=torch.float32,
+    )
+    anchor = InferenceGlueState.initial(xz=(0.0, 0.0), yaw=0.0, dtype=torch.float32)
+    plan_a = build_eval_root_plan_from_world_7d(traj_a, anchor_state=anchor, token_dt=0.20)
+    plan_b = build_eval_root_plan_from_world_7d(traj_b, anchor_state=anchor, token_dt=0.20)
+
+    root_7d, num_tokens = root_plan_events_to_diagnostic_arrays(
+        [{"root_plan": plan_a}, {"root_plan": plan_b}]
+    )
+
+    np.testing.assert_allclose(root_7d, torch.cat([traj_a, traj_b], dim=0).numpy(), atol=1e-6)
+    assert num_tokens == int(plan_a.num_tokens_pred + plan_b.num_tokens_pred)
+
+
+def test_rotated_gt7d_anchor_canonicalizes_back_to_original_local_plan():
+    traj_7d = torch.tensor(
+        [
+            [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 1.0, 0.0, 0.4, 0.1],
+        ],
+        dtype=torch.float32,
+    )
+    rotated = rotate_world_7d_about_anchor(
+        traj_7d,
+        anchor_xyz=traj_7d[0, :3],
+        degrees=90.0,
+    )
+
+    original_plan = build_eval_root_plan_from_world_7d(
+        traj_7d,
+        anchor_state=InferenceGlueState.initial(
+            xz=(float(traj_7d[0, 0]), float(traj_7d[0, 2])),
+            yaw=float(torch.atan2(traj_7d[0, 4], traj_7d[0, 3])),
+            dtype=torch.float32,
+        ),
+        token_dt=0.20,
+    )
+    rotated_plan = build_eval_root_plan_from_world_7d(
+        rotated,
+        anchor_state=InferenceGlueState.initial(
+            xz=(float(rotated[0, 0]), float(rotated[0, 2])),
+            yaw=float(torch.atan2(rotated[0, 4], rotated[0, 3])),
+            dtype=torch.float32,
+        ),
+        token_dt=0.20,
+    )
+
+    np.testing.assert_allclose(
+        rotated_plan.waypoints_local_7d.numpy(),
+        original_plan.waypoints_local_7d.numpy(),
+        atol=1e-6,
+    )
+
+
+def test_recovery_root_state_to_world_applies_session_anchor_yaw():
+    recovery = SimpleNamespace(
+        r_pos_accum=np.asarray([0.0, 0.3, 1.0], dtype=np.float32),
+        r_rot_ang_accum=0.0,
+    )
+    anchor = InferenceGlueState.initial(
+        xz=(2.0, 3.0),
+        yaw=-np.pi / 2.0,
+        dtype=torch.float32,
+    )
+
+    root, yaw = recovery_root_state_to_world(recovery, anchor)
+
+    np.testing.assert_allclose(root, np.asarray([1.0, 0.3, 3.0], dtype=np.float32), atol=1e-6)
+    assert abs(float(yaw) + np.pi / 2.0) < 1e-6
+
+
+def test_append_eval_timeline_state_uses_session_anchor_world_frame():
+    timeline = new_eval_timeline()
+    recovery = SimpleNamespace(
+        r_pos_accum=np.asarray([0.0, 0.3, 1.0], dtype=np.float32),
+        r_rot_ang_accum=0.0,
+    )
+    anchor = InferenceGlueState.initial(
+        xz=(2.0, 3.0),
+        yaw=-np.pi / 2.0,
+        dtype=torch.float32,
+    )
+
+    append_eval_timeline_state(
+        timeline,
+        commit_idx=1,
+        recovery=recovery,
+        session_anchor_state=anchor,
+    )
+
+    state = timeline.at_commit(1)
+    np.testing.assert_allclose(state.world_xz.numpy(), np.asarray([1.0, 3.0], dtype=np.float32))
+    assert abs(float(state.world_yaw) + np.pi / 2.0) < 1e-6
+
+
+def test_append_eval_root_history_records_world_5d_and_next_frame():
+    history = []
+    recovery = SimpleNamespace(
+        r_pos_accum=np.asarray([0.0, 0.3, 1.0], dtype=np.float32),
+        r_rot_ang_accum=0.0,
+    )
+    anchor = InferenceGlueState.initial(
+        xz=(2.0, 3.0),
+        yaw=-np.pi / 2.0,
+        dtype=torch.float32,
+    )
+
+    next_frame = append_eval_root_history(
+        history,
+        5,
+        recovery,
+        session_anchor_state=anchor,
+    )
+
+    assert next_frame == 6
+    frame_idx, root5d = history[0]
+    assert frame_idx == 5
+    np.testing.assert_allclose(root5d[:3], np.asarray([1.0, 0.3, 3.0], dtype=np.float32), atol=1e-6)
+    assert abs(float(root5d[3])) < 1e-6
+    assert abs(float(root5d[4]) + 1.0) < 1e-6
+
+
+def test_clear_model_traj_state_calls_available_clear_methods():
+    calls = []
+
+    class Buffer:
+        def reset(self):
+            calls.append("reset")
+
+        def clear(self):
+            calls.append("clear")
+
+    clear_model_traj_state(SimpleNamespace(_traj_buf=Buffer()))
+
+    assert calls == ["reset", "clear"]
+
+
+def test_set_eval_root_plan_from_world_7d_records_root_plan_event():
+    events = []
+    replan_events = []
+    model = SimpleNamespace(
+        _traj_buf=SimpleNamespace(set_root_plan=lambda plan: setattr(model, "root_plan", plan))
+    )
+    timeline = InferenceGlueTimeline(
+        InferenceGlueState.initial(xz=(0.0, 0.0), yaw=0.0, dtype=torch.float32)
+    )
+    traj_7d = torch.tensor(
+        [[0.0, 0.0, 0.0, 1.0, 0.0, 0.1, 0.0]],
+        dtype=torch.float32,
+    )
+
+    ok = set_eval_root_plan_from_world_7d(
+        model,
+        timeline,
+        traj_7d,
+        start_commit_index=0,
+        text="walk",
+        token_dt=0.20,
+        source="test_gt",
+        replan_events=replan_events,
+        root_plan_events=events,
+    )
+
+    assert ok is True
+    assert model.root_plan.source == "test_gt"
+    assert events[0]["root_plan"] is model.root_plan
+    assert events[0]["source"] == "test_gt"
+    assert replan_events[0]["source"] == "test_gt"
+
+
+def test_set_eval_root_plan_from_route_records_root_plan_event():
+    events = []
+    model = SimpleNamespace(
+        _traj_buf=SimpleNamespace(set_root_plan=lambda plan: setattr(model, "root_plan", plan))
+    )
+    timeline = InferenceGlueTimeline(
+        InferenceGlueState.initial(xz=(0.0, 0.0), yaw=0.0, dtype=torch.float32)
+    )
+    stream_plan = StreamTrajectoryPlan(
+        times=np.asarray([0.0, 0.05], dtype=np.float32),
+        points_xyz=np.asarray([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32),
+        start_commit_index=0,
+        version=0,
+        source="test_route",
+    )
+
+    ok = set_eval_root_plan(
+        model,
+        timeline,
+        stream_plan,
+        text="walk",
+        token_dt=0.20,
+        root_plan_events=events,
+    )
+
+    assert ok is True
+    assert model.root_plan.source == "test_route"
+    assert events[0]["root_plan"] is model.root_plan
+    assert events[0]["root_refiner"] is False
 
 
 def test_motion_video_overlay_kwargs_uses_target_root_xz():
@@ -97,6 +429,33 @@ def test_motion_video_overlay_kwargs_uses_target_root_xz():
     assert kwargs["render_setting"]["cond_traj_show_full"] is True
     np.testing.assert_allclose(kwargs["traj_xz"], target_root[:, [0, 2]])
     np.testing.assert_allclose(kwargs["traj_mask"], np.ones(2, dtype=np.float32))
+
+
+def test_transform_joints_to_runtime_world_aligns_video_root_with_metric_root():
+    joints = np.asarray(
+        [
+            [[0.0, 0.0, 0.0], [0.0, 0.5, 1.0]],
+            [[0.0, 0.0, 1.0], [0.0, 0.5, 2.0]],
+        ],
+        dtype=np.float32,
+    )
+    pred_root = np.asarray(
+        [
+            [10.0, 0.0, 20.0],
+            [9.0, 0.0, 20.0],
+        ],
+        dtype=np.float32,
+    )
+
+    world = _transform_joints_to_runtime_world(
+        joints,
+        pred_root=pred_root,
+        pred_yaw_offset=-np.pi / 2.0,
+    )
+
+    np.testing.assert_allclose(world[:, 0, :], pred_root, atol=1e-6)
+    np.testing.assert_allclose(world[0, 1, [0, 2]], [9.0, 20.0], atol=1e-6)
+    np.testing.assert_allclose(world[1, 1, [0, 2]], [8.0, 20.0], atol=1e-6)
 
 
 def test_stream_benchmark_builds_7d_rootplan_payload_for_model_step():
@@ -817,6 +1176,37 @@ def test_babel_root_refiner_rebuilds_plan_when_text_segment_changes():
     ]
 
 
+def test_step_root_refiner_sets_initial_root_plan():
+    feature = torch.zeros(9, 263)
+    sample = {
+        "token_length": 3,
+        "traj_length": 9,
+        "feature": feature,
+        "traj": torch.zeros(9, 3),
+        "text": "walk forward",
+        "token_mask": torch.ones(3),
+        "traj_mask": torch.ones(9),
+    }
+    runtime = _RecordingRootRefinerRuntime()
+
+    _run_step(
+        _FakeStreamModel(),
+        _FakeVae(),
+        sample,
+        torch.device("cpu"),
+        hl=4,
+        nds=1,
+        hz=1,
+        mode="step_gtroot",
+        condition_path="rootplan_7d",
+        root_refiner_runtime=runtime,
+    )
+
+    assert [(c["text"], c["start_commit_index"]) for c in runtime.calls] == [
+        ("walk forward", 0),
+    ]
+
+
 def test_babel_root_refiner_replan_receives_generated_root_history():
     feature = torch.zeros(9, 263)
     sample = {
@@ -854,6 +1244,42 @@ def test_babel_root_refiner_replan_receives_generated_root_history():
     assert len(replan_events) == 2
     assert replan_events[1]["text"] == "run"
     assert not hasattr(model, "_stream_eval_replan_events")
+
+
+def test_real_gt_motion_7d_runner_records_root_plan_event():
+    feature = torch.zeros(9, 263)
+    sample = {
+        "token_length": 3,
+        "feature_length": 9,
+        "feature": feature,
+        "traj": torch.zeros(9, 3),
+        "text": "walk forward",
+    }
+    root_plan_events = []
+    replan_events = []
+
+    _run_real(
+        _FakeStreamModel(),
+        _FakeVae(),
+        sample,
+        torch.device("cpu"),
+        hl=4,
+        nds=1,
+        hz=2,
+        tdt=0.20,
+        wpdt=0.05,
+        fps=20.0,
+        mode="real_gtroot",
+        condition_path="rootplan_7d",
+        gt_motion_7d=True,
+        root_plan_events=root_plan_events,
+        replan_events=replan_events,
+    )
+
+    assert root_plan_events
+    assert root_plan_events[0]["source"] == "bench_real_gt_motion_7d"
+    assert root_plan_events[0]["root_refiner"] is False
+    assert replan_events[0]["source"] == "bench_real_gt_motion_7d"
 
 
 def test_turn_rootplan_matches_web_delayed_replace_semantics():
@@ -984,7 +1410,7 @@ def test_turn_metric_target_follows_old_path_until_runtime_replacement():
         dtype=np.float32,
     )
 
-    target_t, target_pts = _build_turn_metric_target(
+    target_t, target_pts = build_turn_metric_target(
         old_times=plan_t,
         old_points_xyz=old_pts,
         new_times=plan_t,
@@ -1014,7 +1440,7 @@ def test_turn_metric_target_reanchors_new_route_to_effective_anchor():
         dtype=np.float32,
     )
 
-    _, target_pts = _build_turn_metric_target(
+    _, target_pts = build_turn_metric_target(
         old_times=plan_t,
         old_points_xyz=old_pts,
         new_times=plan_t,

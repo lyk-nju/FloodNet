@@ -53,41 +53,49 @@ from eval.common.visualization import (
     yaw_from_root_path,
 )
 from utils.initialize import check_state_dict, instantiate, load_config
-from utils.inference_glue import InferenceGlueState, InferenceGlueTimeline
-from utils.local_frame import canonicalize_7d
 from utils.motion_process import (
-    StreamJointRecovery263,
-    append_traj_deltas_5d_to_7d,
+    convert_motion_to_joints,
     extract_root_trajectory_263,
 )
-from utils.root_plan import RootPlan
-from utils.runtime_rootplan import build_rootplan_stream_payload_from_buffer
-from utils.stream_rollout import (
-    StreamTextSegment, StreamTextRolloutController,
-    build_stream_step_model_input,
-    build_stream_suffix_conditioning,
-)
-from utils.stream_traj import (
-    StreamTrajectoryPlan,
-    assign_uniform_timestamps,
-    blend_future_trajs,
-    reanchor_stream_plan_to_xz,
-    resample_polyline_by_arclength,
-    sample_plan_future,
-    sample_plan_by_time,
-    sample_timestamped_trajectory,
-    smoothstep01,
-)
 from utils.token_frame import (
-    num_tokens_for_frame_len,
     token_start_frame,
 )
-from utils.visualize import render_single_video
+from utils.render_skeleton import get_humanml3d_chains, render_simple_skeleton_video
 from eval.runtime.cases import get_cases
+from eval.runtime.artifacts import (
+    RuntimeArtifactLayout,
+    infer_ckpt_tag,
+    write_experiment_metrics,
+    write_runtime_debug_report,
+    write_root_diagnostic_artifacts,
+    write_root_diagnostics_summary,
+)
+from eval.runtime.experiments import (
+    build_default_runtime_experiments,
+    filter_runtime_experiments,
+    parse_csv_ints,
+    parse_csv_strings,
+    runtime_debug_mode_for_source,
+    summarize_numeric_records,
+)
 from eval.runtime.metrics import (
     build_plan_metrics,
     compute_plan_targets,
+    compute_root_condition_diagnostics,
     estimate_body_yaw,
+)
+from eval.runtime.root_sources import (
+    normalize_root_source,
+    root_source_metadata,
+    runtime_debug_condition_source,
+)
+from eval.runtime.runners import (
+    build_turn_metric_target as _build_turn_metric_target,
+    root_plan_events_to_diagnostic_arrays,
+    run_babel_case as _run_babel,
+    run_real_case as _run_real,
+    run_step_case as _run_step,
+    run_turn_case as _run_turn,
 )
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -374,293 +382,10 @@ def resolve_traj_condition_source(
     return str(condition_path)
 
 
-def _infer_physical_yaw_from_points(points_xyz: torch.Tensor) -> torch.Tensor:
-    yaw_values = []
-    last_yaw = points_xyz.new_tensor(0.0)
-    n = int(points_xyz.shape[0])
-    for i in range(n):
-        if i < n - 1:
-            delta = points_xyz[i + 1, [0, 2]] - points_xyz[i, [0, 2]]
-        elif i > 0:
-            delta = points_xyz[i, [0, 2]] - points_xyz[i - 1, [0, 2]]
-        else:
-            delta = points_xyz.new_zeros(2)
-        if torch.linalg.norm(delta) > 1e-6:
-            last_yaw = torch.atan2(delta[0], delta[1])
-        yaw_values.append(last_yaw)
-    return torch.stack(yaw_values) if yaw_values else points_xyz.new_zeros(0)
-
-
-def build_eval_root_plan_from_points(
-    points_xyz,
-    *,
-    anchor_state: InferenceGlueState,
-    token_dt: float,
-    frames_per_token: int = 4,
-    source: str = "eval_route",
-) -> RootPlan:
-    """Convert a world-space route sampled at frame cadence into a 7D RootPlan."""
-    points = torch.as_tensor(
-        points_xyz,
-        device=anchor_state.world_xz.device,
-        dtype=torch.float32,
-    )
-    if points.ndim != 2 or points.shape[-1] != 3:
-        raise ValueError(f"points_xyz must be [T,3], got {tuple(points.shape)}")
-    yaw = _infer_physical_yaw_from_points(points)
-    traj_5d_world = torch.cat(
-        [points, torch.cos(yaw).unsqueeze(-1), torch.sin(yaw).unsqueeze(-1)],
-        dim=-1,
-    )
-    traj_7d_world = append_traj_deltas_5d_to_7d(
-        traj_5d_world,
-        physical_yaw=yaw,
-    )
-    anchor_xz = anchor_state.world_xz.to(device=points.device, dtype=torch.float32)
-    anchor_yaw = anchor_state.world_yaw.to(device=points.device, dtype=torch.float32)
-    traj_7d_local = canonicalize_7d(traj_7d_world, anchor_xz, anchor_yaw)
-    valid_frames = int(traj_7d_local.shape[0])
-    return RootPlan(
-        num_tokens_pred=num_tokens_for_frame_len(valid_frames, frames_per_token),
-        valid_frames=valid_frames,
-        waypoints_local_7d=traj_7d_local,
-        frame_dt=float(token_dt) / float(frames_per_token),
-        frames_per_token=int(frames_per_token),
-        anchor_commit_idx=int(anchor_state.commit_idx),
-        anchor_world_xz=anchor_xz,
-        anchor_world_yaw=anchor_yaw,
-        source=str(source),
-    )
-
-
-def build_rootplan_stream_step_payload(
-    model,
-    timeline: InferenceGlueTimeline,
-    *,
-    history_length: int,
-    traj_horizon_tokens: int,
-    absolute_commit_index: int | None = None,
-) -> dict | None:
-    """Build the direct 7D payload consumed by stream_generate_step."""
-    traj_buf = getattr(model, "_traj_buf", None)
-    chunk_size = int(getattr(model, "chunk_size", 1))
-    local_commit = int(getattr(model, "commit_index", 0))
-    absolute_commit = (
-        local_commit if absolute_commit_index is None else int(absolute_commit_index)
-    )
-    return build_rootplan_stream_payload_from_buffer(
-        traj_buf,
-        timeline,
-        local_commit_index=local_commit,
-        absolute_commit_index=absolute_commit,
-        chunk_size=chunk_size,
-        history_length=history_length,
-        traj_horizon_tokens=traj_horizon_tokens,
-    )
-
-
-def _new_eval_timeline() -> InferenceGlueTimeline:
-    return InferenceGlueTimeline(
-        InferenceGlueState.initial(xz=(0.0, 0.0), yaw=0.0, dtype=torch.float32)
-    )
-
-
-def _append_eval_timeline_state(
-    timeline: InferenceGlueTimeline,
-    *,
-    commit_idx: int,
-    recovery: StreamJointRecovery263,
-) -> None:
-    commit_idx = int(commit_idx)
-    if commit_idx <= timeline.head.commit_idx:
-        return
-    root = np.asarray(recovery.r_pos_accum, dtype=np.float32)
-    timeline.append(
-        InferenceGlueState(
-            commit_idx=commit_idx,
-            world_xz=torch.tensor(root[[0, 2]], dtype=torch.float32),
-            world_yaw=torch.tensor(-2.0 * float(recovery.r_rot_ang_accum), dtype=torch.float32),
-            source="stream_eval",
-        )
-    )
-
-
 def _reset_eval_runtime_trace(model) -> None:
     """Backward-compatible cleanup for older callers that stored trace on model."""
     if hasattr(model, "_stream_eval_replan_events"):
         delattr(model, "_stream_eval_replan_events")
-
-
-def _append_eval_root_history(root_5d_history: list, frame_idx: int, recovery) -> int:
-    root = np.asarray(recovery.r_pos_accum, dtype=np.float32).copy()
-    yaw = -2.0 * float(recovery.r_rot_ang_accum)
-    root5d = np.asarray(
-        [root[0], root[1], root[2], np.cos(yaw), np.sin(yaw)],
-        dtype=np.float32,
-    )
-    root_5d_history.append((int(frame_idx), root5d))
-    return int(frame_idx) + 1
-
-
-def _get_eval_root_refiner_history_5d(root_5d_history, anchor_commit: int):
-    if not root_5d_history:
-        return None
-    from utils.token_frame import token_start_frame
-
-    anchor_frame = token_start_frame(max(0, int(anchor_commit)))
-    frames = [
-        np.asarray(root5d, dtype=np.float32)
-        for frame_idx, root5d in root_5d_history
-        if int(frame_idx) <= anchor_frame
-    ]
-    if not frames:
-        return None
-    return np.stack(frames, axis=0).astype(np.float32)
-
-
-def _clear_model_traj_state(model) -> None:
-    traj_buf = getattr(model, "_traj_buf", None)
-    if traj_buf is None:
-        return
-    if hasattr(traj_buf, "reset"):
-        traj_buf.reset()
-    if hasattr(traj_buf, "clear"):
-        traj_buf.clear()
-
-
-def _set_eval_root_plan(
-    model,
-    timeline: InferenceGlueTimeline,
-    stream_plan: StreamTrajectoryPlan,
-    *,
-    text: str,
-    token_dt: float,
-    root_refiner_runtime=None,
-    root_5d_history=None,
-    replan_events=None,
-    frames_per_token: int = 4,
-) -> bool:
-    if not timeline.has_exact_state(int(stream_plan.start_commit_index)):
-        return False
-    anchor_state = timeline.at_commit(int(stream_plan.start_commit_index))
-    root_plan_input = reanchor_stream_plan_to_xz(
-        stream_plan,
-        anchor_state.world_xz.detach().cpu().numpy(),
-    )
-    if root_refiner_runtime is not None:
-        root_plan = root_refiner_runtime.build_root_plan(
-            text=text,
-            plan=root_plan_input,
-            anchor_state=anchor_state,
-            token_dt=token_dt,
-            history_motion_world_5d=_get_eval_root_refiner_history_5d(
-                root_5d_history,
-                int(stream_plan.start_commit_index),
-            ),
-        )
-    else:
-        root_plan = build_eval_root_plan_from_points(
-            root_plan_input.points_xyz,
-            anchor_state=anchor_state,
-            token_dt=token_dt,
-            frames_per_token=frames_per_token,
-            source=root_plan_input.source or "eval_route",
-        )
-    model._traj_buf.set_root_plan(root_plan)
-    if isinstance(replan_events, list):
-        replan_events.append(
-            {
-                "commit": int(stream_plan.start_commit_index),
-                "text": str(text),
-                "source": str(stream_plan.source),
-                "root_refiner": root_refiner_runtime is not None,
-            }
-        )
-    return True
-
-
-def _slice_stream_plan_from_commit(
-    plan_times: np.ndarray,
-    plan_points_xyz: np.ndarray,
-    *,
-    start_commit_index: int,
-    token_dt: float,
-    waypoint_dt: float,
-    version: int,
-    source: str,
-) -> StreamTrajectoryPlan:
-    """Build a future-only stream plan anchored at an absolute commit index."""
-    plan_times = np.asarray(plan_times, dtype=np.float32)
-    plan_points_xyz = np.asarray(plan_points_xyz, dtype=np.float32)
-    start_commit_index = int(start_commit_index)
-    elapsed = max(0.0, float(start_commit_index) * float(token_dt))
-    if plan_times.size == 0:
-        times = np.asarray([0.0, float(waypoint_dt)], dtype=np.float32)
-        points = np.zeros((2, 3), dtype=np.float32)
-    else:
-        end_time = max(elapsed, float(plan_times[-1]))
-        npt = max(2, int(round((end_time - elapsed) / max(float(waypoint_dt), 1e-6))) + 1)
-        query_abs = elapsed + np.arange(npt, dtype=np.float32) * np.float32(waypoint_dt)
-        points = sample_plan_by_time(plan_times, plan_points_xyz, query_abs)
-        times = query_abs - np.float32(elapsed)
-    return StreamTrajectoryPlan(
-        times=times.astype(np.float32),
-        points_xyz=points.astype(np.float32),
-        start_commit_index=start_commit_index,
-        version=int(version),
-        source=str(source),
-    )
-
-
-def _build_turn_metric_target(
-    *,
-    old_times: np.ndarray,
-    old_points_xyz: np.ndarray,
-    new_times: np.ndarray,
-    new_points_xyz: np.ndarray,
-    target_frames: int,
-    motion_fps: float,
-    edit_commit: int,
-    delay_tokens: int,
-    blend_tokens: int,
-    token_dt: float,
-    new_anchor_xz: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Build the time target that matches web delayed-replace RootPlan input.
-
-    The replacement plan is authored in absolute route coordinates but runtime
-    reanchors plan-local t=0 to the effective update anchor before converting it
-    to a RootPlan. Metrics must apply the same XZ translation, otherwise turn
-    ADE/FDE measures a jump that the model never receives as input.
-    """
-    target_t = np.arange(int(target_frames), dtype=np.float32) / np.float32(motion_fps)
-    effective_t = (float(edit_commit) + float(delay_tokens)) * float(token_dt)
-    activation_t = (
-        float(edit_commit) + float(delay_tokens) + float(blend_tokens)
-    ) * float(token_dt)
-    old_target = sample_plan_by_time(old_times, old_points_xyz, target_t)
-    new_target = sample_plan_by_time(new_times, new_points_xyz, target_t)
-    if new_anchor_xz is None:
-        anchor_point = sample_plan_by_time(
-            old_times,
-            old_points_xyz,
-            np.asarray([effective_t], dtype=np.float32),
-        )[0]
-        anchor_xz = anchor_point[[0, 2]]
-    else:
-        anchor_xz = np.asarray(new_anchor_xz, dtype=np.float32).reshape(2)
-    new_zero = sample_plan_by_time(
-        new_times,
-        new_points_xyz,
-        np.asarray([effective_t], dtype=np.float32),
-    )[0]
-    offset = anchor_xz - new_zero[[0, 2]]
-    new_target = new_target.copy()
-    new_target[:, [0, 2]] += offset[None, :]
-    use_new = target_t >= np.float32(activation_t)
-    target = old_target.copy()
-    target[use_new] = new_target[use_new]
-    return target_t.astype(np.float32), target.astype(np.float32)
 
 
 # ── model loading ──────────────────────────────────────────────────────
@@ -803,471 +528,6 @@ def _merge_babel(raw_data_dir, sample_ids):
 
 # ── case runners ───────────────────────────────────────────────────────
 
-def _run_step(model, vae, sample, device, *, hl, nds, mode, **_kw):
-    tl = sample["token_length"]
-    tfs = 1 + 4 * (tl - 1) if tl > 1 else 1
-    hz = int(_kw.get("hz", 20))
-    tdt = float(_kw.get("tdt", 0.20))
-    fps = float(_kw.get("fps", 20.0))
-    condition_path = str(_kw.get("condition_path", "rootplan_7d"))
-    root_refiner_runtime = _kw.get("root_refiner_runtime")
-    replan_events = _kw.get("replan_events")
-    force_no_traj = bool(_kw.get("force_no_traj", False))
-    text = sample["text"] if isinstance(sample["text"], str) else sample["text"][0]
-    timeline = _new_eval_timeline()
-    vae.clear_cache()
-    model.init_generated(hl, batch_size=1, num_denoise_steps=nds)
-    model.generated = model.generated.to(device)
-    _clear_model_traj_state(model)
-    root_5d_history, frame_idx = [], 0
-    _bs = {  # batch-style wrapper for build_stream_suffix_conditioning
-        "traj": sample["traj"].unsqueeze(0),
-        "token_length": torch.tensor([tl]),
-        "traj_length": torch.tensor([sample["traj_length"]]),
-        "token_mask": sample["token_mask"].unsqueeze(0),
-        "traj_mask": sample["traj_mask"].unsqueeze(0),
-    }
-    if condition_path == "rootplan_7d" and mode != "step_no_traj" and not force_no_traj:
-        plan = StreamTrajectoryPlan(
-            times=np.arange(len(sample["traj"]), dtype=np.float32) / fps,
-            points_xyz=sample["traj"].numpy().astype(np.float32),
-            start_commit_index=0,
-            version=0,
-            source="bench_step",
-        )
-        _set_eval_root_plan(
-            model,
-            timeline,
-            plan,
-            text=text,
-            token_dt=tdt,
-            root_refiner_runtime=root_refiner_runtime,
-            root_5d_history=root_5d_history,
-            replan_events=replan_events,
-        )
-    sr = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
-    decs, _roots = [], []
-    fc = True
-    for ci in range(tl):
-        if mode == "step_no_traj" or force_no_traj:
-            ti = None
-        elif condition_path == "rootplan_7d":
-            ti = build_rootplan_stream_step_payload(
-                model,
-                timeline,
-                history_length=hl,
-                traj_horizon_tokens=hz,
-                absolute_commit_index=ci,
-            )
-        elif condition_path == "legacy_xyz" and mode == "step_predroot":
-            ti = build_stream_suffix_conditioning(_bs, ci, prefer_xyz=True)
-            if ti is not None and len(_roots) > 0:
-                pr_cur = _roots[-1]
-                gt_ci = sample["traj"].numpy()[min(ci * 4, len(sample["traj"]) - 1)].astype(np.float32)
-                offset = pr_cur.astype(np.float32) - gt_ci
-                t = ti["traj"]
-                if torch.is_tensor(t):
-                    ti["traj"] = t + torch.from_numpy(offset).float().to(t)
-        elif condition_path == "legacy_xyz":
-            ti = build_stream_suffix_conditioning(_bs, ci, prefer_xyz=True)
-        else:
-            raise ValueError(f"unknown traj_condition_path {condition_path!r}")
-        sp = build_stream_step_model_input(
-            text,
-            traj_input=ti)
-        out = model.stream_generate_step(sp, first_chunk=fc)
-        dec = (vae.stream_decode(out["generated"][0][None, :].to(device),
-                                 first_chunk=fc)[0].float().cpu().numpy())
-        fc = False
-        for frm in dec:
-            sr.process_frame(frm)
-            _roots.append(sr.r_pos_accum.copy())
-            frame_idx = _append_eval_root_history(root_5d_history, frame_idx, sr)
-        _append_eval_timeline_state(
-            timeline,
-            commit_idx=ci + 1,
-            recovery=sr,
-        )
-        decs.append(dec)
-    vae.clear_cache()
-    pm = np.concatenate(decs, axis=0)[:tfs] if decs else np.zeros((0, 263))
-    pr = np.array(_roots, dtype=np.float32)[:tfs] if _roots else np.zeros((0, 3))
-    gr = extract_root_trajectory_263(sample["feature"].numpy()[:tfs])
-    return pm, pr, gr
-
-
-def _run_real(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode,
-              rotate_plan_deg=0.0, condition_path="rootplan_7d",
-              root_refiner_runtime=None, replan_events=None, force_no_traj=False):
-    tl = sample["token_length"]
-    tfs = 1 + 4 * (tl - 1) if tl > 1 else 1
-    gr_arr = sample["traj"].numpy()
-    text = sample["text"] if isinstance(sample["text"], str) else sample["text"][0]
-    timeline = _new_eval_timeline()
-    dur = (sample["feature_length"] - 1) / fps
-    npt = max(2, int(round(dur / wpdt)) + 1)
-    plan_pts = resample_polyline_by_arclength(gr_arr, npt)
-    plan_t = assign_uniform_timestamps(npt, wpdt)
-    if rotate_plan_deg:
-        plan_pts = _rotate_xz(plan_pts, plan_pts[0], float(rotate_plan_deg))
-    gr = extract_root_trajectory_263(sample["feature"].numpy()[:tfs])
-    vae.clear_cache()
-    model.init_generated(hl, batch_size=1, num_denoise_steps=nds)
-    model.generated = model.generated.to(device)
-    _clear_model_traj_state(model)
-    root_5d_history, frame_idx = [], 0
-    if condition_path == "rootplan_7d" and mode != "real_no_traj" and not force_no_traj:
-        _set_eval_root_plan(
-            model,
-            timeline,
-            StreamTrajectoryPlan(
-                times=plan_t,
-                points_xyz=plan_pts,
-                start_commit_index=0,
-                version=0,
-                source="bench_real",
-            ),
-            text=text,
-            token_dt=tdt,
-            root_refiner_runtime=root_refiner_runtime,
-            root_5d_history=root_5d_history,
-            replan_events=replan_events,
-        )
-    sr = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
-    decs, _roots, fc = [], [], True
-    for ci in range(tl):
-        if mode == "real_no_traj" or force_no_traj:
-            ti = None
-        elif condition_path == "rootplan_7d":
-            ti = build_rootplan_stream_step_payload(
-                model,
-                timeline,
-                history_length=hl,
-                traj_horizon_tokens=hz,
-                absolute_commit_index=ci,
-            )
-        elif condition_path == "legacy_xyz":
-            cr = np.zeros(3, dtype=np.float32)
-            if mode == "real_gtroot":
-                cr = gr_arr[min(ci * 4, len(gr_arr) - 1)].astype(np.float32)
-            else:
-                cr[[0, 2]] = sr.r_pos_accum[[0, 2]].astype(np.float32)
-            ft = sample_plan_future(StreamTrajectoryPlan(times=plan_t, points_xyz=plan_pts, start_commit_index=0, version=0, source="bench"), current_commit=ci, current_root_xyz=cr, horizon_tokens=hz, token_dt=tdt, reanchor_to_current_root=True)
-            ti = {"traj": torch.from_numpy(ft).float().unsqueeze(0),
-                  "token_mask": torch.ones(1, hz)}
-        else:
-            raise ValueError(f"unknown traj_condition_path {condition_path!r}")
-        sp = build_stream_step_model_input(
-            text,
-            traj_input=ti)
-        out = model.stream_generate_step(sp, first_chunk=fc)
-        dec = (vae.stream_decode(out["generated"][0][None, :].to(device),
-                                 first_chunk=fc)[0].float().cpu().numpy())
-        fc = False
-        for frm in dec:
-            sr.process_frame(frm)
-            _roots.append(sr.r_pos_accum.copy())
-            frame_idx = _append_eval_root_history(root_5d_history, frame_idx, sr)
-        _append_eval_timeline_state(
-            timeline,
-            commit_idx=ci + 1,
-            recovery=sr,
-        )
-        decs.append(dec)
-    vae.clear_cache()
-    pm = np.concatenate(decs, axis=0)[:tfs] if decs else np.zeros((0, 263))
-    pr = np.array(_roots, dtype=np.float32)[:tfs] if _roots else np.zeros((0, 3))
-    return pm, pr, gr, plan_t, plan_pts
-
-
-def _rotate_xz(points, anchor, deg):
-    pts = np.asarray(points, dtype=np.float32).copy()
-    anc = np.asarray(anchor, dtype=np.float32).reshape(3)
-    c, s = float(np.cos(np.deg2rad(deg))), float(np.sin(np.deg2rad(deg)))
-    rel = pts[:, [0, 2]] - anc[[0, 2]][None, :]
-    pts[:, 0], pts[:, 2] = anc[0] + c * rel[:, 0] - s * rel[:, 1], anc[2] + s * rel[:, 0] + c * rel[:, 1]
-    return pts
-
-
-def _run_turn(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode, angle,
-              delay_tokens=20, blend_tokens=4, condition_path="rootplan_7d",
-              root_refiner_runtime=None, replan_events=None, force_no_traj=False):
-    tl = sample["token_length"]
-    tfs = 1 + 4 * (tl - 1) if tl > 1 else 1
-    gr_arr = sample["traj"].numpy()
-    text = sample["text"] if isinstance(sample["text"], str) else sample["text"][0]
-    timeline = _new_eval_timeline()
-    dur = (sample["feature_length"] - 1) / fps
-    npt = max(2, int(round(dur / wpdt)) + 1)
-    plan_pts = resample_polyline_by_arclength(gr_arr, npt)
-    plan_t = assign_uniform_timestamps(npt, wpdt)
-    split_tok, sf = 15, max(1, 1 + 4 * 14)
-    rot_pts = np.concatenate(
-        [plan_pts[:sf], _rotate_xz(plan_pts[sf:], plan_pts[sf - 1], angle)], axis=0)
-    rot_t = np.arange(len(rot_pts), dtype=np.float32) * wpdt
-    ed = int(delay_tokens) if isinstance(delay_tokens, (int, float)) else 20
-    eb = int(blend_tokens) if isinstance(blend_tokens, (int, float)) else 4
-    # Extend past the blend zone for post-turn observation.
-    extra = max(0, split_tok + ed + eb - tl)
-    total_tl = tl + extra + 8
-    total_tfs = 1 + 4 * (total_tl - 1) if total_tl > 1 else 1
-    # Extend plans to cover the full query horizon past the blend zone.
-    _needed_wp = max(len(plan_pts), int((total_tl + hz) * tdt / wpdt) + 2)
-    for _p_arr, _p_name in [(plan_pts, "plan"), (rot_pts, "rot")]:
-        _n = len(_p_arr)
-        if _needed_wp > _n:
-            _start_wp = max(0, _n - 5)
-            _vel = _p_arr[-1] - _p_arr[_start_wp]
-            _denom = max(1, _n - 1 - _start_wp)  # actual intervals spanned
-            _step = _vel / float(_denom)
-            _n_extra = _needed_wp - _n
-            _p_new = _p_arr[-1][None, :] + np.arange(1, _n_extra + 1, dtype=np.float32)[:, None] * _step[None, :]
-            if _p_name == "plan":
-                plan_pts = np.concatenate([plan_pts, _p_new.astype(np.float32)], axis=0)
-            else:
-                rot_pts = np.concatenate([rot_pts, _p_new.astype(np.float32)], axis=0)
-    plan_t = assign_uniform_timestamps(len(plan_pts), wpdt)
-    rot_t = np.arange(len(rot_pts), dtype=np.float32) * wpdt
-    gr = extract_root_trajectory_263(sample["feature"].numpy()[:tfs])
-    vae.clear_cache()
-    model.init_generated(hl, batch_size=1, num_denoise_steps=nds)
-    model.generated = model.generated.to(device)
-    _clear_model_traj_state(model)
-    root_5d_history, frame_idx = [], 0
-    # Build old/new plans with web-demo effective-commit semantics.
-    edit_commit = split_tok
-    effective_commit = edit_commit + ed
-    old_plan = StreamTrajectoryPlan(
-        times=plan_t, points_xyz=plan_pts,
-        start_commit_index=0, version=0, source="bench_old",
-    )
-    new_plan = _slice_stream_plan_from_commit(
-        rot_t,
-        rot_pts,
-        start_commit_index=effective_commit,
-        token_dt=tdt,
-        waypoint_dt=wpdt,
-        version=1,
-        source="bench_new",
-    )
-    if condition_path == "rootplan_7d" and not force_no_traj:
-        _set_eval_root_plan(
-            model,
-            timeline,
-            old_plan,
-            text=text,
-            token_dt=tdt,
-            root_refiner_runtime=root_refiner_runtime,
-            root_5d_history=root_5d_history,
-            replan_events=replan_events,
-        )
-    new_root_plan_active = False
-    sr = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
-    decs, _roots, fc = [], [], True
-    for ci in range(total_tl):
-        offset = ci - edit_commit
-        if force_no_traj:
-            ti = None
-        elif condition_path == "rootplan_7d":
-            if (
-                not new_root_plan_active
-                and offset >= ed + eb
-                and timeline.has_exact_state(effective_commit)
-            ):
-                new_root_plan_active = _set_eval_root_plan(
-                    model,
-                    timeline,
-                    new_plan,
-                    text=text,
-                    token_dt=tdt,
-                    root_refiner_runtime=root_refiner_runtime,
-                    root_5d_history=root_5d_history,
-                    replan_events=replan_events,
-                )
-            ti = build_rootplan_stream_step_payload(
-                model,
-                timeline,
-                history_length=hl,
-                traj_horizon_tokens=hz,
-                absolute_commit_index=ci,
-            )
-        elif condition_path == "legacy_xyz":
-            cr = np.zeros(3, dtype=np.float32)
-            cr[[0, 2]] = sr.r_pos_accum[[0, 2]].astype(np.float32)
-            _reanchor = dict(current_commit=ci, current_root_xyz=cr,
-                             horizon_tokens=hz, token_dt=tdt, reanchor_to_current_root=True)
-            old_ft = sample_plan_future(old_plan, **_reanchor)
-            if offset < ed:
-                ft = old_ft
-            elif offset < ed + eb and eb > 0:
-                new_ft = sample_plan_future(new_plan, **_reanchor)
-                w = smoothstep01(float(offset - ed) / eb)
-                ft = blend_future_trajs(old_ft, new_ft, w)
-            else:
-                ft = sample_plan_future(new_plan, **_reanchor)
-            ti = {"traj": torch.from_numpy(ft).float().unsqueeze(0), "token_mask": torch.ones(1, hz)}
-        else:
-            raise ValueError(f"unknown traj_condition_path {condition_path!r}")
-        sp = build_stream_step_model_input(
-            text,
-            traj_input=ti)
-        out = model.stream_generate_step(sp, first_chunk=fc)
-        dec = (vae.stream_decode(out["generated"][0][None, :].to(device),
-                                 first_chunk=fc)[0].float().cpu().numpy())
-        fc = False
-        for frm in dec:
-            sr.process_frame(frm)
-            _roots.append(sr.r_pos_accum.copy())
-            frame_idx = _append_eval_root_history(root_5d_history, frame_idx, sr)
-        _append_eval_timeline_state(
-            timeline,
-            commit_idx=ci + 1,
-            recovery=sr,
-        )
-        decs.append(dec)
-    vae.clear_cache()
-    pm = np.concatenate(decs, axis=0)[:total_tfs] if decs else np.zeros((0, 263))
-    pr = np.array(_roots, dtype=np.float32)[:total_tfs] if _roots else np.zeros((0, 3))
-    effective_frame = token_start_frame(effective_commit)
-    if len(pr) > 0:
-        anchor_frame = int(np.clip(effective_frame, 0, len(pr) - 1))
-        new_anchor_xz = pr[anchor_frame, [0, 2]]
-    else:
-        new_anchor_xz = None
-    target_t, target_pts = _build_turn_metric_target(
-        old_times=plan_t,
-        old_points_xyz=plan_pts,
-        new_times=rot_t,
-        new_points_xyz=rot_pts,
-        target_frames=total_tfs,
-        motion_fps=fps,
-        edit_commit=edit_commit,
-        delay_tokens=ed,
-        blend_tokens=eb,
-        token_dt=tdt,
-        new_anchor_xz=new_anchor_xz,
-    )
-    return pm, pr, gr, target_t, target_pts, total_tfs
-
-
-def _run_babel(model, vae, sample, device, *, hl, nds, hz, tdt, wpdt, fps, mode,
-               condition_path="rootplan_7d", root_refiner_runtime=None,
-               replan_events=None, force_no_traj=False):
-    tl = sample["token_length"]
-    tfs = 1 + 4 * (tl - 1) if tl > 1 else 1
-    gr_arr = sample["traj"].numpy()
-    timeline = _new_eval_timeline()
-    dur = (sample["feature_length"] - 1) / fps
-    npt = max(2, int(round(dur / wpdt)) + 1)
-    plan_pts = resample_polyline_by_arclength(gr_arr, npt)
-    plan_t = assign_uniform_timestamps(npt, wpdt)
-    segs = [StreamTextSegment(text=t, token_end=te)
-            for t, te in zip(sample["text"], sample["token_text_end"])]
-    tc = StreamTextRolloutController(segs)
-    gr = extract_root_trajectory_263(sample["feature"].numpy()[:tfs])
-    vae.clear_cache()
-    model.init_generated(hl, batch_size=1, num_denoise_steps=nds)
-    model.generated = model.generated.to(device)
-    _clear_model_traj_state(model)
-    root_5d_history, frame_idx = [], 0
-    active_root_refiner_text = None
-    if condition_path == "rootplan_7d" and mode != "babel_no_traj" and not force_no_traj:
-        initial_text = sample["text"][0] if sample["text"] else ""
-        if _set_eval_root_plan(
-            model,
-            timeline,
-            _slice_stream_plan_from_commit(
-                plan_t,
-                plan_pts,
-                start_commit_index=0,
-                token_dt=tdt,
-                waypoint_dt=wpdt,
-                version=0,
-                source="bench_babel",
-            ),
-            text=initial_text,
-            token_dt=tdt,
-            root_refiner_runtime=root_refiner_runtime,
-            root_5d_history=root_5d_history,
-            replan_events=replan_events,
-        ):
-            active_root_refiner_text = initial_text
-    sr = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
-    decs, _roots, fc = [], [], True
-    for ci in range(tl):
-        txt = tc.get_text_for_commit_index(ci)
-        if mode == "babel_no_traj" or force_no_traj:
-            ti = None
-        elif condition_path == "rootplan_7d":
-            if (
-                root_refiner_runtime is not None
-                and txt != active_root_refiner_text
-                and timeline.has_exact_state(ci)
-            ):
-                refreshed = _set_eval_root_plan(
-                    model,
-                    timeline,
-                    _slice_stream_plan_from_commit(
-                        plan_t,
-                        plan_pts,
-                        start_commit_index=ci,
-                        token_dt=tdt,
-                        waypoint_dt=wpdt,
-                        version=ci,
-                        source="bench_babel_text",
-                    ),
-                    text=txt,
-                    token_dt=tdt,
-                    root_refiner_runtime=root_refiner_runtime,
-                    root_5d_history=root_5d_history,
-                    replan_events=replan_events,
-                )
-                if refreshed:
-                    active_root_refiner_text = txt
-            ti = build_rootplan_stream_step_payload(
-                model,
-                timeline,
-                history_length=hl,
-                traj_horizon_tokens=hz,
-                absolute_commit_index=ci,
-            )
-        elif condition_path == "legacy_xyz" and mode == "babel_timestamped":
-            cr = np.zeros(3, dtype=np.float32)
-            cr[[0, 2]] = sr.r_pos_accum[[0, 2]].astype(np.float32)
-            qt = (float(ci) * tdt + np.arange(hz, dtype=np.float32) * tdt)
-            gt_t = np.arange(len(gr_arr), dtype=np.float32) / 20.0
-            ft = sample_timestamped_trajectory(gt_t, gr_arr, qt)
-            anc = sample_timestamped_trajectory(gt_t, gr_arr, np.asarray([qt[0]], dtype=np.float32))[0]
-            ft = cr + (ft - anc.astype(np.float32))
-            ti = {"traj": torch.from_numpy(ft).float().unsqueeze(0), "token_mask": torch.ones(1, hz)}
-        elif condition_path == "legacy_xyz":
-            cr = np.zeros(3, dtype=np.float32)
-            cr[[0, 2]] = sr.r_pos_accum[[0, 2]].astype(np.float32)
-            ft = sample_plan_future(StreamTrajectoryPlan(times=plan_t, points_xyz=plan_pts, start_commit_index=0, version=0, source="bench"), current_commit=ci, current_root_xyz=cr, horizon_tokens=hz, token_dt=tdt, reanchor_to_current_root=True)
-            ti = {"traj": torch.from_numpy(ft).float().unsqueeze(0), "token_mask": torch.ones(1, hz)}
-        else:
-            raise ValueError(f"unknown traj_condition_path {condition_path!r}")
-        sp = build_stream_step_model_input(txt, traj_input=ti)
-        out = model.stream_generate_step(sp, first_chunk=fc)
-        dec = (vae.stream_decode(out["generated"][0][None, :].to(device),
-                                 first_chunk=fc)[0].float().cpu().numpy())
-        fc = False
-        for frm in dec:
-            sr.process_frame(frm)
-            _roots.append(sr.r_pos_accum.copy())
-            frame_idx = _append_eval_root_history(root_5d_history, frame_idx, sr)
-        _append_eval_timeline_state(
-            timeline,
-            commit_idx=ci + 1,
-            recovery=sr,
-        )
-        decs.append(dec)
-    vae.clear_cache()
-    pm = np.concatenate(decs, axis=0)[:tfs] if decs else np.zeros((0, 263))
-    pr = np.array(_roots, dtype=np.float32)[:tfs] if _roots else np.zeros((0, 3))
-    return pm, pr, gr, plan_t, plan_pts
-
-
 def _motion_video_overlay_kwargs(target_root):
     """Build trajectory overlay kwargs for the skeleton action video."""
     render_setting = {
@@ -1284,6 +544,76 @@ def _motion_video_overlay_kwargs(target_root):
     kwargs["traj_xz"] = target_root[:, [0, 2]]
     kwargs["traj_mask"] = np.ones((target_root.shape[0],), dtype=np.float32)
     return kwargs
+
+
+def _transform_joints_to_runtime_world(
+    joint_positions,
+    *,
+    pred_root,
+    pred_yaw_offset: float = 0.0,
+) -> np.ndarray:
+    """Put rendered joints in the same world frame as runtime metrics."""
+
+    joints = np.asarray(joint_positions, dtype=np.float32).copy()
+    pred = np.asarray(pred_root, dtype=np.float32)
+    if joints.ndim != 3 or joints.shape[-1] != 3:
+        raise ValueError(f"joint_positions must be [T,J,3], got {joints.shape}")
+    if pred.ndim != 2 or pred.shape[-1] < 3:
+        raise ValueError(f"pred_root must be [T,>=3], got {pred.shape}")
+    n = min(len(joints), len(pred))
+    joints = joints[:n]
+    pred = pred[:n]
+    yaw = float(pred_yaw_offset)
+    if abs(yaw) > 1e-8:
+        c = float(np.cos(yaw))
+        s = float(np.sin(yaw))
+        x = joints[..., 0].copy()
+        z = joints[..., 2].copy()
+        joints[..., 0] = c * x + s * z
+        joints[..., 2] = -s * x + c * z
+    root_xz = joints[:, 0, [0, 2]]
+    offset_xz = pred[:, [0, 2]] - root_xz
+    offset_y = pred[:, 1] - joints[:, 0, 1]
+    joints[:, :, 0] += offset_xz[:, 0, None]
+    joints[:, :, 2] += offset_xz[:, 1, None]
+    joints[:, :, 1] += offset_y[:, None]
+    return joints.astype(np.float32)
+
+
+def _render_runtime_case_video(
+    *,
+    motion_263,
+    pred_root,
+    target_root,
+    save_path,
+    pred_yaw_offset: float = 0.0,
+):
+    overlay = _motion_video_overlay_kwargs(target_root)
+    render_setting = overlay.get("render_setting", {})
+    joints = convert_motion_to_joints(np.asarray(motion_263), dim=263)
+    joints_world = _transform_joints_to_runtime_world(
+        joints,
+        pred_root=pred_root,
+        pred_yaw_offset=pred_yaw_offset,
+    )
+    traj_xz = overlay.get("traj_xz")
+    if traj_xz is not None:
+        traj_xz = np.asarray(traj_xz, dtype=np.float32)[: len(joints_world)]
+    traj_mask = overlay.get("traj_mask")
+    if traj_mask is not None:
+        traj_mask = np.asarray(traj_mask, dtype=np.float32)[: len(joints_world)]
+    render_simple_skeleton_video(
+        data=joints_world,
+        chains=get_humanml3d_chains(),
+        out_path=str(save_path),
+        fps=render_setting.get("fps", 20),
+        traj_mask=traj_mask,
+        traj_mask_point_radius=int(render_setting.get("traj_mask_point_radius", 3)),
+        traj_xz=traj_xz,
+        cond_traj_mask=traj_mask,
+        cond_traj_point_radius=int(render_setting.get("cond_traj_point_radius", 4)),
+        cond_traj_show_full=bool(render_setting.get("cond_traj_show_full", True)),
+    )
 
 
 def _render_traj_video(pred_root, target_root, out_path, title, *, split_tok=None):
@@ -1337,6 +667,7 @@ def _write_runtime_case_visuals(
     target_root,
     motion_263=None,
     split_tok: int | None = None,
+    pred_yaw_offset: float = 0.0,
 ) -> None:
     out = ensure_dir(output_dir)
     split_frame = None if split_tok is None else int(token_start_frame(int(split_tok)))
@@ -1352,7 +683,7 @@ def _write_runtime_case_visuals(
     )
     if motion_263 is not None:
         try:
-            pred_yaw = estimate_body_yaw(np.asarray(motion_263))
+            pred_yaw = estimate_body_yaw(np.asarray(motion_263)) + float(pred_yaw_offset)
         except Exception:
             pred_yaw = yaw_from_root_path(pred_root)
     else:
@@ -1409,7 +740,49 @@ def main():
     )
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--precomputed_text_emb_path", default=None)
+    p.add_argument(
+        "--runtime_debug_matrix",
+        action="store_true",
+        default=False,
+        help="Run the new gtroot/rootrefiner/notraj runtime debug matrix.",
+    )
+    p.add_argument(
+        "--runtime_debug_sample_id",
+        default="001168",
+        help="HumanML3D sample id for --runtime_debug_matrix.",
+    )
+    p.add_argument(
+        "--runtime_debug_root_sources",
+        default="gtroot,rootrefiner,notraj",
+        help="Comma-separated root sources for --runtime_debug_matrix.",
+    )
+    p.add_argument(
+        "--runtime_debug_families",
+        default="web_stream,rotation,turn",
+        help="Comma-separated families: web_stream, rotation, turn.",
+    )
+    p.add_argument(
+        "--runtime_debug_rotation_degrees",
+        default="10,20,30,40,50,60,70,80,90",
+        help="Comma-separated rotation degrees for runtime debug rotation family.",
+    )
+    p.add_argument(
+        "--runtime_debug_turn_delay_tokens",
+        default="5,10,20",
+        help="Comma-separated delay-token values for runtime debug turn family.",
+    )
+    p.add_argument(
+        "--runtime_debug_turn_blend_tokens",
+        default="2,4,8",
+        help="Comma-separated blend-token values for runtime debug turn family.",
+    )
     args = p.parse_args()
+
+    if args.runtime_debug_matrix and not (args.root_refiner_config and args.root_refiner_ckpt):
+        p.error(
+            "--runtime_debug_matrix requires --root_refiner_config and "
+            "--root_refiner_ckpt so gtroot/rootrefiner diagnostics can be compared"
+        )
 
     seed_everything(args.seed)
     torch.backends.cudnn.benchmark = False
@@ -1453,6 +826,11 @@ def main():
         )
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    debug_layout = RuntimeArtifactLayout(
+        output_root=args.output_dir,
+        ckpt_tag=infer_ckpt_tag(args.ckpt),
+        run_id=run_id,
+    )
     out_root = os.path.join(args.output_dir, run_id)
     suites_list = [s.strip() for s in args.suites.split(",")] if args.suites else None
     suite_tag = "_".join(suites_list) if suites_list else args.preset
@@ -1477,6 +855,278 @@ def main():
     os.makedirs(out_root, exist_ok=True)
     if vdir: os.makedirs(vdir, exist_ok=True)
     if pdir: os.makedirs(pdir, exist_ok=True)
+
+    if args.runtime_debug_matrix:
+        root_sources = tuple(
+            normalize_root_source(source)
+            for source in parse_csv_strings(
+                args.runtime_debug_root_sources,
+                default=("gtroot", "rootrefiner", "notraj"),
+            )
+        )
+        families = parse_csv_strings(
+            args.runtime_debug_families,
+            default=("web_stream", "rotation", "turn"),
+        )
+        specs = build_default_runtime_experiments(
+            sample_id=str(args.runtime_debug_sample_id),
+            root_sources=root_sources,
+            rotation_degrees=parse_csv_ints(
+                args.runtime_debug_rotation_degrees,
+                default=(10, 20, 30, 40, 50, 60, 70, 80, 90),
+            ),
+            turn_delay_tokens=parse_csv_ints(
+                args.runtime_debug_turn_delay_tokens,
+                default=(5, 10, 20),
+            ),
+            turn_blend_tokens=parse_csv_ints(
+                args.runtime_debug_turn_blend_tokens,
+                default=(2, 4, 8),
+            ),
+        )
+        specs = filter_runtime_experiments(specs, families=families)
+        print(
+            f"{len(specs)} runtime debug experiment(s)  "
+            f"sample={args.runtime_debug_sample_id}"
+        )
+        sample_cache = {}
+        all_recs = []
+        root_plan_cache: dict[tuple[str, tuple[str, ...]], dict[str, tuple[np.ndarray, int]]] = {}
+
+        for spec in specs:
+            root_source = normalize_root_source(spec.root_source)
+            if spec.sample_id not in sample_cache:
+                sample_cache[spec.sample_id] = _load_humanml3d_sample(
+                    args.raw_data_dir,
+                    spec.sample_id,
+                )
+            sample = sample_cache[spec.sample_id]
+            print(
+                f"\n--- {root_source}/{spec.family}/"
+                f"{'/'.join(spec.parts) if spec.parts else spec.name} ---"
+            )
+            seed_everything(args.seed)
+            variant_root_refiner = (
+                root_refiner_runtime if root_source == "rootrefiner" else None
+            )
+            replan_events: list[dict] = []
+            root_plan_events: list[dict] = []
+            kw = dict(
+                hl=args.history_length,
+                nds=args.num_denoise_steps,
+                hz=args.traj_horizon_tokens,
+                tdt=args.token_dt,
+                wpdt=args.waypoint_dt,
+                fps=args.motion_fps,
+                condition_path="rootplan_7d",
+                root_refiner_runtime=variant_root_refiner,
+                replan_events=replan_events,
+                root_plan_events=root_plan_events,
+            )
+            motion_yaw_offset = 0.0
+            split_tok = None
+
+            if spec.family in {"web_stream", "rotation"}:
+                mode, gt_motion_7d, force_no_traj = runtime_debug_mode_for_source(root_source)
+                pm, pr, gr, pt, pp, motion_yaw_offset = _run_real(
+                    model,
+                    vae,
+                    sample,
+                    dev,
+                    mode=mode,
+                    rotate_plan_deg=float(spec.params.get("rotate_plan_deg", 0.0)),
+                    gt_motion_7d=gt_motion_7d,
+                    force_no_traj=force_no_traj,
+                    **kw,
+                )
+                target_frames = sample["feature_length"]
+                target_source = "runtime_debug_gtroot_target" if gt_motion_7d else "runtime_debug_route_target"
+            elif spec.family == "turn":
+                angle = float(spec.params.get("update_angle", 30.0))
+                delay_tokens = int(spec.params.get("mid_update_delay_tokens", 20))
+                blend_tokens = int(spec.params.get("mid_update_blend_tokens", 4))
+                pm, pr, gr, pt, pp, target_frames = _run_turn(
+                    model,
+                    vae,
+                    sample,
+                    dev,
+                    mode=f"turn_{spec.name}",
+                    angle=angle,
+                    delay_tokens=delay_tokens,
+                    blend_tokens=blend_tokens,
+                    force_no_traj=False,
+                    **kw,
+                )
+                split_tok = 15
+                target_source = "runtime_debug_turn_target"
+            else:
+                raise ValueError(f"unknown runtime debug family {spec.family!r}")
+
+            rec = build_plan_metrics(
+                pr,
+                original_gt_root=gr,
+                plan_times=pt,
+                plan_points_xyz=pp,
+                target_frames=target_frames,
+                motion_fps=args.motion_fps,
+                motion_263=pm,
+                motion_yaw_offset=motion_yaw_offset,
+                target_source=target_source,
+            )
+            rec.update(
+                {
+                    "suite": "runtime_debug",
+                    "mode": spec.family,
+                    "sample_id": spec.sample_id,
+                    "base_case_name": spec.name,
+                    "case_name": f"{root_source}/{spec.family}/"
+                    f"{'/'.join(spec.parts) if spec.parts else spec.name}",
+                    "condition_variant": root_source,
+                    "root_source": root_source,
+                    "experiment_family": spec.family,
+                    "experiment_name": spec.name,
+                    "experiment_parts": list(spec.parts),
+                    "traj_condition_path": "rootplan_7d",
+                    "root_refiner_enabled": variant_root_refiner is not None,
+                    "condition_source": runtime_debug_condition_source(
+                        root_source,
+                        family=spec.family,
+                    ),
+                    "rootplan_replan_count": len(replan_events),
+                    "rootplan_replan_commits": [
+                        int(event.get("commit", 0)) for event in replan_events
+                    ],
+                    "rootplan_replan_sources": [
+                        str(event.get("source", "")) for event in replan_events
+                    ],
+                }
+            )
+            all_recs.append(rec)
+            write_experiment_metrics(
+                debug_layout,
+                root_source=root_source,
+                family=spec.family,
+                parts=spec.parts,
+                metrics=rec,
+            )
+            print(f"  ADE={rec.get('ADE', float('nan')):.4f}  FDE={rec.get('FDE', float('nan')):.4f}")
+
+            visual_target_root = _visual_target_root_from_plan(
+                original_gt_root=gr,
+                plan_times=pt,
+                plan_points_xyz=pp,
+                target_frames=len(pr),
+                motion_fps=args.motion_fps,
+            )
+            leaf_dir = debug_layout.experiment_dir(root_source, spec.family, *spec.parts)
+            if not args.no_save_plots and pr is not None and visual_target_root is not None:
+                _write_runtime_case_visuals(
+                    leaf_dir / "plots",
+                    case_name=spec.name,
+                    pred_root=pr,
+                    target_root=visual_target_root,
+                    motion_263=pm,
+                    split_tok=split_tok,
+                    pred_yaw_offset=motion_yaw_offset,
+                )
+            if args.render_video and pm is not None and pm.size > 0:
+                video_dir = ensure_dir(leaf_dir / "video")
+                mp4 = video_dir / f"{spec.name}.mp4"
+                _render_runtime_case_video(
+                    motion_263=pm,
+                    pred_root=pr,
+                    target_root=visual_target_root,
+                    save_path=mp4,
+                    pred_yaw_offset=motion_yaw_offset,
+                )
+                print(f"    video: {mp4}")
+
+            root_7d_world, num_tokens = root_plan_events_to_diagnostic_arrays(
+                root_plan_events
+            )
+            if root_source in {"gtroot", "rootrefiner"} and len(root_7d_world) > 0:
+                root_plan_cache.setdefault((spec.family, spec.parts), {})[root_source] = (
+                    root_7d_world,
+                    num_tokens,
+                )
+
+        root_diag_records = []
+        for (family, parts), by_source in sorted(root_plan_cache.items()):
+            if "gtroot" not in by_source or "rootrefiner" not in by_source:
+                continue
+            gt_root_7d, gt_num_tokens = by_source["gtroot"]
+            pred_root_7d, pred_num_tokens = by_source["rootrefiner"]
+            diag = compute_root_condition_diagnostics(
+                gt_root_7d,
+                pred_root_7d,
+                gt_num_tokens=gt_num_tokens,
+                pred_num_tokens=pred_num_tokens,
+            )
+            diag.update(
+                {
+                    "family": family,
+                    "parts": list(parts),
+                    "experiment": "/".join(parts) if parts else family,
+                }
+            )
+            root_diag_records.append(diag)
+            write_root_diagnostic_artifacts(
+                debug_layout,
+                family=family,
+                parts=parts,
+                metrics=diag,
+                gt_root_7d=gt_root_7d,
+                pred_root_7d=pred_root_7d,
+                gt_num_tokens=gt_num_tokens,
+                pred_num_tokens=pred_num_tokens,
+            )
+
+        aggregate = aggregate_runtime_records(all_recs)
+        root_diag_summary = summarize_numeric_records(root_diag_records)
+        write_root_diagnostics_summary(
+            debug_layout,
+            summary=root_diag_summary,
+            records=root_diag_records,
+        )
+        summary = {
+            "run_id": run_id,
+            "config": args.config,
+            "ckpt": args.ckpt,
+            "vae_ckpt": args.vae_ckpt,
+            "root_refiner_config": args.root_refiner_config,
+            "root_refiner_ckpt": args.root_refiner_ckpt,
+            "runtime_debug_matrix": True,
+            "runtime_debug_sample_id": args.runtime_debug_sample_id,
+            "aggregate": aggregate,
+            "root_diagnostics": root_diag_summary,
+            "summary": aggregate,
+            "records": all_recs,
+        }
+        debug_report_paths = write_runtime_debug_report(
+            debug_layout,
+            manifest={
+                "run_id": run_id,
+                "config": args.config,
+                "ckpt": args.ckpt,
+                "vae_ckpt": args.vae_ckpt,
+                "root_refiner_config": args.root_refiner_config,
+                "root_refiner_ckpt": args.root_refiner_ckpt,
+                "runtime_debug_matrix": True,
+                "runtime_debug_sample_id": args.runtime_debug_sample_id,
+                "root_sources": sorted({spec.root_source for spec in specs}),
+                "num_experiments": len(specs),
+            },
+            summary=summary,
+            records=all_recs,
+            source_payloads={
+                root_source: root_source_metadata(root_source)
+                for root_source in sorted({spec.root_source for spec in specs})
+            },
+        )
+        print(f"\nRuntime debug: {debug_report_paths['summary']}")
+        print(f"Runtime debug CSV: {debug_report_paths['records']}")
+        print(f"Root diagnostics: {debug_layout.run_dir / 'root_diagnostics' / 'summary.json'}")
+        return
 
     cases = get_cases(suites=suites_list, preset=args.preset)
     if any(variant.force_no_traj for variant in condition_variants):
@@ -1517,6 +1167,7 @@ def main():
                       replan_events=replan_events,
                       force_no_traj=variant.force_no_traj)
             visual_target_root = None
+            motion_yaw_offset = 0.0
 
             if case.suite == "step":
                 pm, pr, gr = _run_step(model, vae, sample, dev, mode=case.mode, **kw)
@@ -1537,13 +1188,17 @@ def main():
                 )
             elif case.suite == "real":
                 _rot = case.mode_kwargs.get("rotate_plan_deg", 0.0)
-                pm, pr, gr, pt, pp = _run_real(
+                _gt_motion_7d = bool(case.mode_kwargs.get("gt_motion_7d", False))
+                pm, pr, gr, pt, pp, motion_yaw_offset = _run_real(
                     model, vae, sample, dev, mode=case.mode,
-                    rotate_plan_deg=float(_rot), **kw)
+                    rotate_plan_deg=float(_rot),
+                    gt_motion_7d=_gt_motion_7d,
+                    **kw)
                 rec = build_plan_metrics(
                     pr, original_gt_root=gr, plan_times=pt, plan_points_xyz=pp,
                     target_frames=sample["feature_length"], motion_fps=args.motion_fps,
                     motion_263=pm,
+                    motion_yaw_offset=motion_yaw_offset,
                 )
                 visual_target_root = _visual_target_root_from_plan(
                     original_gt_root=gr,
@@ -1616,6 +1271,8 @@ def main():
                 variant_root_refiner,
                 no_traj=variant.force_no_traj or str(case.mode).endswith("_no_traj"),
             )
+            if bool(case.mode_kwargs.get("gt_motion_7d", False)) and rec["condition_source"] != "none":
+                rec["condition_source"] = "gt_motion_7d"
             rec["rootplan_replan_count"] = len(replan_events)
             rec["rootplan_replan_commits"] = [
                 int(event.get("commit", 0)) for event in replan_events
@@ -1637,6 +1294,7 @@ def main():
                     target_root=_gr,
                     motion_263=_pm,
                     split_tok=_split,
+                    pred_yaw_offset=motion_yaw_offset,
                 )
                 if standard_pdir:
                     for name in (
@@ -1649,11 +1307,12 @@ def main():
 
             if args.render_video and _pm is not None and _pm.size > 0:
                 mp4 = os.path.join(vdir, f"{display_case_name}.mp4")
-                render_single_video(
-                    motion=_pm,
+                _render_runtime_case_video(
+                    motion_263=_pm,
+                    pred_root=_pr,
+                    target_root=_gr,
                     save_path=mp4,
-                    dim=263,
-                    **_motion_video_overlay_kwargs(_gr),
+                    pred_yaw_offset=motion_yaw_offset,
                 )
                 print(f"    video: {mp4}")
                 if standard_vdir:
@@ -1695,10 +1354,32 @@ def main():
         records=all_recs,
         artifact_kinds=("metrics", "plot", "video"),
     )
+    debug_source_payloads = {}
+    for variant in condition_variants:
+        root_source = normalize_root_source(variant.name)
+        debug_source_payloads[root_source] = root_source_metadata(root_source)
+    debug_report_paths = write_runtime_debug_report(
+        debug_layout,
+        manifest={
+            "run_id": run_id,
+            "config": args.config,
+            "ckpt": args.ckpt,
+            "vae_ckpt": args.vae_ckpt,
+            "root_refiner_config": args.root_refiner_config,
+            "root_refiner_ckpt": args.root_refiner_ckpt,
+            "preset": args.preset,
+            "suites": suites_list,
+            "condition_variants": [variant.name for variant in condition_variants],
+        },
+        summary=summary,
+        records=all_recs,
+        source_payloads=debug_source_payloads,
+    )
     print(f"\nSummary: {report_dirs['legacy_root'] / 'summary.json'}")
     if all_recs:
         print(f"CSV: {report_dirs['legacy_root'] / 'summary.csv'}")
         print(f"Runtime metrics: {report_dirs['metrics'] / 'summary.json'}")
+        print(f"Runtime debug: {debug_report_paths['summary']}")
 
 
 if __name__ == "__main__":
