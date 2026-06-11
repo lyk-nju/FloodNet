@@ -82,7 +82,11 @@ from utils.token_frame import (
 )
 from utils.visualize import render_single_video
 from eval.runtime.cases import get_cases
-from eval.runtime.metrics import build_plan_metrics, estimate_body_yaw
+from eval.runtime.metrics import (
+    build_plan_metrics,
+    compute_plan_targets,
+    estimate_body_yaw,
+)
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -229,6 +233,30 @@ def _variant_case_name(case_name: str, variant: ConditionVariant) -> str:
 
 def _is_legacy_no_traj_case(case) -> bool:
     return str(getattr(case, "mode", "")).endswith("_no_traj")
+
+
+def _visual_target_root_from_plan(
+    *,
+    original_gt_root: np.ndarray,
+    plan_times: np.ndarray | None,
+    plan_points_xyz: np.ndarray | None,
+    target_frames: int,
+    motion_fps: float,
+) -> np.ndarray:
+    """Return the same time-sampled target trajectory used by plan metrics."""
+    original = np.asarray(original_gt_root, dtype=np.float32)
+    target_frames = int(target_frames)
+    if target_frames <= 0:
+        return original[:0].copy()
+    if plan_times is None or plan_points_xyz is None:
+        return original[:target_frames].copy()
+    target_time, _target_arc = compute_plan_targets(
+        np.asarray(plan_times, dtype=np.float32),
+        np.asarray(plan_points_xyz, dtype=np.float32),
+        target_frames,
+        float(motion_fps),
+    )
+    return target_time.astype(np.float32, copy=False)
 
 
 def _is_finite_number(value) -> bool:
@@ -1462,15 +1490,24 @@ def main():
                       root_refiner_runtime=variant_root_refiner,
                       replan_events=replan_events,
                       force_no_traj=variant.force_no_traj)
+            visual_target_root = None
 
             if case.suite == "step":
                 pm, pr, gr = _run_step(model, vae, sample, dev, mode=case.mode, **kw)
+                step_plan_times = np.arange(len(gr), dtype=np.float32) / 20.0
                 rec = build_plan_metrics(
                     pr, original_gt_root=gr,
-                    plan_times=np.arange(len(gr), dtype=np.float32) / 20.0,
+                    plan_times=step_plan_times,
                     plan_points_xyz=gr,
                     target_frames=sample["feature_length"], motion_fps=args.motion_fps,
                     motion_263=pm, target_source="original_gt_root",
+                )
+                visual_target_root = _visual_target_root_from_plan(
+                    original_gt_root=gr,
+                    plan_times=step_plan_times,
+                    plan_points_xyz=gr,
+                    target_frames=len(pr),
+                    motion_fps=args.motion_fps,
                 )
             elif case.suite == "real":
                 _rot = case.mode_kwargs.get("rotate_plan_deg", 0.0)
@@ -1481,6 +1518,13 @@ def main():
                     pr, original_gt_root=gr, plan_times=pt, plan_points_xyz=pp,
                     target_frames=sample["feature_length"], motion_fps=args.motion_fps,
                     motion_263=pm,
+                )
+                visual_target_root = _visual_target_root_from_plan(
+                    original_gt_root=gr,
+                    plan_times=pt,
+                    plan_points_xyz=pp,
+                    target_frames=len(pr),
+                    motion_fps=args.motion_fps,
                 )
             elif case.suite == "turn":
                 ang = case.mode_kwargs.get("update_angle", 30.0)
@@ -1502,6 +1546,13 @@ def main():
                     target_frames=ttfs, motion_fps=args.motion_fps,
                     motion_263=pm, target_source="scheduled_turn_target",
                 )
+                visual_target_root = _visual_target_root_from_plan(
+                    original_gt_root=gr,
+                    plan_times=pt,
+                    plan_points_xyz=pp,
+                    target_frames=len(pr),
+                    motion_fps=args.motion_fps,
+                )
                 rec["turn_edit_commit"] = turn_edit_commit
                 rec["turn_delay_tokens"] = turn_delay_tokens
                 rec["turn_blend_tokens"] = turn_blend_tokens
@@ -1515,6 +1566,13 @@ def main():
                     pr, original_gt_root=gr, plan_times=pt, plan_points_xyz=pp,
                     target_frames=sample["feature_length"], motion_fps=args.motion_fps,
                     motion_263=pm,
+                )
+                visual_target_root = _visual_target_root_from_plan(
+                    original_gt_root=gr,
+                    plan_times=pt,
+                    plan_points_xyz=pp,
+                    target_frames=len(pr),
+                    motion_fps=args.motion_fps,
                 )
             else:
                 print(f"  SKIP: unknown suite {case.suite}")
@@ -1542,7 +1600,7 @@ def main():
             all_recs.append(rec)
             print(f"  ADE={rec.get('ADE', float('nan')):.4f}  FDE={rec.get('FDE', float('nan')):.4f}")
 
-            _pm, _pr, _gr = pm, pr, gr
+            _pm, _pr, _gr = pm, pr, visual_target_root
             _split = 15 if case.suite == "turn" else None
 
             if pdir and _pr is not None and _gr is not None:

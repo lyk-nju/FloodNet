@@ -11,6 +11,7 @@ from eval.runtime.benchmark import (
     _csv_safe_record,
     _run_babel,
     _run_turn,
+    _visual_target_root_from_plan,
     _write_runtime_case_visuals,
     aggregate_runtime_records,
     build_eval_root_plan_from_points,
@@ -576,6 +577,31 @@ def test_aggregate_runtime_records_groups_condition_variants():
         summary["by_condition_variant"]["rootrefiner_7d_ldf"]["FDE_mean"] == 4.0
     )
     assert summary["by_suite_variant"]["real/no_traj_ldf"]["ADE_mean"] == 5.0
+
+
+def test_visual_target_root_uses_plan_target_not_original_gt():
+    original_gt = np.zeros((5, 3), dtype=np.float32)
+    plan_times = np.asarray([0.0, 0.2], dtype=np.float32)
+    plan_points = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [2.0, 0.0, 4.0],
+        ],
+        dtype=np.float32,
+    )
+
+    target = _visual_target_root_from_plan(
+        original_gt_root=original_gt,
+        plan_times=plan_times,
+        plan_points_xyz=plan_points,
+        target_frames=5,
+        motion_fps=20.0,
+    )
+
+    assert target.shape == original_gt.shape
+    assert np.allclose(target[0], plan_points[0])
+    assert np.allclose(target[-1], plan_points[-1])
+    assert not np.allclose(target, original_gt)
 
 
 def test_resolve_traj_condition_source_makes_root_refiner_mode_explicit():
