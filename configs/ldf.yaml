@@ -6,11 +6,11 @@ train: true
 dirs:
     deps: /data1/yuankai/text2Motion/FloodDiffusion/deps
     outputs: ./outputs
-    raw_data: /data1/yuankai/text2Motion/FloodDiffusion/raw_data
-
+    raw_data: /data/home/shengqiuProf_user_yuankai/FloodDiffusion/raw_data
+ 
 save_dir: ./outputs
-resume_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/step_485000.ckpt
-test_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/step_485000.ckpt
+resume_ckpt: /data/home/shengqiuProf_user_yuankai/FloodNet/outputs/20260605_012821_ldf/step_485000.ckpt
+test_ckpt: /data/home/shengqiuProf_user_yuankai/FloodNet/outputs/20260605_012821_ldf/step_485000.ckpt
 
 test_vae_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/vae_1d_z4_step=300000.ckpt
 test_vae:
@@ -107,7 +107,7 @@ data:
     train_bs: 8
     val_bs: 32
     test_bs: 4
-    num_workers: 4
+    num_workers: 8
     mask_ratio: 1.0
     traj_feat_dim: 7
 
@@ -241,5 +241,5 @@ optimizer:
 lr_scheduler:
     target: diffusers.optimization.get_cosine_schedule_with_warmup
     params:
-        num_warmup_steps: 1000
+        num_warmup_steps: 2000
         num_training_steps: ${trainer.max_steps}
