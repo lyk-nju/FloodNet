@@ -7,10 +7,10 @@ dirs:
     deps: /data/home/shengqiuProf_user_yuankai/FloodDiffusion/deps
     outputs: ./outputs
     raw_data: /data/home/shengqiuProf_user_yuankai/FloodDiffusion/raw_data
-
+ 
 save_dir: ./outputs
-resume_ckpt: /data/home/shengqiuProf_user_yuankai/FloodNet/outputs/20260526_194540_ldf/step_317500.ckpt
-test_ckpt: /data/home/shengqiuProf_user_yuankai/FloodNet/outputs/20260526_194540_ldf/step_317500.ckpt
+resume_ckpt: /data/home/shengqiuProf_user_yuankai/FloodNet/outputs/20260605_012821_ldf/step_485000.ckpt
+test_ckpt: /data/home/shengqiuProf_user_yuankai/FloodNet/outputs/20260605_012821_ldf/step_485000.ckpt
 
 test_vae_ckpt: /data/home/shengqiuProf_user_yuankai/FloodDiffusion/vae_1d_z4_step=300000.ckpt
 test_vae:
@@ -37,7 +37,7 @@ logger:
         entity: "${wandb_info.entity}"
 
 trainer: # lightning trainer
-    max_steps: 400000
+    max_steps: 700000
     accelerator: gpu
     devices: [0,1,2,3,4,5,6,7]
     log_every_n_steps: 100
@@ -106,7 +106,7 @@ data:
     train_bs: 8
     val_bs: 32
     test_bs: 4
-    num_workers: 4
+    num_workers: 8
     mask_ratio: 1.0
     traj_feat_dim: 7
 
@@ -164,14 +164,14 @@ model:
             - [0.0, 5]
 
 stream_training:
-    enabled: false
+    enabled: true
     context_tokens: 30
     min_history_tokens: 8
     horizon_tokens: 20
     sample_policy: variable_history
     anchor_move_in_rollout: false
     latent_source: precomputed_slice
-    motion_aux_loss: latent_only
+    motion_aux_loss: full_prefix
 
 # control_loss_train_mode selects gradient strategy for the XZ control loss:
 #   1 — active window, absolute coords, no detach   (gradient → ALL tokens via cumsum)
@@ -192,7 +192,7 @@ body_aux_loss:
         heading: 0.5            # do not disable — wastes the new 7D heading channel
         fwd_delta: 0.1         # delta channels are noisy; conservative in v1
         yaw_delta: 0.1
-        end_xz: 1.0            # final active-frame XZ, FDE-like endpoint control
+        end_xz: 1.0
 
 
 anchor_canonicalize:
@@ -202,7 +202,7 @@ anchor_canonicalize:
 
 
 horizon_sim:
-    enabled: true
+    enabled: false
     unit: token
     inference_horizon_tokens: 20       # inference horizon (token-level); frame count
     early_min_horizon_tokens: 20       # early lower bound (>= inference)
@@ -224,8 +224,8 @@ history_corruption:
     curriculum:
         enabled: true
         early_prob: 0.2         # progress < 1/3
-        mid_prob: 0.5           # 1/3 <= progress < 2/3
-        late_prob: 0.8          # progress >= 2/3
+        mid_prob: 0.3           # 1/3 <= progress < 2/3
+        late_prob: 0.5          # progress >= 2/3
 
 resume_reset_optimizer: true
 optimizer:
@@ -240,5 +240,5 @@ optimizer:
 lr_scheduler:
     target: diffusers.optimization.get_cosine_schedule_with_warmup
     params:
-        num_warmup_steps: 1000
+        num_warmup_steps: 2000
         num_training_steps: ${trainer.max_steps}
