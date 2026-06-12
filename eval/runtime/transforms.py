@@ -227,7 +227,10 @@ def compose_turn_root_plan(
         device=new_world.device,
         dtype=torch.long,
     ).clamp(max=int(new_world.shape[0]) - 1)
-    new_global[switch_frame:] = new_world[new_idx]
+    aligned_new_world = new_world.clone()
+    xz_offset = old_world[switch_frame, [0, 2]] - aligned_new_world[0, [0, 2]]
+    aligned_new_world[:, [0, 2]] = aligned_new_world[:, [0, 2]] + xz_offset[None, :]
+    new_global[switch_frame:] = aligned_new_world[new_idx]
 
     blend_tokens = max(0, int(blend_tokens))
     blend_end = (
