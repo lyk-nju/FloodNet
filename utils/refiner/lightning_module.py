@@ -55,8 +55,19 @@ class RootRefinerLightningModule(pl.LightningModule):
         self.loss_weights = dict(cfg.get("loss_weights", {}))
         self.heading_form = cfg.get("loss", {}).get("heading_form", "cosine")
         self.ordinal_sigma = float(cfg.get("loss", {}).get("ordinal_sigma", 1.0))
+        self.validation_suite_names = self._validation_suite_names(cfg)
         self._register_waypoint_stats(cfg)
         self.save_hyperparameters(ignore=["text_encoder"])
+
+    @staticmethod
+    def _validation_suite_names(cfg: dict) -> list[str]:
+        suites = (cfg.get("validation") or {}).get("suites") or []
+        names = [
+            str(suite.get("name"))
+            for suite in suites
+            if isinstance(suite, dict) and suite.get("name")
+        ]
+        return names or ["default"]
 
     def forward(self, batch: dict, *, duration_mode: str = "groundtruth_duration") -> dict:
         if duration_mode not in {"groundtruth_duration", "pred_duration"}:
@@ -307,6 +318,39 @@ class RootRefinerLightningModule(pl.LightningModule):
         frame_idx = torch.arange(target_mask.shape[1], device=target_mask.device)
         return target_mask.bool() & (frame_idx.unsqueeze(0) < valid_eff.unsqueeze(1))
 
+    def _compute_physical_xyz_metrics(
+        self,
+        out: dict,
+        batch: dict,
+        mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        pred7 = self._to_physical_7d(out["waypoints"])
+        if "waypoints_physical" in batch:
+            gt7 = batch["waypoints_physical"].to(
+                device=pred7.device,
+                dtype=pred7.dtype,
+            )
+        else:
+            gt5 = torch.cat(
+                [
+                    batch["waypoints"][..., :3],
+                    F.normalize(batch["waypoints"][..., 3:5], dim=-1, eps=1e-6),
+                ],
+                dim=-1,
+            )
+            gt7 = self._to_physical_7d(gt5)
+        valid = mask.to(device=pred7.device).bool()
+        xyz_err = (pred7[..., :3] - gt7[..., :3]).norm(dim=-1)
+        ade = masked_mean(xyz_err, valid)
+        has_valid = valid.any(dim=1)
+        if bool(has_valid.any().detach().cpu().item()):
+            last_idx = valid.long().sum(dim=1).sub(1).clamp(min=0)
+            fde_per_sample = xyz_err.gather(1, last_idx.view(-1, 1)).squeeze(1)
+            fde = fde_per_sample[has_valid].mean()
+        else:
+            fde = xyz_err.new_zeros(())
+        return {"xyz_ADE_m": ade, "xyz_FDE_m": fde}
+
     def training_step(self, batch: dict, batch_idx: int):
         out = self(batch)
         losses = self._compute_loss(out, batch)
@@ -323,11 +367,15 @@ class RootRefinerLightningModule(pl.LightningModule):
             self.log(f"train/{k}", v, prog_bar=True, on_step=True, on_epoch=False)
         return loss
 
-    def validation_step(self, batch: dict, batch_idx: int):
+    def validation_step(self, batch: dict, batch_idx: int, dataloader_idx: int = 0):
         modes = (self.cfg.get("validation") or {}).get(
             "eval_modes",
             ["groundtruth_duration", "pred_duration"],
         )
+        if dataloader_idx < len(self.validation_suite_names):
+            suite_name = self.validation_suite_names[dataloader_idx]
+        else:
+            suite_name = f"suite_{dataloader_idx}"
         batch_size = int(batch["num_tokens"].shape[0])
         first_loss = None
         for mode in modes:
@@ -342,13 +390,26 @@ class RootRefinerLightningModule(pl.LightningModule):
                 first_loss = losses["loss"]
             for k, v in losses.items():
                 self.log(
-                    f"val_{mode}/{k}",
+                    f"val_{suite_name}/{mode}/{k}",
                     v,
                     prog_bar=(k == "loss" and mode == "groundtruth_duration"),
                     on_step=False,
                     on_epoch=True,
                     sync_dist=True,
                     batch_size=batch_size,
+                    add_dataloader_idx=False,
+                )
+            physical_metrics = self._compute_physical_xyz_metrics(out, batch, metric_mask)
+            for k, v in physical_metrics.items():
+                self.log(
+                    f"val_{suite_name}/{mode}/{k}",
+                    v,
+                    prog_bar=False,
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                    batch_size=batch_size,
+                    add_dataloader_idx=False,
                 )
         return first_loss
 

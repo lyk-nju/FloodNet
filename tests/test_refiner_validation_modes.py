@@ -36,6 +36,10 @@ def _cfg() -> dict:
         "optimizer": {"target": "AdamW", "params": {"lr": 1e-3, "weight_decay": 0.01}},
         "validation": {
             "eval_modes": ["groundtruth_duration", "pred_duration"],
+            "suites": [
+                {"name": "full_dense_max"},
+                {"name": "sliding_dense_random"},
+            ],
         },
         "loss": {"heading_form": "cosine"},
         "loss_weights": {
@@ -101,7 +105,7 @@ def test_common_prefix_mask_uses_predicted_duration_horizon():
     assert torch.equal(mask.sum(dim=1).cpu(), expected_counts)
 
 
-def test_validation_step_logs_groundtruth_and_pred_duration_prefixes():
+def test_validation_step_logs_suite_and_duration_prefixes():
     module = RefinerLightningModule(_cfg())
     batch = _batch(module)
     logged = {}
@@ -114,9 +118,35 @@ def test_validation_step_logs_groundtruth_and_pred_duration_prefixes():
         module,
     )
 
-    module.validation_step(batch, 0)
+    module.validation_step(batch, 0, dataloader_idx=1)
 
-    assert "val_groundtruth_duration/loss" in logged
-    assert "val_pred_duration/loss" in logged
+    assert "val_sliding_dense_random/groundtruth_duration/loss" in logged
+    assert "val_sliding_dense_random/pred_duration/loss" in logged
+    assert "val_sliding_dense_random/groundtruth_duration/xyz_ADE_m" in logged
+    assert "val_sliding_dense_random/pred_duration/xyz_FDE_m" in logged
+    assert not any("dataloader_idx" in key for key in logged)
     assert all(kwargs["sync_dist"] is True for kwargs in log_kwargs.values())
     assert all(kwargs["batch_size"] == 2 for kwargs in log_kwargs.values())
+    assert all(kwargs["add_dataloader_idx"] is False for kwargs in log_kwargs.values())
+
+
+def test_physical_xyz_metrics_report_meter_ade_fde_and_common_prefix():
+    module = RefinerLightningModule(_cfg())
+    B, T = 1, 5
+    pred = torch.zeros(B, T, 5)
+    pred[..., 0] = 1.0
+    pred[..., 3] = 1.0
+    gt = torch.zeros(B, T, 7)
+    gt[..., 3] = 1.0
+    batch = {
+        "waypoints": gt[..., :5],
+        "waypoints_mask": torch.ones(B, T, dtype=torch.bool),
+        "waypoints_physical": gt,
+    }
+    out = {"waypoints": pred}
+    mask = torch.tensor([[True, True, True, False, False]])
+
+    metrics = module._compute_physical_xyz_metrics(out, batch, mask)
+
+    assert torch.allclose(metrics["xyz_ADE_m"], torch.tensor(1.0))
+    assert torch.allclose(metrics["xyz_FDE_m"], torch.tensor(1.0))

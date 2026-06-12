@@ -130,15 +130,31 @@ def test_build_datasets_returns_train_and_val(tmp_path):
         "text_path": "texts",
         # no stats_dir → normalize=False
     }
-    train_ds, val_ds = build_datasets(cfg)
+    train_ds, val_suites = build_datasets(cfg)
     assert len(train_ds) == 3
-    assert val_ds is not None and len(val_ds) == 2
+    assert len(val_suites) == 3
+    assert [suite["name"] for suite in val_suites] == [
+        "full_dense_max",
+        "sliding_dense_random",
+        "sliding_dense_max",
+    ]
 
 
-def test_build_datasets_forces_validation_dense_full_sequence(tmp_path):
-    from train_refiner import build_datasets
+def test_build_datasets_builds_fixed_validation_suites(tmp_path):
+    from train_refiner import build_datasets, apply_default_fixed_validation_dataset
 
-    _make_fake_humanml3d(tmp_path, ["t1"], ["v1"])
+    _make_fake_humanml3d(tmp_path, ["t1"], ["short", "long"])
+    import numpy as np
+
+    ds_root = tmp_path / "HumanML3D"
+    short = np.zeros((10, 263), dtype=np.float32)
+    short[:, 2] = 0.05
+    short[:, 3] = 1.0
+    long = np.zeros((80, 263), dtype=np.float32)
+    long[:, 2] = 0.05
+    long[:, 3] = 1.0
+    np.save(ds_root / "new_joint_vecs" / "short.npy", short)
+    np.save(ds_root / "new_joint_vecs" / "long.npy", long)
     cfg = _tiny_cfg()
     cfg["data"] = {
         "raw_data_dir": str(tmp_path),
@@ -162,23 +178,58 @@ def test_build_datasets_forces_validation_dense_full_sequence(tmp_path):
         },
     }
 
-    train_ds, val_ds = build_datasets(cfg, seed=0)
+    train_ds, val_suites = build_datasets(cfg, seed=0)
     assert train_ds.path_condition_policy == "goal_point"
     assert train_ds.full_plan_ratio == 0.0
     assert train_ds.num_token_policy == "random"
-    assert val_ds is not None
-    assert val_ds.path_condition_policy == "dense_path"
-    assert val_ds.full_plan_ratio == 1.0
-    assert val_ds.num_token_policy == "max"
-    assert val_ds.offset_start_enabled is False
+    assert [suite["name"] for suite in val_suites] == [
+        "full_dense_max",
+        "sliding_dense_random",
+        "sliding_dense_max",
+    ]
 
-    sample = val_ds[0]
-    assert sample["mode"] == "full"
-    assert sample["path_mode"] == "dense_path"
-    assert sample["offset_start_frames"].item() == 0
-    assert sample["num_tokens"].item() == val_ds.max_tokens
-    assert sample["waypoints_mask"].sum().item() == val_ds.max_frames
-    assert sample["path_supervision_mask"].sum().item() == val_ds.max_frames
+    by_name = {suite["name"]: suite["dataset"] for suite in val_suites}
+    full = by_name["full_dense_max"]
+    assert full.path_condition_policy == "dense_path"
+    assert full.full_plan_ratio == 1.0
+    assert full.num_token_policy == "max"
+    assert full.offset_start_enabled is False
+
+    full_sample = full[1]
+    assert full_sample["mode"] == "full"
+    assert full_sample["path_mode"] == "dense_path"
+    assert full_sample["offset_start_frames"].item() == 0
+    assert full_sample["num_tokens"].item() == full.max_tokens
+    assert full_sample["waypoints_mask"].sum().item() == full.max_frames
+    assert full_sample["path_supervision_mask"].sum().item() == full.max_frames
+
+    sliding_random = by_name["sliding_dense_random"]
+    sliding_max = by_name["sliding_dense_max"]
+    assert sliding_random.path_condition_policy == "dense_path"
+    assert sliding_random.full_plan_ratio == 0.0
+    assert sliding_random.num_token_policy == "random"
+    assert sliding_random.offset_start_enabled is False
+    assert sliding_max.path_condition_policy == "dense_path"
+    assert sliding_max.full_plan_ratio == 0.0
+    assert sliding_max.num_token_policy == "max"
+    assert sliding_max.offset_start_enabled is False
+    assert len(sliding_random.valid_indices) == 1
+    assert len(sliding_max.valid_indices) == 1
+
+    random_sample = sliding_random[0]
+    assert random_sample["mode"] == "sliding"
+    assert random_sample["path_mode"] == "dense_path"
+    assert random_sample["offset_start_frames"].item() == 0
+
+    _, fixed_suites = apply_default_fixed_validation_dataset(
+        train_ds,
+        val_suites,
+    )
+    fixed_by_name = {suite["name"]: suite["dataset"] for suite in fixed_suites}
+    max_sample = fixed_by_name["sliding_dense_max"][0]
+    assert max_sample["mode"] == "sliding"
+    assert max_sample["path_mode"] == "dense_path"
+    assert max_sample["num_tokens"].item() == sliding_max.max_tokens
 
 
 def test_module_raises_when_no_encoder_and_no_debug_stub():
@@ -222,9 +273,9 @@ def test_build_datasets_val_none_when_no_val_split(tmp_path):
         "feature_path": "new_joint_vecs",
         "text_path": "texts",
     }
-    train_ds, val_ds = build_datasets(cfg)
+    train_ds, val_suites = build_datasets(cfg)
     assert len(train_ds) == 2
-    assert val_ds is None
+    assert val_suites == []
 
 
 # ---------------------------------------------------------------------------

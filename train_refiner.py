@@ -46,6 +46,50 @@ from utils.text_encoder_resolver import FrozenStubTextEncoder  # noqa: E402,F401
 log = logging.getLogger(__name__)
 
 
+DEFAULT_VALIDATION_SUITES = (
+    {
+        "name": "full_dense_max",
+        "mode_policy": "full",
+        "full_plan_ratio": 1.0,
+        "horizon_policy": "max",
+        "path_condition_policy": "dense_path",
+        "offset_start_enabled": False,
+    },
+    {
+        "name": "sliding_dense_random",
+        "mode_policy": "sliding",
+        "full_plan_ratio": 0.0,
+        "horizon_policy": "random",
+        "path_condition_policy": "dense_path",
+        "offset_start_enabled": False,
+    },
+    {
+        "name": "sliding_dense_max",
+        "mode_policy": "sliding",
+        "full_plan_ratio": 0.0,
+        "horizon_policy": "max",
+        "path_condition_policy": "dense_path",
+        "offset_start_enabled": False,
+    },
+)
+
+
+def normalize_validation_suites_in_cfg(cfg: dict) -> list[dict]:
+    """Ensure cfg.validation.suites is explicit and return copied suite configs."""
+    validation = cfg.setdefault("validation", {})
+    suites = validation.get("suites") or list(DEFAULT_VALIDATION_SUITES)
+    normalized = []
+    for suite in suites:
+        if not isinstance(suite, dict):
+            raise ValueError(f"validation suite must be a mapping, got {suite!r}")
+        item = copy.deepcopy(suite)
+        if not item.get("name"):
+            raise ValueError(f"validation suite missing name: {suite!r}")
+        normalized.append(item)
+    validation["suites"] = normalized
+    return normalized
+
+
 def _load_cfg(config_path: str) -> dict:
     import yaml
 
@@ -274,7 +318,7 @@ def _build_one_dataset(
     *,
     seed: int | None = None,
     randomize_caption: bool = True,
-    validation_dense_full: bool = False,
+    validation_suite: dict | None = None,
 ):
     """Build one RootRefiner dataset split."""
     from scripts.compute_5d_stats import load_clips_from_dir
@@ -317,15 +361,24 @@ def _build_one_dataset(
     path_condition_ratios = path_condition_cfg.get("ratios")
     offset_start_enabled = bool(offset_cfg.get("enabled", False))
     offset_start_prob = float(offset_cfg.get("prob", 0.0))
-    if validation_dense_full:
-        full_plan_ratio = 1.0
-        horizon_policy = "max"
-        path_condition_policy = "dense_path"
-        path_condition_ratios = None
-        offset_start_enabled = False
-        offset_start_prob = 0.0
+    if validation_suite is not None:
+        full_plan_ratio = validation_suite.get("full_plan_ratio", full_plan_ratio)
+        horizon_policy = validation_suite.get("horizon_policy", horizon_policy)
+        path_condition_policy = validation_suite.get(
+            "path_condition_policy", path_condition_policy
+        )
+        path_condition_ratios = validation_suite.get(
+            "path_condition_ratios", path_condition_ratios
+        )
+        offset_start_enabled = bool(
+            validation_suite.get("offset_start_enabled", offset_start_enabled)
+        )
+        default_offset_prob = offset_start_prob if offset_start_enabled else 0.0
+        offset_start_prob = float(
+            validation_suite.get("offset_start_prob", default_offset_prob)
+        )
 
-    return instantiate(
+    dataset = instantiate(
         target=dataset_target,
         cfg=None,
         hfstyle=False,
@@ -353,6 +406,13 @@ def _build_one_dataset(
         seed=seed,
         randomize_caption=randomize_caption,
     )
+    if validation_suite is not None and validation_suite.get("mode_policy") == "sliding":
+        if hasattr(dataset, "valid_indices") and hasattr(dataset, "sliding_eligible_indices"):
+            dataset.valid_indices = [
+                idx for idx in dataset.valid_indices
+                if idx in dataset.sliding_eligible_indices
+            ]
+    return dataset
 
 
 def build_datasets(cfg: dict, seed: int | None = None):
@@ -361,25 +421,32 @@ def build_datasets(cfg: dict, seed: int | None = None):
     train_split = data_cfg.get("train_split_file", "train.txt")
     val_split = data_cfg.get("val_split_file")
     train_ds = _build_one_dataset(cfg, train_split, seed=seed)
-    val_ds = (
-        _build_one_dataset(
+    if not val_split:
+        return train_ds, []
+    suites = []
+    for suite_cfg in normalize_validation_suites_in_cfg(cfg):
+        dataset = _build_one_dataset(
             cfg,
             val_split,
             seed=0,
             randomize_caption=False,
-            validation_dense_full=True,
+            validation_suite=suite_cfg,
         )
-        if val_split
-        else None
-    )
-    return train_ds, val_ds
+        suites.append(
+            {
+                "name": suite_cfg["name"],
+                "mode_policy": suite_cfg.get("mode_policy", "random"),
+                "dataset": dataset,
+            }
+        )
+    return train_ds, suites
 
 
-def apply_fixed_overfit_datasets(train_ds, val_ds, cfg: dict):
+def apply_fixed_overfit_datasets(train_ds, val_suites, cfg: dict):
     """Replace train/val datasets with pre-sampled deterministic diagnostics."""
     fixed_cfg = cfg.get("fixed_overfit") or {}
     if not fixed_cfg.get("enabled", False):
-        return train_ds, val_ds
+        return train_ds, val_suites
 
     from datasets.humanml3d_refiner import (
         FixedRefinerSampleDataset,
@@ -395,10 +462,10 @@ def apply_fixed_overfit_datasets(train_ds, val_ds, cfg: dict):
     train_samples = build_fixed_refiner_samples(train_ds, **kwargs)
     fixed_train = FixedRefinerSampleDataset(train_samples)
 
-    if bool(fixed_cfg.get("val_on_train", True)) or val_ds is None:
+    if bool(fixed_cfg.get("val_on_train", True)) or not val_suites:
         fixed_val = FixedRefinerSampleDataset(train_samples)
     else:
-        val_samples = build_fixed_refiner_samples(val_ds, **kwargs)
+        val_samples = build_fixed_refiner_samples(val_suites[0]["dataset"], **kwargs)
         fixed_val = FixedRefinerSampleDataset(val_samples)
 
     log.info(
@@ -409,33 +476,57 @@ def apply_fixed_overfit_datasets(train_ds, val_ds, cfg: dict):
         kwargs["force_no_path_aug"],
         bool(fixed_cfg.get("val_on_train", True)),
     )
-    return fixed_train, fixed_val
+    return fixed_train, [
+        {
+            "name": "fixed_overfit",
+            "mode_policy": kwargs["mode_policy"],
+            "dataset": fixed_val,
+        }
+    ]
 
 
-def apply_default_fixed_validation_dataset(train_ds, val_ds):
+def apply_default_fixed_validation_dataset(train_ds, val_suites):
     """Replace validation with deterministic fixed samples."""
-    if val_ds is None:
-        return train_ds, val_ds
+    if not val_suites:
+        return train_ds, []
     from datasets.humanml3d_refiner import (
         FixedRefinerSampleDataset,
         build_fixed_refiner_samples,
     )
-    if isinstance(val_ds, FixedRefinerSampleDataset):
-        return train_ds, val_ds
-
-    val_samples = build_fixed_refiner_samples(
-        val_ds,
-        num_samples=len(val_ds),
-        mode_policy="random",
-        force_no_path_aug=True,
-        force_text_idx=0,
-    )
-    fixed_val = FixedRefinerSampleDataset(val_samples)
-    log.info(
-        "default fixed validation: samples=%d mode_policy=random force_no_path_aug=True",
-        len(fixed_val),
-    )
-    return train_ds, fixed_val
+    fixed_suites = []
+    for suite in val_suites:
+        name = suite["name"]
+        dataset = suite["dataset"]
+        if len(dataset) == 0:
+            log.warning("validation suite %s has no samples; skipping.", name)
+            continue
+        if isinstance(dataset, FixedRefinerSampleDataset):
+            fixed_dataset = dataset
+        else:
+            force_anchor_frame = None
+            if (
+                suite.get("mode_policy") == "sliding"
+                and getattr(dataset, "num_token_policy", None) == "max"
+                and hasattr(dataset, "n_hist")
+            ):
+                force_anchor_frame = int(dataset.n_hist) - 1
+            val_samples = build_fixed_refiner_samples(
+                dataset,
+                num_samples=len(dataset),
+                mode_policy=suite.get("mode_policy", "random"),
+                force_no_path_aug=True,
+                force_text_idx=0,
+                force_anchor_frame=force_anchor_frame,
+            )
+            fixed_dataset = FixedRefinerSampleDataset(val_samples)
+        fixed_suites.append({**suite, "dataset": fixed_dataset})
+        log.info(
+            "fixed validation suite=%s samples=%d mode_policy=%s force_no_path_aug=True",
+            name,
+            len(fixed_dataset),
+            suite.get("mode_policy", "random"),
+        )
+    return train_ds, fixed_suites
 
 
 def main(argv=None):
@@ -472,6 +563,7 @@ def main(argv=None):
         cfg["data"]["normalize"] = (args.normalize == "true")
     cfg = resolve_cfg_interpolations(cfg)
     validate_refiner_config(cfg)
+    normalize_validation_suites_in_cfg(cfg)
     wandb_api_key = None
     _wb = (cfg.get("logger") or {}).get("wandb")
     if isinstance(_wb, dict):
@@ -502,9 +594,12 @@ def main(argv=None):
         torch.backends.cudnn.deterministic = True
     log.info("seed=%d deterministic=%s", seed, bool(cfg.get("deterministic", False)))
 
-    train_ds, val_ds = build_datasets(cfg, seed=seed)
-    train_ds, val_ds = apply_fixed_overfit_datasets(train_ds, val_ds, cfg)
-    train_ds, val_ds = apply_default_fixed_validation_dataset(train_ds, val_ds)
+    train_ds, val_suites = build_datasets(cfg, seed=seed)
+    train_ds, val_suites = apply_fixed_overfit_datasets(train_ds, val_suites, cfg)
+    train_ds, val_suites = apply_default_fixed_validation_dataset(train_ds, val_suites)
+    cfg.setdefault("validation", {})["suites"] = [
+        {"name": suite["name"]} for suite in val_suites
+    ]
     from datasets.humanml3d_refiner import refiner_worker_init_fn
     data_cfg = cfg["data"]
     collate_fn = get_function(data_cfg["collate_fn"])
@@ -517,16 +612,22 @@ def main(argv=None):
         drop_last=True,
         worker_init_fn=refiner_worker_init_fn,
     )
-    val_loader = None
-    if val_ds is not None and len(val_ds) > 0:
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=data_cfg["val_bs"],
-            shuffle=False,
-            num_workers=data_cfg["num_workers"],
-            collate_fn=collate_fn,
-            drop_last=False,
+    val_loaders = []
+    for suite in val_suites:
+        dataset = suite["dataset"]
+        if len(dataset) == 0:
+            continue
+        val_loaders.append(
+            DataLoader(
+                dataset,
+                batch_size=data_cfg["val_bs"],
+                shuffle=False,
+                num_workers=data_cfg["num_workers"],
+                collate_fn=collate_fn,
+                drop_last=False,
+            )
         )
+    val_loader = val_loaders or None
 
     module = RefinerLightningModule(cfg)
 

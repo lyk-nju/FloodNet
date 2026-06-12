@@ -671,6 +671,7 @@ def build_fixed_refiner_samples(
     mode_policy: str = "mixed",
     force_no_path_aug: bool = True,
     force_text_idx: int | None = 0,
+    force_anchor_frame: int | None = None,
 ) -> list[dict[str, Any]]:
     """Pre-sample deterministic Refiner tasks from *source*.
 
@@ -694,6 +695,7 @@ def build_fixed_refiner_samples(
                 force_mode=_mode_for_index(mode_policy, out_idx),
                 force_no_path_aug=bool(force_no_path_aug),
                 force_text_idx=force_text_idx,
+                force_anchor_frame=force_anchor_frame,
             )
         else:
             sample = source[src_idx]

@@ -39,6 +39,25 @@ validation:                   # val + checkpoint cadence (mirrors ldf.yaml.valid
   save_every_n_steps: 5000    # periodic ModelCheckpoint cadence
   save_top_k: -1
   eval_modes: [groundtruth_duration, pred_duration]
+  suites:
+    - name: full_dense_max
+      mode_policy: full
+      full_plan_ratio: 1.0
+      horizon_policy: max
+      path_condition_policy: dense_path
+      offset_start_enabled: false
+    - name: sliding_dense_random
+      mode_policy: sliding
+      full_plan_ratio: 0.0
+      horizon_policy: random
+      path_condition_policy: dense_path
+      offset_start_enabled: false
+    - name: sliding_dense_max
+      mode_policy: sliding
+      full_plan_ratio: 0.0
+      horizon_policy: max
+      path_condition_policy: dense_path
+      offset_start_enabled: false
 
 model:
   target: models.root_refiner.RootRefiner
@@ -52,7 +71,7 @@ model:
     ff_dim: 1024
     dropout: 0.2
     max_tokens: 49
-    min_tokens: 4
+    min_tokens: 10
     frames_per_token: 4
     n_path: 64
     n_hist: 20
