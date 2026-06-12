@@ -191,6 +191,9 @@ def compute_root_condition_diagnostics(
                 "xyz_ADE": float("nan"),
                 "xyz_FDE": float("nan"),
                 "x_AE_mean": float("nan"),
+                "y_AE_mean": float("nan"),
+                "y_AE_p90": float("nan"),
+                "y_FDE": float("nan"),
                 "z_AE_mean": float("nan"),
                 "endpoint_xz_error": float("nan"),
                 "heading_mae_deg": float("nan"),
@@ -209,6 +212,7 @@ def compute_root_condition_diagnostics(
     gt_xz = gt_cmp[:, [0, 2]]
     pred_xz = pred_cmp[:, [0, 2]]
     xz_dist = np.linalg.norm(pred_xz - gt_xz, axis=1)
+    y_abs = np.abs(pred_cmp[:, 1] - gt_cmp[:, 1])
     heading_err = np.arctan2(
         np.sin(_heading_yaw_from_7d(pred_cmp) - _heading_yaw_from_7d(gt_cmp)),
         np.cos(_heading_yaw_from_7d(pred_cmp) - _heading_yaw_from_7d(gt_cmp)),
@@ -220,6 +224,9 @@ def compute_root_condition_diagnostics(
             "xyz_ADE": float(np.mean(xz_dist)),
             "xyz_FDE": float(xz_dist[-1]),
             "x_AE_mean": float(np.mean(np.abs(pred_cmp[:, 0] - gt_cmp[:, 0]))),
+            "y_AE_mean": float(np.mean(y_abs)),
+            "y_AE_p90": float(np.percentile(y_abs, 90)),
+            "y_FDE": float(y_abs[-1]),
             "z_AE_mean": float(np.mean(np.abs(pred_cmp[:, 2] - gt_cmp[:, 2]))),
             "endpoint_xz_error": float(xz_dist[-1]),
             "heading_mae_deg": float(np.mean(np.abs(heading_err)) * 180.0 / np.pi),

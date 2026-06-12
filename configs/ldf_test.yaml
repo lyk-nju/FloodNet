@@ -36,17 +36,17 @@ logger:
         project: "${wandb_info.project}"
         entity: "${wandb_info.entity}"
 
-
 trainer: # lightning trainer
     max_steps: 700000
     accelerator: gpu
-    devices: [0,1,2,3,4,5,6,7]
+    devices: [0,1,2,3,4]
     log_every_n_steps: 100
     precision: bf16-mixed
 # Set to true to run T2M FID/R-Precision on val_meta_paths during eval.
 t2m_metric: true
 
 validation:
+    test_mode: async
     validation_steps: 5000
     test_steps: 5000
     save_every_n_steps: 2500
@@ -58,7 +58,7 @@ validation:
     eval_forward_control_loss_window_mode: mean_chunk_windows
     eval_all_captions: true
     stream_eval:
-        enabled: false
+        enabled: true
         stream_mode: stream_generate_step
         max_samples: 5
         num_runs: 1
@@ -106,7 +106,7 @@ data:
     collate_fn: datasets.humanml3d.collate_fn
     train_bs: 8
     val_bs: 32
-    test_bs: 4
+    test_bs: 1
     num_workers: 4
     mask_ratio: 1.0
     traj_feat_dim: 7

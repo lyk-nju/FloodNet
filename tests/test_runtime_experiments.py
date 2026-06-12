@@ -22,9 +22,36 @@ def test_default_runtime_experiments_include_expected_sources_and_families():
 
     assert ("gtroot", "web_stream", "web_stream") in keys
     assert ("rootrefiner", "web_stream", "web_stream") in keys
+    assert ("rootrefiner_gtnum", "web_stream", "web_stream") in keys
     assert ("gtroot", "rotation", "rot_090") in keys
+    assert ("rootrefiner_gtnum", "rotation", "rot_090") in keys
     assert ("rootrefiner", "turn", "delay_020") in keys
+    assert all(
+        spec.root_source != "rootrefiner_gtnum" or spec.family != "turn"
+        for spec in specs
+    )
     assert all(spec.root_source != "notraj" for spec in specs)
+
+
+def test_root_refiner_hybrid_sources_are_explicit_opt_in_and_skip_turn():
+    specs = build_default_runtime_experiments(
+        sample_id="001168",
+        root_sources=(
+            "rootrefiner_gtxyz",
+            "rootrefiner_gtheading",
+            "rootrefiner_gtprogress",
+        ),
+        rotation_degrees=(90,),
+    )
+    keys = {(spec.root_source, spec.family, spec.name) for spec in specs}
+
+    assert ("rootrefiner_gtxyz", "web_stream", "web_stream") in keys
+    assert ("rootrefiner_gtxyz", "rotation", "rot_090") in keys
+    assert ("rootrefiner_gtheading", "web_stream", "web_stream") in keys
+    assert ("rootrefiner_gtheading", "rotation", "rot_090") in keys
+    assert ("rootrefiner_gtprogress", "web_stream", "web_stream") in keys
+    assert ("rootrefiner_gtprogress", "rotation", "rot_090") in keys
+    assert all(spec.family != "turn" for spec in specs)
 
 
 def test_notraj_runtime_experiment_is_explicit_opt_in():
@@ -80,6 +107,12 @@ def test_filter_runtime_experiments_selects_requested_families():
 def test_runtime_debug_mode_for_source_maps_root_source_behavior():
     assert runtime_debug_mode_for_source("gtroot") == ("real_gtroot", True, False)
     assert runtime_debug_mode_for_source("rootrefiner") == ("real_route", False, False)
+    assert runtime_debug_mode_for_source("rootrefiner_gtxyz") == ("real_route", False, False)
+    assert runtime_debug_mode_for_source("rootrefiner_gtheading") == (
+        "real_route",
+        False,
+        False,
+    )
     assert runtime_debug_mode_for_source("notraj") == ("real_no_traj", False, True)
 
 
@@ -110,12 +143,36 @@ def test_normalize_root_source_aliases():
     assert normalize_root_source("gt_7d_ldf") == "gtroot"
     assert normalize_root_source("rootrefiner_7d_ldf") == "rootrefiner"
     assert normalize_root_source("root_refiner_7d_ldf") == "rootrefiner"
+    assert normalize_root_source("rootrefiner_gtnum") == "rootrefiner_gtnum"
+    assert normalize_root_source("rootrefiner_7d_gtnum") == "rootrefiner_gtnum"
+    assert normalize_root_source("rootrefiner_gtxyz") == "rootrefiner_gtxyz"
+    assert normalize_root_source("rootrefiner_7d_gtxyz") == "rootrefiner_gtxyz"
+    assert normalize_root_source("rootrefiner_gtheading") == "rootrefiner_gtheading"
+    assert normalize_root_source("rootrefiner_7d_gtheading") == "rootrefiner_gtheading"
+    assert normalize_root_source("rootrefiner_gtprogress") == "rootrefiner_gtprogress"
+    assert normalize_root_source("rootrefiner_7d_gtprogress") == "rootrefiner_gtprogress"
     assert normalize_root_source("no_traj_ldf") == "notraj"
 
 
 def test_root_source_metadata_describes_condition_source():
     assert root_source_metadata("gtroot")["condition_source"] == "gt_motion_7d"
     assert root_source_metadata("rootrefiner")["condition_source"] == "rootrefiner_7d"
+    assert (
+        root_source_metadata("rootrefiner_gtnum")["condition_source"]
+        == "rootrefiner_7d_gtnum"
+    )
+    assert (
+        root_source_metadata("rootrefiner_gtxyz")["condition_source"]
+        == "rootrefiner_7d_gtxyz"
+    )
+    assert (
+        root_source_metadata("rootrefiner_gtheading")["condition_source"]
+        == "rootrefiner_7d_gtheading"
+    )
+    assert (
+        root_source_metadata("rootrefiner_gtprogress")["condition_source"]
+        == "rootrefiner_7d_gtprogress"
+    )
     assert root_source_metadata("notraj")["condition_source"] == "none"
 
 
@@ -124,6 +181,22 @@ def test_runtime_debug_condition_source_disambiguates_turn_gtroot():
     assert runtime_debug_condition_source("gtroot", family="rotation") == "gt_motion_7d"
     assert runtime_debug_condition_source("gtroot", family="turn") == "route_derived_7d"
     assert runtime_debug_condition_source("rootrefiner", family="turn") == "rootrefiner_7d"
+    assert (
+        runtime_debug_condition_source("rootrefiner_gtnum", family="rotation")
+        == "rootrefiner_7d_gtnum"
+    )
+    assert (
+        runtime_debug_condition_source("rootrefiner_gtxyz", family="rotation")
+        == "rootrefiner_7d_gtxyz"
+    )
+    assert (
+        runtime_debug_condition_source("rootrefiner_gtheading", family="rotation")
+        == "rootrefiner_7d_gtheading"
+    )
+    assert (
+        runtime_debug_condition_source("rootrefiner_gtprogress", family="rotation")
+        == "rootrefiner_7d_gtprogress"
+    )
 
 
 def test_runtime_debug_metadata_policies_are_explicit():
@@ -133,6 +206,28 @@ def test_runtime_debug_metadata_policies_are_explicit():
     assert runtime_debug_root_refiner_history_policy("gtroot", family="web_stream") == "none"
     assert (
         runtime_debug_root_refiner_history_policy("rootrefiner", family="web_stream")
+        == "anchor_only_initial"
+    )
+    assert (
+        runtime_debug_root_refiner_history_policy("rootrefiner_gtnum", family="web_stream")
+        == "anchor_only_initial"
+    )
+    assert (
+        runtime_debug_root_refiner_history_policy("rootrefiner_gtxyz", family="web_stream")
+        == "anchor_only_initial"
+    )
+    assert (
+        runtime_debug_root_refiner_history_policy(
+            "rootrefiner_gtheading",
+            family="web_stream",
+        )
+        == "anchor_only_initial"
+    )
+    assert (
+        runtime_debug_root_refiner_history_policy(
+            "rootrefiner_gtprogress",
+            family="web_stream",
+        )
         == "anchor_only_initial"
     )
     assert (

@@ -57,11 +57,16 @@ class RuntimeArtifactLayout:
             out = out / _path_part(part, label=f"parts[{idx}]")
         return out
 
-    def root_diagnostic_dir(self, family: str, *parts: str) -> Path:
+    def root_diagnostic_dir(
+        self,
+        family: str,
+        *parts: str,
+        comparison: str = "gtroot_vs_rootrefiner",
+    ) -> Path:
         out = self.run_dir / "root_diagnostics" / _path_part(family, label="family")
         for idx, part in enumerate(parts):
             out = out / _path_part(part, label=f"parts[{idx}]")
-        return out / "gtroot_vs_rootrefiner"
+        return out / _path_part(comparison, label="comparison")
 
 
 def _ensure_parent(path: Path) -> Path:
@@ -189,13 +194,14 @@ def write_root_diagnostic_artifacts(
     *,
     family: str,
     parts: tuple[str, ...] = (),
+    comparison: str = "gtroot_vs_rootrefiner",
     metrics: Mapping[str, Any],
     gt_root_7d: Any,
     pred_root_7d: Any,
     gt_num_tokens: int,
     pred_num_tokens: int,
 ) -> Path:
-    out_dir = layout.root_diagnostic_dir(family, *parts)
+    out_dir = layout.root_diagnostic_dir(family, *parts, comparison=comparison)
     out_dir.mkdir(parents=True, exist_ok=True)
     write_json_strict(out_dir / "metrics.json", dict(metrics))
     np.savez(

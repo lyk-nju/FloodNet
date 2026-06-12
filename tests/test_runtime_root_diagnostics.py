@@ -6,17 +6,17 @@ from eval.runtime.metrics import compute_root_condition_diagnostics
 def test_root_condition_diagnostics_compare_token_xyz_and_heading():
     gt_root_7d = np.asarray(
         [
-            [0.0, 0.0, 0.0, 1.0, 0.0, 0.20, 0.00],
-            [0.0, 0.0, 1.0, 1.0, 0.0, 0.25, 0.10],
-            [0.0, 0.0, 2.0, 1.0, 0.0, 0.30, 0.20],
+            [0.0, 0.8, 0.0, 1.0, 0.0, 0.20, 0.00],
+            [0.0, 0.9, 1.0, 1.0, 0.0, 0.25, 0.10],
+            [0.0, 1.0, 2.0, 1.0, 0.0, 0.30, 0.20],
         ],
         dtype=np.float32,
     )
     pred_root_7d = np.asarray(
         [
-            [0.0, 0.0, 0.0, 1.0, 0.0, 0.30, 0.00],
-            [1.0, 0.0, 1.0, 0.0, 1.0, 0.35, 0.20],
-            [0.0, 0.0, 4.0, 1.0, 0.0, 0.40, 0.40],
+            [0.0, 0.9, 0.0, 1.0, 0.0, 0.30, 0.00],
+            [1.0, 1.1, 1.0, 0.0, 1.0, 0.35, 0.20],
+            [0.0, 1.3, 4.0, 1.0, 0.0, 0.40, 0.40],
         ],
         dtype=np.float32,
     )
@@ -36,6 +36,8 @@ def test_root_condition_diagnostics_compare_token_xyz_and_heading():
     assert np.isclose(metrics["xyz_ADE"], 1.0)
     assert np.isclose(metrics["xyz_FDE"], 2.0)
     assert np.isclose(metrics["x_AE_mean"], 1.0 / 3.0)
+    assert np.isclose(metrics["y_AE_mean"], 0.2)
+    assert np.isclose(metrics["y_FDE"], 0.3)
     assert np.isclose(metrics["z_AE_mean"], 2.0 / 3.0)
     assert np.isclose(metrics["endpoint_xz_error"], 2.0)
     assert np.isclose(metrics["heading_mae_deg"], 30.0)
@@ -53,3 +55,4 @@ def test_root_condition_diagnostics_handles_empty_inputs():
 
     assert metrics["num_frames_compared"] == 0
     assert np.isnan(metrics["xyz_ADE"])
+    assert np.isnan(metrics["y_AE_mean"])

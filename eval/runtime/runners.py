@@ -12,6 +12,7 @@ from eval.runtime.transforms import (
     build_eval_root_plan_from_points,
     build_eval_root_plan_from_world_7d,
     compose_turn_root_plan,
+    hybridize_root_plan_with_gt_7d,
     recovery_root_state_to_world,
     root_plan_to_world_7d,
     rotate_xz_points,
@@ -87,6 +88,15 @@ def build_rootplan_stream_step_payload(
 def new_eval_timeline() -> InferenceGlueTimeline:
     return InferenceGlueTimeline(
         InferenceGlueState.initial(xz=(0.0, 0.0), yaw=0.0, dtype=torch.float32)
+    )
+
+
+def _initial_anchor_state_from_world_7d(traj_7d_world: Any) -> InferenceGlueState:
+    first = torch.as_tensor(traj_7d_world[0], dtype=torch.float32)
+    return InferenceGlueState.initial(
+        xz=(float(first[0]), float(first[2])),
+        yaw=float(torch.atan2(first[4], first[3])),
+        dtype=torch.float32,
     )
 
 
@@ -169,6 +179,10 @@ def build_eval_root_plan_for_stream_plan(
     root_refiner_runtime: Any = None,
     root_5d_history: list | None = None,
     frames_per_token: int = 4,
+    forced_num_tokens: int | None = None,
+    gt_root_7d_world: Any = None,
+    hybrid_gt_mode: str | None = None,
+    hybrid_source: str | None = None,
 ) -> Any | None:
     if not timeline.has_exact_state(int(stream_plan.start_commit_index)):
         return None
@@ -178,16 +192,28 @@ def build_eval_root_plan_for_stream_plan(
         anchor_state.world_xz.detach().cpu().numpy(),
     )
     if root_refiner_runtime is not None:
-        root_plan = root_refiner_runtime.build_root_plan(
-            text=text,
-            plan=root_plan_input,
-            anchor_state=anchor_state,
-            token_dt=token_dt,
-            history_motion_world_5d=get_eval_root_refiner_history_5d(
+        refiner_kwargs = {
+            "text": text,
+            "plan": root_plan_input,
+            "anchor_state": anchor_state,
+            "token_dt": token_dt,
+            "history_motion_world_5d": get_eval_root_refiner_history_5d(
                 root_5d_history or [],
                 int(stream_plan.start_commit_index),
             ),
-        )
+        }
+        if forced_num_tokens is not None:
+            refiner_kwargs["forced_num_tokens"] = int(forced_num_tokens)
+        root_plan = root_refiner_runtime.build_root_plan(**refiner_kwargs)
+        if hybrid_gt_mode is not None:
+            if gt_root_7d_world is None:
+                raise ValueError("gt_root_7d_world is required for hybrid RootPlan mode")
+            root_plan = hybridize_root_plan_with_gt_7d(
+                root_plan,
+                gt_root_7d_world,
+                mode=str(hybrid_gt_mode),
+                source=str(hybrid_source or root_plan.source),
+            )
     else:
         root_plan = build_eval_root_plan_from_points(
             root_plan_input.points_xyz,
@@ -249,6 +275,10 @@ def set_eval_root_plan(
     root_plan_events: list | None = None,
     frames_per_token: int = 4,
     diagnostic_plan: bool = True,
+    forced_num_tokens: int | None = None,
+    gt_root_7d_world: Any = None,
+    hybrid_gt_mode: str | None = None,
+    hybrid_source: str | None = None,
 ) -> bool:
     root_plan = build_eval_root_plan_for_stream_plan(
         timeline,
@@ -258,6 +288,10 @@ def set_eval_root_plan(
         root_refiner_runtime=root_refiner_runtime,
         root_5d_history=root_5d_history,
         frames_per_token=frames_per_token,
+        forced_num_tokens=forced_num_tokens,
+        gt_root_7d_world=gt_root_7d_world,
+        hybrid_gt_mode=hybrid_gt_mode,
+        hybrid_source=hybrid_source,
     )
     if root_plan is None:
         return False
@@ -437,6 +471,7 @@ def run_step_case(
     condition_path = str(kwargs.get("condition_path", "rootplan_7d"))
     root_refiner_runtime = kwargs.get("root_refiner_runtime")
     replan_events = kwargs.get("replan_events")
+    root_plan_events = kwargs.get("root_plan_events")
     force_no_traj = bool(kwargs.get("force_no_traj", False))
     text = sample["text"] if isinstance(sample["text"], str) else sample["text"][0]
     timeline = new_eval_timeline()
@@ -469,6 +504,7 @@ def run_step_case(
             root_refiner_runtime=root_refiner_runtime,
             root_5d_history=root_5d_history,
             replan_events=replan_events,
+            root_plan_events=root_plan_events,
         )
     recovery = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
     decoded_chunks, roots = [], []
@@ -742,6 +778,8 @@ def run_real_case(
     force_no_traj: bool = False,
     gt_motion_7d: bool = False,
     root_plan_events: list | None = None,
+    force_root_refiner_num_tokens: bool = False,
+    root_refiner_gt_override: str | None = None,
 ):
     tl = sample["token_length"]
     tfs = 1 + 4 * (tl - 1) if tl > 1 else 1
@@ -754,7 +792,12 @@ def run_real_case(
         yaw=0.0,
         dtype=torch.float32,
     )
-    if gt_motion_7d:
+    need_gt_world_7d = (
+        gt_motion_7d
+        or root_refiner_gt_override is not None
+        or (float(rotate_plan_deg) != 0.0 and root_refiner_runtime is not None)
+    )
+    if need_gt_world_7d:
         gt_traj_7d_world = extract_root_traj_feats_7d_263(
             sample["feature"].numpy()[:tfs]
         )
@@ -769,15 +812,19 @@ def run_real_case(
                 .cpu()
                 .numpy()
             )
-        first = torch.as_tensor(gt_traj_7d_world[0], dtype=torch.float32)
-        session_anchor_state = InferenceGlueState.initial(
-            xz=(float(first[0]), float(first[2])),
-            yaw=float(torch.atan2(first[4], first[3])),
-            dtype=torch.float32,
-        )
+    if gt_motion_7d:
+        session_anchor_state = _initial_anchor_state_from_world_7d(gt_traj_7d_world)
         plan_pts = np.asarray(gt_traj_7d_world[:, :3], dtype=np.float32)
         plan_t = np.arange(len(plan_pts), dtype=np.float32) / float(fps)
     else:
+        if (
+            float(rotate_plan_deg) != 0.0
+            and root_refiner_runtime is not None
+            and gt_traj_7d_world is not None
+        ):
+            session_anchor_state = _initial_anchor_state_from_world_7d(
+                gt_traj_7d_world
+            )
         dur = (sample["feature_length"] - 1) / fps
         npt = max(2, int(round(dur / wpdt)) + 1)
         plan_pts = resample_polyline_by_arclength(gr_arr, npt)
@@ -820,6 +867,19 @@ def run_real_case(
                 root_5d_history=root_5d_history,
                 replan_events=replan_events,
                 root_plan_events=root_plan_events,
+                forced_num_tokens=(
+                    tl
+                    if force_root_refiner_num_tokens
+                    or root_refiner_gt_override is not None
+                    else None
+                ),
+                gt_root_7d_world=gt_traj_7d_world,
+                hybrid_gt_mode=root_refiner_gt_override,
+                hybrid_source=(
+                    f"root_refiner_{root_refiner_gt_override.replace('_', '')}"
+                    if root_refiner_gt_override is not None
+                    else None
+                ),
             )
     recovery = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
     decs, roots, first_chunk = [], [], True

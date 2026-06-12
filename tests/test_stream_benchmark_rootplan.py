@@ -9,6 +9,9 @@ import torch
 
 from eval.runtime.benchmark import (
     DEFAULT_RUNTIME_OUTPUT_DIR,
+    _add_metric_target_aliases,
+    _add_refiner_condition_aliases,
+    _add_root_condition_metrics,
     _csv_safe_record,
     _motion_video_overlay_kwargs,
     _parse_runtime_debug_devices,
@@ -46,6 +49,8 @@ from eval.runtime.transforms import (
     build_eval_root_plan_from_points,
     build_eval_root_plan_from_world_7d,
     compose_turn_root_plan,
+    hybridize_root_plan_with_gt_7d,
+    retime_root_plan_to_gt_progress,
     recovery_root_state_to_world,
     root_plan_to_world_7d,
     rotate_xz_points,
@@ -97,6 +102,47 @@ def _moving_z_timeline(num_commits: int) -> InferenceGlueTimeline:
 
 def test_runtime_default_output_dir_is_eval_output_eval():
     assert DEFAULT_RUNTIME_OUTPUT_DIR.endswith("/eval/output_eval")
+
+
+def test_runtime_record_separates_metric_target_and_root_condition_target():
+    root_7d = torch.tensor(
+        [
+            [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    root_plan = build_eval_root_plan_from_world_7d(
+        root_7d,
+        anchor_state=InferenceGlueState.initial(
+            xz=(0.0, 0.0),
+            yaw=0.0,
+            dtype=torch.float32,
+        ),
+        token_dt=0.20,
+    )
+    record = {"ADE": 9.0, "FDE": 8.0, "condition_source": "rootrefiner_7d"}
+
+    _add_metric_target_aliases(record)
+    _add_root_condition_metrics(
+        record,
+        pred_root_xyz=np.asarray(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
+            dtype=np.float32,
+        ),
+        root_plan_events=[{"root_plan": root_plan, "diagnostic_plan": True}],
+    )
+    _add_refiner_condition_aliases(record)
+
+    assert record["ADE_vs_metric_target"] == 9.0
+    assert record["FDE_vs_metric_target"] == 8.0
+    assert np.isclose(record["ADE_vs_root_condition"], 1.0 / 3.0)
+    assert np.isclose(record["FDE_vs_root_condition"], 1.0)
+    assert np.isclose(record["refiner_ADE"], 1.0 / 3.0)
+    assert np.isclose(record["refiner_FDE"], 1.0)
+    assert record["root_condition_num_tokens"] == root_plan.num_tokens_pred
+    assert record["root_condition_num_frames"] == 3
 
 
 def test_real_suite_uses_route_and_motion7d_gtroot_cases():
@@ -422,6 +468,43 @@ def test_root_plan_events_to_diagnostic_arrays_uses_last_diagnostic_plan():
     assert num_tokens == int(plan_b.num_tokens_pred)
 
 
+def test_retime_root_plan_to_gt_progress_preserves_shape_and_uses_gt_arc_timing():
+    anchor = InferenceGlueState.initial(
+        xz=(0.0, 0.0),
+        yaw=0.0,
+        dtype=torch.float32,
+    )
+    pred_points = np.zeros((5, 3), dtype=np.float32)
+    pred_points[:, 2] = np.linspace(0.0, 4.0, 5, dtype=np.float32)
+    pred_plan = build_eval_root_plan_from_points(
+        pred_points,
+        anchor_state=anchor,
+        token_dt=0.2,
+        source="pred",
+    )
+    gt_5d = np.zeros((5, 5), dtype=np.float32)
+    gt_5d[:, 1] = 1.0
+    gt_5d[:, 3] = 1.0
+    gt_5d[:, 2] = np.asarray([0.0, 0.0, 0.0, 2.0, 4.0], dtype=np.float32)
+    gt_7d = append_traj_deltas_5d_to_7d(torch.from_numpy(gt_5d)).numpy()
+
+    retimed = retime_root_plan_to_gt_progress(
+        pred_plan,
+        gt_7d,
+        source="root_refiner_gtprogress",
+    )
+    retimed_world = root_plan_to_world_7d(retimed).detach().cpu().numpy()
+
+    np.testing.assert_allclose(retimed_world[:, 0], 0.0, atol=1e-6)
+    np.testing.assert_allclose(
+        retimed_world[:, 2],
+        [0.0, 0.0, 0.0, 2.0, 4.0],
+        atol=1e-5,
+    )
+    assert retimed.source == "root_refiner_gtprogress"
+    assert retimed.num_tokens_pred == pred_plan.num_tokens_pred
+
+
 def test_rotated_gt7d_anchor_canonicalizes_back_to_original_local_plan():
     traj_7d = torch.tensor(
         [
@@ -658,6 +741,141 @@ def test_set_eval_root_plan_from_route_records_root_plan_event():
     assert model.root_plan.source == "test_route"
     assert events[0]["root_plan"] is model.root_plan
     assert events[0]["root_refiner"] is False
+
+
+def test_set_eval_root_plan_passes_forced_num_tokens_to_root_refiner():
+    events = []
+    calls = []
+    model = SimpleNamespace(
+        _traj_buf=SimpleNamespace(set_root_plan=lambda plan: setattr(model, "root_plan", plan))
+    )
+    timeline = InferenceGlueTimeline(
+        InferenceGlueState.initial(xz=(0.0, 0.0), yaw=0.0, dtype=torch.float32)
+    )
+    stream_plan = StreamTrajectoryPlan(
+        times=np.asarray([0.0, 0.05], dtype=np.float32),
+        points_xyz=np.asarray([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32),
+        start_commit_index=0,
+        version=0,
+        source="test_route",
+    )
+
+    class Runtime:
+        def build_root_plan(self, **kwargs):
+            calls.append(kwargs)
+            return build_eval_root_plan_from_world_7d(
+                torch.tensor(
+                    [[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]],
+                    dtype=torch.float32,
+                ),
+                anchor_state=kwargs["anchor_state"],
+                token_dt=kwargs["token_dt"],
+                source="root_refiner_gtnum",
+            )
+
+    ok = set_eval_root_plan(
+        model,
+        timeline,
+        stream_plan,
+        text="walk",
+        token_dt=0.20,
+        root_refiner_runtime=Runtime(),
+        root_plan_events=events,
+        forced_num_tokens=6,
+    )
+
+    assert ok is True
+    assert calls[0]["forced_num_tokens"] == 6
+    assert events[0]["root_refiner"] is True
+    assert model.root_plan.source == "root_refiner_gtnum"
+
+
+def test_hybridize_root_plan_with_gtxyz_recomputes_delta_channels():
+    anchor = InferenceGlueState.initial(xz=(0.0, 0.0), yaw=0.0, dtype=torch.float32)
+    pred_world = torch.tensor(
+        [
+            [0.0, 0.9, 0.0, 1.0, 0.0, 9.0, 9.0],
+            [0.0, 0.9, 1.0, 1.0, 0.0, 9.0, 9.0],
+            [0.0, 0.9, 2.0, 1.0, 0.0, 9.0, 9.0],
+        ],
+        dtype=torch.float32,
+    )
+    gt_world = torch.tensor(
+        [
+            [2.0, 1.1, 0.0, 0.0, 1.0, -3.0, -3.0],
+            [3.0, 1.2, 0.0, 0.0, 1.0, -3.0, -3.0],
+            [4.0, 1.3, 0.0, 0.0, 1.0, -3.0, -3.0],
+        ],
+        dtype=torch.float32,
+    )
+    plan = build_eval_root_plan_from_world_7d(
+        pred_world,
+        anchor_state=anchor,
+        token_dt=0.20,
+        source="root_refiner",
+    )
+
+    mixed = hybridize_root_plan_with_gt_7d(
+        plan,
+        gt_world,
+        mode="gt_xyz",
+        source="root_refiner_gtxyz",
+    )
+    mixed_world = root_plan_to_world_7d(mixed)
+    expected = append_traj_deltas_5d_to_7d(
+        torch.cat([gt_world[:, :3], pred_world[:, 3:5]], dim=-1),
+        physical_yaw=torch.atan2(pred_world[:, 4], pred_world[:, 3]),
+    )
+
+    assert mixed.source == "root_refiner_gtxyz"
+    assert torch.allclose(mixed_world, expected)
+    assert torch.allclose(mixed_world[:, :3], gt_world[:, :3])
+    assert torch.allclose(mixed_world[:, 3:5], pred_world[:, 3:5])
+    assert not torch.allclose(mixed_world[:, 5:7], pred_world[:, 5:7])
+
+
+def test_hybridize_root_plan_with_gtheading_recomputes_delta_channels():
+    anchor = InferenceGlueState.initial(xz=(0.0, 0.0), yaw=0.0, dtype=torch.float32)
+    pred_world = torch.tensor(
+        [
+            [0.0, 0.9, 0.0, 1.0, 0.0, 9.0, 9.0],
+            [0.0, 0.9, 1.0, 1.0, 0.0, 9.0, 9.0],
+            [0.0, 0.9, 2.0, 1.0, 0.0, 9.0, 9.0],
+        ],
+        dtype=torch.float32,
+    )
+    gt_world = torch.tensor(
+        [
+            [2.0, 1.1, 0.0, 0.0, 1.0, -3.0, -3.0],
+            [3.0, 1.2, 0.0, 0.0, 1.0, -3.0, -3.0],
+            [4.0, 1.3, 0.0, 0.0, 1.0, -3.0, -3.0],
+        ],
+        dtype=torch.float32,
+    )
+    plan = build_eval_root_plan_from_world_7d(
+        pred_world,
+        anchor_state=anchor,
+        token_dt=0.20,
+        source="root_refiner",
+    )
+
+    mixed = hybridize_root_plan_with_gt_7d(
+        plan,
+        gt_world,
+        mode="gt_heading",
+        source="root_refiner_gtheading",
+    )
+    mixed_world = root_plan_to_world_7d(mixed)
+    expected = append_traj_deltas_5d_to_7d(
+        torch.cat([pred_world[:, :3], gt_world[:, 3:5]], dim=-1),
+        physical_yaw=torch.atan2(gt_world[:, 4], gt_world[:, 3]),
+    )
+
+    assert mixed.source == "root_refiner_gtheading"
+    assert torch.allclose(mixed_world, expected)
+    assert torch.allclose(mixed_world[:, :3], pred_world[:, :3])
+    assert torch.allclose(mixed_world[:, 3:5], gt_world[:, 3:5])
+    assert not torch.allclose(mixed_world[:, 5:7], pred_world[:, 5:7])
 
 
 def test_motion_video_overlay_kwargs_uses_target_root_xz():
@@ -1398,8 +1616,10 @@ def test_runtime_case_visuals_write_static_path_and_yaw_plots(tmp_path):
     frames = 8
     pred_root = np.zeros((frames, 3), dtype=np.float32)
     target_root = np.zeros((frames, 3), dtype=np.float32)
+    root_condition = np.zeros((frames, 3), dtype=np.float32)
     pred_root[:, 2] = np.arange(frames, dtype=np.float32) * 0.12
     target_root[:, 2] = np.arange(frames, dtype=np.float32) * 0.10
+    root_condition[:, 2] = np.arange(frames, dtype=np.float32) * 0.11
     motion = np.zeros((frames, 263), dtype=np.float32)
     motion[:, 2] = pred_root[:, 2]
 
@@ -1408,12 +1628,22 @@ def test_runtime_case_visuals_write_static_path_and_yaw_plots(tmp_path):
         case_name="case_a",
         pred_root=pred_root,
         target_root=target_root,
+        input_path_root=target_root,
+        root_condition_root=root_condition,
         motion_263=motion,
         split_tok=1,
     )
 
     assert (tmp_path / "case_a_plot_world_xz.png").is_file()
     assert (tmp_path / "case_a_plot_yaw.png").is_file()
+    assert (tmp_path / "case_a_path_debug_xz.png").is_file()
+    arrays = np.load(tmp_path / "case_a_path_debug_xz.npz")
+    np.testing.assert_allclose(arrays["input_path_xz"], target_root[:, [0, 2]])
+    np.testing.assert_allclose(
+        arrays["root_condition_xz"],
+        root_condition[:, [0, 2]],
+    )
+    np.testing.assert_allclose(arrays["pred_motion_xz"], pred_root[:, [0, 2]])
 
 
 class _FakeStreamModel:
@@ -1483,6 +1713,7 @@ class _RecordingRootRefinerRuntime:
                 "history": history_motion_world_5d,
                 "first_point": plan.points_xyz[0].copy(),
                 "num_points": len(plan.points_xyz),
+                "anchor_yaw": float(anchor_state.world_yaw.item()),
             }
         )
         points = torch.zeros(80, 3)
@@ -1559,6 +1790,38 @@ def test_step_root_refiner_sets_initial_root_plan():
     assert [(c["text"], c["start_commit_index"]) for c in runtime.calls] == [
         ("walk forward", 0),
     ]
+
+
+def test_real_rotated_root_refiner_uses_rotated_session_anchor_yaw():
+    feature = torch.zeros(9, 263)
+    sample = {
+        "token_length": 3,
+        "feature_length": 9,
+        "feature": feature,
+        "traj": torch.zeros(9, 3),
+        "text": "walk forward",
+    }
+    runtime = _RecordingRootRefinerRuntime()
+
+    _run_real(
+        _FakeStreamModel(),
+        _CausalFakeVae(),
+        sample,
+        torch.device("cpu"),
+        hl=4,
+        nds=1,
+        hz=2,
+        tdt=0.20,
+        wpdt=0.05,
+        fps=20.0,
+        mode="real_route_rot90",
+        condition_path="rootplan_7d",
+        root_refiner_runtime=runtime,
+        rotate_plan_deg=90.0,
+    )
+
+    assert runtime.calls
+    assert np.isclose(runtime.calls[0]["anchor_yaw"], -np.pi / 2, atol=1e-5)
 
 
 def test_babel_root_refiner_replan_receives_generated_root_history():

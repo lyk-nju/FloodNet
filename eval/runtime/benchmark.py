@@ -51,6 +51,7 @@ from eval.common.artifacts import ensure_dir, standard_eval_artifact_dirs
 from eval.common.visualization import (
     plot_xz_trajectories,
     plot_yaw_series,
+    xz_from_path,
     yaw_from_root_path,
 )
 from utils.initialize import check_state_dict, instantiate, load_config
@@ -111,6 +112,37 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 # ── 7D RootPlan streaming helpers ──────────────────────────────────────
 
+_ROOT_CONDITION_SOURCES = {
+    "gtroot",
+    "rootrefiner",
+    "rootrefiner_gtnum",
+    "rootrefiner_gtxyz",
+    "rootrefiner_gtheading",
+    "rootrefiner_gtprogress",
+}
+_ROOT_REFINER_SOURCES = {
+    "rootrefiner",
+    "rootrefiner_gtnum",
+    "rootrefiner_gtxyz",
+    "rootrefiner_gtheading",
+    "rootrefiner_gtprogress",
+}
+_ROOT_REFINER_FORCE_GT_NUM_SOURCES = {
+    "rootrefiner_gtnum",
+    "rootrefiner_gtxyz",
+    "rootrefiner_gtheading",
+    "rootrefiner_gtprogress",
+}
+_ROOT_REFINER_GT_OVERRIDE = {
+    "rootrefiner_gtxyz": "gt_xyz",
+    "rootrefiner_gtheading": "gt_heading",
+    "rootrefiner_gtprogress": "gt_progress",
+}
+
+
+def _root_diagnostic_comparison_name(pred_root_source: str) -> str:
+    return f"gtroot_vs_{normalize_root_source(pred_root_source)}"
+
 def _json_sanitize(value):
     from eval.common.json import json_sanitize
 
@@ -136,8 +168,16 @@ def _csv_safe_record(record: dict) -> dict:
 _AGGREGATE_METRIC_KEYS = (
     "ADE",
     "FDE",
+    "ADE_vs_metric_target",
+    "FDE_vs_metric_target",
     "turn_post_switch_ADE",
     "turn_post_switch_FDE",
+    "ADE_vs_original_gt",
+    "FDE_vs_original_gt",
+    "ADE_vs_root_condition",
+    "FDE_vs_root_condition",
+    "refiner_ADE",
+    "refiner_FDE",
     "path_arc",
     "path_chamfer",
     "heading_path_error_deg",
@@ -153,6 +193,8 @@ _RUNTIME_RECORD_FIELDS = (
     "condition_variant",
     "ADE",
     "FDE",
+    "ADE_vs_metric_target",
+    "FDE_vs_metric_target",
     "turn_post_switch_ADE",
     "turn_post_switch_FDE",
     "path_arc",
@@ -163,6 +205,12 @@ _RUNTIME_RECORD_FIELDS = (
     "target_source",
     "ADE_vs_original_gt",
     "FDE_vs_original_gt",
+    "ADE_vs_root_condition",
+    "FDE_vs_root_condition",
+    "refiner_ADE",
+    "refiner_FDE",
+    "root_condition_num_tokens",
+    "root_condition_num_frames",
     "traj_condition_path",
     "condition_source",
     "root_refiner_enabled",
@@ -337,6 +385,48 @@ def _add_turn_post_switch_metrics(
         pred[start_frame:n],
         target_time[start_frame:n],
     )
+
+
+def _add_metric_target_aliases(rec: dict) -> None:
+    """Expose ADE/FDE as explicitly measured against the current metric target."""
+    rec["ADE_vs_metric_target"] = rec.get("ADE", float("nan"))
+    rec["FDE_vs_metric_target"] = rec.get("FDE", float("nan"))
+
+
+def _add_root_condition_metrics(
+    rec: dict,
+    *,
+    pred_root_xyz: np.ndarray,
+    root_plan_events: list[dict] | None,
+) -> None:
+    """Compare generated root against the final RootPlan actually used by LDF."""
+    root_7d_world, num_tokens = root_plan_events_to_diagnostic_arrays(
+        root_plan_events or []
+    )
+    rec["root_condition_num_tokens"] = int(num_tokens)
+    rec["root_condition_num_frames"] = int(len(root_7d_world))
+    if len(root_7d_world) <= 0:
+        rec["ADE_vs_root_condition"] = float("nan")
+        rec["FDE_vs_root_condition"] = float("nan")
+        return
+    rec["ADE_vs_root_condition"] = compute_ade(
+        np.asarray(pred_root_xyz, dtype=np.float32),
+        root_7d_world[:, :3],
+    )
+    rec["FDE_vs_root_condition"] = compute_fde(
+        np.asarray(pred_root_xyz, dtype=np.float32),
+        root_7d_world[:, :3],
+    )
+
+
+def _add_refiner_condition_aliases(rec: dict) -> None:
+    """Expose root-condition ADE/FDE under refiner names for RootRefiner cases."""
+
+    condition_source = str(rec.get("condition_source", ""))
+    if not condition_source.startswith(("rootrefiner_7d", "root_refiner_7d")):
+        return
+    rec["refiner_ADE"] = rec.get("ADE_vs_root_condition", float("nan"))
+    rec["refiner_FDE"] = rec.get("FDE_vs_root_condition", float("nan"))
 
 
 def _is_finite_number(value) -> bool:
@@ -587,7 +677,7 @@ def _collect_runtime_debug_outputs(
             raise FileNotFoundError(f"missing runtime debug metrics: {metrics_path}")
         with metrics_path.open() as f:
             records.append(json.load(f))
-        if root_source in {"gtroot", "rootrefiner"}:
+        if root_source in _ROOT_CONDITION_SOURCES:
             loaded = read_experiment_root_plan(
                 layout,
                 root_source=root_source,
@@ -612,34 +702,41 @@ def _write_runtime_debug_final_report(
 ) -> tuple[dict[str, Path], dict[str, Path]]:
     root_diag_records = []
     for (family, parts), by_source in sorted(root_plan_cache.items()):
-        if "gtroot" not in by_source or "rootrefiner" not in by_source:
+        if "gtroot" not in by_source:
             continue
         gt_root_7d, gt_num_tokens = by_source["gtroot"]
-        pred_root_7d, pred_num_tokens = by_source["rootrefiner"]
-        diag = compute_root_condition_diagnostics(
-            gt_root_7d,
-            pred_root_7d,
-            gt_num_tokens=gt_num_tokens,
-            pred_num_tokens=pred_num_tokens,
-        )
-        diag.update(
-            {
-                "family": family,
-                "parts": list(parts),
-                "experiment": "/".join(parts) if parts else family,
-            }
-        )
-        root_diag_records.append(diag)
-        write_root_diagnostic_artifacts(
-            debug_layout,
-            family=family,
-            parts=parts,
-            metrics=diag,
-            gt_root_7d=gt_root_7d,
-            pred_root_7d=pred_root_7d,
-            gt_num_tokens=gt_num_tokens,
-            pred_num_tokens=pred_num_tokens,
-        )
+        for pred_source in sorted(_ROOT_REFINER_SOURCES):
+            if pred_source not in by_source:
+                continue
+            pred_root_7d, pred_num_tokens = by_source[pred_source]
+            comparison = _root_diagnostic_comparison_name(pred_source)
+            diag = compute_root_condition_diagnostics(
+                gt_root_7d,
+                pred_root_7d,
+                gt_num_tokens=gt_num_tokens,
+                pred_num_tokens=pred_num_tokens,
+            )
+            diag.update(
+                {
+                    "family": family,
+                    "parts": list(parts),
+                    "experiment": "/".join(parts) if parts else family,
+                    "comparison": comparison,
+                    "pred_root_source": pred_source,
+                }
+            )
+            root_diag_records.append(diag)
+            write_root_diagnostic_artifacts(
+                debug_layout,
+                family=family,
+                parts=parts,
+                comparison=comparison,
+                metrics=diag,
+                gt_root_7d=gt_root_7d,
+                pred_root_7d=pred_root_7d,
+                gt_num_tokens=gt_num_tokens,
+                pred_num_tokens=pred_num_tokens,
+            )
 
     aggregate = aggregate_runtime_records(all_recs)
     root_diag_summary = summarize_numeric_records(root_diag_records)
@@ -1048,12 +1145,162 @@ def _render_traj_video(pred_root, target_root, out_path, title, *, split_tok=Non
     plt.close(_f2)
 
 
+def _sample_label_frames(*paths) -> list[int]:
+    max_len = max((len(xz_from_path(path)) for path in paths if path is not None), default=0)
+    if max_len <= 0:
+        return []
+    candidates = [0, 20, 45, 70, 93, 124, max_len - 1]
+    return sorted({int(idx) for idx in candidates if 0 <= int(idx) < max_len})
+
+
+def _write_path_debug_xz(
+    output_dir,
+    *,
+    case_name: str,
+    input_path_root=None,
+    root_condition_root=None,
+    pred_root=None,
+    input_waypoints_xyz=None,
+    gt_root=None,
+    boundary_frames=None,
+) -> None:
+    """Write a static XZ comparison of path input, LDF condition, and output."""
+
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    out = ensure_dir(output_dir)
+    input_path_xz = xz_from_path(input_path_root)
+    root_condition_xz = xz_from_path(root_condition_root)
+    pred_motion_xz = xz_from_path(pred_root)
+    input_waypoints_xz = xz_from_path(input_waypoints_xyz)
+    gt_motion_xz = xz_from_path(gt_root)
+
+    np.savez(
+        out / f"{case_name}_path_debug_xz.npz",
+        input_path_xz=input_path_xz.astype(np.float32, copy=False),
+        root_condition_xz=root_condition_xz.astype(np.float32, copy=False),
+        pred_motion_xz=pred_motion_xz.astype(np.float32, copy=False),
+        input_waypoints_xz=input_waypoints_xz.astype(np.float32, copy=False),
+        gt_motion_xz=gt_motion_xz.astype(np.float32, copy=False),
+    )
+
+    fig, ax = plt.subplots(figsize=(8.0, 4.8))
+    any_points = False
+
+    def _plot_line(label, xz, *, color, marker, linestyle="-", alpha=0.9, linewidth=1.6):
+        nonlocal any_points
+        if xz.shape[0] <= 0:
+            return
+        any_points = True
+        ax.plot(
+            xz[:, 0],
+            xz[:, 1],
+            color=color,
+            linestyle=linestyle,
+            linewidth=linewidth,
+            alpha=alpha,
+            label=label,
+        )
+        ax.scatter(
+            xz[:, 0],
+            xz[:, 1],
+            s=14,
+            color=color,
+            marker=marker,
+            alpha=min(1.0, alpha + 0.05),
+        )
+
+    _plot_line("input_path_xz", input_path_xz, color="#d62728", marker="o", alpha=0.65)
+    _plot_line(
+        "root_condition_xz",
+        root_condition_xz,
+        color="#1f77b4",
+        marker="^",
+        linestyle="--",
+        alpha=0.78,
+    )
+    _plot_line("pred_motion_xz", pred_motion_xz, color="#2ca02c", marker=".", alpha=0.78)
+    if gt_motion_xz.shape[0] > 0:
+        _plot_line(
+            "gt_motion_xz",
+            gt_motion_xz,
+            color="0.35",
+            marker="x",
+            linestyle=":",
+            alpha=0.55,
+            linewidth=1.1,
+        )
+    if input_waypoints_xz.shape[0] > 0:
+        any_points = True
+        ax.scatter(
+            input_waypoints_xz[:, 0],
+            input_waypoints_xz[:, 1],
+            s=34,
+            marker="x",
+            linewidths=1.4,
+            color="#d62728",
+            label="input_waypoints_xz",
+        )
+
+    label_frames = _sample_label_frames(input_path_xz, root_condition_xz, pred_motion_xz)
+    for idx in label_frames:
+        if idx < root_condition_xz.shape[0]:
+            ax.text(
+                root_condition_xz[idx, 0],
+                root_condition_xz[idx, 1],
+                f"c{idx}",
+                color="#1f77b4",
+                fontsize=7,
+            )
+        if idx < pred_motion_xz.shape[0]:
+            ax.text(
+                pred_motion_xz[idx, 0],
+                pred_motion_xz[idx, 1],
+                f"p{idx}",
+                color="#2ca02c",
+                fontsize=7,
+            )
+
+    for frame in boundary_frames or []:
+        idx = int(frame)
+        if 0 <= idx < root_condition_xz.shape[0]:
+            ax.scatter(
+                root_condition_xz[idx, 0],
+                root_condition_xz[idx, 1],
+                s=52,
+                marker="s",
+                facecolors="none",
+                edgecolors="#1f77b4",
+                linewidths=1.2,
+            )
+
+    if not any_points:
+        ax.text(0.5, 0.5, "no trajectory", ha="center", va="center")
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("z (m)")
+    ax.set_title(f"{case_name} path debug")
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.grid(True, alpha=0.25)
+    if any_points:
+        ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out / f"{case_name}_path_debug_xz.png", dpi=140)
+    plt.close(fig)
+
+
 def _write_runtime_case_visuals(
     output_dir,
     *,
     case_name: str,
     pred_root,
     target_root,
+    input_path_root=None,
+    root_condition_root=None,
+    input_waypoints_xyz=None,
+    gt_root=None,
     motion_263=None,
     split_tok: int | None = None,
     pred_yaw_offset: float = 0.0,
@@ -1068,6 +1315,16 @@ def _write_runtime_case_visuals(
             "pred": pred_root,
         },
         title=str(case_name),
+        boundary_frames=boundary_frames,
+    )
+    _write_path_debug_xz(
+        out,
+        case_name=case_name,
+        input_path_root=target_root if input_path_root is None else input_path_root,
+        root_condition_root=root_condition_root,
+        pred_root=pred_root,
+        input_waypoints_xyz=input_waypoints_xyz,
+        gt_root=gt_root,
         boundary_frames=boundary_frames,
     )
     if motion_263 is not None:
@@ -1134,7 +1391,7 @@ def main():
         action="store_true",
         default=False,
         help=(
-            "Run the new runtime debug matrix. Defaults to gtroot/rootrefiner; "
+            "Run the new runtime debug matrix. Defaults to gtroot/rootrefiner/rootrefiner_gtnum; "
             "pass --runtime_debug_root_sources gtroot,rootrefiner,notraj to include no-traj."
         ),
     )
@@ -1293,8 +1550,12 @@ def main():
             )
             seed_everything(args.seed)
             variant_root_refiner = (
-                root_refiner_runtime if root_source == "rootrefiner" else None
+                root_refiner_runtime if root_source in _ROOT_REFINER_SOURCES else None
             )
+            force_root_refiner_num_tokens = (
+                root_source in _ROOT_REFINER_FORCE_GT_NUM_SOURCES
+            )
+            root_refiner_gt_override = _ROOT_REFINER_GT_OVERRIDE.get(root_source)
             replan_events: list[dict] = []
             root_plan_events: list[dict] = []
             kw = dict(
@@ -1323,6 +1584,8 @@ def main():
                     rotate_plan_deg=float(spec.params.get("rotate_plan_deg", 0.0)),
                     gt_motion_7d=gt_motion_7d,
                     force_no_traj=force_no_traj,
+                    force_root_refiner_num_tokens=force_root_refiner_num_tokens,
+                    root_refiner_gt_override=root_refiner_gt_override,
                     **kw,
                 )
                 target_frames = sample["feature_length"]
@@ -1425,6 +1688,13 @@ def main():
                         "turn_target_source": "runtime_debug_turn_target",
                     }
                 )
+            _add_metric_target_aliases(rec)
+            _add_root_condition_metrics(
+                rec,
+                pred_root_xyz=pr,
+                root_plan_events=root_plan_events,
+            )
+            _add_refiner_condition_aliases(rec)
             all_recs.append(rec)
             write_experiment_metrics(
                 debug_layout,
@@ -1435,6 +1705,10 @@ def main():
             )
             print(f"  ADE={rec.get('ADE', float('nan')):.4f}  FDE={rec.get('FDE', float('nan')):.4f}")
 
+            root_7d_world, num_tokens = root_plan_events_to_diagnostic_arrays(
+                root_plan_events
+            )
+            root_condition_root = root_7d_world[:, :3] if len(root_7d_world) > 0 else None
             visual_target_root = _visual_target_root_from_plan(
                 original_gt_root=gr,
                 plan_times=pt,
@@ -1449,6 +1723,10 @@ def main():
                     case_name=spec.name,
                     pred_root=pr,
                     target_root=visual_target_root,
+                    input_path_root=visual_target_root,
+                    root_condition_root=root_condition_root,
+                    input_waypoints_xyz=pp,
+                    gt_root=gr,
                     motion_263=pm,
                     split_tok=split_tok,
                     pred_yaw_offset=motion_yaw_offset,
@@ -1465,10 +1743,7 @@ def main():
                 )
                 print(f"    video: {mp4}")
 
-            root_7d_world, num_tokens = root_plan_events_to_diagnostic_arrays(
-                root_plan_events
-            )
-            if root_source in {"gtroot", "rootrefiner"} and len(root_7d_world) > 0:
+            if root_source in _ROOT_CONDITION_SOURCES and len(root_7d_world) > 0:
                 write_experiment_root_plan(
                     debug_layout,
                     root_source=root_source,
@@ -1491,34 +1766,41 @@ def main():
 
         root_diag_records = []
         for (family, parts), by_source in sorted(root_plan_cache.items()):
-            if "gtroot" not in by_source or "rootrefiner" not in by_source:
+            if "gtroot" not in by_source:
                 continue
             gt_root_7d, gt_num_tokens = by_source["gtroot"]
-            pred_root_7d, pred_num_tokens = by_source["rootrefiner"]
-            diag = compute_root_condition_diagnostics(
-                gt_root_7d,
-                pred_root_7d,
-                gt_num_tokens=gt_num_tokens,
-                pred_num_tokens=pred_num_tokens,
-            )
-            diag.update(
-                {
-                    "family": family,
-                    "parts": list(parts),
-                    "experiment": "/".join(parts) if parts else family,
-                }
-            )
-            root_diag_records.append(diag)
-            write_root_diagnostic_artifacts(
-                debug_layout,
-                family=family,
-                parts=parts,
-                metrics=diag,
-                gt_root_7d=gt_root_7d,
-                pred_root_7d=pred_root_7d,
-                gt_num_tokens=gt_num_tokens,
-                pred_num_tokens=pred_num_tokens,
-            )
+            for pred_source in sorted(_ROOT_REFINER_SOURCES):
+                if pred_source not in by_source:
+                    continue
+                pred_root_7d, pred_num_tokens = by_source[pred_source]
+                comparison = _root_diagnostic_comparison_name(pred_source)
+                diag = compute_root_condition_diagnostics(
+                    gt_root_7d,
+                    pred_root_7d,
+                    gt_num_tokens=gt_num_tokens,
+                    pred_num_tokens=pred_num_tokens,
+                )
+                diag.update(
+                    {
+                        "family": family,
+                        "parts": list(parts),
+                        "experiment": "/".join(parts) if parts else family,
+                        "comparison": comparison,
+                        "pred_root_source": pred_source,
+                    }
+                )
+                root_diag_records.append(diag)
+                write_root_diagnostic_artifacts(
+                    debug_layout,
+                    family=family,
+                    parts=parts,
+                    comparison=comparison,
+                    metrics=diag,
+                    gt_root_7d=gt_root_7d,
+                    pred_root_7d=pred_root_7d,
+                    gt_num_tokens=gt_num_tokens,
+                    pred_num_tokens=pred_num_tokens,
+                )
 
         aggregate = aggregate_runtime_records(all_recs)
         root_diag_summary = summarize_numeric_records(root_diag_records)
@@ -1598,12 +1880,14 @@ def main():
                 root_refiner_runtime if variant.use_root_refiner else None
             )
             replan_events: list[dict] = []
+            root_plan_events: list[dict] = []
             kw = dict(hl=args.history_length, nds=args.num_denoise_steps,
                       hz=args.traj_horizon_tokens, tdt=args.token_dt,
                       wpdt=args.waypoint_dt, fps=args.motion_fps,
                       condition_path=variant.condition_path,
                       root_refiner_runtime=variant_root_refiner,
                       replan_events=replan_events,
+                      root_plan_events=root_plan_events,
                       force_no_traj=variant.force_no_traj)
             visual_target_root = None
             motion_yaw_offset = 0.0
@@ -1731,9 +2015,20 @@ def main():
             rec["rootplan_replan_sources"] = [
                 str(event.get("source", "")) for event in replan_events
             ]
+            _add_metric_target_aliases(rec)
+            _add_root_condition_metrics(
+                rec,
+                pred_root_xyz=pr,
+                root_plan_events=root_plan_events,
+            )
+            _add_refiner_condition_aliases(rec)
             all_recs.append(rec)
             print(f"  ADE={rec.get('ADE', float('nan')):.4f}  FDE={rec.get('FDE', float('nan')):.4f}")
 
+            root_7d_world, _num_tokens = root_plan_events_to_diagnostic_arrays(
+                root_plan_events
+            )
+            root_condition_root = root_7d_world[:, :3] if len(root_7d_world) > 0 else None
             _pm, _pr, _gr = pm, pr, visual_target_root
             _split = 15 if case.suite == "turn" else None
 
@@ -1743,6 +2038,10 @@ def main():
                     case_name=display_case_name,
                     pred_root=_pr,
                     target_root=_gr,
+                    input_path_root=_gr,
+                    root_condition_root=root_condition_root,
+                    input_waypoints_xyz=pp,
+                    gt_root=gr,
                     motion_263=_pm,
                     split_tok=_split,
                     pred_yaw_offset=motion_yaw_offset,
@@ -1751,6 +2050,8 @@ def main():
                     for name in (
                         f"{display_case_name}_plot_world_xz.png",
                         f"{display_case_name}_plot_yaw.png",
+                        f"{display_case_name}_path_debug_xz.png",
+                        f"{display_case_name}_path_debug_xz.npz",
                     ):
                         src = os.path.join(pdir, name)
                         if os.path.exists(src):

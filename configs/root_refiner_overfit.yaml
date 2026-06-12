@@ -1,0 +1,68 @@
+# RootRefiner 16-sample tiny overfit config
+# Purpose:
+#   Verify RootRefiner can overfit a tiny fixed subset.
+#   This is NOT the final training config.
+
+model:
+  d_model: 256
+  n_layers: 6
+  n_heads: 8
+  ff_dim: 1024
+  dropout: 0.0
+  max_tokens: 49
+  min_tokens: 4
+  frames_per_token: 4
+  n_path: 64
+  n_hist: 20
+  text_emb_dim: 4096
+
+canonicalization:
+  mode: b_full
+  anchor: first_effective_frame
+  full_plan_valid_history_frames: 1
+
+training:
+  batch_size: 64
+  val_batch_size: 32
+  lr: 1.0e-4
+  optimizer: adamw
+  weight_decay: 0.0
+  total_steps: 10000
+  sampling_mode_full_ratio: 1.0
+  gradient_clip_val: 1.0
+  num_workers: 0
+
+loss:
+  heading_form: cosine
+
+loss_weights:
+  num_token: 1.0
+  xyz: 5.0
+  heading: 1.0
+  fwd_delta: 0.5
+  yaw_delta: 0.5
+  smoothness: 0.2
+
+text_encoder:
+  type: precomputed_t5_pool
+  precomputed_text_emb_path: ${data.raw_data_dir}/HumanML3D/t5_text_embeddings.pt
+  pooling: mean
+  share_with: ldf
+  freeze: true
+  debug_stub: false
+
+data:
+  raw_data_dir: /data1/yuankai/text2Motion/FloodDiffusion/raw_data
+  dataset: humanml3d
+  train_split_file: train.txt
+  val_split_file: val.txt
+  feature_path: new_joint_vecs
+  text_path: texts
+  normalize: true
+  stats_dir: deps/refiner_stats
+
+path_aug:
+  trim_prob: 0.0
+  trim_max_frames: 0
+  sparse_prob: 0.0
+  sparse_range: [3, 8]

@@ -21,6 +21,10 @@ from utils.root_plan import RootPlan
 from utils.token_frame import num_frames_for_tokens
 
 
+def _state_dict_has_pace_duration(state_dict) -> bool:
+    return any(str(key).startswith("refiner.pace_head.") for key in state_dict.keys())
+
+
 class RootRefinerRuntime:
     def __init__(
         self,
@@ -70,12 +74,15 @@ class RootRefinerRuntime:
         module = RootRefinerLightningModule(cfg)
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         state_dict = ckpt.get("state_dict", ckpt)
+        has_pace_duration = _state_dict_has_pace_duration(state_dict)
         try:
             module.load_state_dict(state_dict, strict=strict)
         except RuntimeError:
             if strict:
                 raise
             module.load_state_dict(state_dict, strict=False)
+        if not has_pace_duration and hasattr(module.refiner, "use_pace_duration"):
+            module.refiner.use_pace_duration = False
 
         data_cfg = cfg.get("data", {}) or {}
         cm_mean = cm_std = cm_norm_idx = None
@@ -169,9 +176,19 @@ class RootRefinerRuntime:
             - self.pf_mean.to(device=path_features.device, dtype=path_features.dtype)
         ) / self.pf_std.to(device=path_features.device, dtype=path_features.dtype)
 
+    def _default_root_height(self):
+        for stats in (self.cm_mean, self.wp_mean):
+            if stats is None or int(stats.numel()) <= 1:
+                continue
+            return stats.to(device=self.device, dtype=torch.float32)[1]
+        return None
+
     def _history_anchor_only(self):
         n_hist = int(self.refiner.n_hist)
         hist = torch.zeros(n_hist, 5, device=self.device, dtype=torch.float32)
+        default_y = self._default_root_height()
+        if default_y is not None:
+            hist[-1, 1] = default_y
         hist[-1, 3] = 1.0
         hist_mask = torch.zeros(n_hist, device=self.device, dtype=torch.bool)
         hist_mask[-1] = True
@@ -220,6 +237,7 @@ class RootRefinerRuntime:
         anchor_state,
         token_dt: float,
         history_motion_world_5d=None,
+        forced_num_tokens: int | None = None,
     ) -> RootPlan:
         points = torch.as_tensor(
             plan.points_xyz, device=self.device, dtype=torch.float32
@@ -262,6 +280,14 @@ class RootRefinerRuntime:
         )
         text_emb = self.text_encoder.encode([str(text)], device=self.device)
 
+        forced_num_tokens_t = None
+        if forced_num_tokens is not None:
+            forced_num_tokens_t = torch.as_tensor(
+                [int(forced_num_tokens)],
+                dtype=torch.long,
+                device=self.device,
+            )
+
         out = self.refiner(
             text_emb=text_emb,
             path=path,
@@ -274,7 +300,7 @@ class RootRefinerRuntime:
             history_motion=history_motion,
             history_mask=history_mask,
             offset_start_frames=torch.zeros(1, dtype=torch.long, device=self.device),
-            num_tokens=None,
+            num_tokens=forced_num_tokens_t,
         )
 
         used_tokens = int(out["used_num_tokens"][0].detach().cpu().item())
@@ -298,7 +324,7 @@ class RootRefinerRuntime:
             anchor_commit_idx=int(anchor_state.commit_idx),
             anchor_world_xz=anchor_xz,
             anchor_world_yaw=anchor_yaw,
-            source="root_refiner",
+            source="root_refiner_gtnum" if forced_num_tokens is not None else "root_refiner",
         )
 
 

@@ -1,24 +1,10 @@
-# RootRefiner real training config.
-#
-# This config uses precomputed semantic T5 embeddings and normalized 5D root
-# targets. It is the default starting point for real RootRefiner runs.
-#
-# Prereqs on the training box:
-#   1. tools/pretokenize_t5_text.py has produced the T5 cache at
-#      text_encoder.precomputed_text_emb_path.
-#   2. scripts/compute_5d_stats.py has populated data.stats_dir.
-#
-# Hard constraints (same as the debug config): canonicalization.mode=b_full +
-# anchor=first_effective_frame; full_plan_valid_history_frames=1;
-# loss_weights uses fwd_delta/yaw_delta (per-frame deltas, not m/s).
-
-exp_name: root_refiner        # used in the wandb run name
-seed: 1234                    # torch + dataset-aug RNG seed (pl.seed_everything)
-debug: false                  # false → wandb ON (real run); true → wandb OFF (smoke)
+exp_name: root_refiner_pace_stream_base
+seed: 1234
+debug: false
 train: true
-deterministic: false          # true = bit-reproducible (slower)
+deterministic: false
 save_dir: ./outputs
-resume_ckpt:               # path to resume from; empty = fresh run
+resume_ckpt:
 
 logger:
   wandb:
@@ -26,19 +12,21 @@ logger:
     project: "${refiner_wandb_info.project}"
     entity: "${wandb_info.entity}"
 
-trainer:                      # Lightning Trainer kwargs (mirrors ldf.yaml.trainer)
-  max_steps: 2000000
-  accelerator: auto           # ldf uses gpu; auto stays host-portable
-  devices: [0,1,2,3]
+trainer:
+  max_steps: 200000
+  accelerator: auto
+  devices: [0, 1, 2, 3]
   log_every_n_steps: 50
-  precision: bf16-mixed       # matches ldf; auto-downgraded to 32-true on CPU hosts
+  precision: bf16-mixed
   gradient_clip_val: 1.0
 
-validation:                   # val + checkpoint cadence (mirrors ldf.yaml.validation)
-  validation_steps: 5000      # step-based val cadence (Trainer val_check_interval)
-  save_every_n_steps: 5000    # periodic ModelCheckpoint cadence
+validation:
+  validation_steps: 1000
+  save_every_n_steps: 1000
   save_top_k: -1
+  save_last: true
   eval_modes: [groundtruth_duration, pred_duration]
+
   suites:
     - name: full_dense_max
       mode_policy: full
@@ -46,18 +34,23 @@ validation:                   # val + checkpoint cadence (mirrors ldf.yaml.valid
       horizon_policy: max
       path_condition_policy: dense_path
       offset_start_enabled: false
+      offset_start_prob: 0.0
+
     - name: sliding_dense_random
       mode_policy: sliding
       full_plan_ratio: 0.0
       horizon_policy: random
       path_condition_policy: dense_path
       offset_start_enabled: false
+      offset_start_prob: 0.0
+
     - name: sliding_dense_max
       mode_policy: sliding
       full_plan_ratio: 0.0
       horizon_policy: max
       path_condition_policy: dense_path
       offset_start_enabled: false
+      offset_start_prob: 0.0
 
 model:
   target: models.root_refiner.RootRefiner
@@ -69,21 +62,26 @@ model:
     n_layers_token: 3
     n_heads: 8
     ff_dim: 1024
-    dropout: 0.2
+    dropout: 0.1
+
     max_tokens: 49
-    min_tokens: 10
+    min_tokens: 4
     frames_per_token: 4
+
     n_path: 64
     n_hist: 20
-    text_emb_dim: 4096          # precomputed T5 cache text_dim
+    text_emb_dim: 4096
     path_features_dim: 5
-    decoder_type: path_cond     # path_cond | simple
-    decoder_width: 512          # PathCondFrameDecoder hidden width
-    decoder_path_cond_dim: 6    # [path_x, path_z, tan_x, tan_z, horizon_prog, grid_prog]
-    decoder_token_res_depth: 2  # token-grid ResBlocks
-    decoder_frame_res_depth: 4  # frame-grid dilated ResBlocks (repeated path cond)
+
+    decoder_type: path_cond
+    decoder_width: 512
+    decoder_path_cond_dim: 6
+    decoder_token_res_depth: 2
+    decoder_frame_res_depth: 4
     decoder_dilation_growth_rate: 2
-    decoder_dropout: 0.15
+    decoder_dropout: 0.1
+
+    pace_text_dim: 32
 
 canonicalization:
   mode: b_full
@@ -97,28 +95,36 @@ optimizer:
     weight_decay: 0.01
 
 lr_scheduler:
-  target:
-  params: {}
+  target: diffusers.optimization.get_cosine_schedule_with_warmup
+  interval: step
+  frequency: 1
+  params:
+    num_warmup_steps: 5000
+    num_training_steps: ${trainer.max_steps}
 
 loss:
   heading_form: cosine
-  ordinal_sigma: 1.0         # duration soft-label bandwidth
+  ordinal_sigma: 1.0
 
 loss_weights:
   pace: 0.5
-  num_token: 0.2
+
+  # classification head 只作为辅助对照，不再作为主 duration planner
+  num_token: 0.3
   num_token_soft: 0.02
+
+  # 第一轮只验证 xyz/head + pace，不混入 dynamics loss
   xyz: 5.0
   heading: 1.0
-  fwd_delta: 0.5
-  yaw_delta: 0.5
-  path_control: 0.0              # enable after basic waypoint fitting is stable
-  smoothness: 0.005             # enable (0.005~0.01) only for ablation / fine-tune
+  fwd_delta: 0.0
+  yaw_delta: 0.0
+  path_control: 0.0
+  smoothness: 0.0
 
 text_encoder:
   type: precomputed_t5_pool
   precomputed_text_emb_path: ${data.raw_data_dir}/HumanML3D/t5_text_embeddings.pt
-  pooling: mean               # mean | first
+  pooling: mean
   share_with: ldf
   freeze: true
   debug_stub: false
@@ -130,29 +136,35 @@ data:
   val_bs: 64
   test_bs: 64
   num_workers: 4
+
   raw_data_dir: /data1/yuankai/text2Motion/FloodDiffusion/raw_data
   dataset: humanml3d
   train_split_file: train.txt
   val_split_file: val.txt
   feature_path: new_joint_vecs
   text_path: texts
+
   normalize: true
   stats_dir: deps/refiner_stats
+
   path_feature_stats_dir: null
 
 sampling:
-  full_plan_ratio: 0.5
-  horizon_policy: random       # random | max
+  full_plan_ratio: 0.3
+  horizon_policy: random
+
   path_condition:
-    policy: mixed              # mixed | dense_path | sparse_path | goal_point
+    policy: mixed
     ratios:
-      dense_path: 0.5
-      sparse_path: 0.3
-      goal_point: 0.2
+      dense_path: 1.0
+      sparse_path: 0.0
+      goal_point: 0.0
+
     offset_start:
-      enabled: true
-      prob: 0.3
-      max_frames: 40
-      apply_to: [dense_path, sparse_path]
+      enabled: false
+      prob: 0.0
+      max_frames: 0
+      apply_to: []
+
     sparse_path:
       point_range: [3, 8]

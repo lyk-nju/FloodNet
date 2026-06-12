@@ -86,6 +86,17 @@ def test_root_refiner_inference_uses_predicted_duration():
     assert out["used_num_tokens"].max() <= model.max_tokens
 
 
+def test_root_refiner_can_disable_pace_duration_for_legacy_checkpoints():
+    model = _model()
+    model.use_pace_duration = False
+    inputs = _inputs(model)
+
+    out = model(**inputs)
+
+    assert torch.equal(out["pred_num_tokens"], out["pred_num_tokens_cls"])
+    assert torch.equal(out["used_num_tokens"], out["pred_num_tokens_cls"])
+
+
 def test_path_control_mask_changes_condition_encoding():
     model = _model().eval()
     inputs = _inputs(model)

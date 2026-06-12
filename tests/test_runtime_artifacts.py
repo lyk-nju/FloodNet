@@ -56,6 +56,18 @@ def test_runtime_layout_builds_root_diagnostic_paths(tmp_path: Path):
         layout.root_diagnostic_dir("turn", "delay", "delay_020")
         == layout.run_dir / "root_diagnostics" / "turn" / "delay" / "delay_020" / "gtroot_vs_rootrefiner"
     )
+    assert (
+        layout.root_diagnostic_dir(
+            "rotation",
+            "rot_090",
+            comparison="gtroot_vs_rootrefiner_gtnum",
+        )
+        == layout.run_dir
+        / "root_diagnostics"
+        / "rotation"
+        / "rot_090"
+        / "gtroot_vs_rootrefiner_gtnum"
+    )
 
 
 def test_runtime_layout_rejects_empty_path_parts(tmp_path: Path):
@@ -190,6 +202,7 @@ def test_write_root_diagnostic_artifacts_writes_metrics_and_npz(tmp_path: Path):
         layout,
         family="rotation",
         parts=("rot_090",),
+        comparison="gtroot_vs_rootrefiner_gtnum",
         metrics={"xyz_ADE": 1.0},
         gt_root_7d=gt,
         pred_root_7d=pred,
@@ -197,7 +210,11 @@ def test_write_root_diagnostic_artifacts_writes_metrics_and_npz(tmp_path: Path):
         pred_num_tokens=3,
     )
 
-    expected = layout.root_diagnostic_dir("rotation", "rot_090")
+    expected = layout.root_diagnostic_dir(
+        "rotation",
+        "rot_090",
+        comparison="gtroot_vs_rootrefiner_gtnum",
+    )
     assert out_dir == expected
     assert json.loads((expected / "metrics.json").read_text())["xyz_ADE"] == 1.0
     arrays = np.load(expected / "root_plans.npz")

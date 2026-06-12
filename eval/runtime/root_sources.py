@@ -19,6 +19,22 @@ ROOT_SOURCE_ALIASES = {
     "root_refiner_7d": "rootrefiner",
     "rootrefiner_7d_ldf": "rootrefiner",
     "root_refiner_7d_ldf": "rootrefiner",
+    "rootrefiner_gtnum": "rootrefiner_gtnum",
+    "root_refiner_gtnum": "rootrefiner_gtnum",
+    "rootrefiner_7d_gtnum": "rootrefiner_gtnum",
+    "root_refiner_7d_gtnum": "rootrefiner_gtnum",
+    "rootrefiner_gtxyz": "rootrefiner_gtxyz",
+    "root_refiner_gtxyz": "rootrefiner_gtxyz",
+    "rootrefiner_7d_gtxyz": "rootrefiner_gtxyz",
+    "root_refiner_7d_gtxyz": "rootrefiner_gtxyz",
+    "rootrefiner_gtheading": "rootrefiner_gtheading",
+    "root_refiner_gtheading": "rootrefiner_gtheading",
+    "rootrefiner_7d_gtheading": "rootrefiner_gtheading",
+    "root_refiner_7d_gtheading": "rootrefiner_gtheading",
+    "rootrefiner_gtprogress": "rootrefiner_gtprogress",
+    "root_refiner_gtprogress": "rootrefiner_gtprogress",
+    "rootrefiner_7d_gtprogress": "rootrefiner_gtprogress",
+    "root_refiner_7d_gtprogress": "rootrefiner_gtprogress",
     "notraj": "notraj",
     "no_traj": "notraj",
     "no_traj_ldf": "notraj",
@@ -47,6 +63,69 @@ ROOT_SOURCE_METADATA = {
             "turn": "rootrefiner_7d",
         },
         "description": "RootRefiner-predicted 7D root condition passed to LDF.",
+        "requires_root_refiner": True,
+        "passes_root_condition": True,
+    },
+    "rootrefiner_gtnum": {
+        "root_source": "rootrefiner_gtnum",
+        "condition_source": "rootrefiner_7d_gtnum",
+        "family_condition_sources": {
+            "web_stream": "rootrefiner_7d_gtnum",
+            "rotation": "rootrefiner_7d_gtnum",
+            "turn": "unsupported",
+        },
+        "description": (
+            "RootRefiner-predicted 7D root condition with num_tokens "
+            "teacher-forced from the GT/sample duration."
+        ),
+        "requires_root_refiner": True,
+        "passes_root_condition": True,
+    },
+    "rootrefiner_gtxyz": {
+        "root_source": "rootrefiner_gtxyz",
+        "condition_source": "rootrefiner_7d_gtxyz",
+        "family_condition_sources": {
+            "web_stream": "rootrefiner_7d_gtxyz",
+            "rotation": "rootrefiner_7d_gtxyz",
+            "turn": "unsupported",
+        },
+        "description": (
+            "RootRefiner-predicted 7D root condition with num_tokens and "
+            "xyz channels teacher-forced from GT motion 7D; heading is kept "
+            "from RootRefiner and deltas are recomputed."
+        ),
+        "requires_root_refiner": True,
+        "passes_root_condition": True,
+    },
+    "rootrefiner_gtheading": {
+        "root_source": "rootrefiner_gtheading",
+        "condition_source": "rootrefiner_7d_gtheading",
+        "family_condition_sources": {
+            "web_stream": "rootrefiner_7d_gtheading",
+            "rotation": "rootrefiner_7d_gtheading",
+            "turn": "unsupported",
+        },
+        "description": (
+            "RootRefiner-predicted 7D root condition with num_tokens and "
+            "heading channels teacher-forced from GT motion 7D; xyz is kept "
+            "from RootRefiner and deltas are recomputed."
+        ),
+        "requires_root_refiner": True,
+        "passes_root_condition": True,
+    },
+    "rootrefiner_gtprogress": {
+        "root_source": "rootrefiner_gtprogress",
+        "condition_source": "rootrefiner_7d_gtprogress",
+        "family_condition_sources": {
+            "web_stream": "rootrefiner_7d_gtprogress",
+            "rotation": "rootrefiner_7d_gtprogress",
+            "turn": "unsupported",
+        },
+        "description": (
+            "RootRefiner-predicted 7D root condition with num_tokens "
+            "teacher-forced from the GT/sample duration, then retimed along "
+            "the RootRefiner path by GT motion arc-progress."
+        ),
         "requires_root_refiner": True,
         "passes_root_condition": True,
     },

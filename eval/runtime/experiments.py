@@ -10,12 +10,22 @@ import numpy as np
 from eval.runtime.root_sources import normalize_root_source
 
 
-DEFAULT_ROOT_SOURCES: tuple[str, ...] = ("gtroot", "rootrefiner")
+DEFAULT_ROOT_SOURCES: tuple[str, ...] = ("gtroot", "rootrefiner", "rootrefiner_gtnum")
 DEFAULT_ROTATION_DEGREES: tuple[int, ...] = (10, 20, 30, 40, 50, 60, 70, 80, 90)
 DEFAULT_TURN_DELAY_TOKENS: tuple[int, ...] = (5, 10, 20)
 DEFAULT_TURN_BLEND_TOKENS: tuple[int, ...] = (2, 4, 8)
 DEFAULT_TURN_ANGLE_DEG = 30.0
 DEFAULT_TURN_BLEND_DELAY_TOKENS = 20
+ROOT_REFINER_ORACLE_DURATION_SOURCES = {
+    "rootrefiner_gtnum",
+    "rootrefiner_gtxyz",
+    "rootrefiner_gtheading",
+    "rootrefiner_gtprogress",
+}
+ROOT_REFINER_SOURCES = {
+    "rootrefiner",
+    *ROOT_REFINER_ORACLE_DURATION_SOURCES,
+}
 
 
 @dataclass(frozen=True)
@@ -51,7 +61,8 @@ def build_default_runtime_experiments(
     """Build the default web-demo-equivalent runtime debug matrix."""
 
     specs: list[RuntimeExperimentSpec] = []
-    for root_source in root_sources:
+    for raw_root_source in root_sources:
+        root_source = normalize_root_source(raw_root_source)
         specs.append(
             RuntimeExperimentSpec(
                 root_source=root_source,
@@ -76,6 +87,9 @@ def build_default_runtime_experiments(
                     params={"rotate_plan_deg": float(angle)},
                 )
             )
+
+        if root_source in ROOT_REFINER_ORACLE_DURATION_SOURCES:
+            continue
 
         specs.append(
             RuntimeExperimentSpec(
@@ -142,7 +156,7 @@ def runtime_debug_mode_for_source(root_source: str) -> tuple[str, bool, bool]:
     source = normalize_root_source(root_source)
     if source == "gtroot":
         return "real_gtroot", True, False
-    if source == "rootrefiner":
+    if source in ROOT_REFINER_SOURCES:
         return "real_route", False, False
     if source == "notraj":
         return "real_no_traj", False, True
@@ -151,15 +165,21 @@ def runtime_debug_mode_for_source(root_source: str) -> tuple[str, bool, bool]:
 
 def runtime_debug_turn_plan_policy(family: str, *, root_source: str) -> str:
     source = normalize_root_source(root_source)
-    if str(family) == "turn" and source != "notraj":
+    if (
+        str(family) == "turn"
+        and source != "notraj"
+        and source not in ROOT_REFINER_ORACLE_DURATION_SOURCES
+    ):
         return "composed_rootplan"
     return "none"
 
 
 def runtime_debug_root_refiner_history_policy(root_source: str, *, family: str) -> str:
     source = normalize_root_source(root_source)
-    if source != "rootrefiner":
+    if source not in ROOT_REFINER_SOURCES:
         return "none"
+    if source in ROOT_REFINER_ORACLE_DURATION_SOURCES:
+        return "anchor_only_initial"
     if str(family) == "turn":
         return "generated_history"
     return "anchor_only_initial"

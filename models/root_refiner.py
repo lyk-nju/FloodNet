@@ -327,6 +327,7 @@ class RootRefiner(nn.Module):
         self.text_emb_dim = text_emb_dim
         self.path_features_dim = path_features_dim
         self.max_frames = num_frames_for_tokens(max_tokens, frames_per_token)
+        self.use_pace_duration = True
 
         # Split the layer budget into cond / token stages (backward compatible:
         # absent n_layers_cond/token → split n_layers ~evenly, e.g. 6 → 3 + 3).
@@ -517,7 +518,11 @@ class RootRefiner(nn.Module):
         pred_num_tokens_pace = (
             1.0 + pred_log_pace.clamp(-8.0, 8.0).exp() * effective_length
         ).round().long().clamp(self.min_tokens, self.max_tokens)
-        pred_num_tokens = pred_num_tokens_pace
+        pred_num_tokens = (
+            pred_num_tokens_pace
+            if bool(getattr(self, "use_pace_duration", True))
+            else pred_num_tokens_cls
+        )
         # Teacher-force the horizon whenever a num_tokens is PROVIDED — training,
         # validation, AND oracle-duration eval — and fall back to the model's own
         # expected-round duration when it is absent (real inference / normal
