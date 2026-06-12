@@ -38,5 +38,4 @@ exec "$PY" train_ldf.py --config configs/ldf.yaml --override \
   "body_aux_loss.enabled=true" \
   "anchor_canonicalize.enabled=true" \
   "history_corruption.enabled=true" \
-  "history_corruption.z_stats_dir=${Z_STATS_DIR}" \
-  "horizon_sim.enabled=true"
+  "history_corruption.z_stats_dir=${Z_STATS_DIR}"

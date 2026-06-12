@@ -167,9 +167,12 @@ model:
 stream_training:
     enabled: true
     context_tokens: 30
-    min_history_tokens: 8
-    horizon_tokens: 20
-    sample_policy: variable_history
+    window_sampling:
+        enabled: true
+        history_tokens_min: 0
+        history_tokens_max: auto
+        horizon_tokens_min: 5
+        horizon_tokens_max: 25
     anchor_move_in_rollout: false
     latent_source: precomputed_slice
     motion_aux_loss: full_prefix
@@ -200,18 +203,6 @@ anchor_canonicalize:
     enabled: true
     source: gt_root      # anchor pose source (v1: read from traj_cond_7d itself)
     mode: full           # full local-frame canonical (translate + rotate)
-
-
-horizon_sim:
-    enabled: false
-    unit: token
-    inference_horizon_tokens: 20       # inference horizon (token-level); frame count
-    early_min_horizon_tokens: 20       # early lower bound (>= inference)
-    early_max_horizon_ratio: 1.0       # early upper = clip_tokens * ratio
-    late_min_horizon_tokens: 10        # late short-horizon lower bound
-    late_max_horizon_tokens: 20        # late upper bound
-    p_exact_inference_horizon: 0.5     # late: 50% exact = 20, else U[10,20]
-    warmup_ratio: 0.5                  # first 50% of steps = early phase
 
 
 history_corruption:

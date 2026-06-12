@@ -14,7 +14,7 @@ fine-tune; see docs/TODO.md T_B_11):
   - one SF step: total loss + body_aux/* (root_xz/root_y/heading/fwd_delta/
     yaw_delta) are finite and decreasing;
   - anchor_canonicalize/valid_frac ~ 1.0 on normal-length clips;
-  - history_corruption/applied and horizon_sim/horizon_tokens log sane values;
+  - history_corruption/applied and stream_training/runtime_horizon_tokens log sane values;
   - traj_encoder_in_dim=7 with body_aux_loss.enabled=false raises at startup.
 """
 

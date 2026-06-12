@@ -32,9 +32,11 @@ def test_all_new_sections_present_and_readable():
     # T_B_03
     assert cfg.history_corruption.enabled is True
     assert "curriculum" in cfg.history_corruption
-    # T_B_04
-    assert cfg.horizon_sim.enabled is True
-    assert cfg.horizon_sim.inference_horizon_tokens == 20
+    # Stream-training v2: horizon sampling lives under stream_training.window_sampling.
+    assert cfg.stream_training.window_sampling.enabled is True
+    assert cfg.stream_training.window_sampling.horizon_tokens_min == 5
+    assert cfg.stream_training.window_sampling.horizon_tokens_max == 25
+    assert "horizon_sim" not in cfg
     # T_B_05
     assert cfg.anchor_canonicalize.enabled is True
     assert cfg.anchor_canonicalize.mode == "full"
@@ -186,6 +188,54 @@ def test_stream_eval_rejects_negative_sample_limits():
     })
     with pytest.raises(ValueError, match="max_samples"):
         validate_stream_eval_config(cfg)
+
+
+def test_stream_training_accepts_window_sampling_auto_history():
+    cfg = OmegaConf.create({
+        "model": {
+            "params": {
+                "chunk_size": 5,
+                "self_forcing_k_schedule": [[0.0, 5]],
+                "self_forcing_stride_tokens": 1,
+            }
+        },
+        "stream_training": {
+            "enabled": True,
+            "context_tokens": 30,
+            "window_sampling": {
+                "enabled": True,
+                "history_tokens_min": 0,
+                "history_tokens_max": "auto",
+                "horizon_tokens_min": 5,
+                "horizon_tokens_max": 25,
+            },
+            "latent_source": "precomputed_slice",
+            "motion_aux_loss": "full_prefix",
+            "anchor_move_in_rollout": False,
+        },
+    })
+
+    validate_stream_training_config(cfg)
+
+
+def test_stream_training_window_sampling_rejects_invalid_horizon_range():
+    cfg = OmegaConf.create({
+        "model": {"params": {"chunk_size": 5}},
+        "stream_training": {
+            "enabled": True,
+            "context_tokens": 30,
+            "window_sampling": {
+                "enabled": True,
+                "history_tokens_min": 0,
+                "history_tokens_max": "auto",
+                "horizon_tokens_min": 25,
+                "horizon_tokens_max": 5,
+            },
+        },
+    })
+
+    with pytest.raises(ValueError, match="horizon_tokens"):
+        validate_stream_training_config(cfg)
 
 
 def test_stream_training_rejects_min_history_below_chunk_size():

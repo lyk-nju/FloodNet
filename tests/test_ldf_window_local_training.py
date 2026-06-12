@@ -281,6 +281,53 @@ def test_window_local_model_batch_crops_segmented_text_to_local_window():
     assert out["feature_text_end"] == [[1, 4]]
 
 
+def test_window_local_model_batch_v2_uses_active_left_history_and_horizon_metadata():
+    token = torch.arange(2 * 40 * 3, dtype=torch.float32).view(2, 40, 3)
+    raw = _make_motion263(batch_size=2, num_frames=200)
+    batch = {
+        "token": token,
+        "token_length": torch.tensor([40, 40]),
+        "feature": raw,
+        "feature_length": torch.tensor([200, 200]),
+        "text": ["walk", "run"],
+    }
+
+    out = build_window_local_model_batch(
+        batch,
+        context_tokens=30,
+        horizon_tokens=0,
+        window_sampling={
+            "enabled": True,
+            "history_tokens_min": 0,
+            "history_tokens_max": "auto",
+            "horizon_tokens_min": 5,
+            "horizon_tokens_max": 25,
+        },
+        chunk_size=5,
+        rollout_span=4,
+        active_left_tokens=torch.tensor([10, 0]),
+        history_tokens=torch.tensor([3, 0]),
+        sampled_horizon_tokens=torch.tensor([7, 5]),
+    )
+
+    assert out["_window_local_sample_policy"] == "active_left"
+    assert out["_window_local_latent_start_token"].tolist() == [7, 0]
+    assert out["_window_sampling_active_left_token"].tolist() == [10, 0]
+    assert out["_window_sampling_history_tokens"].tolist() == [3, 0]
+    assert out["_window_sampling_horizon_tokens"].tolist() == [7, 5]
+    assert out["_window_sampling_horizon_cap_clip"].tolist() == [31, 31]
+    assert out["_window_sampling_horizon_short_fallback"].tolist() == [False, False]
+    assert out["_window_sampling_rollout_span"] == 4
+    assert out["_window_sampling_history_tokens_max_effective"] == 21
+
+    assert out["feature_length"].tolist() == [12, 9]
+    assert out["traj_num_tokens"].tolist() == [19, 14]
+    assert torch.allclose(out["feature"][0, :12], token[0, 7:19])
+    assert torch.allclose(out["feature"][1, :9], token[1, 0:9])
+    assert torch.count_nonzero(out["feature"][0, 12:]) == 0
+    assert torch.count_nonzero(out["feature"][1, 9:]) == 0
+
+
 def test_window_local_model_batch_fills_uncovered_text_tail_with_empty_text():
     token = torch.arange(1 * 6 * 3, dtype=torch.float32).view(1, 6, 3)
     raw = _make_motion263(batch_size=1, num_frames=40)

@@ -291,7 +291,7 @@ def build_traj_frame_mask(
 
 
 def build_traj_token_mask(x: dict, seq_len: int, device, *,
-                          horizon_tokens: int | None = None,
+                          horizon_tokens: int | torch.Tensor | None = None,
                           horizon_active_end_token=0,
                           frames_per_token: int = 4,
                           traj_start_token: int | None = None):
@@ -333,7 +333,7 @@ def build_traj_token_mask(x: dict, seq_len: int, device, *,
 def _apply_horizon_mask_tokens_range(
     mask_frame: torch.Tensor,
     active_end_token,
-    horizon_tokens: int,
+    horizon_tokens: int | torch.Tensor,
     *,
     start_token_idx: int | torch.Tensor,
     frames_per_token: int,
@@ -343,7 +343,8 @@ def _apply_horizon_mask_tokens_range(
 
     per_sample_starts = _per_sample_start_tokens(start_token_idx, mask_frame.shape[0])
     active_is_batch = torch.is_tensor(active_end_token) and active_end_token.dim() > 0
-    if per_sample_starts is not None or active_is_batch:
+    horizon_is_batch = torch.is_tensor(horizon_tokens) and horizon_tokens.dim() > 0
+    if per_sample_starts is not None or active_is_batch or horizon_is_batch:
         if per_sample_starts is None:
             if torch.is_tensor(start_token_idx):
                 start = int(start_token_idx.item())
@@ -356,9 +357,14 @@ def _apply_horizon_mask_tokens_range(
                 if active_is_batch
                 else int(active_end_token)
             )
+            horizon = (
+                int(horizon_tokens[b])
+                if horizon_is_batch
+                else int(horizon_tokens)
+            )
             origin_frame = token_start_frame(start, frames_per_token)
             cutoff = (
-                token_start_frame(active_end + horizon_tokens, frames_per_token)
+                token_start_frame(active_end + horizon, frames_per_token)
                 - origin_frame
             )
             if cutoff <= 0:
@@ -370,7 +376,7 @@ def _apply_horizon_mask_tokens_range(
         start_token_idx = int(start_token_idx.item())
     origin_frame = token_start_frame(start_token_idx, frames_per_token)
     cutoff = (
-        token_start_frame(int(active_end_token) + horizon_tokens, frames_per_token)
+        token_start_frame(int(active_end_token) + int(horizon_tokens), frames_per_token)
         - origin_frame
     )
     if cutoff <= 0:
@@ -387,7 +393,7 @@ def encode_traj_batch(
     local_traj_encoder: torch.nn.Module,
     traj_encoder: torch.nn.Module,
     *,
-    horizon_tokens: int | None = None,
+    horizon_tokens: int | torch.Tensor | None = None,
     horizon_active_end_token: int = 0,
     frames_per_token: int = 4,
     return_token_mask: bool = False,

@@ -11,6 +11,7 @@ import torch
 
 from utils.motion_process import recover_root_rot_pos, root_to_traj_feats_7d
 from utils.token_frame import token_range_to_frame_slice, token_start_frame
+from utils.training.window_sampling import sample_stream_window_indices
 
 RAW_HUMANML3D_MOTION_DIM = 263
 
@@ -144,6 +145,12 @@ def build_window_local_model_batch(
     start_tokens=None,
     end_tokens=None,
     frames_per_token: int = 4,
+    window_sampling: dict | None = None,
+    chunk_size: int | None = None,
+    rollout_span: int = 0,
+    active_left_tokens=None,
+    history_tokens=None,
+    sampled_horizon_tokens=None,
 ) -> dict:
     """Build a model batch for window-local limited-history training.
 
@@ -160,93 +167,118 @@ def build_window_local_model_batch(
     token_length = _as_long_1d(
         batch["token_length"], batch_size=batch_size, device=device, name="token_length"
     )
-    sample_policy = str(sample_policy)
-    if sample_policy not in {"variable_history", "fixed_window"}:
-        raise ValueError(
-            "sample_policy must be 'variable_history' or 'fixed_window', "
-            f"got {sample_policy!r}"
-        )
     context_tokens = int(context_tokens)
-    horizon_tokens = int(horizon_tokens)
     if context_tokens <= 0:
         raise ValueError(f"context_tokens must be > 0, got {context_tokens}")
-    if horizon_tokens < 0:
-        raise ValueError(f"horizon_tokens must be >= 0, got {horizon_tokens}")
-    min_history_tokens = int(min_history_tokens)
-    if min_history_tokens <= 0:
-        raise ValueError(f"min_history_tokens must be > 0, got {min_history_tokens}")
-    if context_tokens < min_history_tokens:
-        raise ValueError(
-            "context_tokens must be >= min_history_tokens; "
-            f"got context_tokens={context_tokens}, "
-            f"min_history_tokens={min_history_tokens}"
-        )
 
-    if sample_policy == "fixed_window":
-        if end_tokens is None:
-            if bool((token_length < min_history_tokens).any()):
-                raise ValueError(
-                    "fixed_window sampling requires token_length >= "
-                    f"min_history_tokens={min_history_tokens}; "
-                    f"token_length={token_length.tolist()}"
+    ws_cfg = window_sampling or {}
+    window_sampling_enabled = bool(ws_cfg.get("enabled", False))
+    stream_sample: dict | None = None
+    if window_sampling_enabled:
+        if chunk_size is None:
+            raise ValueError("chunk_size is required when window_sampling is enabled")
+        stream_sample = sample_stream_window_indices(
+            token_length,
+            context_tokens=context_tokens,
+            chunk_size=int(chunk_size),
+            rollout_span=int(rollout_span),
+            history_tokens_min=int(ws_cfg.get("history_tokens_min", 0)),
+            history_tokens_max=ws_cfg.get("history_tokens_max", "auto"),
+            horizon_tokens_min=int(ws_cfg.get("horizon_tokens_min", 0)),
+            horizon_tokens_max=int(ws_cfg.get("horizon_tokens_max", 0)),
+            active_left_tokens=active_left_tokens,
+            history_tokens=history_tokens,
+            horizon_tokens=sampled_horizon_tokens,
+        )
+        starts = stream_sample["window_left_tokens"]
+        latent_lengths = stream_sample["latent_num_tokens"]
+        traj_token_lengths = stream_sample["traj_num_tokens"]
+        sample_policy = "active_left"
+    else:
+        sample_policy = str(sample_policy)
+        if sample_policy not in {"variable_history", "fixed_window"}:
+            raise ValueError(
+                "sample_policy must be 'variable_history' or 'fixed_window', "
+                f"got {sample_policy!r}"
+            )
+        horizon_tokens = int(horizon_tokens)
+        if horizon_tokens < 0:
+            raise ValueError(f"horizon_tokens must be >= 0, got {horizon_tokens}")
+        min_history_tokens = int(min_history_tokens)
+        if min_history_tokens <= 0:
+            raise ValueError(f"min_history_tokens must be > 0, got {min_history_tokens}")
+        if context_tokens < min_history_tokens:
+            raise ValueError(
+                "context_tokens must be >= min_history_tokens; "
+                f"got context_tokens={context_tokens}, "
+                f"min_history_tokens={min_history_tokens}"
+            )
+
+        if sample_policy == "fixed_window":
+            if end_tokens is None:
+                if bool((token_length < min_history_tokens).any()):
+                    raise ValueError(
+                        "fixed_window sampling requires token_length >= "
+                        f"min_history_tokens={min_history_tokens}; "
+                        f"token_length={token_length.tolist()}"
+                    )
+                ends = torch.stack(
+                    [
+                        torch.randint(
+                            min_history_tokens,
+                            int(token_length[b].item()) + 1,
+                            (1,),
+                            device=device,
+                        )[0]
+                        for b in range(batch_size)
+                    ]
+                ).to(dtype=torch.long)
+            else:
+                ends = _as_long_1d(
+                    end_tokens, batch_size=batch_size, device=device, name="end_tokens"
                 )
-            ends = torch.stack(
+            if bool((ends <= 0).any()):
+                raise ValueError(f"end_tokens must be > 0, got {ends.tolist()}")
+            if bool((ends > token_length).any()):
+                raise ValueError(
+                    "end_tokens must be <= token_length; "
+                    f"end_tokens={ends.tolist()}, token_length={token_length.tolist()}"
+                )
+            starts = (ends - context_tokens).clamp(min=0)
+        elif start_tokens is None:
+            max_start = (token_length - context_tokens).clamp(min=0)
+            starts = torch.stack(
                 [
-                    torch.randint(
-                        min_history_tokens,
-                        int(token_length[b].item()) + 1,
-                        (1,),
-                        device=device,
-                    )[0]
+                    torch.randint(0, int(max_start[b].item()) + 1, (1,), device=device)[0]
                     for b in range(batch_size)
                 ]
             ).to(dtype=torch.long)
         else:
-            ends = _as_long_1d(
-                end_tokens, batch_size=batch_size, device=device, name="end_tokens"
+            starts = _as_long_1d(
+                start_tokens, batch_size=batch_size, device=device, name="start_tokens"
             )
-        if bool((ends <= 0).any()):
-            raise ValueError(f"end_tokens must be > 0, got {ends.tolist()}")
-        if bool((ends > token_length).any()):
-            raise ValueError(
-                "end_tokens must be <= token_length; "
-                f"end_tokens={ends.tolist()}, token_length={token_length.tolist()}"
-            )
-        starts = (ends - context_tokens).clamp(min=0)
-    elif start_tokens is None:
-        max_start = (token_length - context_tokens).clamp(min=0)
-        starts = torch.stack(
-            [
-                torch.randint(0, int(max_start[b].item()) + 1, (1,), device=device)[0]
-                for b in range(batch_size)
-            ]
-        ).to(dtype=torch.long)
-    else:
-        starts = _as_long_1d(
-            start_tokens, batch_size=batch_size, device=device, name="start_tokens"
-        )
-    if bool((starts < 0).any()):
-        raise ValueError(f"start_tokens must be >= 0, got {starts.tolist()}")
+        if bool((starts < 0).any()):
+            raise ValueError(f"start_tokens must be >= 0, got {starts.tolist()}")
 
-    latent_lengths = torch.minimum(
-        torch.full_like(token_length, context_tokens),
-        token_length - starts,
-    )
-    if sample_policy == "fixed_window":
-        latent_lengths = ends - starts
-    if bool((latent_lengths <= 0).any()):
-        raise ValueError(
-            "window-local model batch requires at least one latent token after "
-            f"start; starts={starts.tolist()}, token_length={token_length.tolist()}"
+        latent_lengths = torch.minimum(
+            torch.full_like(token_length, context_tokens),
+            token_length - starts,
         )
-    if bool((latent_lengths < min_history_tokens).any()):
-        raise ValueError(
-            "window-local model batch produced a window shorter than "
-            "min_history_tokens; "
-            f"latent_lengths={latent_lengths.tolist()}, "
-            f"min_history_tokens={min_history_tokens}"
-        )
-    traj_token_lengths = latent_lengths + horizon_tokens
+        if sample_policy == "fixed_window":
+            latent_lengths = ends - starts
+        if bool((latent_lengths <= 0).any()):
+            raise ValueError(
+                "window-local model batch requires at least one latent token after "
+                f"start; starts={starts.tolist()}, token_length={token_length.tolist()}"
+            )
+        if bool((latent_lengths < min_history_tokens).any()):
+            raise ValueError(
+                "window-local model batch produced a window shorter than "
+                "min_history_tokens; "
+                f"latent_lengths={latent_lengths.tolist()}, "
+                f"min_history_tokens={min_history_tokens}"
+            )
+        traj_token_lengths = latent_lengths + horizon_tokens
     max_attn_len = int(traj_token_lengths.max().item())
 
     feature = token.new_zeros(batch_size, max_attn_len, latent_dim)
@@ -292,6 +324,18 @@ def build_window_local_model_batch(
     out["_window_local_latent_start_token"] = starts
     out["_window_local_latent_valid_len"] = latent_lengths
     out["_window_local_sample_policy"] = sample_policy
+    if stream_sample is not None:
+        out["_window_sampling_active_left_token"] = stream_sample["active_left_tokens"]
+        out["_window_sampling_history_tokens"] = stream_sample["history_tokens"]
+        out["_window_sampling_horizon_tokens"] = stream_sample["horizon_tokens"]
+        out["_window_sampling_horizon_cap_clip"] = stream_sample["horizon_cap_clip"]
+        out["_window_sampling_horizon_short_fallback"] = stream_sample[
+            "horizon_short_fallback"
+        ]
+        out["_window_sampling_rollout_span"] = stream_sample["rollout_span"]
+        out["_window_sampling_history_tokens_max_effective"] = (
+            stream_sample["history_tokens_max_effective"]
+        )
     return out
 
 

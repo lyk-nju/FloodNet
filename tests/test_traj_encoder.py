@@ -201,6 +201,24 @@ def test_build_traj_token_mask_supports_per_sample_start_token():
     assert torch.allclose(token_mask, torch.tensor([[1.0, 0.0], [0.0, 1.0]]))
 
 
+def test_build_traj_token_mask_supports_per_sample_horizon_tokens():
+    seq_len = 10
+    feats = torch.ones(2, num_frames_for_tokens(seq_len), 7)
+
+    token_mask = build_traj_token_mask(
+        {"traj_features": feats},
+        seq_len,
+        "cpu",
+        horizon_tokens=torch.tensor([2, 5], dtype=torch.long),
+        horizon_active_end_token=torch.tensor([1, 1], dtype=torch.long),
+    )
+
+    expected = torch.zeros(2, seq_len)
+    expected[0, :3] = 1.0
+    expected[1, :6] = 1.0
+    assert torch.equal(token_mask, expected)
+
+
 def test_encode_traj_batch_threads_traj_start_token_into_grouping():
     seq_len = 3
     feats = torch.arange(12, dtype=torch.float32).view(1, 12, 1)

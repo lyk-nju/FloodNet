@@ -74,10 +74,7 @@ def test_collect_validation_status_reports_passed_stages_and_newest_ckpt(tmp_pat
     assert status["overall"]["status"] == "passed"
     assert status["baseline"]["status"] == "present"
     assert [stage["status"] for stage in status["stages"]] == [
-        "passed",
-        "passed",
-        "passed",
-        "passed",
+        "passed" for _ in payload["stages"]
     ]
     assert status["stages"][0]["candidate_ckpt"].endswith(
         "01_smoke_latent/checkpoints/last.ckpt"

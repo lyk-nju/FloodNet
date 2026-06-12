@@ -202,18 +202,6 @@ anchor_canonicalize:
     mode: full           # full local-frame canonical (translate + rotate)
 
 
-horizon_sim:
-    enabled: false
-    unit: token
-    inference_horizon_tokens: 20       # inference horizon (token-level); frame count
-    early_min_horizon_tokens: 20       # early lower bound (>= inference)
-    early_max_horizon_ratio: 1.0       # early upper = clip_tokens * ratio
-    late_min_horizon_tokens: 10        # late short-horizon lower bound
-    late_max_horizon_tokens: 20        # late upper bound
-    p_exact_inference_horizon: 0.5     # late: 50% exact = 20, else U[10,20]
-    warmup_ratio: 0.5                  # first 50% of steps = early phase
-
-
 history_corruption:
     enabled: true
     apply_prob: null            # null = use curriculum below; a float skips curriculum

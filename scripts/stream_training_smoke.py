@@ -39,6 +39,10 @@ class SmokeRunConfig:
     context_tokens: int = 30
     min_history_tokens: int = 8
     horizon_tokens: int = 20
+    history_tokens_min: int = 0
+    history_tokens_max: str = "auto"
+    horizon_tokens_min: int = 5
+    horizon_tokens_max: int = 25
     z_stats_dir: str = ""
     train_split: str = ""
     val_split: str = ""
@@ -96,38 +100,28 @@ def build_validation_plan(base: SmokeRunConfig) -> list[ValidationPlanEntry]:
     stages = [
         (
             "01_smoke_latent",
-            "one-step or short smoke with variable-history latent-only loss",
-            "variable_history",
+            "one-step or short smoke with active-left window sampling and latent-only loss",
             "latent_only",
         ),
         (
             "02_overfit_latent",
-            "small overfit with variable-history latent-only loss",
-            "variable_history",
+            "small overfit with active-left window sampling and latent-only loss",
             "latent_only",
         ),
         (
             "03_overfit_full_prefix",
-            "small overfit with full-prefix motion auxiliary loss",
-            "variable_history",
+            "small overfit with active-left window sampling and full-prefix motion auxiliary loss",
             "full_prefix",
-        ),
-        (
-            "04_smoke_fixed_window",
-            "fixed-window sampler smoke with latent-only loss",
-            "fixed_window",
-            "latent_only",
         ),
     ]
     out = []
-    for stage, description, sample_policy, motion_aux_loss in stages:
+    for stage, description, motion_aux_loss in stages:
         out.append(
             ValidationPlanEntry(
                 stage=stage,
                 description=description,
                 config=replace(
                     base,
-                    sample_policy=sample_policy,
                     motion_aux_loss=motion_aux_loss,
                     exp_name=f"{base.exp_name}_{stage}",
                     output_dir=str(Path(base.output_dir) / stage),
@@ -139,11 +133,6 @@ def build_validation_plan(base: SmokeRunConfig) -> list[ValidationPlanEntry]:
 
 
 def build_train_command(cfg: SmokeRunConfig) -> list[str]:
-    if cfg.sample_policy not in {"variable_history", "fixed_window"}:
-        raise ValueError(
-            "sample_policy must be 'variable_history' or 'fixed_window', "
-            f"got {cfg.sample_policy!r}"
-        )
     if cfg.motion_aux_loss not in {"latent_only", "full_prefix", "disabled"}:
         raise ValueError(
             "motion_aux_loss must be 'latent_only', 'full_prefix', or "
@@ -178,13 +167,14 @@ def build_train_command(cfg: SmokeRunConfig) -> list[str]:
         "model.params.self_forcing_enabled=true",
         "stream_training.enabled=true",
         f"stream_training.context_tokens={int(cfg.context_tokens)}",
-        f"stream_training.min_history_tokens={int(cfg.min_history_tokens)}",
-        f"stream_training.horizon_tokens={int(cfg.horizon_tokens)}",
-        f"stream_training.sample_policy={cfg.sample_policy}",
+        "stream_training.window_sampling.enabled=true",
+        f"stream_training.window_sampling.history_tokens_min={int(cfg.history_tokens_min)}",
+        f"stream_training.window_sampling.history_tokens_max={cfg.history_tokens_max}",
+        f"stream_training.window_sampling.horizon_tokens_min={int(cfg.horizon_tokens_min)}",
+        f"stream_training.window_sampling.horizon_tokens_max={int(cfg.horizon_tokens_max)}",
         "stream_training.anchor_move_in_rollout=false",
         "stream_training.latent_source=precomputed_slice",
         f"stream_training.motion_aux_loss={cfg.motion_aux_loss}",
-        "horizon_sim.enabled=true",
         "history_corruption.enabled=true",
         "anchor_canonicalize.enabled=true",
         "body_aux_loss.enabled=true",
@@ -446,6 +436,7 @@ def parse_args(argv: list[str] | None = None) -> SmokeRunConfig:
         "--sample-policy",
         choices=("variable_history", "fixed_window"),
         default="variable_history",
+        help="Deprecated legacy option; stream-training v2 always uses active-left window sampling.",
     )
     parser.add_argument(
         "--motion-aux-loss",
@@ -455,6 +446,10 @@ def parse_args(argv: list[str] | None = None) -> SmokeRunConfig:
     parser.add_argument("--context-tokens", type=int, default=30)
     parser.add_argument("--min-history-tokens", type=int, default=8)
     parser.add_argument("--horizon-tokens", type=int, default=20)
+    parser.add_argument("--history-tokens-min", type=int, default=0)
+    parser.add_argument("--history-tokens-max", default="auto")
+    parser.add_argument("--horizon-tokens-min", type=int, default=5)
+    parser.add_argument("--horizon-tokens-max", type=int, default=25)
     parser.add_argument("--z-stats-dir", default="")
     parser.add_argument("--train-split", default="")
     parser.add_argument("--val-split", default="")
@@ -466,7 +461,7 @@ def parse_args(argv: list[str] | None = None) -> SmokeRunConfig:
         action="store_true",
         help=(
             "Print or run the standard validation matrix: latent smoke, "
-            "latent overfit, full-prefix overfit, and fixed-window smoke."
+            "latent overfit, and full-prefix overfit."
         ),
     )
     parser.add_argument(

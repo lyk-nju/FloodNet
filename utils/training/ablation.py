@@ -6,7 +6,7 @@ isolate each gap-closure subitem:
 
     all_on               5 subitems on, 7D
     no_corruption        history corruption off (T_B_03 / §2.1)
-    no_horizon_sim       horizon simulation off (T_B_04 / §2.2)
+    no_horizon_sim       variable horizon off: fixed 20-token horizon (T_B_04 / §2.2)
     no_anchor_canonical  body-window canonicalize off → absolute world xyz (T_B_05 / §2.3)
     no_heading_loss      heading term zeroed in body aux loss (T_B_06 / §2.4)
 
@@ -33,7 +33,11 @@ def body_ablation_overrides() -> dict[str, dict]:
     return {
         "all_on": dict(base),
         "no_corruption": {**base, "history_corruption.enabled": False},
-        "no_horizon_sim": {**base, "horizon_sim.enabled": False},
+        "no_horizon_sim": {
+            **base,
+            "stream_training.window_sampling.horizon_tokens_min": 20,
+            "stream_training.window_sampling.horizon_tokens_max": 20,
+        },
         "no_anchor_canonical": {**base, "anchor_canonicalize.enabled": False},
         # body_aux_loss can't be disabled in 7D (the heading channels need
         # supervision — _check_preconditions raises); ablate by zeroing the

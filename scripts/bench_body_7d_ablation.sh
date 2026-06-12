@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # T_B_12: body 7D fine-tune ablation sweep + predroot stream benchmark.
 #
-# RUN ON THE DATA MACHINE (needs data + VAE + GPU). For each of the 6 ablations
-# (all_on, no_corruption, no_horizon_sim, no_anchor_canonical, no_heading_loss,
-# no_7d) it (1) fine-tunes a variant from the base ckpt with that ablation's
+# RUN ON THE DATA MACHINE (needs data + VAE + GPU). For each of the 5 ablations
+# (all_on, no_corruption, no_horizon_sim, no_anchor_canonical, no_heading_loss)
+# it (1) fine-tunes a variant from the base ckpt with that ablation's
 # config overrides, then (2) runs stream_benchmark predroot on the result. The
 # override sets come from utils/training/ablation.py (single source of truth).
 #
@@ -21,7 +21,7 @@ ROOT_OUT="${ROOT_OUT:-outputs/body_finetune_ablation}"
 
 cd "$(dirname "$0")/.."
 
-ABLATIONS="all_on no_corruption no_horizon_sim no_anchor_canonical no_heading_loss no_7d"
+ABLATIONS="all_on no_corruption no_horizon_sim no_anchor_canonical no_heading_loss"
 
 for name in $ABLATIONS; do
   echo "==================== ablation: ${name} ===================="

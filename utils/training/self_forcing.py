@@ -125,6 +125,15 @@ class SelfForcingTrainer:
                     default_context,
                 )
             )
+            window_sampling_cfg = st_cfg.get("window_sampling", {}) or {}
+            window_sampling_enabled = bool(window_sampling_cfg.get("enabled", False))
+            stride_tokens = int(getattr(module_model, "self_forcing_stride_tokens", 1))
+            if window_sampling_enabled:
+                semantics = compute_step_semantics(self._module)
+                target_k = self.resolve_k(semantics.progress)
+                rollout_span = max(0, (target_k - 1) * stride_tokens)
+            else:
+                rollout_span = 0
             horizon_tokens = int(st_cfg.get("horizon_tokens", 0))
             min_history_tokens = int(
                 st_cfg.get("min_history_tokens", getattr(module_model, "chunk_size", 1))
@@ -135,12 +144,19 @@ class SelfForcingTrainer:
                 horizon_tokens=horizon_tokens,
                 sample_policy=st_cfg.get("sample_policy", "variable_history"),
                 min_history_tokens=min_history_tokens,
+                window_sampling=window_sampling_cfg if window_sampling_enabled else None,
+                chunk_size=getattr(module_model, "chunk_size", None),
+                rollout_span=rollout_span,
             )
             loss_batch = batch.copy()
             for key in (
                 "_window_local_latent_start_token",
                 "_window_local_latent_valid_len",
                 "_window_local_traj",
+                "_window_sampling_active_left_token",
+                "_window_sampling_history_tokens",
+                "_window_sampling_horizon_tokens",
+                "_window_sampling_rollout_span",
             ):
                 if key in model_batch:
                     loss_batch[key] = model_batch[key]
@@ -192,10 +208,22 @@ class SelfForcingTrainer:
         runtime_metrics["history_corruption/applied"] = getattr(
             self, "_last_corruption_applied", 0.0
         )
-        # T_B_04: sampled horizon (tokens) this step; -1 when horizon_sim off.
-        runtime_metrics["horizon_sim/horizon_tokens"] = getattr(
-            self, "_last_horizon_tokens", -1.0
+        last_horizon_tokens = getattr(self, "_last_horizon_tokens", -1.0)
+        st_cfg = module.cfg.get("stream_training", {}) or {}
+        window_sampling_enabled = bool(
+            (st_cfg.get("window_sampling", {}) or {}).get("enabled", False)
         )
+        hs_enabled = bool((module.cfg.get("horizon_sim", {}) or {}).get("enabled", False))
+        if bool(st_cfg.get("enabled", False)) and window_sampling_enabled:
+            runtime_metrics["stream_training/runtime_horizon_tokens"] = (
+                last_horizon_tokens
+            )
+        elif hs_enabled:
+            runtime_metrics["horizon_sim/horizon_tokens"] = last_horizon_tokens
+        elif bool(st_cfg.get("enabled", False)):
+            runtime_metrics["stream_training/runtime_horizon_tokens"] = (
+                last_horizon_tokens
+            )
         # T_B_05: fraction of samples with a valid canonicalize anchor (loss-weighted).
         _slm = getattr(self, "_last_sample_loss_mask", None)
         if _slm is not None:
@@ -293,7 +321,11 @@ class SelfForcingTrainer:
         return max(1, k)
 
     def plan_rollout(
-        self, feature_length: torch.Tensor, device: torch.device, progress: float
+        self,
+        feature_length: torch.Tensor,
+        device: torch.device,
+        progress: float,
+        model_batch: dict | None = None,
     ) -> RolloutPlan:
         """Plan the rollout: K depth, per-sample start indices, and phase offsets.
 
@@ -304,6 +336,51 @@ class SelfForcingTrainer:
         target_k = self.resolve_k(progress)
         st_cfg = self._module.cfg.get("stream_training", {}) or {}
         stream_training_enabled = bool(st_cfg.get("enabled", False))
+        window_sampling_enabled = bool(
+            (st_cfg.get("window_sampling", {}) or {}).get("enabled", False)
+        )
+        if (
+            stream_training_enabled
+            and window_sampling_enabled
+            and model_batch is not None
+            and "_window_sampling_history_tokens" in model_batch
+        ):
+            history_tokens = model_batch["_window_sampling_history_tokens"]
+            if not torch.is_tensor(history_tokens):
+                history_tokens = torch.as_tensor(
+                    history_tokens, device=device, dtype=torch.long
+                )
+            else:
+                history_tokens = history_tokens.to(device=device, dtype=torch.long)
+            history_tokens = history_tokens.view(-1)
+            if history_tokens.numel() == 1 and feature_length.numel() > 1:
+                history_tokens = history_tokens.expand(feature_length.numel())
+            if history_tokens.numel() != feature_length.numel():
+                raise ValueError(
+                    "_window_sampling_history_tokens must provide one value per "
+                    f"sample; got {history_tokens.numel()} values for batch "
+                    f"size {feature_length.numel()}"
+                )
+            stride_tokens = int(getattr(model, "self_forcing_stride_tokens", 1))
+            rollout_span = max(0, (target_k - 1) * stride_tokens)
+            start_end_indices = history_tokens + int(model.chunk_size)
+            required_len = start_end_indices + rollout_span
+            feature_length_local = feature_length.to(device=device, dtype=torch.long).view(-1)
+            if bool((feature_length_local < required_len).any()):
+                raise ValueError(
+                    "window_sampling metadata is inconsistent with feature_length; "
+                    f"feature_length={feature_length_local.tolist()}, "
+                    f"required_final_active_right={required_len.tolist()}"
+                )
+            batch_size = int(feature_length_local.shape[0])
+            phase_offset = torch.empty(
+                batch_size, device=device, dtype=torch.float32
+            ).uniform_(0.0, 1.0 / model.chunk_size)
+            return RolloutPlan(
+                effective_k=target_k,
+                start_end_indices=start_end_indices,
+                phase_offset=phase_offset,
+            )
         min_history_tokens = 1
         if stream_training_enabled:
             min_history_tokens = int(
@@ -385,7 +462,7 @@ class SelfForcingTrainer:
         text_dropped_flags = model._decide_text_dropout(feature.shape[0], device)
         all_text_context = model._prepare_text_context(model_batch, seq_len, device, text_dropped_flags)
         traj_dropped = model._decide_traj_dropout(device)
-        plan = self.plan_rollout(feature_length, device, progress)
+        plan = self.plan_rollout(feature_length, device, progress, model_batch=model_batch)
         self._last_window_local_rollout_metrics = _collect_window_local_rollout_metrics(
             model_batch, plan
         )
@@ -420,56 +497,65 @@ class SelfForcingTrainer:
             model_batch = {**model_batch, "traj_features": canon}
             self._last_sample_loss_mask = sample_loss_mask
 
-        # T_B_04 / B-P0-2: compute the horizon (token-level) in the outer loop and
-        # pass it down — the model never reads global_step. The horizon is
-        # truncated relative to the FINAL supervised step's active-window token
-        # position (NOT clip start): horizon_active_end = start_end + (K-1), per
-        # sample. Fixed across the K rollout steps so all steps see one
-        # consistent traj mask. In stream_training mode, the configured
-        # horizon_tokens is the visible horizon bound even when horizon_sim is
-        # disabled; horizon_sim may sample a shorter value but not a longer one.
-        # Outside stream_training, None horizon_tokens keeps the legacy
-        # full-traj-cond behavior when horizon_sim is disabled.
-        horizon_tokens = None
-        horizon_active_end = 0
         st_cfg = self._module.cfg.get("stream_training", {}) or {}
         stream_training_enabled = bool(st_cfg.get("enabled", False))
-        st_visible_horizon = None
-        if stream_training_enabled:
-            st_visible_horizon = int(st_cfg.get("horizon_tokens", 0))
-            horizon_tokens = st_visible_horizon
-        hs_cfg = self._module.cfg.get("horizon_sim", {}) or {}
-        if hs_cfg.get("enabled", False):
-            sampled_horizon = sample_random_horizon_tokens(
-                progress, 1.0, seq_len, hs_cfg,
-            )
-            if st_visible_horizon is None:
-                horizon_tokens = sampled_horizon
-            else:
-                horizon_tokens = min(int(sampled_horizon), st_visible_horizon)
-        if horizon_tokens is not None:
-            local_active_end = (
-                plan.start_end_indices + (plan.effective_k - 1)
-            ).to(device)
-            traj_start_token = model_batch.get("traj_start_token")
-            if traj_start_token is not None:
-                if not torch.is_tensor(traj_start_token):
-                    traj_start_token = torch.as_tensor(
-                        traj_start_token, device=device, dtype=torch.long
-                    )
-                else:
-                    traj_start_token = traj_start_token.to(device=device, dtype=torch.long)
-                if traj_start_token.ndim == 0:
-                    traj_start_token = traj_start_token.repeat(local_active_end.shape[0])
-                horizon_active_end = traj_start_token + local_active_end
-            else:
-                horizon_active_end = local_active_end
-        self._last_horizon_tokens = float(horizon_tokens) if horizon_tokens is not None else -1.0
-
-        traj_emb, traj_seq_lens, _, traj_token_mask = model._prepare_traj_condition(
-            model_batch, seq_len, device, traj_dropped_override=traj_dropped,
-            horizon_tokens=horizon_tokens, horizon_active_end=horizon_active_end,
+        window_sampling_enabled = bool(
+            (st_cfg.get("window_sampling", {}) or {}).get("enabled", False)
         )
+        use_window_sampling_horizon = (
+            stream_training_enabled
+            and window_sampling_enabled
+            and "_window_sampling_horizon_tokens" in model_batch
+        )
+
+        horizon_tokens = None
+        horizon_active_end = 0
+        traj_emb = traj_seq_lens = traj_token_mask = None
+        if use_window_sampling_horizon:
+            horizon_tokens = model_batch["_window_sampling_horizon_tokens"]
+            if not torch.is_tensor(horizon_tokens):
+                horizon_tokens = torch.as_tensor(
+                    horizon_tokens, device=device, dtype=torch.long
+                )
+            else:
+                horizon_tokens = horizon_tokens.to(device=device, dtype=torch.long)
+            horizon_tokens = horizon_tokens.view(-1)
+            if horizon_tokens.numel() == 1 and feature.shape[0] > 1:
+                horizon_tokens = horizon_tokens.expand(feature.shape[0])
+            self._last_horizon_tokens = float(
+                horizon_tokens.to(dtype=torch.float32).mean().item()
+            )
+        else:
+            # Legacy horizon path: compute one mask for the final supervised step
+            # and reuse it across the rollout. Stream-training v2 bypasses this.
+            st_visible_horizon = None
+            if stream_training_enabled:
+                st_visible_horizon = int(st_cfg.get("horizon_tokens", 0))
+                horizon_tokens = st_visible_horizon
+            hs_cfg = self._module.cfg.get("horizon_sim", {}) or {}
+            if hs_cfg.get("enabled", False):
+                sampled_horizon = sample_random_horizon_tokens(
+                    progress, 1.0, seq_len, hs_cfg,
+                )
+                if st_visible_horizon is None:
+                    horizon_tokens = sampled_horizon
+                else:
+                    horizon_tokens = min(int(sampled_horizon), st_visible_horizon)
+            if horizon_tokens is not None:
+                local_active_end = (
+                    plan.start_end_indices + (plan.effective_k - 1)
+                ).to(device)
+                horizon_active_end = _absolute_active_end_token(
+                    model_batch, local_active_end, device
+                )
+            self._last_horizon_tokens = (
+                float(horizon_tokens) if horizon_tokens is not None else -1.0
+            )
+
+            traj_emb, traj_seq_lens, _, traj_token_mask = model._prepare_traj_condition(
+                model_batch, seq_len, device, traj_dropped_override=traj_dropped,
+                horizon_tokens=horizon_tokens, horizon_active_end=horizon_active_end,
+            )
 
         clean_feature_state = feature.clone()
         corruption_mask = None
@@ -502,17 +588,32 @@ class SelfForcingTrainer:
 
         final_step_result = None
         window_start_tokens = model_batch.get("_window_local_latent_start_token")
+        stride_tokens = int(getattr(model, "self_forcing_stride_tokens", 1))
         for step_idx in range(plan.effective_k):
             current_feature = _apply_fixed_history_corruption_view(
                 clean_feature_state, corruption_mask, corrupted_feature_values
             )
-            end_indices = plan.start_end_indices + step_idx
+            end_indices = plan.start_end_indices + step_idx * stride_tokens
             time_steps = shifted_local_time_steps(
                 end_indices,
                 start_tokens=window_start_tokens,
                 chunk_size=int(model.chunk_size),
                 phase_offset=plan.phase_offset,
             )
+            if use_window_sampling_horizon:
+                step_horizon_active_end = _absolute_active_end_token(
+                    model_batch, end_indices.to(device), device
+                )
+                traj_emb, traj_seq_lens, _, traj_token_mask = (
+                    model._prepare_traj_condition(
+                        model_batch,
+                        seq_len,
+                        device,
+                        traj_dropped_override=traj_dropped,
+                        horizon_tokens=horizon_tokens,
+                        horizon_active_end=step_horizon_active_end,
+                    )
+                )
             is_final_step = step_idx == plan.effective_k - 1
             if is_final_step:
                 final_step_result = model._forward_single_window(
@@ -754,6 +855,35 @@ def _collect_window_local_metrics(model_batch: dict) -> dict[str, float]:
     return metrics
 
 
+def _absolute_active_end_token(
+    model_batch: dict,
+    local_active_end: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    local_active_end = local_active_end.to(device=device, dtype=torch.long).view(-1)
+    traj_start_token = model_batch.get(
+        "traj_start_token", model_batch.get("_window_local_latent_start_token")
+    )
+    if traj_start_token is None:
+        return local_active_end
+    if not torch.is_tensor(traj_start_token):
+        traj_start_token = torch.as_tensor(
+            traj_start_token, device=device, dtype=torch.long
+        )
+    else:
+        traj_start_token = traj_start_token.to(device=device, dtype=torch.long)
+    traj_start_token = traj_start_token.view(-1)
+    if traj_start_token.numel() == 1 and local_active_end.numel() > 1:
+        traj_start_token = traj_start_token.expand_as(local_active_end)
+    if traj_start_token.numel() != local_active_end.numel():
+        raise ValueError(
+            "traj_start_token must be scalar or match batch size; "
+            f"got {traj_start_token.numel()} starts for "
+            f"{local_active_end.numel()} active ends"
+        )
+    return traj_start_token + local_active_end
+
+
 def _collect_window_local_rollout_metrics(
     model_batch: dict,
     plan: RolloutPlan,
@@ -761,15 +891,58 @@ def _collect_window_local_rollout_metrics(
     """Summarize the actual final active history selected by plan_rollout()."""
     if not bool(model_batch.get("_window_local_traj", False)):
         return {}
-    final_active_end = (
-        plan.start_end_indices.to(dtype=torch.long) + int(plan.effective_k) - 1
-    )
+    rollout_span = model_batch.get("_window_sampling_rollout_span")
+    if rollout_span is None:
+        rollout_span = int(plan.effective_k) - 1
+    else:
+        rollout_span = int(rollout_span)
+    final_active_end = plan.start_end_indices.to(dtype=torch.long) + rollout_span
     active_len = final_active_end.to(dtype=torch.float32)
     metrics = {
         "stream_training/active_history_len_mean": float(active_len.mean().item()),
         "stream_training/active_history_len_min": float(active_len.min().item()),
         "stream_training/active_history_len_max": float(active_len.max().item()),
     }
+    history_tokens = model_batch.get("_window_sampling_history_tokens")
+    if history_tokens is not None:
+        hist_t = torch.as_tensor(history_tokens, dtype=torch.float32).view(-1)
+        metrics["stream_training/history_tokens_mean"] = float(hist_t.mean().item())
+        metrics["stream_training/history_tokens_min"] = float(hist_t.min().item())
+        metrics["stream_training/history_tokens_max"] = float(hist_t.max().item())
+    horizon_tokens = model_batch.get("_window_sampling_horizon_tokens")
+    if horizon_tokens is not None:
+        hor_t = torch.as_tensor(horizon_tokens, dtype=torch.float32).view(-1)
+        metrics["stream_training/horizon_tokens_mean"] = float(hor_t.mean().item())
+        metrics["stream_training/horizon_tokens_min"] = float(hor_t.min().item())
+        metrics["stream_training/horizon_tokens_max"] = float(hor_t.max().item())
+    horizon_cap_clip = model_batch.get("_window_sampling_horizon_cap_clip")
+    if horizon_cap_clip is not None:
+        cap_t = torch.as_tensor(horizon_cap_clip, dtype=torch.float32).view(-1)
+        metrics["stream_training/horizon_cap_clip_mean"] = float(cap_t.mean().item())
+    horizon_short_fallback = model_batch.get("_window_sampling_horizon_short_fallback")
+    if horizon_short_fallback is not None:
+        fallback_t = torch.as_tensor(
+            horizon_short_fallback, dtype=torch.float32
+        ).view(-1)
+        metrics["stream_training/horizon_short_fallback_rate"] = float(
+            fallback_t.mean().item()
+        )
+    if "_window_sampling_rollout_span" in model_batch:
+        metrics["stream_training/rollout_span"] = float(rollout_span)
+    if "_window_sampling_history_tokens_max_effective" in model_batch:
+        metrics["stream_training/history_tokens_max_effective"] = float(
+            model_batch["_window_sampling_history_tokens_max_effective"]
+        )
+    lengths = model_batch.get("_window_local_latent_valid_len")
+    if lengths is not None:
+        final_len = torch.as_tensor(lengths, dtype=torch.float32).view(-1)
+        metrics["stream_training/final_visible_latent_len_mean"] = float(
+            final_len.mean().item()
+        )
+    active_left = model_batch.get("_window_sampling_active_left_token")
+    if active_left is not None:
+        active_left_t = torch.as_tensor(active_left, dtype=torch.float32).view(-1)
+        metrics["stream_training/active_left_mean"] = float(active_left_t.mean().item())
     starts = model_batch.get("_window_local_latent_start_token")
     if starts is not None:
         starts_t = torch.as_tensor(

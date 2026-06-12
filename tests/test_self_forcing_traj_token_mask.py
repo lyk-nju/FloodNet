@@ -183,6 +183,37 @@ def test_plan_rollout_right_aligns_fixed_window_policy():
     assert plan.start_end_indices.tolist() == [6]
 
 
+def test_plan_rollout_uses_window_sampling_history_as_step0_active_right():
+    model = MagicMock(name="model")
+    model.chunk_size = 5
+    model.self_forcing_k_schedule = [(0.0, 5)]
+    model.self_forcing_stride_tokens = 1
+    cfg = SimpleNamespace()
+    cfg.get = lambda key, default=None: {
+        "stream_training": {
+            "enabled": True,
+            "window_sampling": {"enabled": True},
+        },
+    }.get(key, default)
+    module = SimpleNamespace(model=model, cfg=cfg)
+    trainer = SelfForcingTrainer.__new__(SelfForcingTrainer)
+    trainer._module = module
+    model_batch = {
+        "_window_local_traj": True,
+        "_window_sampling_history_tokens": torch.tensor([0, 7], dtype=torch.long),
+    }
+
+    plan = trainer.plan_rollout(
+        torch.tensor([9, 16], dtype=torch.long),
+        torch.device("cpu"),
+        progress=1.0,
+        model_batch=model_batch,
+    )
+
+    assert plan.effective_k == 5
+    assert plan.start_end_indices.tolist() == [5, 12]
+
+
 def test_run_rollout_adds_window_start_to_horizon_active_end():
     trainer, model, model_batch, _ = _make_trainer()
 
@@ -218,6 +249,53 @@ def test_run_rollout_adds_window_start_to_horizon_active_end():
     kwargs = model._prepare_traj_condition.call_args.kwargs
     assert kwargs["horizon_tokens"] == 2
     assert kwargs["horizon_active_end"].tolist() == [8]
+
+
+def test_run_rollout_window_sampling_rebuilds_traj_condition_each_step_with_fixed_horizon():
+    trainer, model, model_batch, _ = _make_trainer()
+
+    cfg = SimpleNamespace()
+    cfg.get = lambda key, default=None: {
+        "stream_training": {
+            "enabled": True,
+            "window_sampling": {"enabled": True},
+        },
+        "anchor_canonicalize": {"enabled": False},
+        "horizon_sim": {"enabled": False},
+        "history_corruption": {},
+        "self_forcing_disable_replace": True,
+    }.get(key, default)
+    trainer._module.cfg = cfg
+    trainer.plan_rollout = MagicMock(
+        return_value=RolloutPlan(
+            effective_k=3,
+            start_end_indices=torch.tensor([2], dtype=torch.long),
+            phase_offset=torch.tensor([0.0]),
+        )
+    )
+    model_batch = {
+        **model_batch,
+        "feature": torch.zeros(_BATCH, 8, _HIDDEN),
+        "feature_length": torch.tensor([8], dtype=torch.long),
+        "_window_local_traj": True,
+        "_window_local_latent_start_token": torch.tensor([5], dtype=torch.long),
+        "_window_sampling_horizon_tokens": torch.tensor([4], dtype=torch.long),
+    }
+
+    trainer._run_rollout(model_batch, progress=1.0)
+
+    assert model._prepare_traj_condition.call_count == 3
+    horizon_active_ends = [
+        call.kwargs["horizon_active_end"].tolist()
+        for call in model._prepare_traj_condition.call_args_list
+    ]
+    horizon_tokens = [
+        call.kwargs["horizon_tokens"].tolist()
+        for call in model._prepare_traj_condition.call_args_list
+    ]
+    assert horizon_active_ends == [[7], [8], [9]]
+    assert horizon_tokens == [[4], [4], [4]]
+    assert trainer._last_horizon_tokens == 4.0
 
 
 def test_run_rollout_uses_stream_training_horizon_when_horizon_sim_disabled():
@@ -306,6 +384,8 @@ def test_run_rollout_records_window_local_active_history_metrics():
         "_window_local_traj": True,
         "_window_local_latent_start_token": torch.tensor([5], dtype=torch.long),
         "_window_local_latent_valid_len": torch.tensor([4], dtype=torch.long),
+        "_window_sampling_horizon_cap_clip": torch.tensor([2], dtype=torch.long),
+        "_window_sampling_horizon_short_fallback": torch.tensor([True]),
     }
 
     trainer._run_rollout(model_batch, progress=1.0)
@@ -315,6 +395,8 @@ def test_run_rollout_records_window_local_active_history_metrics():
     assert metrics["stream_training/active_history_len_min"] == 3.0
     assert metrics["stream_training/active_history_len_max"] == 3.0
     assert metrics["stream_training/active_abs_end_mean"] == 8.0
+    assert metrics["stream_training/horizon_cap_clip_mean"] == 2.0
+    assert metrics["stream_training/horizon_short_fallback_rate"] == 1.0
 
 
 def test_run_rollout_replacement_diff_uses_clean_state_under_corruption(monkeypatch):

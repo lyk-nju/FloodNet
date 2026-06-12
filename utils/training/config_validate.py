@@ -70,8 +70,11 @@ def validate_stream_training_config(cfg) -> None:
     enabled = bool(OmegaConf.select(cfg, "stream_training.enabled", default=False))
     if not enabled:
         return
-    chunk_size = int(OmegaConf.select(cfg, "model.params.chunk_size", default=1))
+    chunk_size = int(OmegaConf.select(cfg, "model.params.chunk_size", default=5))
     context_tokens = int(OmegaConf.select(cfg, "stream_training.context_tokens", default=0))
+    window_sampling_enabled = bool(
+        OmegaConf.select(cfg, "stream_training.window_sampling.enabled", default=False)
+    )
     min_history_tokens = int(
         OmegaConf.select(cfg, "stream_training.min_history_tokens", default=chunk_size)
     )
@@ -92,6 +95,70 @@ def validate_stream_training_config(cfg) -> None:
         raise ValueError(
             "stream_training.context_tokens must be > 0 when stream_training is enabled"
         )
+    if window_sampling_enabled:
+        ws_prefix = "stream_training.window_sampling"
+        history_min = int(OmegaConf.select(cfg, f"{ws_prefix}.history_tokens_min", default=0))
+        history_max = OmegaConf.select(cfg, f"{ws_prefix}.history_tokens_max", default="auto")
+        horizon_min = int(OmegaConf.select(cfg, f"{ws_prefix}.horizon_tokens_min", default=0))
+        horizon_max = int(OmegaConf.select(cfg, f"{ws_prefix}.horizon_tokens_max", default=0))
+        stride = int(
+            OmegaConf.select(cfg, "model.params.self_forcing_stride_tokens", default=1)
+        )
+        schedule = OmegaConf.select(
+            cfg, "model.params.self_forcing_k_schedule", default=[[0.0, 1]]
+        )
+        max_k = 1
+        for row in schedule:
+            max_k = max(max_k, int(row[1]))
+        rollout_span = max(0, (max_k - 1) * stride)
+        auto_history_max = context_tokens - chunk_size - rollout_span
+        if history_min < 0:
+            raise ValueError(
+                f"{ws_prefix}.history_tokens_min must be >= 0, got {history_min}"
+            )
+        if auto_history_max < history_min:
+            raise ValueError(
+                f"{ws_prefix}.history_tokens_max=auto leaves no valid history "
+                f"range for context_tokens={context_tokens}, chunk_size={chunk_size}, "
+                f"rollout_span={rollout_span}, history_tokens_min={history_min}"
+            )
+        if history_max is not None and str(history_max).lower() != "auto":
+            if int(history_max) < history_min:
+                raise ValueError(
+                    f"{ws_prefix}.history_tokens_max must be >= history_tokens_min "
+                    f"or 'auto'; got {history_max}"
+                )
+        if horizon_min < 0 or horizon_max < max(horizon_min, 1):
+            raise ValueError(
+                f"{ws_prefix}.horizon_tokens_min/max must define a non-negative "
+                f"range with at least one complete future token; got "
+                f"min={horizon_min}, max={horizon_max}"
+            )
+        hs_enabled = bool(OmegaConf.select(cfg, "horizon_sim.enabled", default=False))
+        if hs_enabled:
+            raise ValueError(
+                "horizon_sim.enabled=true must not be mixed with "
+                "stream_training.window_sampling.enabled=true; variable horizon "
+                "is sampled by window_sampling in stream-training v2."
+            )
+        if latent_source != "precomputed_slice":
+            raise ValueError(
+                "stream_training.latent_source must be 'precomputed_slice' for v2; "
+                f"got {latent_source!r}. VAE window re-encoding is intentionally "
+                "not part of the window-local training contract."
+            )
+        if motion_aux_loss not in {"latent_only", "full_prefix", "disabled"}:
+            raise ValueError(
+                "stream_training.motion_aux_loss must be 'latent_only', "
+                f"'full_prefix', or 'disabled'; got {motion_aux_loss!r}."
+            )
+        if anchor_move:
+            raise ValueError(
+                "stream_training.anchor_move_in_rollout=true is not implemented yet. "
+                "Keep it false until trajectory/text/loss windows are rebuilt per "
+                "rollout step."
+            )
+        return
     if min_history_tokens < chunk_size:
         raise ValueError(
             "stream_training.min_history_tokens must be >= model.params.chunk_size; "
