@@ -75,7 +75,9 @@ from eval.runtime.experiments import (
     filter_runtime_experiments,
     parse_csv_ints,
     parse_csv_strings,
+    runtime_debug_root_refiner_history_policy,
     runtime_debug_mode_for_source,
+    runtime_debug_turn_plan_policy,
     summarize_numeric_records,
 )
 from eval.runtime.metrics import (
@@ -989,6 +991,15 @@ def main():
                     "traj_condition_path": "rootplan_7d",
                     "root_refiner_enabled": variant_root_refiner is not None,
                     "condition_source": runtime_debug_condition_source(
+                        root_source,
+                        family=spec.family,
+                    ),
+                    "timeline_semantics": "token_start_frame",
+                    "turn_plan_policy": runtime_debug_turn_plan_policy(
+                        spec.family,
+                        root_source=root_source,
+                    ),
+                    "root_refiner_history_policy": runtime_debug_root_refiner_history_policy(
                         root_source,
                         family=spec.family,
                     ),

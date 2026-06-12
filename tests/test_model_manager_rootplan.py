@@ -313,24 +313,25 @@ def test_reset_glue_timeline_initializes_commit_zero_state():
     assert torch.allclose(mgr._glue_timeline.head.world_yaw, torch.tensor(0.0))
 
 
-def test_append_glue_state_from_stream_recovery_records_commit_pose_once():
+def test_append_glue_state_from_stream_recovery_records_only_token_start_frames():
     mgr = ModelManager.__new__(ModelManager)
     mgr.device = "cpu"
     mgr.model = _DummyModel()
-    mgr.model.commit_index = 0
-    mgr.model.commit_index = 7
     mgr.stream_recovery = SimpleNamespace(
         r_pos_accum=np.array([1.0, 0.0, 2.0], dtype=np.float32),
         r_rot_ang_accum=0.25,
     )
     mgr._reset_glue_timeline()
 
-    mgr._append_glue_state_from_stream_recovery()
-    mgr._append_glue_state_from_stream_recovery()
+    assert mgr._append_glue_state_from_stream_recovery(frame_idx=0) is False
+    assert mgr._append_glue_state_from_stream_recovery(frame_idx=1) is True
+    assert mgr._append_glue_state_from_stream_recovery(frame_idx=4) is False
+    mgr.stream_recovery.r_pos_accum = np.array([1.0, 0.0, 5.0], dtype=np.float32)
+    assert mgr._append_glue_state_from_stream_recovery(frame_idx=5) is True
 
-    assert len(mgr._glue_timeline) == 2
-    assert mgr._glue_timeline.head.commit_idx == 7
-    assert torch.allclose(mgr._glue_timeline.head.world_xz, torch.tensor([1.0, 2.0]))
+    assert len(mgr._glue_timeline) == 3
+    assert mgr._glue_timeline.head.commit_idx == 2
+    assert torch.allclose(mgr._glue_timeline.head.world_xz, torch.tensor([1.0, 5.0]))
     assert torch.allclose(mgr._glue_timeline.head.world_yaw, torch.tensor(-0.5))
 
 

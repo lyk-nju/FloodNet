@@ -29,6 +29,11 @@ ROOT_SOURCE_METADATA = {
     "gtroot": {
         "root_source": "gtroot",
         "condition_source": "gt_motion_7d",
+        "family_condition_sources": {
+            "web_stream": "gt_motion_7d",
+            "rotation": "gt_motion_7d",
+            "turn": "route_derived_7d",
+        },
         "description": "Dataset motion 7D extracted from the ground-truth motion.",
         "requires_root_refiner": False,
         "passes_root_condition": True,
@@ -36,6 +41,11 @@ ROOT_SOURCE_METADATA = {
     "rootrefiner": {
         "root_source": "rootrefiner",
         "condition_source": "rootrefiner_7d",
+        "family_condition_sources": {
+            "web_stream": "rootrefiner_7d",
+            "rotation": "rootrefiner_7d",
+            "turn": "rootrefiner_7d",
+        },
         "description": "RootRefiner-predicted 7D root condition passed to LDF.",
         "requires_root_refiner": True,
         "passes_root_condition": True,
@@ -43,6 +53,11 @@ ROOT_SOURCE_METADATA = {
     "notraj": {
         "root_source": "notraj",
         "condition_source": "none",
+        "family_condition_sources": {
+            "web_stream": "none",
+            "rotation": "none",
+            "turn": "none",
+        },
         "description": "No trajectory/root condition is passed to LDF.",
         "requires_root_refiner": False,
         "passes_root_condition": False,

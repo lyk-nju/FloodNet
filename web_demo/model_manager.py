@@ -19,6 +19,7 @@ from utils.inference_glue import InferenceGlueState, InferenceGlueTimeline
 from utils.motion_process import StreamJointRecovery263, append_traj_deltas_5d_to_7d
 from utils.root_plan import RootPlan
 from utils.runtime_rootplan import build_rootplan_stream_payload_from_buffer
+from utils.runtime_timeline import append_timeline_state_at_token_start_frame
 from utils.stream_rollout import build_stream_step_model_input
 from utils.token_frame import num_frames_for_tokens, token_start_frame
 from utils.stream_traj import (
@@ -635,35 +636,24 @@ class ModelManager:
             InferenceGlueState.initial(device=self.device, dtype=torch.float32)
         )
 
-    def _append_glue_state_from_stream_recovery(self):
+    def _append_glue_state_from_stream_recovery(self, *, frame_idx: int) -> bool:
         timeline = getattr(self, "_glue_timeline", None)
         if timeline is None:
             self._reset_glue_timeline()
             timeline = self._glue_timeline
 
-        commit_idx = self._get_commit_index()
-        if commit_idx <= timeline.head.commit_idx:
-            return
-
-        root = np.asarray(self.stream_recovery.r_pos_accum, dtype=np.float32)
-        world_xz = torch.tensor(root[[0, 2]], device=self.device, dtype=torch.float32)
-        world_yaw = torch.tensor(
-            -2.0 * float(self.stream_recovery.r_rot_ang_accum),
-            device=self.device,
-            dtype=torch.float32,
+        appended = append_timeline_state_at_token_start_frame(
+            timeline,
+            frame_idx=frame_idx,
+            recovery=self.stream_recovery,
+            source="stream_recovery",
         )
-        timeline.append(
-            InferenceGlueState(
-                commit_idx=commit_idx,
-                world_xz=world_xz,
-                world_yaw=world_yaw,
-                source="stream_recovery",
-            )
-        )
-        history_length = int(getattr(self, "history_length", 0))
-        if history_length > 0:
-            keep_from = max(0, commit_idx - history_length * 2)
-            timeline.trim_before(keep_from)
+        if appended:
+            history_length = int(getattr(self, "history_length", 0))
+            if history_length > 0:
+                keep_from = max(0, timeline.head.commit_idx - history_length * 2)
+                timeline.trim_before(keep_from)
+        return appended
 
     def _stream_plan_to_root_plan(
         self,
@@ -1050,9 +1040,11 @@ class ModelManager:
                                 dtype=np.float32,
                             )
                             self.root_5d_history.append((int(self._generated_frame_count), root5d))
+                            self._append_glue_state_from_stream_recovery(
+                                frame_idx=int(self._generated_frame_count)
+                            )
                             self._generated_frame_count += 1
                             self.frame_buffer.add_frame(joints)
-                        self._append_glue_state_from_stream_recovery()
                         
                         step_time = time.time() - step_start
                         total_gen_time += step_time

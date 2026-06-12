@@ -11,6 +11,7 @@ import torch
 from eval.runtime.transforms import (
     build_eval_root_plan_from_points,
     build_eval_root_plan_from_world_7d,
+    compose_turn_root_plan,
     recovery_root_state_to_world,
     root_plan_to_world_7d,
     rotate_xz_points,
@@ -23,6 +24,7 @@ from utils.motion_process import (
     extract_root_trajectory_263,
 )
 from utils.runtime_rootplan import build_rootplan_stream_payload_from_buffer
+from utils.runtime_timeline import append_timeline_state_at_token_start_frame
 from utils.stream_rollout import (
     StreamTextSegment,
     StreamTextRolloutController,
@@ -158,8 +160,7 @@ def clear_model_traj_state(model: Any) -> None:
         traj_buf.clear()
 
 
-def set_eval_root_plan(
-    model: Any,
+def build_eval_root_plan_for_stream_plan(
     timeline: InferenceGlueTimeline,
     stream_plan: Any,
     *,
@@ -167,12 +168,10 @@ def set_eval_root_plan(
     token_dt: float,
     root_refiner_runtime: Any = None,
     root_5d_history: list | None = None,
-    replan_events: list | None = None,
-    root_plan_events: list | None = None,
     frames_per_token: int = 4,
-) -> bool:
+) -> Any | None:
     if not timeline.has_exact_state(int(stream_plan.start_commit_index)):
-        return False
+        return None
     anchor_state = timeline.at_commit(int(stream_plan.start_commit_index))
     root_plan_input = reanchor_stream_plan_to_xz(
         stream_plan,
@@ -197,14 +196,32 @@ def set_eval_root_plan(
             frames_per_token=frames_per_token,
             source=root_plan_input.source or "eval_route",
         )
+    return root_plan
+
+
+def _activate_eval_root_plan(model: Any, root_plan: Any) -> None:
     model._traj_buf.set_root_plan(root_plan)
+    setattr(model, "_runtime_last_root_plan", root_plan)
+
+
+def _record_eval_root_plan_event(
+    *,
+    root_plan: Any,
+    stream_plan: Any,
+    text: str,
+    root_refiner: bool,
+    replan_events: list | None = None,
+    root_plan_events: list | None = None,
+    diagnostic_plan: bool = True,
+) -> None:
     if isinstance(root_plan_events, list):
         root_plan_events.append(
             {
                 "commit": int(stream_plan.start_commit_index),
                 "text": str(text),
                 "source": str(stream_plan.source),
-                "root_refiner": root_refiner_runtime is not None,
+                "root_refiner": bool(root_refiner),
+                "diagnostic_plan": bool(diagnostic_plan),
                 "root_plan": root_plan,
             }
         )
@@ -214,9 +231,46 @@ def set_eval_root_plan(
                 "commit": int(stream_plan.start_commit_index),
                 "text": str(text),
                 "source": str(stream_plan.source),
-                "root_refiner": root_refiner_runtime is not None,
+                "root_refiner": bool(root_refiner),
             }
         )
+
+
+def set_eval_root_plan(
+    model: Any,
+    timeline: InferenceGlueTimeline,
+    stream_plan: Any,
+    *,
+    text: str,
+    token_dt: float,
+    root_refiner_runtime: Any = None,
+    root_5d_history: list | None = None,
+    replan_events: list | None = None,
+    root_plan_events: list | None = None,
+    frames_per_token: int = 4,
+    diagnostic_plan: bool = True,
+) -> bool:
+    root_plan = build_eval_root_plan_for_stream_plan(
+        timeline,
+        stream_plan,
+        text=text,
+        token_dt=token_dt,
+        root_refiner_runtime=root_refiner_runtime,
+        root_5d_history=root_5d_history,
+        frames_per_token=frames_per_token,
+    )
+    if root_plan is None:
+        return False
+    _activate_eval_root_plan(model, root_plan)
+    _record_eval_root_plan_event(
+        root_plan=root_plan,
+        stream_plan=stream_plan,
+        text=text,
+        root_refiner=root_refiner_runtime is not None,
+        replan_events=replan_events,
+        root_plan_events=root_plan_events,
+        diagnostic_plan=diagnostic_plan,
+    )
     return True
 
 
@@ -232,6 +286,7 @@ def set_eval_root_plan_from_world_7d(
     replan_events: list | None = None,
     root_plan_events: list | None = None,
     frames_per_token: int = 4,
+    diagnostic_plan: bool = True,
 ) -> bool:
     if not timeline.has_exact_state(int(start_commit_index)):
         return False
@@ -243,7 +298,7 @@ def set_eval_root_plan_from_world_7d(
         frames_per_token=frames_per_token,
         source=source,
     )
-    model._traj_buf.set_root_plan(root_plan)
+    _activate_eval_root_plan(model, root_plan)
     if isinstance(root_plan_events, list):
         root_plan_events.append(
             {
@@ -251,6 +306,7 @@ def set_eval_root_plan_from_world_7d(
                 "text": str(text),
                 "source": str(source),
                 "root_refiner": False,
+                "diagnostic_plan": bool(diagnostic_plan),
                 "root_plan": root_plan,
             }
         )
@@ -301,6 +357,19 @@ def slice_stream_plan_from_commit(
         version=int(version),
         source=str(source),
     )
+
+
+def _text_segment_start_commit(
+    segments: list[StreamTextSegment],
+    commit_idx: int,
+) -> int:
+    start = 0
+    commit_idx = int(commit_idx)
+    for segment in segments:
+        if commit_idx < int(segment.token_end):
+            return int(start)
+        start = int(segment.token_end)
+    return int(start)
 
 
 def build_turn_metric_target(
@@ -449,12 +518,13 @@ def run_step_case(
         for frame in decoded:
             recovery.process_frame(frame)
             roots.append(recovery.r_pos_accum.copy())
+            append_timeline_state_at_token_start_frame(
+                timeline,
+                frame_idx=frame_idx,
+                recovery=recovery,
+                source="stream_eval",
+            )
             frame_idx = append_eval_root_history(root_5d_history, frame_idx, recovery)
-        append_eval_timeline_state(
-            timeline,
-            commit_idx=commit_idx + 1,
-            recovery=recovery,
-        )
         decoded_chunks.append(decoded)
     vae.clear_cache()
     pred_motion = (
@@ -540,10 +610,11 @@ def run_babel_case(
         if mode == "babel_no_traj" or force_no_traj:
             traj_input = None
         elif condition_path == "rootplan_7d":
+            text_anchor_commit = _text_segment_start_commit(segments, commit_idx)
             if (
                 root_refiner_runtime is not None
                 and text != active_root_refiner_text
-                and timeline.has_exact_state(commit_idx)
+                and timeline.has_exact_state(text_anchor_commit)
             ):
                 refreshed = set_eval_root_plan(
                     model,
@@ -551,10 +622,10 @@ def run_babel_case(
                     slice_stream_plan_from_commit(
                         plan_times,
                         plan_points,
-                        start_commit_index=commit_idx,
+                        start_commit_index=text_anchor_commit,
                         token_dt=tdt,
                         waypoint_dt=wpdt,
-                        version=commit_idx,
+                        version=text_anchor_commit,
                         source="bench_babel_text",
                     ),
                     text=text,
@@ -629,12 +700,13 @@ def run_babel_case(
         for frame in decoded:
             recovery.process_frame(frame)
             roots.append(recovery.r_pos_accum.copy())
+            append_timeline_state_at_token_start_frame(
+                timeline,
+                frame_idx=frame_idx,
+                recovery=recovery,
+                source="stream_eval",
+            )
             frame_idx = append_eval_root_history(root_5d_history, frame_idx, recovery)
-        append_eval_timeline_state(
-            timeline,
-            commit_idx=commit_idx + 1,
-            recovery=recovery,
-        )
         decoded_chunks.append(decoded)
     vae.clear_cache()
     pred_motion = (
@@ -806,18 +878,19 @@ def run_real_case(
             recovery.process_frame(frame)
             root_world, _ = recovery_root_state_to_world(recovery, session_anchor_state)
             roots.append(root_world)
+            append_timeline_state_at_token_start_frame(
+                timeline,
+                frame_idx=frame_idx,
+                recovery=recovery,
+                session_anchor_state=session_anchor_state,
+                source="stream_eval",
+            )
             frame_idx = append_eval_root_history(
                 root_5d_history,
                 frame_idx,
                 recovery,
                 session_anchor_state=session_anchor_state,
             )
-        append_eval_timeline_state(
-            timeline,
-            commit_idx=commit_idx + 1,
-            recovery=recovery,
-            session_anchor_state=session_anchor_state,
-        )
         decs.append(dec)
     vae.clear_cache()
     pred_motion = np.concatenate(decs, axis=0)[:tfs] if decs else np.zeros((0, 263))
@@ -924,7 +997,10 @@ def run_turn_case(
             root_5d_history=root_5d_history,
             replan_events=replan_events,
             root_plan_events=root_plan_events,
+            diagnostic_plan=False,
         )
+    old_root_plan = getattr(model, "_runtime_last_root_plan", None)
+    diagnostic_root_plan = old_root_plan
     new_root_plan_active = False
     recovery = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
     decs, roots, first_chunk = [], [], True
@@ -938,17 +1014,41 @@ def run_turn_case(
                 and offset >= edit_delay + edit_blend
                 and timeline.has_exact_state(effective_commit)
             ):
-                new_root_plan_active = set_eval_root_plan(
-                    model,
+                new_root_plan = build_eval_root_plan_for_stream_plan(
                     timeline,
                     new_plan,
                     text=text,
                     token_dt=tdt,
                     root_refiner_runtime=root_refiner_runtime,
                     root_5d_history=root_5d_history,
-                    replan_events=replan_events,
-                    root_plan_events=root_plan_events,
                 )
+                if old_root_plan is not None and new_root_plan is not None:
+                    composed_root_plan = compose_turn_root_plan(
+                        old_root_plan,
+                        new_root_plan,
+                        switch_commit=effective_commit,
+                        blend_tokens=edit_blend,
+                        source="bench_composed",
+                    )
+                    _activate_eval_root_plan(model, composed_root_plan)
+                    diagnostic_root_plan = composed_root_plan
+                    composed_stream_plan = StreamTrajectoryPlan(
+                        times=rot_t,
+                        points_xyz=rot_pts,
+                        start_commit_index=effective_commit,
+                        version=2,
+                        source="bench_composed",
+                    )
+                    _record_eval_root_plan_event(
+                        root_plan=composed_root_plan,
+                        stream_plan=composed_stream_plan,
+                        text=text,
+                        root_refiner=root_refiner_runtime is not None,
+                        replan_events=replan_events,
+                        root_plan_events=root_plan_events,
+                        diagnostic_plan=True,
+                    )
+                    new_root_plan_active = True
             traj_input = build_rootplan_stream_step_payload(
                 model,
                 timeline,
@@ -996,56 +1096,64 @@ def run_turn_case(
         for frame in dec:
             recovery.process_frame(frame)
             roots.append(recovery.r_pos_accum.copy())
+            append_timeline_state_at_token_start_frame(
+                timeline,
+                frame_idx=frame_idx,
+                recovery=recovery,
+                source="stream_eval",
+            )
             frame_idx = append_eval_root_history(root_5d_history, frame_idx, recovery)
-        append_eval_timeline_state(
-            timeline,
-            commit_idx=commit_idx + 1,
-            recovery=recovery,
-        )
         decs.append(dec)
     vae.clear_cache()
     pred_motion = np.concatenate(decs, axis=0)[:total_tfs] if decs else np.zeros((0, 263))
     pred_root = np.array(roots, dtype=np.float32)[:total_tfs] if roots else np.zeros((0, 3))
-    effective_frame = token_start_frame(effective_commit)
-    if len(pred_root) > 0:
-        anchor_frame = int(np.clip(effective_frame, 0, len(pred_root) - 1))
-        new_anchor_xz = pred_root[anchor_frame, [0, 2]]
+    target_t = np.arange(int(total_tfs), dtype=np.float32) / np.float32(fps)
+    if condition_path == "rootplan_7d" and not force_no_traj and diagnostic_root_plan is not None:
+        world_7d = root_plan_to_world_7d(diagnostic_root_plan).detach().cpu().numpy()
+        target_pts = world_7d[:, :3].astype(np.float32, copy=False)
+        if len(target_pts) < total_tfs and len(target_pts) > 0:
+            pad = np.repeat(target_pts[-1:],
+                            int(total_tfs) - int(len(target_pts)),
+                            axis=0)
+            target_pts = np.concatenate([target_pts, pad.astype(np.float32)], axis=0)
+        target_pts = target_pts[:total_tfs]
     else:
-        new_anchor_xz = None
-    target_t, target_pts = build_turn_metric_target(
-        old_times=plan_t,
-        old_points_xyz=plan_pts,
-        new_times=rot_t,
-        new_points_xyz=rot_pts,
-        target_frames=total_tfs,
-        motion_fps=fps,
-        edit_commit=edit_commit,
-        delay_tokens=edit_delay,
-        blend_tokens=edit_blend,
-        token_dt=tdt,
-        new_anchor_xz=new_anchor_xz,
-    )
+        target_t, target_pts = build_turn_metric_target(
+            old_times=plan_t,
+            old_points_xyz=plan_pts,
+            new_times=rot_t,
+            new_points_xyz=rot_pts,
+            target_frames=total_tfs,
+            motion_fps=fps,
+            edit_commit=edit_commit,
+            delay_tokens=edit_delay,
+            blend_tokens=edit_blend,
+            token_dt=tdt,
+        )
     return pred_motion, pred_root, gr, target_t, target_pts, total_tfs
 
 
 def root_plan_events_to_diagnostic_arrays(
     root_plan_events: list[dict],
 ) -> tuple[np.ndarray, int]:
-    """Return concatenated world 7D root plans and summed token count."""
+    """Return the final diagnostic world 7D root plan and token count."""
 
-    world_chunks = []
-    num_tokens = 0
+    selected_event = None
     for event in root_plan_events:
         root_plan = event.get("root_plan") if isinstance(event, dict) else None
         if root_plan is None:
             continue
-        world = root_plan_to_world_7d(root_plan).detach().cpu().numpy()
-        if len(world) > 0:
-            world_chunks.append(world.astype(np.float32, copy=False))
-        num_tokens += int(root_plan.num_tokens_pred)
-    if not world_chunks:
-        return np.zeros((0, 7), dtype=np.float32), int(num_tokens)
-    return np.concatenate(world_chunks, axis=0).astype(np.float32), int(num_tokens)
+        if bool(event.get("diagnostic_plan", False)):
+            selected_event = event
+        elif selected_event is None:
+            selected_event = event
+    if selected_event is None:
+        return np.zeros((0, 7), dtype=np.float32), 0
+    root_plan = selected_event["root_plan"]
+    world = root_plan_to_world_7d(root_plan).detach().cpu().numpy()
+    if len(world) <= 0:
+        return np.zeros((0, 7), dtype=np.float32), int(root_plan.num_tokens_pred)
+    return world.astype(np.float32, copy=False), int(root_plan.num_tokens_pred)
 
 
 __all__ = [

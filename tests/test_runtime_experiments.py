@@ -3,7 +3,9 @@ from eval.runtime.experiments import (
     filter_runtime_experiments,
     parse_csv_ints,
     parse_csv_strings,
+    runtime_debug_root_refiner_history_policy,
     runtime_debug_mode_for_source,
+    runtime_debug_turn_plan_policy,
     summarize_numeric_records,
 )
 from eval.runtime.root_sources import (
@@ -112,6 +114,29 @@ def test_runtime_debug_condition_source_disambiguates_turn_gtroot():
     assert runtime_debug_condition_source("gtroot", family="rotation") == "gt_motion_7d"
     assert runtime_debug_condition_source("gtroot", family="turn") == "route_derived_7d"
     assert runtime_debug_condition_source("rootrefiner", family="turn") == "rootrefiner_7d"
+
+
+def test_runtime_debug_metadata_policies_are_explicit():
+    assert runtime_debug_turn_plan_policy("web_stream", root_source="gtroot") == "none"
+    assert runtime_debug_turn_plan_policy("turn", root_source="gtroot") == "composed_rootplan"
+    assert runtime_debug_turn_plan_policy("turn", root_source="notraj") == "none"
+    assert runtime_debug_root_refiner_history_policy("gtroot", family="web_stream") == "none"
+    assert (
+        runtime_debug_root_refiner_history_policy("rootrefiner", family="web_stream")
+        == "anchor_only_initial"
+    )
+    assert (
+        runtime_debug_root_refiner_history_policy("rootrefiner", family="turn")
+        == "generated_history"
+    )
+
+
+def test_root_source_metadata_documents_family_condition_sources():
+    metadata = root_source_metadata("gtroot")
+
+    assert metadata["family_condition_sources"]["web_stream"] == "gt_motion_7d"
+    assert metadata["family_condition_sources"]["rotation"] == "gt_motion_7d"
+    assert metadata["family_condition_sources"]["turn"] == "route_derived_7d"
 
 
 def test_runtime_generation_result_keeps_generation_boundary_fields():

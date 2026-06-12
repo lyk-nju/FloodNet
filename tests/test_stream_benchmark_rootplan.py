@@ -38,13 +38,16 @@ from eval.runtime.runners import (
 from eval.runtime.transforms import (
     build_eval_root_plan_from_points,
     build_eval_root_plan_from_world_7d,
+    compose_turn_root_plan,
     recovery_root_state_to_world,
     root_plan_to_world_7d,
     rotate_xz_points,
     rotate_world_7d_about_anchor,
 )
 from utils.inference_glue import InferenceGlueState, InferenceGlueTimeline
+from utils.motion_process import append_traj_deltas_5d_to_7d
 from utils.runtime_rootplan import build_rootplan_stream_payload_from_buffer
+from utils.runtime_timeline import append_timeline_state_at_token_start_frame
 from utils.stream_traj import StreamTrajectoryPlan
 from utils.token_frame import token_range_to_frame_slice, token_start_frame
 from utils.traj_stream_buffer import TrajStreamBuffer
@@ -207,7 +210,120 @@ def test_root_plan_to_world_7d_inverts_plan_anchor_canonicalization():
     np.testing.assert_allclose(world.numpy(), traj_7d.numpy(), atol=1e-6)
 
 
-def test_root_plan_events_to_diagnostic_arrays_concatenates_world_plans():
+def test_compose_turn_root_plan_switches_world_7d_and_recomputes_deltas():
+    anchor = InferenceGlueState.initial(xz=(0.0, 0.0), yaw=0.0, dtype=torch.float32)
+    old_5d = torch.zeros(13, 5, dtype=torch.float32)
+    old_5d[:, 2] = torch.arange(13, dtype=torch.float32)
+    old_5d[:, 3] = 1.0
+    new_5d = old_5d.clone()
+    new_5d[:, 0] = torch.arange(13, dtype=torch.float32)
+    new_5d[:, 2] = 10.0
+    new_5d[:, 3] = 0.0
+    new_5d[:, 4] = 1.0
+    old_plan = build_eval_root_plan_from_world_7d(
+        append_traj_deltas_5d_to_7d(old_5d),
+        anchor_state=anchor,
+        token_dt=0.20,
+        source="old",
+    )
+    new_plan = build_eval_root_plan_from_world_7d(
+        append_traj_deltas_5d_to_7d(new_5d),
+        anchor_state=anchor,
+        token_dt=0.20,
+        source="new",
+    )
+
+    composed = compose_turn_root_plan(
+        old_plan,
+        new_plan,
+        switch_commit=2,
+        blend_tokens=0,
+        source="composed",
+    )
+    world = root_plan_to_world_7d(composed)
+
+    np.testing.assert_allclose(world[:5, :3].numpy(), old_5d[:5, :3].numpy(), atol=1e-6)
+    np.testing.assert_allclose(world[5:, :3].numpy(), new_5d[5:, :3].numpy(), atol=1e-6)
+    np.testing.assert_allclose(world[4, 3:5].numpy(), old_5d[4, 3:5].numpy(), atol=1e-6)
+    np.testing.assert_allclose(world[5, 3:5].numpy(), new_5d[5, 3:5].numpy(), atol=1e-6)
+    assert np.isfinite(world[:, 5:].numpy()).all()
+    assert not np.isclose(float(world[5, 5]), float(new_plan.waypoints_local_7d[5, 5]))
+    assert composed.anchor_commit_idx == 0
+    assert composed.source == "composed"
+
+
+def test_compose_turn_root_plan_blends_xyz_and_heading_continuously():
+    anchor = InferenceGlueState.initial(xz=(0.0, 0.0), yaw=0.0, dtype=torch.float32)
+    old_5d = torch.zeros(21, 5, dtype=torch.float32)
+    old_5d[:, 2] = torch.arange(21, dtype=torch.float32)
+    old_5d[:, 3] = 1.0
+    new_5d = old_5d.clone()
+    new_5d[:, 0] = 10.0
+    new_5d[:, 3] = 0.0
+    new_5d[:, 4] = 1.0
+    old_plan = build_eval_root_plan_from_world_7d(
+        append_traj_deltas_5d_to_7d(old_5d),
+        anchor_state=anchor,
+        token_dt=0.20,
+    )
+    new_plan = build_eval_root_plan_from_world_7d(
+        append_traj_deltas_5d_to_7d(new_5d),
+        anchor_state=anchor,
+        token_dt=0.20,
+    )
+
+    composed = compose_turn_root_plan(
+        old_plan,
+        new_plan,
+        switch_commit=2,
+        blend_tokens=1,
+    )
+    world = root_plan_to_world_7d(composed)
+
+    assert 0.0 < float(world[6, 0]) < 10.0
+    heading_norm = torch.linalg.norm(world[:, 3:5], dim=-1)
+    np.testing.assert_allclose(heading_norm.numpy(), np.ones(len(world)), atol=1e-5)
+    yaw = torch.atan2(world[:, 4], world[:, 3])
+    assert float(yaw[5]) <= float(yaw[6]) <= float(yaw[8])
+
+
+def test_composed_turn_root_plan_keeps_body_window_prefix_valid_after_replacement():
+    anchor = InferenceGlueState.initial(xz=(0.0, 0.0), yaw=0.0, dtype=torch.float32)
+    old_5d = torch.zeros(140, 5, dtype=torch.float32)
+    old_5d[:, 2] = torch.arange(140, dtype=torch.float32)
+    old_5d[:, 3] = 1.0
+    new_5d = old_5d.clone()
+    new_5d[:, 0] = 5.0
+    old_plan = build_eval_root_plan_from_world_7d(
+        append_traj_deltas_5d_to_7d(old_5d),
+        anchor_state=anchor,
+        token_dt=0.20,
+    )
+    new_plan = build_eval_root_plan_from_world_7d(
+        append_traj_deltas_5d_to_7d(new_5d),
+        anchor_state=anchor,
+        token_dt=0.20,
+    )
+    composed = compose_turn_root_plan(old_plan, new_plan, switch_commit=10, blend_tokens=0)
+    buf = TrajStreamBuffer(batch_size=1, buf_len=256)
+    buf.set_root_plan(composed)
+    timeline = _timeline(32)
+
+    payload = build_rootplan_stream_payload_from_buffer(
+        buf,
+        timeline,
+        local_commit_index=20,
+        absolute_commit_index=20,
+        chunk_size=1,
+        history_length=20,
+        traj_horizon_tokens=4,
+    )
+
+    assert payload is not None
+    assert bool(payload["traj_cond_frame_mask"].all())
+
+
+def test_root_plan_events_to_diagnostic_arrays_uses_last_diagnostic_plan():
     traj_a = torch.tensor(
         [[0.0, 0.0, 0.0, 1.0, 0.0, 0.1, 0.0]],
         dtype=torch.float32,
@@ -221,11 +337,15 @@ def test_root_plan_events_to_diagnostic_arrays_concatenates_world_plans():
     plan_b = build_eval_root_plan_from_world_7d(traj_b, anchor_state=anchor, token_dt=0.20)
 
     root_7d, num_tokens = root_plan_events_to_diagnostic_arrays(
-        [{"root_plan": plan_a}, {"root_plan": plan_b}]
+        [
+            {"root_plan": plan_a, "diagnostic_plan": True},
+            {"root_plan": plan_a, "diagnostic_plan": False},
+            {"root_plan": plan_b, "diagnostic_plan": True},
+        ]
     )
 
-    np.testing.assert_allclose(root_7d, torch.cat([traj_a, traj_b], dim=0).numpy(), atol=1e-6)
-    assert num_tokens == int(plan_a.num_tokens_pred + plan_b.num_tokens_pred)
+    np.testing.assert_allclose(root_7d, traj_b.numpy(), atol=1e-6)
+    assert num_tokens == int(plan_b.num_tokens_pred)
 
 
 def test_rotated_gt7d_anchor_canonicalizes_back_to_original_local_plan():
@@ -307,6 +427,57 @@ def test_append_eval_timeline_state_uses_session_anchor_world_frame():
     state = timeline.at_commit(1)
     np.testing.assert_allclose(state.world_xz.numpy(), np.asarray([1.0, 3.0], dtype=np.float32))
     assert abs(float(state.world_yaw) + np.pi / 2.0) < 1e-6
+
+
+def test_frame_aware_timeline_helper_skips_first_chunk_frame_zero():
+    timeline = new_eval_timeline()
+    recovery = SimpleNamespace(
+        r_pos_accum=np.asarray([0.0, 0.0, 9.0], dtype=np.float32),
+        r_rot_ang_accum=0.0,
+    )
+
+    appended = append_timeline_state_at_token_start_frame(
+        timeline,
+        frame_idx=0,
+        recovery=recovery,
+    )
+
+    assert appended is False
+    assert timeline.head.commit_idx == 0
+    assert len(timeline) == 1
+
+
+def test_frame_aware_timeline_helper_appends_only_token_start_frames():
+    timeline = new_eval_timeline()
+    recovery = SimpleNamespace(
+        r_pos_accum=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        r_rot_ang_accum=0.0,
+    )
+
+    assert append_timeline_state_at_token_start_frame(
+        timeline,
+        frame_idx=1,
+        recovery=recovery,
+    )
+    assert timeline.head.commit_idx == 1
+    np.testing.assert_allclose(timeline.head.world_xz.numpy(), np.asarray([0.0, 1.0]))
+
+    recovery.r_pos_accum = np.asarray([0.0, 0.0, 4.0], dtype=np.float32)
+    assert not append_timeline_state_at_token_start_frame(
+        timeline,
+        frame_idx=4,
+        recovery=recovery,
+    )
+    assert timeline.head.commit_idx == 1
+
+    recovery.r_pos_accum = np.asarray([0.0, 0.0, 5.0], dtype=np.float32)
+    assert append_timeline_state_at_token_start_frame(
+        timeline,
+        frame_idx=5,
+        recovery=recovery,
+    )
+    assert timeline.head.commit_idx == 2
+    np.testing.assert_allclose(timeline.head.world_xz.numpy(), np.asarray([0.0, 5.0]))
 
 
 def test_append_eval_root_history_records_world_5d_and_next_frame():
@@ -1109,6 +1280,15 @@ class _FakeVae:
         return torch.zeros(1, 1, 263)
 
 
+class _CausalFakeVae:
+    def clear_cache(self):
+        pass
+
+    def stream_decode(self, generated, first_chunk=True):
+        num_frames = 1 if first_chunk else 4
+        return torch.zeros(1, num_frames, 263)
+
+
 class _RecordingRootRefinerRuntime:
     def __init__(self):
         self.calls = []
@@ -1223,7 +1403,7 @@ def test_babel_root_refiner_replan_receives_generated_root_history():
     replan_events = []
     _run_babel(
         model,
-        _FakeVae(),
+        _CausalFakeVae(),
         sample,
         torch.device("cpu"),
         hl=4,
@@ -1260,7 +1440,7 @@ def test_real_gt_motion_7d_runner_records_root_plan_event():
 
     _run_real(
         _FakeStreamModel(),
-        _FakeVae(),
+        _CausalFakeVae(),
         sample,
         torch.device("cpu"),
         hl=4,
@@ -1282,7 +1462,7 @@ def test_real_gt_motion_7d_runner_records_root_plan_event():
     assert replan_events[0]["source"] == "bench_real_gt_motion_7d"
 
 
-def test_turn_rootplan_matches_web_delayed_replace_semantics():
+def test_turn_rootplan_activates_composed_plan_for_delayed_replace():
     feature = torch.zeros(81, 263)
     sample = {
         "token_length": 20,
@@ -1296,7 +1476,7 @@ def test_turn_rootplan_matches_web_delayed_replace_semantics():
 
     _run_turn(
         model,
-        _FakeVae(),
+        _CausalFakeVae(),
         sample,
         torch.device("cpu"),
         hl=4,
@@ -1315,9 +1495,48 @@ def test_turn_rootplan_matches_web_delayed_replace_semantics():
     )
 
     sources = [event["source"] for event in replan_events]
-    assert sources == ["bench_old", "bench_new"]
-    assert "bench_blend" not in sources
+    assert sources == ["bench_old", "bench_composed"]
+    assert "bench_new" not in sources
     assert not hasattr(model, "_stream_eval_replan_events")
+
+
+def test_turn_rootplan_returns_composed_plan_as_visual_target():
+    feature = torch.zeros(81, 263)
+    traj = torch.zeros(81, 3)
+    traj[:, 2] = torch.arange(81, dtype=torch.float32) * 0.05
+    sample = {
+        "token_length": 20,
+        "feature_length": 81,
+        "feature": feature,
+        "traj": traj,
+        "text": "walk forward",
+    }
+    root_plan_events = []
+
+    _pm, _pr, _gr, target_t, target_pts, _ttfs = _run_turn(
+        _FakeStreamModel(),
+        _CausalFakeVae(),
+        sample,
+        torch.device("cpu"),
+        hl=4,
+        nds=1,
+        hz=2,
+        tdt=0.20,
+        wpdt=0.05,
+        fps=20.0,
+        mode="turn_mid_update",
+        angle=45.0,
+        delay_tokens=0,
+        blend_tokens=4,
+        condition_path="rootplan_7d",
+        root_refiner_runtime=None,
+        root_plan_events=root_plan_events,
+    )
+
+    diagnostic_7d, _num_tokens = root_plan_events_to_diagnostic_arrays(root_plan_events)
+    n = min(len(target_pts), len(diagnostic_7d))
+    assert np.allclose(target_t[:n], np.arange(n, dtype=np.float32) / 20.0)
+    np.testing.assert_allclose(target_pts[:n], diagnostic_7d[:n, :3], atol=1e-6)
 
 
 def test_turn_force_no_traj_skips_rootplan_setup():
@@ -1334,7 +1553,7 @@ def test_turn_force_no_traj_skips_rootplan_setup():
 
     _run_turn(
         model,
-        _FakeVae(),
+        _CausalFakeVae(),
         sample,
         torch.device("cpu"),
         hl=4,
@@ -1373,7 +1592,7 @@ def test_turn_root_refiner_does_not_rebuild_every_blend_token():
 
     _run_turn(
         _FakeStreamModel(),
-        _FakeVae(),
+        _CausalFakeVae(),
         sample,
         torch.device("cpu"),
         hl=4,
@@ -1396,7 +1615,7 @@ def test_turn_root_refiner_does_not_rebuild_every_blend_token():
         ("walk forward", 15),
     ]
     assert runtime.calls[1]["num_points"] < runtime.calls[0]["num_points"]
-    assert [event["source"] for event in replan_events] == ["bench_old", "bench_new"]
+    assert [event["source"] for event in replan_events] == ["bench_old", "bench_composed"]
 
 
 def test_turn_metric_target_follows_old_path_until_runtime_replacement():

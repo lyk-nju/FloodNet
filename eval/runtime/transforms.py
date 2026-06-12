@@ -10,13 +10,12 @@ import torch
 from utils.inference_glue import InferenceGlueState
 from utils.local_frame import (
     canonicalize_7d,
-    transform_xz_local_delta_to_world,
     uncanonicalize_7d,
-    wrap_angle,
 )
 from utils.motion_process import append_traj_deltas_5d_to_7d
 from utils.root_plan import RootPlan
-from utils.token_frame import num_tokens_for_frame_len
+from utils.runtime_timeline import recovery_root_state_to_world
+from utils.token_frame import num_tokens_for_frame_len, token_start_frame
 
 
 def _infer_physical_yaw_from_points(points_xyz: torch.Tensor) -> torch.Tensor:
@@ -186,31 +185,87 @@ def root_plan_to_world_7d(root_plan: RootPlan) -> torch.Tensor:
     )
 
 
-def recovery_root_state_to_world(
-    recovery: Any,
-    anchor_state: InferenceGlueState,
-) -> tuple[np.ndarray, float]:
-    """Convert a full-stream local recovery state back to session-world root."""
+def _hold_last_to_length(values: torch.Tensor, length: int) -> torch.Tensor:
+    if int(values.shape[0]) >= int(length):
+        return values[:length]
+    if int(values.shape[0]) <= 0:
+        raise ValueError("cannot extend an empty RootPlan")
+    pad = values[-1:].expand(int(length) - int(values.shape[0]), -1)
+    return torch.cat([values, pad], dim=0)
 
-    local_root = np.asarray(recovery.r_pos_accum, dtype=np.float32)
-    anchor_xz = anchor_state.world_xz.to(dtype=torch.float32)
-    anchor_yaw = anchor_state.world_yaw.to(dtype=torch.float32)
-    local_xz = torch.as_tensor(local_root[[0, 2]], dtype=torch.float32, device=anchor_xz.device)
-    world_xz = anchor_xz + transform_xz_local_delta_to_world(local_xz, anchor_yaw)
-    local_yaw = torch.as_tensor(
-        -2.0 * float(recovery.r_rot_ang_accum),
-        dtype=torch.float32,
-        device=anchor_xz.device,
+
+def compose_turn_root_plan(
+    old_plan: RootPlan,
+    new_plan: RootPlan,
+    *,
+    switch_commit: int,
+    blend_tokens: int = 0,
+    source: str = "bench_composed",
+) -> RootPlan:
+    """Compose old/new RootPlans into one session-anchored turn RootPlan.
+
+    The result keeps the old plan before ``switch_commit`` and uses the new plan
+    after the optional blend. Delta channels are rebuilt from the composed 5D
+    path so the 7D condition is internally consistent.
+    """
+
+    old_world = root_plan_to_world_7d(old_plan)
+    new_world = root_plan_to_world_7d(new_plan).to(
+        device=old_world.device,
+        dtype=old_world.dtype,
     )
-    world_yaw = wrap_angle(anchor_yaw + local_yaw)
-    root = local_root.copy()
-    root[[0, 2]] = world_xz.detach().cpu().numpy()
-    return root.astype(np.float32), float(world_yaw.detach().cpu().item())
+    valid_frames = max(int(old_world.shape[0]), int(new_world.shape[0]))
+    old_world = _hold_last_to_length(old_world, valid_frames)
+    new_world = _hold_last_to_length(new_world, valid_frames)
+
+    frames_per_token = int(old_plan.frames_per_token)
+    switch_frame = token_start_frame(int(switch_commit), frames_per_token)
+    blend_tokens = max(0, int(blend_tokens))
+    blend_end = (
+        token_start_frame(int(switch_commit) + blend_tokens, frames_per_token)
+        if blend_tokens > 0
+        else switch_frame
+    )
+
+    idx = torch.arange(valid_frames, device=old_world.device, dtype=old_world.dtype)
+    weight = torch.zeros(valid_frames, device=old_world.device, dtype=old_world.dtype)
+    if blend_tokens > 0 and blend_end > switch_frame:
+        raw = ((idx - float(switch_frame)) / float(blend_end - switch_frame)).clamp(0.0, 1.0)
+        weight = raw * raw * (3.0 - 2.0 * raw)
+        weight = torch.where(idx >= float(blend_end), torch.ones_like(weight), weight)
+    else:
+        weight = torch.where(idx >= float(switch_frame), torch.ones_like(weight), weight)
+
+    xyz = old_world[:, :3] * (1.0 - weight[:, None]) + new_world[:, :3] * weight[:, None]
+    old_yaw = torch.atan2(old_world[:, 4], old_world[:, 3])
+    new_yaw = torch.atan2(new_world[:, 4], new_world[:, 3])
+    yaw_delta = torch.atan2(torch.sin(new_yaw - old_yaw), torch.cos(new_yaw - old_yaw))
+    yaw = old_yaw + yaw_delta * weight
+    traj_5d_world = torch.cat(
+        [xyz, torch.cos(yaw).unsqueeze(-1), torch.sin(yaw).unsqueeze(-1)],
+        dim=-1,
+    )
+    traj_7d_world = append_traj_deltas_5d_to_7d(traj_5d_world, physical_yaw=yaw)
+    anchor_xz = old_plan.anchor_world_xz.to(device=old_world.device, dtype=old_world.dtype)
+    anchor_yaw = old_plan.anchor_world_yaw.to(device=old_world.device, dtype=old_world.dtype)
+    traj_7d_local = canonicalize_7d(traj_7d_world, anchor_xz, anchor_yaw)
+    return RootPlan(
+        num_tokens_pred=num_tokens_for_frame_len(valid_frames, frames_per_token),
+        valid_frames=valid_frames,
+        waypoints_local_7d=traj_7d_local,
+        frame_dt=float(old_plan.frame_dt),
+        frames_per_token=frames_per_token,
+        anchor_commit_idx=int(old_plan.anchor_commit_idx),
+        anchor_world_xz=anchor_xz,
+        anchor_world_yaw=anchor_yaw,
+        source=str(source),
+    )
 
 
 __all__ = [
     "build_eval_root_plan_from_points",
     "build_eval_root_plan_from_world_7d",
+    "compose_turn_root_plan",
     "recovery_root_state_to_world",
     "root_plan_to_world_7d",
     "rotate_xz_points",
