@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import types
 
 import torch
@@ -45,6 +46,7 @@ def _cfg() -> dict:
         "loss_weights": {
             "num_token": 1.0,
             "num_token_soft": 0.1,
+            "pace": 0.5,
             "xyz": 5.0,
             "heading": 1.0,
             "fwd_delta": 0.5,
@@ -68,6 +70,7 @@ def _batch(module: RefinerLightningModule, B: int = 2) -> dict:
         "path_valid_mask": torch.ones(B, m.n_path, dtype=torch.bool),
         "path_control_mask": torch.ones(B, m.n_path, dtype=torch.bool),
         "path_features": torch.randn(B, 5, generator=g),
+        "path_features_raw": torch.rand(B, 5, generator=g) + 1.0,
         "history_motion": torch.randn(B, m.n_hist, 5, generator=g),
         "history_mask": torch.ones(B, m.n_hist, dtype=torch.bool),
         "waypoints": waypoints,
@@ -130,6 +133,39 @@ def test_validation_step_logs_suite_and_duration_prefixes():
     assert all(kwargs["add_dataloader_idx"] is False for kwargs in log_kwargs.values())
 
 
+def test_training_step_logs_physical_xyz_metrics():
+    module = RefinerLightningModule(_cfg())
+    batch = _batch(module, B=1)
+    T = module.refiner.max_frames
+    batch["num_tokens"] = torch.tensor([3])
+    batch["waypoints"] = torch.zeros(1, T, 5)
+    batch["waypoints"][..., 3] = 1.0
+    batch["waypoints_physical"] = torch.zeros(1, T, 7)
+    batch["waypoints_physical"][..., 3] = 1.0
+    pred = batch["waypoints"].clone()
+    pred[..., 0] = 1.0
+    out = {
+        "waypoints": pred,
+        "num_token_logits": torch.zeros(1, module.max_tokens - module.min_tokens + 1),
+        "pred_log_pace": torch.zeros(1),
+        "pred_num_tokens_cls": torch.tensor([3]),
+        "pred_num_tokens_pace": torch.tensor([3]),
+        "pred_num_tokens": torch.tensor([3]),
+        "used_num_tokens": torch.tensor([3]),
+    }
+    module.forward = types.MethodType(lambda self, batch: out, module)
+    logged = {}
+    module.log = types.MethodType(
+        lambda self, key, value, **kwargs: logged.__setitem__(key, value),
+        module,
+    )
+
+    module.training_step(batch, 0)
+
+    assert "train/xyz_ADE_m" in logged
+    assert torch.allclose(logged["train/xyz_ADE_m"], torch.tensor(1.0))
+
+
 def test_physical_xyz_metrics_report_meter_ade_fde_and_common_prefix():
     module = RefinerLightningModule(_cfg())
     B, T = 1, 5
@@ -150,3 +186,10 @@ def test_physical_xyz_metrics_report_meter_ade_fde_and_common_prefix():
 
     assert torch.allclose(metrics["xyz_ADE_m"], torch.tensor(1.0))
     assert torch.allclose(metrics["xyz_FDE_m"], torch.tensor(1.0))
+
+
+def test_physical_xyz_metrics_has_no_cpu_sync_branch():
+    source = inspect.getsource(RefinerLightningModule._compute_physical_xyz_metrics)
+
+    assert ".item()" not in source
+    assert ".cpu()" not in source

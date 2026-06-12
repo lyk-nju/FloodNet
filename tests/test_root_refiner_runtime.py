@@ -74,6 +74,9 @@ def test_root_refiner_runtime_builds_anchor_local_7d_root_plan():
     assert len(refiner.calls) == 1
     call = refiner.calls[0]
     assert call["path_mode"] == ["dense_path"]
+    assert call["sample_mode"] == ["full"]
+    assert "path_features_raw" in call
+    assert torch.allclose(call["path_features"], call["path_features_raw"])
     assert torch.allclose(call["path"][0, 0], torch.tensor([0.0, 0.0]))
     assert torch.allclose(call["path"][0, -1], torch.tensor([0.0, 2.0]))
     assert torch.allclose(call["history_motion"][0, -1], torch.tensor([0.0, 0.0, 0.0, 1.0, 0.0]))
@@ -117,6 +120,7 @@ def test_root_refiner_runtime_uses_world_history_when_available():
     )
 
     call = refiner.calls[0]
+    assert call["sample_mode"] == ["sliding"]
     assert call["history_mask"].tolist() == [[False, False, True, True]]
     assert torch.allclose(call["history_motion"][0, -2], torch.tensor([0.0, 0.0, 0.0, 1.0, 0.0]))
     assert torch.allclose(call["history_motion"][0, -1], torch.tensor([0.0, 0.0, 1.0, 1.0, 0.0]))

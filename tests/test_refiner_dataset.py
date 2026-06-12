@@ -389,6 +389,7 @@ def test_returned_dict_has_required_keys_and_shapes():
         "path_valid_mask",
         "path_control_mask",
         "path_features",
+        "path_features_raw",
         "path_mode",
         "history_motion",
         "waypoints",
@@ -403,6 +404,7 @@ def test_returned_dict_has_required_keys_and_shapes():
     assert s["target_mask"].shape == (num_frames_for_tokens(49),)
     assert s["history_mask"].dtype == torch.bool
     assert s["target_mask"].dtype == torch.bool
+    assert torch.allclose(s["path_features"], s["path_features_raw"])
 
 
 def test_uniform_shape_between_full_and_sliding_modes():

@@ -2,13 +2,15 @@
 
 Architecture (redesigned — duration-first / trajectory-second):
 
-  Stage 1 — condition-only num-token predictor:
+  Stage 1 — condition-only hybrid duration planner:
       cond_seq = [CLS, text, path_features, path × n_path, history × n_hist]
       cond_hidden = cond_transformer(cond_seq, cond_pad)
-      num_token_logits = num_token_head(fused condition summary)
+      num_token_logits = auxiliary ordinal classifier(fused condition summary)
+      pred_log_pace = pace_head(history + raw path features + sample mode + text style)
+      pred_num_tokens = round(1 + exp(pred_log_pace) * effective_length)
     The horizon (num_tokens) is decided from the conditions ALONE — it never
-    attends to the 193 frame-level waypoint queries, so the CLS representation
-    is not diluted and waypoint-regression gradients do not dominate it.
+    attends to the frame-level waypoint queries. Classification logits remain as
+    auxiliary diagnostics/losses; pace is the main predicted-duration path.
 
   Stage 2 — token-level plan-latent generator (conditioned on the chosen horizon):
       used_class = (num_tokens given) ? num_tokens - min_tokens      # teacher-force
@@ -40,8 +42,9 @@ decoder emits max_tokens*fpt frames; the causal trim keeps token 0 as ONE
 effective frame and tokens 1..N-1 as 4 frames each:
     waypoints = cat([dense[:, :1], dense[:, fpt:]], dim=1).
 
-Output keys: num_token_logits, expected_num_tokens, pred_num_tokens,
-used_num_tokens, waypoints. Loss lives in train_refiner.py.
+Output keys include num_token_logits, pred_log_pace, pred_num_tokens_cls,
+pred_num_tokens_pace, pred_num_tokens, used_num_tokens, waypoints. Loss lives
+in utils.refiner.lightning_module.
 """
 
 from __future__ import annotations
@@ -54,6 +57,7 @@ from torch import Tensor
 from utils.token_frame import frame_idx_to_token_idx, num_frames_for_tokens
 
 _PATH_MODE_TO_ID = {"dense_path": 0, "sparse_path": 1, "goal_point": 2}
+_SAMPLE_MODE_TO_ID = {"full": 0, "sliding": 1}
 
 
 def _make_encoder(d_model: int, n_heads: int, ff_dim: int, dropout: float,
@@ -304,6 +308,7 @@ class RootRefiner(nn.Module):
         decoder_frame_res_depth: int = 4,
         decoder_dilation_growth_rate: int = 2,
         decoder_dropout: float = 0.0,
+        pace_text_dim: int = 32,
     ):
         super().__init__()
         if max_tokens < min_tokens:
@@ -337,6 +342,7 @@ class RootRefiner(nn.Module):
         self.path_proj = nn.Linear(2, d_model)
         self.path_control_proj = nn.Linear(1, d_model)
         self.path_mode_emb = nn.Embedding(len(_PATH_MODE_TO_ID), d_model)
+        self.sample_mode_emb = nn.Embedding(len(_SAMPLE_MODE_TO_ID), d_model)
         self.stats_proj = nn.Linear(path_features_dim, d_model)
         self.hist_proj = nn.Linear(5, d_model)
 
@@ -345,19 +351,12 @@ class RootRefiner(nn.Module):
         self.path_pos_emb = nn.Embedding(n_path, d_model)
         self.hist_pos_emb = nn.Embedding(n_hist, d_model)
 
-        # Stage 1: condition-only num-token predictor.
+        # Stage 1: condition-only hybrid duration planner.
         self.cond_transformer = _make_encoder(
             d_model, n_heads, ff_dim, dropout, n_layers_cond, norm_first)
         self.num_token_logits_dim = max_tokens - min_tokens + 1
-        # R2.3 duration head clean-L skip. The 4th head input slot used to be
-        # `cond_hidden[:, 2]` — the path_features (length-summary) token AFTER the
-        # condition transformer mixed it with text/path/history and z-score noise,
-        # so the head never saw a clean physical L and could only memorise (L,N)
-        # pairs (confident-wrong horizon overfit). duration_feat_proj is a RAW skip:
-        # it projects path_features straight from the input, bypassing the
-        # transformer, so the head sees an undiluted length summary and can learn
-        # the smooth N ≈ (L/v̄+3)/4 relation. Still d_model wide → head input
-        # stays 4*d_model (num_token_head unchanged).
+        # Auxiliary ordinal classifier. It stays available for ablation and
+        # diagnostics, but inference uses the pace head below.
         self.duration_feat_proj = nn.Sequential(
             nn.Linear(self.path_features_dim, d_model),
             nn.GELU(),
@@ -371,6 +370,22 @@ class RootRefiner(nn.Module):
             nn.GELU(),
             nn.LayerNorm(max(1, d_model // 2)),
             nn.Linear(max(1, d_model // 2), self.num_token_logits_dim),
+        )
+        self.pace_text_dim = int(pace_text_dim)
+        self.pace_text_proj = nn.Sequential(
+            nn.Linear(d_model, self.pace_text_dim),
+            nn.GELU(),
+        )
+        self.pace_feature_proj = nn.Sequential(
+            nn.Linear(self.path_features_dim, d_model),
+            nn.GELU(),
+        )
+        self.pace_head = nn.Sequential(
+            nn.Linear(3 * d_model + self.pace_text_dim, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, 1),
         )
 
         # Stage 2: token-level plan generator, conditioned on the chosen horizon.
@@ -419,6 +434,8 @@ class RootRefiner(nn.Module):
         path_control_mask: Tensor | None = None,  # [B, n_path] bool (True = user control)
         path_mode=None,             # list[str] or [B] long mode ids
         path_features: Tensor | None = None,    # [B, path_features_dim]
+        path_features_raw: Tensor | None = None,  # [B, path_features_dim] raw physical
+        sample_mode=None,            # list[str] or [B] long mode ids: full/sliding
         history_motion: Tensor | None = None,   # [B, n_hist, 5]
         history_mask: Tensor | None = None,     # [B, n_hist] bool (True = valid)
         offset_start_frames: Tensor | None = None,  # [B] frame offset of first user path point
@@ -442,6 +459,11 @@ class RootRefiner(nn.Module):
         path_control_mask = path_control_mask.to(device=device).bool() & path_valid_mask.to(device=device).bool()
         mode_ids = self._path_mode_ids(path_mode, B, device)
         mode_emb = self.path_mode_emb(mode_ids)
+        sample_mode_ids = self._sample_mode_ids(sample_mode, B, device)
+        sample_mode_emb = self.sample_mode_emb(sample_mode_ids)
+        if path_features_raw is None:
+            path_features_raw = path_features
+        path_features_raw = path_features_raw.to(device=device, dtype=path_features.dtype)
 
         # ---- Stage 1: condition-only num-token prediction ----
         cls_tok = self.cls_token.unsqueeze(0).unsqueeze(0).expand(B, 1, -1)      # [B,1,D]
@@ -471,8 +493,7 @@ class RootRefiner(nn.Module):
         hist_idx_1d = (history_mask.bool().long() * hist_ar.unsqueeze(0)).amax(dim=1)
         hist_idx = hist_idx_1d.view(B, 1, 1).expand(-1, 1, hist_hidden.shape[-1])
         hist_repr = hist_hidden.gather(1, hist_idx).squeeze(1)
-        # R2.3: raw skip — feed the physical length summary straight to the head,
-        # bypassing the transformer dilution (see duration_feat_proj definition).
+        # Auxiliary classification head, retained for comparison with pace.
         feature_repr = self.duration_feat_proj(path_features)
         duration_repr = torch.cat([cls_repr, path_repr, hist_repr, feature_repr], dim=-1)
         num_token_logits = self.num_token_head(duration_repr)                    # [B, K]
@@ -480,8 +501,23 @@ class RootRefiner(nn.Module):
         pred_class = num_token_logits.argmax(dim=-1)                             # [B] in [0,K-1]
         probs = num_token_logits.softmax(dim=-1)
         class_idx = torch.arange(self.num_token_logits_dim, device=device, dtype=probs.dtype)
-        expected_num_tokens = (probs * class_idx[None, :]).sum(dim=-1) + float(self.min_tokens)
-        pred_num_tokens = expected_num_tokens.round().long().clamp(self.min_tokens, self.max_tokens)
+        expected_num_tokens_cls = (probs * class_idx[None, :]).sum(dim=-1) + float(self.min_tokens)
+        pred_num_tokens_cls = expected_num_tokens_cls.round().long().clamp(self.min_tokens, self.max_tokens)
+        raw_feature_repr = self.pace_feature_proj(path_features_raw)
+        text_style_repr = self.pace_text_proj(cond_hidden[:, 1])
+        pace_repr = torch.cat(
+            [hist_repr, raw_feature_repr, sample_mode_emb, text_style_repr],
+            dim=-1,
+        )
+        pred_log_pace = self.pace_head(pace_repr).squeeze(-1)
+        effective_length = (
+            path_features_raw[:, 0].clamp_min(0.0)
+            + path_features_raw[:, 3].clamp_min(0.0)
+        )
+        pred_num_tokens_pace = (
+            1.0 + pred_log_pace.clamp(-8.0, 8.0).exp() * effective_length
+        ).round().long().clamp(self.min_tokens, self.max_tokens)
+        pred_num_tokens = pred_num_tokens_pace
         # Teacher-force the horizon whenever a num_tokens is PROVIDED — training,
         # validation, AND oracle-duration eval — and fall back to the model's own
         # expected-round duration when it is absent (real inference / normal
@@ -545,8 +581,12 @@ class RootRefiner(nn.Module):
 
         return {
             "num_token_logits": num_token_logits,
+            "expected_num_tokens": expected_num_tokens_cls,
+            "expected_num_tokens_cls": expected_num_tokens_cls,
+            "pred_num_tokens_cls": pred_num_tokens_cls,
+            "pred_log_pace": pred_log_pace,
+            "pred_num_tokens_pace": pred_num_tokens_pace,
             "pred_num_tokens": pred_num_tokens,
-            "expected_num_tokens": expected_num_tokens,
             "used_num_tokens": used_num_tokens,
             "waypoints": waypoints,
         }
@@ -583,6 +623,34 @@ class RootRefiner(nn.Module):
             raise ValueError(
                 f"path_mode length {len(ids)} does not match batch size {batch_size}"
             )
+        return torch.as_tensor(ids, dtype=torch.long, device=device)
+
+    @staticmethod
+    def _sample_mode_ids(sample_mode, batch_size: int, device: torch.device) -> Tensor:
+        if sample_mode is None:
+            return torch.zeros(batch_size, dtype=torch.long, device=device)
+        if torch.is_tensor(sample_mode):
+            ids = sample_mode.to(device=device, dtype=torch.long)
+            if ids.numel() != batch_size:
+                raise ValueError(
+                    f"sample_mode length {ids.numel()} does not match batch size {batch_size}"
+                )
+            if (ids < 0).any() or (ids >= len(_SAMPLE_MODE_TO_ID)).any():
+                raise ValueError(
+                    f"unknown sample_mode id; expected ids in [0, {len(_SAMPLE_MODE_TO_ID) - 1}]"
+                )
+            return ids.reshape(batch_size)
+        if isinstance(sample_mode, str):
+            sample_mode = [sample_mode] * batch_size
+        if len(sample_mode) != batch_size:
+            raise ValueError(
+                f"sample_mode length {len(sample_mode)} does not match batch size {batch_size}"
+            )
+        ids = []
+        for mode in sample_mode:
+            if mode not in _SAMPLE_MODE_TO_ID:
+                raise ValueError(f"unknown sample_mode {mode!r}")
+            ids.append(_SAMPLE_MODE_TO_ID[mode])
         return torch.as_tensor(ids, dtype=torch.long, device=device)
 
     def count_parameters(self) -> int:

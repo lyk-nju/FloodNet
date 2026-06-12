@@ -33,8 +33,10 @@ def _inputs(model: RootRefiner, batch_size: int = 3) -> dict:
         "path_valid_mask": torch.ones(batch_size, model.n_path, dtype=torch.bool),
         "path_control_mask": torch.ones(batch_size, model.n_path, dtype=torch.bool),
         "path_features": torch.randn(batch_size, 5, generator=g),
+        "path_features_raw": torch.rand(batch_size, 5, generator=g) + 1.0,
         "history_motion": torch.randn(batch_size, model.n_hist, 5, generator=g),
         "history_mask": torch.ones(batch_size, model.n_hist, dtype=torch.bool),
+        "sample_mode": ["full", "sliding", "full"][:batch_size],
     }
 
 
@@ -46,8 +48,12 @@ def test_root_refiner_accepts_new_forward_contract_and_returns_used_tokens():
     out = model(**inputs, num_tokens=num_tokens)
 
     assert out["num_token_logits"].shape == (3, model.max_tokens - model.min_tokens + 1)
-    assert out["expected_num_tokens"].shape == (3,)
+    assert out["expected_num_tokens_cls"].shape == (3,)
+    assert out["pred_num_tokens_cls"].shape == (3,)
+    assert out["pred_log_pace"].shape == (3,)
+    assert out["pred_num_tokens_pace"].shape == (3,)
     assert torch.equal(out["used_num_tokens"], num_tokens)
+    assert torch.equal(out["pred_num_tokens"], out["pred_num_tokens_pace"])
     assert out["pred_num_tokens"].shape == (3,)
     assert out["waypoints"].shape == (3, model.max_frames, 5)
 
@@ -74,7 +80,8 @@ def test_root_refiner_inference_uses_predicted_duration():
 
     out = model(**inputs)
 
-    assert torch.equal(out["used_num_tokens"], out["pred_num_tokens"])
+    assert torch.equal(out["used_num_tokens"], out["pred_num_tokens_pace"])
+    assert torch.equal(out["pred_num_tokens"], out["pred_num_tokens_pace"])
     assert out["used_num_tokens"].min() >= model.min_tokens
     assert out["used_num_tokens"].max() <= model.max_tokens
 
@@ -139,21 +146,30 @@ def test_path_cond_frame_decoder_offsets_path_hint_prefix():
     assert torch.allclose(cond[0, 5, :2], path[0, 0], atol=1e-5)
 
 
-def test_duration_head_gets_clean_raw_path_features_skip():
-    """R2.3: the num_token logits must depend on path_features through the RAW
-    duration_feat_proj skip (bypassing the condition transformer), so the head
-    sees an undiluted physical length summary. We verify the gradient of the
-    logits w.r.t. duration_feat_proj is non-zero — i.e. the skip is wired in."""
+def test_pace_head_gets_clean_raw_path_features_skip():
+    """Duration v2: pace logits must depend on path_features_raw through the raw
+    physical feature branch, so the head sees an undiluted length summary."""
     model = _model()
     inputs = _inputs(model)
-    inputs["path_features"].requires_grad_(True)
+    inputs["path_features_raw"].requires_grad_(True)
 
     out = model(**inputs)
-    out["num_token_logits"].sum().backward()
+    out["pred_log_pace"].sum().backward()
 
-    # gradient flows into the raw skip projection (clean-L path).
     grads = [
-        p.grad for p in model.duration_feat_proj.parameters() if p.grad is not None
+        p.grad for p in model.pace_feature_proj.parameters() if p.grad is not None
     ]
-    assert grads, "duration_feat_proj received no gradient — clean-L skip not wired"
+    assert grads, "pace_feature_proj received no gradient — raw feature path not wired"
     assert any(g.abs().sum() > 0 for g in grads)
+
+
+def test_sample_mode_changes_pace_head_not_condition_classifier():
+    model = _model().eval()
+    inputs = _inputs(model)
+    inputs["sample_mode"] = ["full"] * inputs["text_emb"].shape[0]
+    full_out = model(**inputs)
+    inputs["sample_mode"] = ["sliding"] * inputs["text_emb"].shape[0]
+    sliding_out = model(**inputs)
+
+    assert not torch.allclose(full_out["pred_log_pace"], sliding_out["pred_log_pace"])
+    assert torch.allclose(full_out["num_token_logits"], sliding_out["num_token_logits"])

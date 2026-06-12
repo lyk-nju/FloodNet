@@ -249,6 +249,12 @@ class RootRefinerRuntime:
         path_features = self._normalize_path_features(
             condition.path_features_raw.to(self.device)
         ).unsqueeze(0)
+        sample_mode = (
+            "sliding"
+            if history_motion_world_5d is not None
+            and torch.as_tensor(history_motion_world_5d).shape[0] > 1
+            else "full"
+        )
         history_motion, history_mask = self._history_from_world_5d(
             history_motion_world_5d,
             anchor_xz,
@@ -263,6 +269,8 @@ class RootRefinerRuntime:
             path_control_mask=condition.path_control_mask.to(self.device).unsqueeze(0),
             path_mode=[condition.path_mode],
             path_features=path_features,
+            path_features_raw=condition.path_features_raw.to(self.device).unsqueeze(0),
+            sample_mode=[sample_mode],
             history_motion=history_motion,
             history_mask=history_mask,
             offset_start_frames=torch.zeros(1, dtype=torch.long, device=self.device),

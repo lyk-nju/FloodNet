@@ -84,6 +84,8 @@ class RootRefinerLightningModule(pl.LightningModule):
             path_control_mask=batch.get("path_control_mask"),
             path_mode=batch.get("path_mode"),
             path_features=batch["path_features"],
+            path_features_raw=batch.get("path_features_raw", batch["path_features"]),
+            sample_mode=batch.get("mode"),
             history_motion=batch["history_motion"],
             history_mask=batch["history_mask"],
             offset_start_frames=batch.get("offset_start_frames"),
@@ -109,6 +111,29 @@ class RootRefinerLightningModule(pl.LightningModule):
         L_num = dur["ordinal_ce"]
         L_num_soft = dur["expected"]
         expected_class = dur["expected_num_tokens"] - float(self.min_tokens)
+        raw_features = batch.get("path_features_raw", batch["path_features"]).to(
+            device=out["waypoints"].device,
+            dtype=out["waypoints"].dtype,
+        )
+        effective_length = (
+            raw_features[:, 0].clamp_min(0.0)
+            + raw_features[:, 3].clamp_min(0.0)
+        )
+        pace_valid = effective_length >= 0.05
+        target_tokens = batch["num_tokens"].to(
+            device=out["waypoints"].device,
+            dtype=out["waypoints"].dtype,
+        )
+        target_log_pace = torch.log(
+            (target_tokens - 1.0).clamp_min(1.0)
+            / effective_length.clamp_min(0.05)
+        )
+        pace_terms = F.smooth_l1_loss(
+            out["pred_log_pace"],
+            target_log_pace,
+            reduction="none",
+        )
+        L_pace = masked_mean(pace_terms, pace_valid)
 
         L_xyz = smooth_l1_masked(out["waypoints"][..., 0:3], target_wp[..., 0:3], target_mask)
 
@@ -144,7 +169,8 @@ class RootRefinerLightningModule(pl.LightningModule):
         else:
             L_path_control = self._compute_path_control_loss(out, batch, target_mask)
         loss = (
-            w.get("num_token", 1.0) * L_num
+            w.get("pace", 0.0) * L_pace
+            + w.get("num_token", 1.0) * L_num
             + w.get("num_token_soft", 0.1) * L_num_soft
             + w.get("xyz", 5.0) * L_xyz
             + w.get("heading", 1.0) * L_head
@@ -157,11 +183,21 @@ class RootRefinerLightningModule(pl.LightningModule):
         with torch.no_grad():
             pred_class = out["num_token_logits"].argmax(dim=-1)
             pred_token_class = out["pred_num_tokens"].to(target_class.device) - self.min_tokens
+            pred_token_class_pace = (
+                out["pred_num_tokens_pace"].to(target_class.device) - self.min_tokens
+            )
+            pred_token_class_cls = (
+                out["pred_num_tokens_cls"].to(target_class.device) - self.min_tokens
+            )
             err = (pred_token_class - target_class).abs().float()
+            pace_err = (pred_token_class_pace - target_class).abs().float()
+            cls_err = (pred_token_class_cls - target_class).abs().float()
             argmax_err = (pred_class - target_class).abs().float()
             soft_err = (expected_class - target_class.to(expected_class.dtype)).abs()
+            physical_metrics = self._compute_physical_xyz_metrics(out, batch, target_mask)
         return {
             "loss": loss,
+            "pace": L_pace,
             "num_token": L_num,
             "num_token_soft": L_num_soft,
             "xyz": L_xyz,
@@ -174,8 +210,11 @@ class RootRefinerLightningModule(pl.LightningModule):
             "num_token_acc_pm1": (err <= 1).float().mean(),
             "num_token_acc_pm2": (err <= 2).float().mean(),
             "num_token_mae": err.mean(),
+            "num_token_mae_pace": pace_err.mean(),
+            "num_token_mae_cls": cls_err.mean(),
             "num_token_argmax_mae": argmax_err.mean(),
-            "num_token_soft_mae": soft_err.mean(),
+            "num_token_soft_mae_cls": soft_err.mean(),
+            **physical_metrics,
         }
 
     def _compute_path_control_loss(
@@ -252,8 +291,12 @@ class RootRefinerLightningModule(pl.LightningModule):
         "num_token_acc_pm1",
         "num_token_acc_pm2",
         "num_token_mae",
+        "num_token_mae_pace",
+        "num_token_mae_cls",
         "num_token_argmax_mae",
-        "num_token_soft_mae",
+        "num_token_soft_mae_cls",
+        "xyz_ADE_m",
+        "xyz_FDE_m",
     )
 
     def _register_waypoint_stats(self, cfg: dict) -> None:
@@ -341,14 +384,14 @@ class RootRefinerLightningModule(pl.LightningModule):
             gt7 = self._to_physical_7d(gt5)
         valid = mask.to(device=pred7.device).bool()
         xyz_err = (pred7[..., :3] - gt7[..., :3]).norm(dim=-1)
-        ade = masked_mean(xyz_err, valid)
-        has_valid = valid.any(dim=1)
-        if bool(has_valid.any().detach().cpu().item()):
-            last_idx = valid.long().sum(dim=1).sub(1).clamp(min=0)
-            fde_per_sample = xyz_err.gather(1, last_idx.view(-1, 1)).squeeze(1)
-            fde = fde_per_sample[has_valid].mean()
-        else:
-            fde = xyz_err.new_zeros(())
+        valid_f = valid.to(dtype=xyz_err.dtype)
+        ade = (xyz_err * valid_f).sum() / valid_f.sum().clamp_min(1.0)
+        valid_count = valid.long().sum(dim=1)
+        has_valid = valid_count > 0
+        last_idx = valid_count.sub(1).clamp(min=0)
+        fde_per_sample = xyz_err.gather(1, last_idx.view(-1, 1)).squeeze(1)
+        has_valid_f = has_valid.to(dtype=xyz_err.dtype)
+        fde = (fde_per_sample * has_valid_f).sum() / has_valid_f.sum().clamp_min(1.0)
         return {"xyz_ADE_m": ade, "xyz_FDE_m": fde}
 
     def training_step(self, batch: dict, batch_idx: int):
@@ -393,18 +436,6 @@ class RootRefinerLightningModule(pl.LightningModule):
                     f"val_{suite_name}/{mode}/{k}",
                     v,
                     prog_bar=(k == "loss" and mode == "groundtruth_duration"),
-                    on_step=False,
-                    on_epoch=True,
-                    sync_dist=True,
-                    batch_size=batch_size,
-                    add_dataloader_idx=False,
-                )
-            physical_metrics = self._compute_physical_xyz_metrics(out, batch, metric_mask)
-            for k, v in physical_metrics.items():
-                self.log(
-                    f"val_{suite_name}/{mode}/{k}",
-                    v,
-                    prog_bar=False,
                     on_step=False,
                     on_epoch=True,
                     sync_dist=True,

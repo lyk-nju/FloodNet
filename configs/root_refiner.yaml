@@ -83,8 +83,9 @@ loss:
   ordinal_sigma: 1.0                  # duration soft-label bandwidth
 
 loss_weights:
-  num_token: 1.0
-  num_token_soft: 0.1
+  pace: 0.5
+  num_token: 0.2
+  num_token_soft: 0.02
   xyz: 5.0
   heading: 1.0
   fwd_delta: 0.5                      # per-frame forward delta (NOT m/s)

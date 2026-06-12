@@ -44,6 +44,7 @@ def test_train_config_is_real_precomputed_t5():
     assert te.get("pooling") in ("mean", "first")
     assert cfg["model"]["params"]["text_emb_dim"] == 4096   # = T5 cache text_dim (P0-1)
     assert cfg["data"]["normalize"] is True        # real training z-scores (P2-1)
+    assert cfg["data"].get("path_feature_stats_dir") is None
 
 
 def test_train_config_has_no_fixed_validation_knob():
@@ -134,8 +135,9 @@ def test_loss_and_loss_weights():
     assert cfg["loss"]["heading_form"] == "cosine"
     weights = cfg["loss_weights"]
     expected_w = {
-        "num_token": 1.0,
-        "num_token_soft": 0.1,
+        "pace": 0.5,
+        "num_token": 0.2,
+        "num_token_soft": 0.02,
         "xyz": 5.0,
         "heading": 1.0,
         "fwd_delta": 0.5,

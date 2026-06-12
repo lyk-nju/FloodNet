@@ -762,6 +762,11 @@ def run_benchmark(
                 path_control_mask=sample["path_control_mask"].unsqueeze(0).to(device),
                 path_mode=[sample.get("path_mode", "dense_path")],
                 path_features=sample["path_features"].unsqueeze(0).to(device),
+                path_features_raw=sample.get(
+                    "path_features_raw",
+                    sample["path_features"],
+                ).unsqueeze(0).to(device),
+                sample_mode=[sample.get("mode", "full")],
                 history_motion=sample["history_motion"].unsqueeze(0).to(device),
                 history_mask=sample["history_mask"].unsqueeze(0).to(device),
                 offset_start_frames=sample.get(

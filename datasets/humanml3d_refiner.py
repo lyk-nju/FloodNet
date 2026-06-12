@@ -541,7 +541,8 @@ class HumanML3DRefinerDataset(RefinerDataset):
 
         out = dict(sample)
         path_tokens = condition.path
-        path_features = condition.path_features_raw
+        path_features_raw = condition.path_features_raw
+        path_features = path_features_raw
         if getattr(self, "normalize", False):
             path_tokens = self._zscore_path_xz(path_tokens)
             path_features = self._normalize_path_features(path_features)
@@ -551,6 +552,7 @@ class HumanML3DRefinerDataset(RefinerDataset):
                 "path_valid_mask": condition.path_valid_mask,
                 "path_control_mask": condition.path_control_mask,
                 "path_features": path_features,
+                "path_features_raw": path_features_raw,
                 "path_mode": condition.path_mode,
                 "history_motion": sample["current_motion"],
                 "waypoints": waypoints,
@@ -601,6 +603,7 @@ def refiner_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "path_valid_mask",
         "path_control_mask",
         "path_features",
+        "path_features_raw",
         "history_motion",
         "history_mask",
         "waypoints",
