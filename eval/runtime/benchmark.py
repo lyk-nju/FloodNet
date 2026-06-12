@@ -86,6 +86,8 @@ from eval.runtime.experiments import (
 )
 from eval.runtime.metrics import (
     build_plan_metrics,
+    compute_ade,
+    compute_fde,
     compute_plan_targets,
     compute_root_condition_diagnostics,
     estimate_body_yaw,
@@ -134,6 +136,8 @@ def _csv_safe_record(record: dict) -> dict:
 _AGGREGATE_METRIC_KEYS = (
     "ADE",
     "FDE",
+    "turn_post_switch_ADE",
+    "turn_post_switch_FDE",
     "path_arc",
     "path_chamfer",
     "heading_path_error_deg",
@@ -149,6 +153,8 @@ _RUNTIME_RECORD_FIELDS = (
     "condition_variant",
     "ADE",
     "FDE",
+    "turn_post_switch_ADE",
+    "turn_post_switch_FDE",
     "path_arc",
     "path_chamfer",
     "chamfer_type",
@@ -166,8 +172,11 @@ _RUNTIME_RECORD_FIELDS = (
     "turn_edit_commit",
     "turn_delay_tokens",
     "turn_blend_tokens",
+    "turn_requested_effective_commit",
     "turn_effective_commit",
     "turn_activation_commit",
+    "turn_post_switch_start_frame",
+    "turn_post_switch_num_frames",
     "turn_target_source",
 )
 
@@ -273,6 +282,61 @@ def _visual_target_root_from_plan(
         float(motion_fps),
     )
     return target_time.astype(np.float32, copy=False)
+
+
+def _turn_activation_commit_from_events(
+    replan_events: list[dict] | None,
+    *,
+    fallback_commit: int,
+) -> int:
+    """Return the commit where the composed turn RootPlan actually became active."""
+    fallback = int(fallback_commit)
+    for event in reversed(replan_events or []):
+        if str(event.get("source", "")) != "bench_composed":
+            continue
+        try:
+            return int(event.get("commit", fallback))
+        except (TypeError, ValueError):
+            return fallback
+    return fallback
+
+
+def _add_turn_post_switch_metrics(
+    rec: dict,
+    *,
+    pred_root_xyz: np.ndarray,
+    plan_times: np.ndarray,
+    plan_points_xyz: np.ndarray,
+    target_frames: int,
+    motion_fps: float,
+    activation_commit: int,
+) -> None:
+    """Add ADE/FDE measured only after the turn condition actually switches."""
+    target_time, _target_arc = compute_plan_targets(
+        np.asarray(plan_times, dtype=np.float32),
+        np.asarray(plan_points_xyz, dtype=np.float32),
+        int(target_frames),
+        float(motion_fps),
+    )
+    pred = np.asarray(pred_root_xyz, dtype=np.float32)
+    n = min(len(pred), len(target_time))
+    start_frame = int(token_start_frame(int(activation_commit)))
+    start_frame = max(0, start_frame)
+    num_frames = max(0, n - start_frame)
+    rec["turn_post_switch_start_frame"] = int(start_frame)
+    rec["turn_post_switch_num_frames"] = int(num_frames)
+    if num_frames <= 0:
+        rec["turn_post_switch_ADE"] = float("nan")
+        rec["turn_post_switch_FDE"] = float("nan")
+        return
+    rec["turn_post_switch_ADE"] = compute_ade(
+        pred[start_frame:n],
+        target_time[start_frame:n],
+    )
+    rec["turn_post_switch_FDE"] = compute_fde(
+        pred[start_frame:n],
+        target_time[start_frame:n],
+    )
 
 
 def _is_finite_number(value) -> bool:
@@ -1337,13 +1401,27 @@ def main():
                 turn_delay_tokens = int(spec.params.get("mid_update_delay_tokens", 20))
                 turn_blend_tokens = int(spec.params.get("mid_update_blend_tokens", 4))
                 turn_effective_commit = turn_edit_commit + turn_delay_tokens
+                turn_activation_commit = _turn_activation_commit_from_events(
+                    replan_events,
+                    fallback_commit=turn_effective_commit,
+                )
+                _add_turn_post_switch_metrics(
+                    rec,
+                    pred_root_xyz=pr,
+                    plan_times=pt,
+                    plan_points_xyz=pp,
+                    target_frames=target_frames,
+                    motion_fps=args.motion_fps,
+                    activation_commit=turn_activation_commit,
+                )
                 rec.update(
                     {
                         "turn_edit_commit": turn_edit_commit,
                         "turn_delay_tokens": turn_delay_tokens,
                         "turn_blend_tokens": turn_blend_tokens,
+                        "turn_requested_effective_commit": turn_effective_commit,
                         "turn_effective_commit": turn_effective_commit,
-                        "turn_activation_commit": turn_effective_commit,
+                        "turn_activation_commit": turn_activation_commit,
                         "turn_target_source": "runtime_debug_turn_target",
                     }
                 )
@@ -1578,15 +1656,27 @@ def main():
                 turn_blend_tokens = int(db_val)
                 turn_edit_commit = 15
                 turn_effective_commit = turn_edit_commit + turn_delay_tokens
-                turn_activation_commit = turn_effective_commit
                 pm, pr, gr, pt, pp, ttfs = _run_turn(
                     model, vae, sample, dev, mode=case.mode,
                     angle=ang, delay_tokens=int(dt_val),
                     blend_tokens=int(db_val), **kw)
+                turn_activation_commit = _turn_activation_commit_from_events(
+                    replan_events,
+                    fallback_commit=turn_effective_commit,
+                )
                 rec = build_plan_metrics(
                     pr, original_gt_root=gr, plan_times=pt, plan_points_xyz=pp,
                     target_frames=ttfs, motion_fps=args.motion_fps,
                     motion_263=pm, target_source="scheduled_turn_target",
+                )
+                _add_turn_post_switch_metrics(
+                    rec,
+                    pred_root_xyz=pr,
+                    plan_times=pt,
+                    plan_points_xyz=pp,
+                    target_frames=ttfs,
+                    motion_fps=args.motion_fps,
+                    activation_commit=turn_activation_commit,
                 )
                 visual_target_root = _visual_target_root_from_plan(
                     original_gt_root=gr,
@@ -1598,6 +1688,7 @@ def main():
                 rec["turn_edit_commit"] = turn_edit_commit
                 rec["turn_delay_tokens"] = turn_delay_tokens
                 rec["turn_blend_tokens"] = turn_blend_tokens
+                rec["turn_requested_effective_commit"] = turn_effective_commit
                 rec["turn_effective_commit"] = turn_effective_commit
                 rec["turn_activation_commit"] = turn_activation_commit
                 rec["turn_target_source"] = "scheduled_turn_target"

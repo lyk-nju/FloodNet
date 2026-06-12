@@ -1014,6 +1014,7 @@ def run_turn_case(
                 and offset >= edit_delay
                 and timeline.has_exact_state(effective_commit)
             ):
+                actual_activation_commit = int(commit_idx)
                 new_root_plan = build_eval_root_plan_for_stream_plan(
                     timeline,
                     new_plan,
@@ -1026,7 +1027,7 @@ def run_turn_case(
                     composed_root_plan = compose_turn_root_plan(
                         old_root_plan,
                         new_root_plan,
-                        switch_commit=effective_commit,
+                        switch_commit=actual_activation_commit,
                         blend_tokens=edit_blend,
                         source="bench_composed",
                     )
@@ -1035,7 +1036,7 @@ def run_turn_case(
                     composed_stream_plan = StreamTrajectoryPlan(
                         times=rot_t,
                         points_xyz=rot_pts,
-                        start_commit_index=effective_commit,
+                        start_commit_index=actual_activation_commit,
                         version=2,
                         source="bench_composed",
                     )

@@ -12,8 +12,10 @@ from eval.runtime.benchmark import (
     _csv_safe_record,
     _motion_video_overlay_kwargs,
     _parse_runtime_debug_devices,
+    _add_turn_post_switch_metrics,
     _split_runtime_debug_indices,
     _strip_cli_option,
+    _turn_activation_commit_from_events,
     _transform_joints_to_runtime_world,
     _visual_target_root_from_plan,
     _write_runtime_case_visuals,
@@ -254,9 +256,13 @@ def test_compose_turn_root_plan_switches_world_7d_and_recomputes_deltas():
         old_5d[:switch_frame, :3].numpy(),
         atol=1e-6,
     )
+    expected_new = new_5d[:, :3].clone()
+    expected_new[:, [0, 2]] += (
+        old_5d[switch_frame, [0, 2]] - new_5d[0, [0, 2]]
+    )[None, :]
     np.testing.assert_allclose(
         world[switch_frame : switch_frame + len(new_5d), :3].numpy(),
-        new_5d[:, :3].numpy(),
+        expected_new.numpy(),
         atol=1e-6,
     )
     np.testing.assert_allclose(
@@ -284,7 +290,7 @@ def test_compose_turn_root_plan_blends_xyz_and_heading_continuously():
     old_5d[:, 2] = torch.arange(21, dtype=torch.float32)
     old_5d[:, 3] = 1.0
     new_5d = old_5d.clone()
-    new_5d[:, 0] = 10.0
+    new_5d[:, 0] = 10.0 + torch.arange(21, dtype=torch.float32) * 0.5
     new_5d[:, 3] = 0.0
     new_5d[:, 4] = 1.0
     old_plan = build_eval_root_plan_from_world_7d(
@@ -306,11 +312,53 @@ def test_compose_turn_root_plan_blends_xyz_and_heading_continuously():
     )
     world = root_plan_to_world_7d(composed)
 
-    assert 0.0 < float(world[6, 0]) < 10.0
+    assert 0.0 < float(world[6, 0]) < 0.5
     heading_norm = torch.linalg.norm(world[:, 3:5], dim=-1)
     np.testing.assert_allclose(heading_norm.numpy(), np.ones(len(world)), atol=1e-5)
     yaw = torch.atan2(world[:, 4], world[:, 3])
     assert float(yaw[5]) <= float(yaw[6]) <= float(yaw[8])
+
+
+def test_compose_turn_root_plan_translates_new_suffix_to_switch_target():
+    anchor = InferenceGlueState.initial(xz=(0.0, 0.0), yaw=0.0, dtype=torch.float32)
+    old_5d = torch.zeros(32, 5, dtype=torch.float32)
+    old_5d[:, 2] = torch.arange(32, dtype=torch.float32) * 0.1
+    old_5d[:, 3] = 1.0
+    new_5d = torch.zeros(16, 5, dtype=torch.float32)
+    new_5d[:, 0] = 10.0 + torch.arange(16, dtype=torch.float32) * 0.2
+    new_5d[:, 2] = -4.0
+    new_5d[:, 4] = 1.0
+    old_plan = build_eval_root_plan_from_world_7d(
+        append_traj_deltas_5d_to_7d(old_5d),
+        anchor_state=anchor,
+        token_dt=0.20,
+    )
+    new_plan = build_eval_root_plan_from_world_7d(
+        append_traj_deltas_5d_to_7d(new_5d),
+        anchor_state=anchor,
+        token_dt=0.20,
+    )
+
+    composed = compose_turn_root_plan(
+        old_plan,
+        new_plan,
+        switch_commit=4,
+        blend_tokens=0,
+    )
+    world = root_plan_to_world_7d(composed)
+    switch_frame = token_start_frame(4)
+
+    np.testing.assert_allclose(
+        world[switch_frame, [0, 2]].numpy(),
+        old_5d[switch_frame, [0, 2]].numpy(),
+        atol=1e-6,
+    )
+    new_delta = new_5d[1:, [0, 2]] - new_5d[:-1, [0, 2]]
+    composed_delta = (
+        world[switch_frame + 1 : switch_frame + len(new_5d), [0, 2]]
+        - world[switch_frame : switch_frame + len(new_5d) - 1, [0, 2]]
+    )
+    np.testing.assert_allclose(composed_delta.numpy(), new_delta.numpy(), atol=1e-6)
 
 
 def test_composed_turn_root_plan_keeps_body_window_prefix_valid_after_replacement():
@@ -1626,6 +1674,8 @@ def test_turn_rootplan_activates_composed_plan_for_delayed_replace():
     assert model.active_plan_sources[14] == "bench_old"
     assert model.active_plan_sources[15] == "bench_old"
     assert model.active_plan_sources[16] == "bench_composed"
+    assert replan_events[1]["commit"] == 16
+    assert _turn_activation_commit_from_events(replan_events, fallback_commit=15) == 16
     assert not hasattr(model, "_stream_eval_replan_events")
 
 
@@ -1745,6 +1795,31 @@ def test_turn_root_refiner_does_not_rebuild_every_blend_token():
     ]
     assert runtime.calls[1]["num_points"] < runtime.calls[0]["num_points"]
     assert [event["source"] for event in replan_events] == ["bench_old", "bench_composed"]
+    assert replan_events[1]["commit"] == 16
+
+
+def test_turn_post_switch_metrics_start_at_actual_activation_commit():
+    rec = {}
+    pred_root = np.zeros((10, 3), dtype=np.float32)
+    pred_root[:5, 0] = 10.0
+    pred_root[5:, 0] = 1.0
+    plan_points = np.zeros((10, 3), dtype=np.float32)
+    plan_times = np.arange(10, dtype=np.float32) / 20.0
+
+    _add_turn_post_switch_metrics(
+        rec,
+        pred_root_xyz=pred_root,
+        plan_times=plan_times,
+        plan_points_xyz=plan_points,
+        target_frames=10,
+        motion_fps=20.0,
+        activation_commit=2,
+    )
+
+    assert rec["turn_post_switch_start_frame"] == token_start_frame(2)
+    assert rec["turn_post_switch_num_frames"] == 5
+    assert rec["turn_post_switch_ADE"] == 1.0
+    assert rec["turn_post_switch_FDE"] == 1.0
 
 
 def test_turn_metric_target_follows_old_path_until_runtime_replacement():
