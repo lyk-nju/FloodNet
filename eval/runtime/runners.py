@@ -1011,7 +1011,7 @@ def run_turn_case(
         elif condition_path == "rootplan_7d":
             if (
                 not new_root_plan_active
-                and offset >= edit_delay + edit_blend
+                and offset >= edit_delay
                 and timeline.has_exact_state(effective_commit)
             ):
                 new_root_plan = build_eval_root_plan_for_stream_plan(

@@ -18,6 +18,7 @@ import csv
 import json
 import os
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -65,12 +66,15 @@ from eval.runtime.cases import get_cases
 from eval.runtime.artifacts import (
     RuntimeArtifactLayout,
     infer_ckpt_tag,
+    read_experiment_root_plan,
     write_experiment_metrics,
+    write_experiment_root_plan,
     write_runtime_debug_report,
     write_root_diagnostic_artifacts,
     write_root_diagnostics_summary,
 )
 from eval.runtime.experiments import (
+    DEFAULT_ROOT_SOURCES,
     build_default_runtime_experiments,
     filter_runtime_experiments,
     parse_csv_ints,
@@ -371,16 +375,335 @@ def write_runtime_report(
     return {"legacy_root": legacy_root, **dirs}
 
 
+def prepare_runtime_media_dirs(
+    *,
+    output_dir: str | Path,
+    run_id: str,
+    suite_tag: str,
+    render_video: bool,
+    save_plots: bool,
+    enabled: bool = True,
+) -> dict[str, str | None]:
+    """Prepare legacy runtime media dirs for non-debug runtime runs.
+
+    The runtime debug matrix writes into ``runtime/<ckpt>/<run_id>`` via
+    ``RuntimeArtifactLayout``. Creating the older ``<output>/<run_id>`` folder
+    for debug runs leaves an empty timestamp directory, so callers can disable
+    this helper there.
+    """
+
+    if not enabled:
+        return {
+            "out_root": None,
+            "video_dir": None,
+            "plot_dir": None,
+            "standard_video_dir": None,
+            "standard_plot_dir": None,
+        }
+
+    out_root = ensure_dir(Path(output_dir) / str(run_id))
+    standard_media_dirs = standard_eval_artifact_dirs(
+        output_dir,
+        evaluator="Runtime",
+        probe_tag=suite_tag,
+        run_id=run_id,
+        artifact_kinds=("plot", "video"),
+        create=False,
+    )
+    video_dir = ensure_dir(out_root / "videos") if render_video else None
+    plot_dir = ensure_dir(out_root / "plots") if save_plots else None
+    standard_video_dir = (
+        ensure_dir(standard_media_dirs["video"]) if render_video else None
+    )
+    standard_plot_dir = (
+        ensure_dir(standard_media_dirs["plot"]) if save_plots else None
+    )
+    return {
+        "out_root": str(out_root),
+        "video_dir": str(video_dir) if video_dir is not None else None,
+        "plot_dir": str(plot_dir) if plot_dir is not None else None,
+        "standard_video_dir": (
+            str(standard_video_dir) if standard_video_dir is not None else None
+        ),
+        "standard_plot_dir": (
+            str(standard_plot_dir) if standard_plot_dir is not None else None
+        ),
+    }
+
+
+def _parse_runtime_debug_devices(raw: str | None) -> tuple[str, ...]:
+    if raw is None:
+        return ()
+    return tuple(part.strip() for part in str(raw).split(",") if part.strip())
+
+
+def _split_runtime_debug_indices(
+    num_specs: int,
+    devices: tuple[str, ...],
+) -> list[list[int]]:
+    if int(num_specs) <= 0 or not devices:
+        return []
+    chunks = [[] for _ in devices]
+    for idx in range(int(num_specs)):
+        chunks[idx % len(devices)].append(idx)
+    return [chunk for chunk in chunks if chunk]
+
+
+def _strip_cli_option(argv: list[str], option: str) -> list[str]:
+    stripped: list[str] = []
+    skip_next = False
+    prefix = f"{option}="
+    for arg in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == option:
+            skip_next = True
+            continue
+        if arg.startswith(prefix):
+            continue
+        stripped.append(arg)
+    return stripped
+
+
+def _build_runtime_debug_specs_from_args(args) -> list:
+    root_sources = tuple(
+        normalize_root_source(source)
+        for source in parse_csv_strings(
+            args.runtime_debug_root_sources,
+            default=DEFAULT_ROOT_SOURCES,
+        )
+    )
+    families = parse_csv_strings(
+        args.runtime_debug_families,
+        default=("web_stream", "rotation", "turn"),
+    )
+    specs = build_default_runtime_experiments(
+        sample_id=str(args.runtime_debug_sample_id),
+        root_sources=root_sources,
+        rotation_degrees=parse_csv_ints(
+            args.runtime_debug_rotation_degrees,
+            default=(10, 20, 30, 40, 50, 60, 70, 80, 90),
+        ),
+        turn_delay_tokens=parse_csv_ints(
+            args.runtime_debug_turn_delay_tokens,
+            default=(5, 10, 20),
+        ),
+        turn_blend_tokens=parse_csv_ints(
+            args.runtime_debug_turn_blend_tokens,
+            default=(2, 4, 8),
+        ),
+    )
+    return filter_runtime_experiments(specs, families=families)
+
+
+def _select_runtime_debug_specs(specs: list, raw_indices: str | None) -> list:
+    if not raw_indices:
+        return list(specs)
+    selected = []
+    for idx in parse_csv_ints(raw_indices, default=tuple(range(len(specs)))):
+        if int(idx) < 0 or int(idx) >= len(specs):
+            raise ValueError(f"runtime debug spec index out of range: {idx}")
+        selected.append(specs[int(idx)])
+    return selected
+
+
+def _collect_runtime_debug_outputs(
+    layout: RuntimeArtifactLayout,
+    specs: list,
+) -> tuple[list[dict], dict[tuple[str, tuple[str, ...]], dict[str, tuple[np.ndarray, int]]]]:
+    records: list[dict] = []
+    root_plan_cache: dict[tuple[str, tuple[str, ...]], dict[str, tuple[np.ndarray, int]]] = {}
+    for spec in specs:
+        root_source = normalize_root_source(spec.root_source)
+        metrics_path = (
+            layout.experiment_dir(root_source, spec.family, *spec.parts) / "metrics.json"
+        )
+        if not metrics_path.exists():
+            raise FileNotFoundError(f"missing runtime debug metrics: {metrics_path}")
+        with metrics_path.open() as f:
+            records.append(json.load(f))
+        if root_source in {"gtroot", "rootrefiner"}:
+            loaded = read_experiment_root_plan(
+                layout,
+                root_source=root_source,
+                family=spec.family,
+                parts=spec.parts,
+            )
+            if loaded is not None:
+                root_plan_cache.setdefault((spec.family, spec.parts), {})[
+                    root_source
+                ] = loaded
+    return records, root_plan_cache
+
+
+def _write_runtime_debug_final_report(
+    *,
+    debug_layout: RuntimeArtifactLayout,
+    args,
+    run_id: str,
+    specs: list,
+    all_recs: list[dict],
+    root_plan_cache: dict[tuple[str, tuple[str, ...]], dict[str, tuple[np.ndarray, int]]],
+) -> tuple[dict[str, Path], dict[str, Path]]:
+    root_diag_records = []
+    for (family, parts), by_source in sorted(root_plan_cache.items()):
+        if "gtroot" not in by_source or "rootrefiner" not in by_source:
+            continue
+        gt_root_7d, gt_num_tokens = by_source["gtroot"]
+        pred_root_7d, pred_num_tokens = by_source["rootrefiner"]
+        diag = compute_root_condition_diagnostics(
+            gt_root_7d,
+            pred_root_7d,
+            gt_num_tokens=gt_num_tokens,
+            pred_num_tokens=pred_num_tokens,
+        )
+        diag.update(
+            {
+                "family": family,
+                "parts": list(parts),
+                "experiment": "/".join(parts) if parts else family,
+            }
+        )
+        root_diag_records.append(diag)
+        write_root_diagnostic_artifacts(
+            debug_layout,
+            family=family,
+            parts=parts,
+            metrics=diag,
+            gt_root_7d=gt_root_7d,
+            pred_root_7d=pred_root_7d,
+            gt_num_tokens=gt_num_tokens,
+            pred_num_tokens=pred_num_tokens,
+        )
+
+    aggregate = aggregate_runtime_records(all_recs)
+    root_diag_summary = summarize_numeric_records(root_diag_records)
+    root_diag_paths = write_root_diagnostics_summary(
+        debug_layout,
+        summary=root_diag_summary,
+        records=root_diag_records,
+    )
+    devices = _parse_runtime_debug_devices(getattr(args, "runtime_debug_devices", ""))
+    summary = {
+        "run_id": run_id,
+        "config": args.config,
+        "ckpt": args.ckpt,
+        "vae_ckpt": args.vae_ckpt,
+        "root_refiner_config": args.root_refiner_config,
+        "root_refiner_ckpt": args.root_refiner_ckpt,
+        "runtime_debug_matrix": True,
+        "runtime_debug_sample_id": args.runtime_debug_sample_id,
+        "runtime_debug_devices": list(devices),
+        "aggregate": aggregate,
+        "root_diagnostics": root_diag_summary,
+        "summary": aggregate,
+        "records": all_recs,
+    }
+    debug_report_paths = write_runtime_debug_report(
+        debug_layout,
+        manifest={
+            "run_id": run_id,
+            "config": args.config,
+            "ckpt": args.ckpt,
+            "vae_ckpt": args.vae_ckpt,
+            "root_refiner_config": args.root_refiner_config,
+            "root_refiner_ckpt": args.root_refiner_ckpt,
+            "runtime_debug_matrix": True,
+            "runtime_debug_sample_id": args.runtime_debug_sample_id,
+            "runtime_debug_devices": list(devices),
+            "root_sources": sorted({spec.root_source for spec in specs}),
+            "num_experiments": len(specs),
+        },
+        summary=summary,
+        records=all_recs,
+        source_payloads={
+            root_source: root_source_metadata(root_source)
+            for root_source in sorted({spec.root_source for spec in specs})
+        },
+    )
+    return debug_report_paths, root_diag_paths
+
+
+def _run_runtime_debug_distributed(
+    *,
+    args,
+    run_id: str,
+    debug_layout: RuntimeArtifactLayout,
+    specs: list,
+) -> None:
+    devices = _parse_runtime_debug_devices(args.runtime_debug_devices)
+    chunks = _split_runtime_debug_indices(len(specs), devices)
+    if not chunks:
+        raise ValueError("--runtime_debug_devices was provided but no work was assigned")
+
+    base_argv = list(sys.argv[1:])
+    for opt in (
+        "--runtime_debug_devices",
+        "--runtime_debug_run_id",
+        "--runtime_debug_spec_indices",
+        "--runtime_debug_worker_id",
+    ):
+        base_argv = _strip_cli_option(base_argv, opt)
+
+    workers = []
+    for worker_id, indices in enumerate(chunks):
+        device = devices[worker_id]
+        cmd = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            *base_argv,
+            "--runtime_debug_run_id",
+            str(run_id),
+            "--runtime_debug_spec_indices",
+            ",".join(str(idx) for idx in indices),
+            "--runtime_debug_worker_id",
+            str(worker_id),
+        ]
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(device)
+        print(
+            f"[runtime-debug] worker {worker_id} gpu={device} "
+            f"specs={','.join(str(idx) for idx in indices)}",
+            flush=True,
+        )
+        workers.append((worker_id, subprocess.Popen(cmd, env=env)))
+
+    failed = []
+    for worker_id, proc in workers:
+        ret = proc.wait()
+        if ret != 0:
+            failed.append((worker_id, ret))
+    if failed:
+        raise SystemExit(f"runtime debug worker failure(s): {failed}")
+
+    all_recs, root_plan_cache = _collect_runtime_debug_outputs(debug_layout, specs)
+    debug_report_paths, root_diag_paths = _write_runtime_debug_final_report(
+        debug_layout=debug_layout,
+        args=args,
+        run_id=run_id,
+        specs=specs,
+        all_recs=all_recs,
+        root_plan_cache=root_plan_cache,
+    )
+    print(f"\nRuntime debug: {debug_report_paths['summary']}")
+    print(f"Runtime debug CSV: {debug_report_paths['records']}")
+    print(f"Root diagnostics: {root_diag_paths['summary']}")
+
+
 def resolve_traj_condition_source(
     condition_path: str,
     root_refiner_runtime=None,
     *,
     no_traj: bool = False,
+    gt_motion_7d: bool = False,
 ) -> str:
     if no_traj:
         return "none"
     if condition_path == "rootplan_7d":
-        return "root_refiner_7d" if root_refiner_runtime is not None else "route_7d"
+        if gt_motion_7d:
+            return "gt_motion_7d"
+        return "rootrefiner_7d" if root_refiner_runtime is not None else "route_derived_7d"
     return str(condition_path)
 
 
@@ -746,7 +1069,10 @@ def main():
         "--runtime_debug_matrix",
         action="store_true",
         default=False,
-        help="Run the new gtroot/rootrefiner/notraj runtime debug matrix.",
+        help=(
+            "Run the new runtime debug matrix. Defaults to gtroot/rootrefiner; "
+            "pass --runtime_debug_root_sources gtroot,rootrefiner,notraj to include no-traj."
+        ),
     )
     p.add_argument(
         "--runtime_debug_sample_id",
@@ -755,9 +1081,20 @@ def main():
     )
     p.add_argument(
         "--runtime_debug_root_sources",
-        default="gtroot,rootrefiner,notraj",
+        default=",".join(DEFAULT_ROOT_SOURCES),
         help="Comma-separated root sources for --runtime_debug_matrix.",
     )
+    p.add_argument(
+        "--runtime_debug_devices",
+        default="",
+        help=(
+            "Comma-separated GPU ids for multi-process runtime debug matrix. "
+            "Empty keeps single-process execution."
+        ),
+    )
+    p.add_argument("--runtime_debug_run_id", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--runtime_debug_spec_indices", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--runtime_debug_worker_id", default=None, help=argparse.SUPPRESS)
     p.add_argument(
         "--runtime_debug_families",
         default="web_stream,rotation,turn",
@@ -785,6 +1122,28 @@ def main():
             "--runtime_debug_matrix requires --root_refiner_config and "
             "--root_refiner_ckpt so gtroot/rootrefiner diagnostics can be compared"
         )
+
+    run_id = args.runtime_debug_run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+    debug_layout = RuntimeArtifactLayout(
+        output_root=args.output_dir,
+        ckpt_tag=infer_ckpt_tag(args.ckpt),
+        run_id=run_id,
+    )
+    runtime_debug_specs = (
+        _build_runtime_debug_specs_from_args(args) if args.runtime_debug_matrix else []
+    )
+    if (
+        args.runtime_debug_matrix
+        and _parse_runtime_debug_devices(args.runtime_debug_devices)
+        and not args.runtime_debug_spec_indices
+    ):
+        _run_runtime_debug_distributed(
+            args=args,
+            run_id=run_id,
+            debug_layout=debug_layout,
+            specs=runtime_debug_specs,
+        )
+        return
 
     seed_everything(args.seed)
     torch.backends.cudnn.benchmark = False
@@ -827,66 +1186,27 @@ def main():
             "--root_refiner_config and --root_refiner_ckpt"
         )
 
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    debug_layout = RuntimeArtifactLayout(
-        output_root=args.output_dir,
-        ckpt_tag=infer_ckpt_tag(args.ckpt),
-        run_id=run_id,
-    )
-    out_root = os.path.join(args.output_dir, run_id)
     suites_list = [s.strip() for s in args.suites.split(",")] if args.suites else None
     suite_tag = "_".join(suites_list) if suites_list else args.preset
-    standard_media_dirs = standard_eval_artifact_dirs(
-        args.output_dir,
-        evaluator="Runtime",
-        probe_tag=suite_tag,
+    media_dirs = prepare_runtime_media_dirs(
+        output_dir=args.output_dir,
         run_id=run_id,
-        artifact_kinds=("plot", "video"),
-        create=False,
+        suite_tag=suite_tag,
+        render_video=bool(args.render_video),
+        save_plots=not bool(args.no_save_plots),
+        enabled=not bool(args.runtime_debug_matrix),
     )
-    vdir = os.path.join(out_root, "videos") if args.render_video else None
-    pdir = os.path.join(out_root, "plots") if not args.no_save_plots else None
-    standard_vdir = (
-        str(ensure_dir(standard_media_dirs["video"])) if args.render_video else None
-    )
-    standard_pdir = (
-        str(ensure_dir(standard_media_dirs["plot"]))
-        if not args.no_save_plots
-        else None
-    )
-    os.makedirs(out_root, exist_ok=True)
-    if vdir: os.makedirs(vdir, exist_ok=True)
-    if pdir: os.makedirs(pdir, exist_ok=True)
+    vdir = media_dirs["video_dir"]
+    pdir = media_dirs["plot_dir"]
+    standard_vdir = media_dirs["standard_video_dir"]
+    standard_pdir = media_dirs["standard_plot_dir"]
 
     if args.runtime_debug_matrix:
-        root_sources = tuple(
-            normalize_root_source(source)
-            for source in parse_csv_strings(
-                args.runtime_debug_root_sources,
-                default=("gtroot", "rootrefiner", "notraj"),
-            )
+        all_specs = runtime_debug_specs
+        specs = _select_runtime_debug_specs(
+            all_specs,
+            args.runtime_debug_spec_indices,
         )
-        families = parse_csv_strings(
-            args.runtime_debug_families,
-            default=("web_stream", "rotation", "turn"),
-        )
-        specs = build_default_runtime_experiments(
-            sample_id=str(args.runtime_debug_sample_id),
-            root_sources=root_sources,
-            rotation_degrees=parse_csv_ints(
-                args.runtime_debug_rotation_degrees,
-                default=(10, 20, 30, 40, 50, 60, 70, 80, 90),
-            ),
-            turn_delay_tokens=parse_csv_ints(
-                args.runtime_debug_turn_delay_tokens,
-                default=(5, 10, 20),
-            ),
-            turn_blend_tokens=parse_csv_ints(
-                args.runtime_debug_turn_blend_tokens,
-                default=(2, 4, 8),
-            ),
-        )
-        specs = filter_runtime_experiments(specs, families=families)
         print(
             f"{len(specs)} runtime debug experiment(s)  "
             f"sample={args.runtime_debug_sample_id}"
@@ -1012,6 +1332,21 @@ def main():
                     ],
                 }
             )
+            if spec.family == "turn":
+                turn_edit_commit = 15
+                turn_delay_tokens = int(spec.params.get("mid_update_delay_tokens", 20))
+                turn_blend_tokens = int(spec.params.get("mid_update_blend_tokens", 4))
+                turn_effective_commit = turn_edit_commit + turn_delay_tokens
+                rec.update(
+                    {
+                        "turn_edit_commit": turn_edit_commit,
+                        "turn_delay_tokens": turn_delay_tokens,
+                        "turn_blend_tokens": turn_blend_tokens,
+                        "turn_effective_commit": turn_effective_commit,
+                        "turn_activation_commit": turn_effective_commit,
+                        "turn_target_source": "runtime_debug_turn_target",
+                    }
+                )
             all_recs.append(rec)
             write_experiment_metrics(
                 debug_layout,
@@ -1056,10 +1391,25 @@ def main():
                 root_plan_events
             )
             if root_source in {"gtroot", "rootrefiner"} and len(root_7d_world) > 0:
+                write_experiment_root_plan(
+                    debug_layout,
+                    root_source=root_source,
+                    family=spec.family,
+                    parts=spec.parts,
+                    root_7d_world=root_7d_world,
+                    num_tokens=num_tokens,
+                )
                 root_plan_cache.setdefault((spec.family, spec.parts), {})[root_source] = (
                     root_7d_world,
                     num_tokens,
                 )
+
+        if args.runtime_debug_worker_id is not None:
+            print(
+                f"[runtime-debug] worker {args.runtime_debug_worker_id} "
+                f"completed {len(all_recs)} experiment(s)"
+            )
+            return
 
         root_diag_records = []
         for (family, parts), by_source in sorted(root_plan_cache.items()):
@@ -1228,7 +1578,7 @@ def main():
                 turn_blend_tokens = int(db_val)
                 turn_edit_commit = 15
                 turn_effective_commit = turn_edit_commit + turn_delay_tokens
-                turn_activation_commit = turn_effective_commit + turn_blend_tokens
+                turn_activation_commit = turn_effective_commit
                 pm, pr, gr, pt, pp, ttfs = _run_turn(
                     model, vae, sample, dev, mode=case.mode,
                     angle=ang, delay_tokens=int(dt_val),
@@ -1281,9 +1631,8 @@ def main():
                 variant.condition_path,
                 variant_root_refiner,
                 no_traj=variant.force_no_traj or str(case.mode).endswith("_no_traj"),
+                gt_motion_7d=bool(case.mode_kwargs.get("gt_motion_7d", False)),
             )
-            if bool(case.mode_kwargs.get("gt_motion_7d", False)) and rec["condition_source"] != "none":
-                rec["condition_source"] = "gt_motion_7d"
             rec["rootplan_replan_count"] = len(replan_events)
             rec["rootplan_replan_commits"] = [
                 int(event.get("commit", 0)) for event in replan_events

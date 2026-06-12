@@ -214,12 +214,21 @@ def compose_turn_root_plan(
         device=old_world.device,
         dtype=old_world.dtype,
     )
-    valid_frames = max(int(old_world.shape[0]), int(new_world.shape[0]))
-    old_world = _hold_last_to_length(old_world, valid_frames)
-    new_world = _hold_last_to_length(new_world, valid_frames)
-
     frames_per_token = int(old_plan.frames_per_token)
     switch_frame = token_start_frame(int(switch_commit), frames_per_token)
+    valid_frames = max(
+        int(old_world.shape[0]),
+        int(switch_frame) + int(new_world.shape[0]),
+    )
+    old_world = _hold_last_to_length(old_world, valid_frames)
+    new_global = old_world.clone()
+    new_idx = torch.arange(
+        valid_frames - switch_frame,
+        device=new_world.device,
+        dtype=torch.long,
+    ).clamp(max=int(new_world.shape[0]) - 1)
+    new_global[switch_frame:] = new_world[new_idx]
+
     blend_tokens = max(0, int(blend_tokens))
     blend_end = (
         token_start_frame(int(switch_commit) + blend_tokens, frames_per_token)
@@ -236,9 +245,9 @@ def compose_turn_root_plan(
     else:
         weight = torch.where(idx >= float(switch_frame), torch.ones_like(weight), weight)
 
-    xyz = old_world[:, :3] * (1.0 - weight[:, None]) + new_world[:, :3] * weight[:, None]
+    xyz = old_world[:, :3] * (1.0 - weight[:, None]) + new_global[:, :3] * weight[:, None]
     old_yaw = torch.atan2(old_world[:, 4], old_world[:, 3])
-    new_yaw = torch.atan2(new_world[:, 4], new_world[:, 3])
+    new_yaw = torch.atan2(new_global[:, 4], new_global[:, 3])
     yaw_delta = torch.atan2(torch.sin(new_yaw - old_yaw), torch.cos(new_yaw - old_yaw))
     yaw = old_yaw + yaw_delta * weight
     traj_5d_world = torch.cat(

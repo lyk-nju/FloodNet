@@ -8,7 +8,9 @@ import pytest
 from eval.runtime.artifacts import (
     RuntimeArtifactLayout,
     infer_ckpt_tag,
+    read_experiment_root_plan,
     write_experiment_metrics,
+    write_experiment_root_plan,
     write_manifest,
     write_records_csv,
     write_runtime_debug_report,
@@ -151,6 +153,32 @@ def test_write_experiment_metrics_uses_leaf_experiment_directory(tmp_path: Path)
 
     assert path == layout.run_dir / "gtroot" / "rotation" / "rot_090" / "metrics.json"
     assert json.loads(path.read_text())["ADE"] == 0.25
+
+
+def test_write_and_read_experiment_root_plan_uses_leaf_directory(tmp_path: Path):
+    layout = RuntimeArtifactLayout(tmp_path, "step_485000", "20260611_220231")
+    root_7d = np.arange(14, dtype=np.float32).reshape(2, 7)
+
+    path = write_experiment_root_plan(
+        layout,
+        root_source="gtroot",
+        family="rotation",
+        parts=("rot_090",),
+        root_7d_world=root_7d,
+        num_tokens=2,
+    )
+    loaded = read_experiment_root_plan(
+        layout,
+        root_source="gtroot",
+        family="rotation",
+        parts=("rot_090",),
+    )
+
+    assert path == layout.run_dir / "gtroot" / "rotation" / "rot_090" / "root_plan_world.npz"
+    assert loaded is not None
+    loaded_root, loaded_tokens = loaded
+    np.testing.assert_allclose(loaded_root, root_7d)
+    assert loaded_tokens == 2
 
 
 def test_write_root_diagnostic_artifacts_writes_metrics_and_npz(tmp_path: Path):

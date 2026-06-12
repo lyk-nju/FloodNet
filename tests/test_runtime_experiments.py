@@ -22,9 +22,19 @@ def test_default_runtime_experiments_include_expected_sources_and_families():
 
     assert ("gtroot", "web_stream", "web_stream") in keys
     assert ("rootrefiner", "web_stream", "web_stream") in keys
-    assert ("notraj", "web_stream", "web_stream") in keys
     assert ("gtroot", "rotation", "rot_090") in keys
     assert ("rootrefiner", "turn", "delay_020") in keys
+    assert all(spec.root_source != "notraj" for spec in specs)
+
+
+def test_notraj_runtime_experiment_is_explicit_opt_in():
+    specs = build_default_runtime_experiments(
+        sample_id="001168",
+        root_sources=("gtroot", "rootrefiner", "notraj"),
+    )
+    keys = {(spec.root_source, spec.family, spec.name) for spec in specs}
+
+    assert ("notraj", "web_stream", "web_stream") in keys
     assert all(spec.root_source != "notraj" or spec.family == "web_stream" for spec in specs)
 
 

@@ -106,6 +106,43 @@ def write_experiment_metrics(
     return path
 
 
+def write_experiment_root_plan(
+    layout: RuntimeArtifactLayout,
+    *,
+    root_source: str,
+    family: str,
+    parts: tuple[str, ...] = (),
+    root_7d_world: Any,
+    num_tokens: int,
+) -> Path:
+    path = _ensure_parent(
+        layout.experiment_dir(root_source, family, *parts) / "root_plan_world.npz"
+    )
+    np.savez(
+        path,
+        root_7d_world=np.asarray(root_7d_world, dtype=np.float32),
+        num_tokens=np.asarray(int(num_tokens), dtype=np.int64),
+    )
+    return path
+
+
+def read_experiment_root_plan(
+    layout: RuntimeArtifactLayout,
+    *,
+    root_source: str,
+    family: str,
+    parts: tuple[str, ...] = (),
+) -> tuple[np.ndarray, int] | None:
+    path = layout.experiment_dir(root_source, family, *parts) / "root_plan_world.npz"
+    if not path.exists():
+        return None
+    arrays = np.load(path)
+    return (
+        np.asarray(arrays["root_7d_world"], dtype=np.float32),
+        int(arrays["num_tokens"]),
+    )
+
+
 def write_runtime_debug_report(
     layout: RuntimeArtifactLayout,
     *,
@@ -194,8 +231,10 @@ def write_root_diagnostics_summary(
 
 __all__ = [
     "infer_ckpt_tag",
+    "read_experiment_root_plan",
     "RuntimeArtifactLayout",
     "write_experiment_metrics",
+    "write_experiment_root_plan",
     "write_manifest",
     "write_records_csv",
     "write_runtime_debug_report",

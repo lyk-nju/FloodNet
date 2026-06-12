@@ -10,7 +10,7 @@ import numpy as np
 from eval.runtime.root_sources import normalize_root_source
 
 
-DEFAULT_ROOT_SOURCES: tuple[str, ...] = ("gtroot", "rootrefiner", "notraj")
+DEFAULT_ROOT_SOURCES: tuple[str, ...] = ("gtroot", "rootrefiner")
 DEFAULT_ROTATION_DEGREES: tuple[int, ...] = (10, 20, 30, 40, 50, 60, 70, 80, 90)
 DEFAULT_TURN_DELAY_TOKENS: tuple[int, ...] = (5, 10, 20)
 DEFAULT_TURN_BLEND_TOKENS: tuple[int, ...] = (2, 4, 8)
@@ -149,6 +149,22 @@ def runtime_debug_mode_for_source(root_source: str) -> tuple[str, bool, bool]:
     raise AssertionError(source)
 
 
+def runtime_debug_turn_plan_policy(family: str, *, root_source: str) -> str:
+    source = normalize_root_source(root_source)
+    if str(family) == "turn" and source != "notraj":
+        return "composed_rootplan"
+    return "none"
+
+
+def runtime_debug_root_refiner_history_policy(root_source: str, *, family: str) -> str:
+    source = normalize_root_source(root_source)
+    if source != "rootrefiner":
+        return "none"
+    if str(family) == "turn":
+        return "generated_history"
+    return "anchor_only_initial"
+
+
 def parse_csv_strings(raw: str | None, *, default: tuple[str, ...]) -> tuple[str, ...]:
     if raw is None:
         return tuple(default)
@@ -202,6 +218,8 @@ __all__ = [
     "filter_runtime_experiments",
     "parse_csv_ints",
     "parse_csv_strings",
+    "runtime_debug_root_refiner_history_policy",
     "runtime_debug_mode_for_source",
+    "runtime_debug_turn_plan_policy",
     "summarize_numeric_records",
 ]

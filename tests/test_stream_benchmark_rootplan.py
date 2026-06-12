@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,11 +11,15 @@ from eval.runtime.benchmark import (
     DEFAULT_RUNTIME_OUTPUT_DIR,
     _csv_safe_record,
     _motion_video_overlay_kwargs,
+    _parse_runtime_debug_devices,
+    _split_runtime_debug_indices,
+    _strip_cli_option,
     _transform_joints_to_runtime_world,
     _visual_target_root_from_plan,
     _write_runtime_case_visuals,
     aggregate_runtime_records,
     parse_condition_variants,
+    prepare_runtime_media_dirs,
     resolve_traj_condition_source,
     write_runtime_report,
     write_stream_summary,
@@ -241,13 +246,34 @@ def test_compose_turn_root_plan_switches_world_7d_and_recomputes_deltas():
         source="composed",
     )
     world = root_plan_to_world_7d(composed)
+    switch_frame = token_start_frame(2)
 
-    np.testing.assert_allclose(world[:5, :3].numpy(), old_5d[:5, :3].numpy(), atol=1e-6)
-    np.testing.assert_allclose(world[5:, :3].numpy(), new_5d[5:, :3].numpy(), atol=1e-6)
-    np.testing.assert_allclose(world[4, 3:5].numpy(), old_5d[4, 3:5].numpy(), atol=1e-6)
-    np.testing.assert_allclose(world[5, 3:5].numpy(), new_5d[5, 3:5].numpy(), atol=1e-6)
+    assert len(world) == switch_frame + len(new_5d)
+    np.testing.assert_allclose(
+        world[:switch_frame, :3].numpy(),
+        old_5d[:switch_frame, :3].numpy(),
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        world[switch_frame : switch_frame + len(new_5d), :3].numpy(),
+        new_5d[:, :3].numpy(),
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        world[switch_frame - 1, 3:5].numpy(),
+        old_5d[switch_frame - 1, 3:5].numpy(),
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        world[switch_frame, 3:5].numpy(),
+        new_5d[0, 3:5].numpy(),
+        atol=1e-6,
+    )
     assert np.isfinite(world[:, 5:].numpy()).all()
-    assert not np.isclose(float(world[5, 5]), float(new_plan.waypoints_local_7d[5, 5]))
+    assert not np.isclose(
+        float(world[switch_frame, 5]),
+        float(new_plan.waypoints_local_7d[0, 5]),
+    )
     assert composed.anchor_commit_idx == 0
     assert composed.source == "composed"
 
@@ -1093,6 +1119,77 @@ def test_write_runtime_report_exposes_standard_media_dirs(tmp_path):
     assert (dirs["metrics"] / "records.csv").is_file()
 
 
+def test_prepare_runtime_media_dirs_skips_legacy_dirs_for_debug_matrix(tmp_path):
+    dirs = prepare_runtime_media_dirs(
+        output_dir=tmp_path,
+        run_id="20260612_120000",
+        suite_tag="step_real_turn",
+        render_video=True,
+        save_plots=True,
+        enabled=False,
+    )
+
+    assert dirs == {
+        "out_root": None,
+        "video_dir": None,
+        "plot_dir": None,
+        "standard_video_dir": None,
+        "standard_plot_dir": None,
+    }
+    assert not (tmp_path / "20260612_120000").exists()
+    assert not (tmp_path / "Runtime").exists()
+
+
+def test_prepare_runtime_media_dirs_keeps_standard_runtime_layout(tmp_path):
+    dirs = prepare_runtime_media_dirs(
+        output_dir=tmp_path,
+        run_id="20260612_120000",
+        suite_tag="step_real_turn",
+        render_video=True,
+        save_plots=True,
+        enabled=True,
+    )
+
+    assert dirs["out_root"] == str(tmp_path / "20260612_120000")
+    assert dirs["video_dir"] == str(tmp_path / "20260612_120000" / "videos")
+    assert dirs["plot_dir"] == str(tmp_path / "20260612_120000" / "plots")
+    assert dirs["standard_video_dir"] == str(
+        tmp_path / "Runtime/video/step_real_turn/20260612_120000"
+    )
+    assert dirs["standard_plot_dir"] == str(
+        tmp_path / "Runtime/plot/step_real_turn/20260612_120000"
+    )
+    assert Path(dirs["video_dir"]).is_dir()
+    assert Path(dirs["plot_dir"]).is_dir()
+
+
+def test_runtime_debug_devices_parse_and_split_specs_round_robin():
+    assert _parse_runtime_debug_devices("") == ()
+    assert _parse_runtime_debug_devices(" 0, 2,4 ") == ("0", "2", "4")
+    assert _split_runtime_debug_indices(7, ("0", "1", "2")) == [
+        [0, 3, 6],
+        [1, 4],
+        [2, 5],
+    ]
+
+
+def test_strip_cli_option_removes_runtime_debug_devices_forms():
+    assert _strip_cli_option(
+        [
+            "--config",
+            "configs/ldf.yaml",
+            "--runtime_debug_devices",
+            "0,1",
+            "--runtime_debug_matrix",
+        ],
+        "--runtime_debug_devices",
+    ) == ["--config", "configs/ldf.yaml", "--runtime_debug_matrix"]
+    assert _strip_cli_option(
+        ["--runtime_debug_devices=0,1", "--runtime_debug_matrix"],
+        "--runtime_debug_devices",
+    ) == ["--runtime_debug_matrix"]
+
+
 def test_parse_condition_variants_expands_runtime_control_paths():
     variants = parse_condition_variants("gt_7d_ldf,rootrefiner_7d_ldf,no_traj_ldf")
 
@@ -1172,14 +1269,26 @@ def test_visual_target_root_uses_plan_target_not_original_gt():
 
 
 def test_resolve_traj_condition_source_makes_root_refiner_mode_explicit():
-    assert resolve_traj_condition_source("rootplan_7d", None) == "route_7d"
+    assert (
+        resolve_traj_condition_source("rootplan_7d", None)
+        == "route_derived_7d"
+    )
+    assert (
+        resolve_traj_condition_source("rootplan_7d", None, gt_motion_7d=True)
+        == "gt_motion_7d"
+    )
     assert (
         resolve_traj_condition_source("rootplan_7d", object())
-        == "root_refiner_7d"
+        == "rootrefiner_7d"
     )
     assert resolve_traj_condition_source("legacy_xyz", None) == "legacy_xyz"
     assert (
-        resolve_traj_condition_source("rootplan_7d", object(), no_traj=True)
+        resolve_traj_condition_source(
+            "rootplan_7d",
+            object(),
+            no_traj=True,
+            gt_motion_7d=True,
+        )
         == "none"
     )
 
@@ -1270,6 +1379,23 @@ class _FakeStreamModel:
     def stream_generate_step(self, step_input, first_chunk=True):
         self.commit_index += 1
         return {"generated": torch.zeros(1, 1, 263)}
+
+
+class _RecordingActivePlanModel(_FakeStreamModel):
+    def init_generated(self, history_length, batch_size=1, num_denoise_steps=None):
+        super().init_generated(
+            history_length,
+            batch_size=batch_size,
+            num_denoise_steps=num_denoise_steps,
+        )
+        self.active_plan_sources = []
+
+    def stream_generate_step(self, step_input, first_chunk=True):
+        active_plan = getattr(self._traj_buf, "_active_plan", None)
+        self.active_plan_sources.append(
+            None if active_plan is None else str(active_plan.source)
+        )
+        return super().stream_generate_step(step_input, first_chunk=first_chunk)
 
 
 class _FakeVae:
@@ -1471,7 +1597,7 @@ def test_turn_rootplan_activates_composed_plan_for_delayed_replace():
         "traj": torch.zeros(81, 3),
         "text": "walk forward",
     }
-    model = _FakeStreamModel()
+    model = _RecordingActivePlanModel()
     replan_events = []
 
     _run_turn(
@@ -1497,6 +1623,9 @@ def test_turn_rootplan_activates_composed_plan_for_delayed_replace():
     sources = [event["source"] for event in replan_events]
     assert sources == ["bench_old", "bench_composed"]
     assert "bench_new" not in sources
+    assert model.active_plan_sources[14] == "bench_old"
+    assert model.active_plan_sources[15] == "bench_old"
+    assert model.active_plan_sources[16] == "bench_composed"
     assert not hasattr(model, "_stream_eval_replan_events")
 
 
