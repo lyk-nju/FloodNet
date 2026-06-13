@@ -126,11 +126,9 @@ loss_weights:
   pace: 1.0
   num_token_pace: 0.1
 
-  # classification head 只作为辅助对照，不再作为主 duration planner
   num_token_cls: 0.0
   num_token_soft_cls: 0.0
 
-  # 第一轮只验证 xyz/head + pace，不混入 dynamics loss
   xyz: 5.0
   heading: 1.0
   fwd_delta: 0.0
