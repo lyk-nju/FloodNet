@@ -309,7 +309,7 @@ def build_window_local_model_batch(
     for key in (
         "traj", "traj_cond", "traj_cond_7d", "traj_mask", "traj_cond_mask",
         "traj_loss_mask", "traj_features", "traj_length", "traj_features_length",
-        "traj_loss_gt",
+        "traj_loss_gt", "token_mask",
     ):
         out.pop(key, None)
     out.update(traj_part)
@@ -318,7 +318,7 @@ def build_window_local_model_batch(
     out["token"] = feature
     out["token_length"] = latent_lengths
     if token_mask_out is not None:
-        out["token_mask"] = token_mask_out
+        out["latent_token_mask"] = token_mask_out
     _crop_segmented_text_fields(out, starts, latent_lengths)
     out["_window_local_traj"] = True
     out["_window_local_latent_start_token"] = starts

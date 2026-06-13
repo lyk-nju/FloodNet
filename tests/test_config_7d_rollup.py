@@ -9,7 +9,6 @@ from omegaconf import OmegaConf
 
 from utils.training.config_validate import (
     validate_7d_requires_self_forcing,
-    validate_stream_eval_config,
     validate_stream_training_config,
     validate_traj_dim_consistency,
 )
@@ -37,12 +36,24 @@ def test_all_new_sections_present_and_readable():
     assert cfg.stream_training.window_sampling.horizon_tokens_min == 5
     assert cfg.stream_training.window_sampling.horizon_tokens_max == 25
     assert "horizon_sim" not in cfg
-    # T_B_05
-    assert cfg.anchor_canonicalize.enabled is True
-    assert cfg.anchor_canonicalize.mode == "full"
+    assert "scheduled_sampling_prob" not in cfg.model.params
+    assert "self_forcing_stride_tokens" not in cfg.model.params
+    assert "self_forcing_detach_between_steps" not in cfg.model.params
+    assert "anchor_move_in_rollout" not in cfg.stream_training
+    assert "latent_source" not in cfg.stream_training
+    assert "motion_aux_loss" not in cfg.stream_training
+    assert "t2m_metric" not in cfg
+    assert cfg.validation.t2m_metric is True
+    assert "val_repeat" not in cfg
+    assert cfg.validation.val_repeat == 1
+    # T_B_05 is now a hard default in the self-forcing path; only ablations
+    # should add anchor_canonicalize.enabled=false as an override.
+    assert "anchor_canonicalize" not in cfg
     # T_B_06 (body_aux_loss subsumes the design's older heading_loss section)
     assert cfg.body_aux_loss.enabled is True
     assert cfg.body_aux_loss.heading_form in ("cosine", "smooth_l1")
+    assert "control_loss_train_mode" not in cfg
+    assert cfg.body_aux_loss.control_loss_train_mode == 1
     for k in ("root_xz", "root_y", "heading", "fwd_delta", "yaw_delta", "end_xz"):
         assert k in cfg.body_aux_loss.weights
     # T_B_07 / T_B_09 flags — shipped ldf.yaml is now on the 7D path.
@@ -148,46 +159,18 @@ def test_shipped_stream_training_config_valid():
     validate_stream_training_config(cfg)
 
 
-def test_shipped_ldf_declares_stream_eval_gate_default_off():
+def test_shipped_ldf_does_not_expose_async_eval_gate():
     cfg = OmegaConf.load(_LDF)
-    assert cfg.validation.stream_eval.enabled is False
-    assert cfg.validation.stream_eval.stream_mode == "stream_generate_step"
-    validate_stream_eval_config(cfg)
+    assert "test_mode" not in cfg.validation
+    assert "stream_eval" not in cfg.validation
 
 
-def test_stream_eval_rejects_unknown_stream_mode():
-    cfg = OmegaConf.create({
-        "validation": {
-            "stream_eval": {
-                "enabled": True,
-                "stream_mode": "direct_suffix",
-            }
-        }
-    })
-    with pytest.raises(ValueError, match="stream_mode"):
-        validate_stream_eval_config(cfg)
+def test_shipped_history_corruption_only_exposes_main_knobs():
+    cfg = OmegaConf.load(_LDF)
+    hc = cfg.history_corruption
 
-
-def test_stream_eval_rejects_non_positive_num_runs():
-    cfg = OmegaConf.create({
-        "validation": {"stream_eval": {"enabled": True, "num_runs": 0}}
-    })
-    with pytest.raises(ValueError, match="num_runs"):
-        validate_stream_eval_config(cfg)
-
-
-def test_stream_eval_rejects_negative_sample_limits():
-    cfg = OmegaConf.create({
-        "validation": {
-            "stream_eval": {
-                "enabled": True,
-                "max_samples": -1,
-                "max_batches": -1,
-            }
-        }
-    })
-    with pytest.raises(ValueError, match="max_samples"):
-        validate_stream_eval_config(cfg)
+    assert set(hc.keys()) == {"enabled", "z_stats_dir", "curriculum"}
+    assert set(hc.curriculum.keys()) == {"early_prob", "mid_prob", "late_prob"}
 
 
 def test_stream_training_accepts_window_sampling_auto_history():
@@ -210,7 +193,6 @@ def test_stream_training_accepts_window_sampling_auto_history():
                 "horizon_tokens_max": 25,
             },
             "latent_source": "precomputed_slice",
-            "motion_aux_loss": "full_prefix",
             "anchor_move_in_rollout": False,
         },
     })
@@ -291,14 +273,14 @@ def test_stream_training_rejects_unknown_sample_policy():
         validate_stream_training_config(cfg)
 
 
-def test_stream_training_rejects_unknown_motion_aux_loss():
+def test_stream_training_rejects_exposed_motion_aux_loss():
     cfg = OmegaConf.create({
         "model": {"params": {"chunk_size": 5}},
         "stream_training": {
             "enabled": True,
             "context_tokens": 30,
             "min_history_tokens": 8,
-            "motion_aux_loss": "decode_suffix",
+            "motion_aux_loss": "full_prefix",
         },
     })
     with pytest.raises(ValueError, match="motion_aux_loss"):

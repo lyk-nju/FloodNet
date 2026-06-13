@@ -17,11 +17,7 @@ def build_test_probe_tags(cfg):
 
 
 def build_val_dataloaders(cfg, val_dataloader, test_probe_loaders):
-    test_mode = str(cfg.get("validation", {}).get("test_mode", "inline"))
-    if test_mode == "async":
-        rank_zero_info("Validation test mode: async (emit requests only)")
-        return val_dataloader
-    rank_zero_info("Validation test mode: inline")
+    rank_zero_info("Validation eval: local generation probes enabled")
     return [val_dataloader] + test_probe_loaders
 
 

@@ -55,6 +55,16 @@ def test_curriculum_progress_thresholds():
     assert should_apply_corruption(80, 100, cfg)
 
 
+def test_curriculum_defaults_to_enabled_when_prob_schedule_is_present():
+    cfg = {
+        "enabled": True,
+        "curriculum": {"early_prob": 0.0, "mid_prob": 0.0, "late_prob": 1.0},
+    }
+
+    assert not should_apply_corruption(10, 100, cfg)
+    assert should_apply_corruption(80, 100, cfg)
+
+
 def test_curriculum_disabled_returns_false():
     cfg = {"enabled": True, "apply_prob": None, "curriculum": {"enabled": False}}
     assert should_apply_corruption(50, 100, cfg) is False

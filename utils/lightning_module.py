@@ -140,7 +140,7 @@ class BasicLightningModule(LightningModule):
     def on_save_checkpoint(self, checkpoint):
         checkpoint["ema_state"] = self.ema.state_dict()
         checkpoint["state_dict"] = self.model.state_dict()
-        # Write EMA-applied hash so inline eval can verify the saved ckpt
+        # Write EMA-applied hash so validation eval can verify the saved ckpt
         # matches what generation will actually use.
         _trainer = getattr(self, "trainer", None)
         if _trainer is not None and _trainer.is_global_zero:

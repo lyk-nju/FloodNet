@@ -1,12 +1,10 @@
 """FloodNet training entrypoint.
 
 Wires dataset, model, VAE, EMA, and Lightning Trainer. Supports standard
-(auto opt) and self-forcing (manual opt) training with inline generation eval
-and async eval watcher.
+(auto opt) and self-forcing (manual opt) training with validation generation eval.
 """
 
 import os
-from pathlib import Path
 import time
 
 # Keep CPU BLAS/OpenMP thread pools small. This process already uses DDP ranks,
@@ -35,8 +33,8 @@ from torch_ema import ExponentialMovingAverage
 
 from metrics.t2m import T2MMetrics
 from eval.ldf.conditioning import prepare_ldf_eval_model_batch
-from eval.eval_runner import run_inline_generation_eval
-from eval.eval_summary import process_inline_generation_results
+from eval.eval_runner import run_validation_generation_eval
+from eval.eval_summary import process_validation_generation_results
 from utils.initialize import (
     check_state_dict,
     get_function,
@@ -47,23 +45,20 @@ from utils.initialize import (
 )
 from utils.lightning_module import BasicLightningModule
 from utils.training import (
-    is_async_eval,
     prepare_model_input,
     build_probe_loaders,
-    build_test_probe_tags,
     build_val_dataloaders,
     compute_control_loss_xz,
-    emit_eval_request,
-    emit_resume_eval,
     ckpt_step_info,
-    launch_eval_watcher,
     resolve_sf_runtime,
     SelfForcingTrainer,
+    t2m_metric_enabled,
+    validation_repeat_count,
+    control_loss_train_mode,
 )
 from utils.training.ckpt_compat import strip_legacy_traj_encoder_weights
 from utils.training.config_validate import (
     validate_7d_requires_self_forcing,
-    validate_stream_eval_config,
     validate_stream_training_config,
     validate_traj_dim_consistency,
 )
@@ -76,7 +71,7 @@ class CustomLightningModule(BasicLightningModule):
     """Lightning module wiring diffusion model, VAE, EMA, and eval metrics.
 
     Routes training between standard (auto opt) and self-forcing (manual opt)
-    via ``SelfForcingTrainer``. Handles ControlNet re-init on resume, inline
+    via ``SelfForcingTrainer``. Handles ControlNet re-init on resume, validation
     generation eval, and T2M metric computation.
     """
     def __init__(self, cfg):
@@ -86,8 +81,7 @@ class CustomLightningModule(BasicLightningModule):
         validate_traj_dim_consistency(cfg)
         validate_7d_requires_self_forcing(cfg)
         validate_stream_training_config(cfg)
-        validate_stream_eval_config(cfg)
-        self._inline_eval_dedup = {}
+        self._validation_eval_dedup = {}
         self._resume_step_offset = 0
         super().__init__(cfg)
         # Must set AFTER super().__init__() because LightningModule.__init__
@@ -172,7 +166,7 @@ class CustomLightningModule(BasicLightningModule):
         traj = traj_loss_gt
         traj_mask = batch.get("traj_loss_mask", batch.get("traj_mask"))
         traj_length = batch["traj_length"]
-        train_mode = self.cfg.get("control_loss_train_mode", 3)
+        train_mode = control_loss_train_mode(self.cfg)
         chunk_size_tokens = getattr(self.model, "chunk_size", None)
         return compute_control_loss_xz(
             pred_list,
@@ -224,7 +218,7 @@ class CustomLightningModule(BasicLightningModule):
         # t2m metrics
         ##############################
         self.recover_dim = self.cfg.metrics.dim
-        self.t2m_enabled = bool(self.cfg.get("t2m_metric", False))
+        self.t2m_enabled = t2m_metric_enabled(self.cfg)
         self.t2m_metrics = T2MMetrics(self.cfg.metrics.t2m) if self.t2m_enabled else None
 
     def on_load_checkpoint(self, checkpoint):
@@ -359,7 +353,6 @@ class CustomLightningModule(BasicLightningModule):
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         super().on_train_batch_end(outputs, batch, batch_idx)
-        emit_eval_request(self)
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -503,32 +496,29 @@ class CustomLightningModule(BasicLightningModule):
             self.log(f"metrics/t2m_metrics/{key}", value, sync_dist=True)
 
     def on_validation_epoch_end(self):
-        if not is_async_eval(self.cfg):
-            _force = getattr(self, "_eval_on_resume", False)
-            if (
-                not self.trainer.sanity_checking
-                and self.global_step > 0
-                and (_force or self.global_step % self.cfg.validation.test_steps == 0)
-            ):
-                self.on_test_epoch_end()
-                self._inline_eval_dedup.clear()
-                # Re-save checkpoint: ModelCheckpoint saved earlier (on_validation_end)
-                # with stale EMA. Now that inline eval has run, overwrite with the
-                # EMA that was actually used.
-                _step_val = int(ckpt_step_info(self).metric_value)
-                _ckpt_path = os.path.join(
-                    self.cfg.save_dir, f"step_{_step_val:06.0f}.ckpt"
-                )
-                rank_zero_info(
-                    f"[re-save] overwriting {_ckpt_path} with step={_step_val}"
-                )
-                self.trainer.save_checkpoint(_ckpt_path, weights_only=False)
-        else:
-            self._inline_eval_dedup.clear()
+        _force = getattr(self, "_eval_on_resume", False)
+        if (
+            not self.trainer.sanity_checking
+            and self.global_step > 0
+            and (_force or self.global_step % self.cfg.validation.test_steps == 0)
+        ):
+            self.on_test_epoch_end()
+            self._validation_eval_dedup.clear()
+            # Re-save checkpoint: ModelCheckpoint saved earlier (on_validation_end)
+            # with stale EMA. Now that validation eval has run, overwrite with the
+            # EMA that was actually used.
+            _step_val = int(ckpt_step_info(self).metric_value)
+            _ckpt_path = os.path.join(
+                self.cfg.save_dir, f"step_{_step_val:06.0f}.ckpt"
+            )
+            rank_zero_info(
+                f"[re-save] overwriting {_ckpt_path} with step={_step_val}"
+            )
+            self.trainer.save_checkpoint(_ckpt_path, weights_only=False)
         self.compute_metrics()
 
     def update_test(self, batch, batch_idx=None, test_loader_idx=0):
-        return run_inline_generation_eval(
+        return run_validation_generation_eval(
             self,
             batch,
             batch_idx=batch_idx,
@@ -536,7 +526,7 @@ class CustomLightningModule(BasicLightningModule):
         )
 
     def process_test_results(self):
-        process_inline_generation_results(self)
+        process_validation_generation_results(self)
 
 
 def main():
@@ -557,11 +547,6 @@ def main():
         f"Save dir: {save_dir}, current working dir: {os.getcwd()}, exp_name: {cfg.exp_name}"
     )
     save_config_and_codes(cfg, cfg.save_dir)
-    async_test_mode = is_async_eval(cfg)
-    launch_eval_watcher(cfg, save_dir)
-    if cfg.train and cfg.resume_ckpt and async_test_mode:
-        emit_resume_eval(cfg, save_dir, cfg.resume_ckpt)
-
     ##############################
     # logger
     ##############################
@@ -623,19 +608,11 @@ def main():
         **{k: v for k, v in dl_kwargs.items() if v is not None},
     )
 
-    if async_test_mode:
-        test_probe_loaders = []
-        test_loader_tags = build_test_probe_tags(cfg)
-        total_probe_samples = 0
-        rank_zero_info(
-            "Async test mode enabled: skip building test probe loaders inside training."
-        )
-    else:
-        (
-            test_probe_loaders,
-            test_loader_tags,
-            total_probe_samples,
-        ) = build_probe_loaders(cfg, collate_fn)
+    (
+        test_probe_loaders,
+        test_loader_tags,
+        total_probe_samples,
+    ) = build_probe_loaders(cfg, collate_fn)
 
     rank_zero_info(
         f"Train dataset: {len(train_dataset) if train_dataset is not None else 0}, "
@@ -743,7 +720,7 @@ def main():
     # train or validate
     ##############################
     if cfg.train:
-        if cfg.resume_ckpt and not async_test_mode:
+        if cfg.resume_ckpt:
             rank_zero_info(
                 f"[eval-on-resume] running test on resume ckpt: {cfg.resume_ckpt}"
             )
@@ -761,7 +738,7 @@ def main():
             weights_only=False,
         )
     else:
-        for i in range(cfg.config.val_repeat):
+        for i in range(validation_repeat_count(cfg.config)):
             # Set different seed for each validation run to get diverse results
             # But keep it deterministic: same i -> same seed -> same result
             seed_everything(cfg.seed + i)
@@ -775,15 +752,6 @@ def main():
 
     if not cfg.debug and logger is not None:
         wandb.finish()
-
-    ##############################
-    # async eval teardown
-    ##############################
-    if async_test_mode:
-        done_marker = Path(save_dir) / "async_eval" / "training_done"
-        done_marker.parent.mkdir(parents=True, exist_ok=True)
-        done_marker.touch()
-        rank_zero_info("[async-eval] training_done marker written")
 
 
 if __name__ == "__main__":

@@ -35,7 +35,6 @@ class SmokeRunConfig:
     devices: str = "1"
     accelerator: str = "cpu"
     sample_policy: str = "variable_history"
-    motion_aux_loss: str = "latent_only"
     context_tokens: int = 30
     min_history_tokens: int = 8
     horizon_tokens: int = 20
@@ -99,30 +98,26 @@ def build_validation_plan(base: SmokeRunConfig) -> list[ValidationPlanEntry]:
     """Expand one base config into the standard stream-training validation plan."""
     stages = [
         (
-            "01_smoke_latent",
-            "one-step or short smoke with active-left window sampling and latent-only loss",
-            "latent_only",
+            "01_smoke_full_prefix",
+            "one-step or short smoke with active-left window sampling",
         ),
         (
-            "02_overfit_latent",
-            "small overfit with active-left window sampling and latent-only loss",
-            "latent_only",
+            "02_overfit_full_prefix",
+            "small overfit with active-left window sampling",
         ),
         (
             "03_overfit_full_prefix",
             "small overfit with active-left window sampling and full-prefix motion auxiliary loss",
-            "full_prefix",
         ),
     ]
     out = []
-    for stage, description, motion_aux_loss in stages:
+    for stage, description in stages:
         out.append(
             ValidationPlanEntry(
                 stage=stage,
                 description=description,
                 config=replace(
                     base,
-                    motion_aux_loss=motion_aux_loss,
                     exp_name=f"{base.exp_name}_{stage}",
                     output_dir=str(Path(base.output_dir) / stage),
                     validation_plan=False,
@@ -133,11 +128,6 @@ def build_validation_plan(base: SmokeRunConfig) -> list[ValidationPlanEntry]:
 
 
 def build_train_command(cfg: SmokeRunConfig) -> list[str]:
-    if cfg.motion_aux_loss not in {"latent_only", "full_prefix", "disabled"}:
-        raise ValueError(
-            "motion_aux_loss must be 'latent_only', 'full_prefix', or "
-            f"'disabled', got {cfg.motion_aux_loss!r}"
-        )
     if int(cfg.max_steps) <= 0:
         raise ValueError("max_steps must be an absolute Lightning target step > 0")
 
@@ -158,7 +148,7 @@ def build_train_command(cfg: SmokeRunConfig) -> list[str]:
         "validation.test_steps=1",
         "validation.save_every_n_steps=1",
         "validation.eval_generation_metrics=false",
-        "t2m_metric=false",
+        "validation.t2m_metric=false",
         "data.num_workers=0",
         "data.train_bs=1",
         "data.val_bs=1",
@@ -172,11 +162,7 @@ def build_train_command(cfg: SmokeRunConfig) -> list[str]:
         f"stream_training.window_sampling.history_tokens_max={cfg.history_tokens_max}",
         f"stream_training.window_sampling.horizon_tokens_min={int(cfg.horizon_tokens_min)}",
         f"stream_training.window_sampling.horizon_tokens_max={int(cfg.horizon_tokens_max)}",
-        "stream_training.anchor_move_in_rollout=false",
-        "stream_training.latent_source=precomputed_slice",
-        f"stream_training.motion_aux_loss={cfg.motion_aux_loss}",
         "history_corruption.enabled=true",
-        "anchor_canonicalize.enabled=true",
         "body_aux_loss.enabled=true",
     ]
     overrides.extend(_split_override(f"history_corruption.z_stats_dir={cfg.z_stats_dir}" if cfg.z_stats_dir else None))
@@ -438,11 +424,6 @@ def parse_args(argv: list[str] | None = None) -> SmokeRunConfig:
         default="variable_history",
         help="Deprecated legacy option; stream-training v2 always uses active-left window sampling.",
     )
-    parser.add_argument(
-        "--motion-aux-loss",
-        choices=("latent_only", "full_prefix", "disabled"),
-        default="latent_only",
-    )
     parser.add_argument("--context-tokens", type=int, default=30)
     parser.add_argument("--min-history-tokens", type=int, default=8)
     parser.add_argument("--horizon-tokens", type=int, default=20)
@@ -460,8 +441,7 @@ def parse_args(argv: list[str] | None = None) -> SmokeRunConfig:
         "--validation-plan",
         action="store_true",
         help=(
-            "Print or run the standard validation matrix: latent smoke, "
-            "latent overfit, and full-prefix overfit."
+            "Print or run the standard full-prefix stream-training validation matrix."
         ),
     )
     parser.add_argument(

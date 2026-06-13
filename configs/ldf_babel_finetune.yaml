@@ -29,8 +29,6 @@ test_setting:
             - "${dirs.raw_data}/BABEL_streamed/animations"
         compare_names:
             - "Ground Truth"
-val_repeat: 1
-
 logger:
     wandb:
         wandb_key: "${wandb_info.key}"
@@ -47,9 +45,9 @@ trainer:
 validation:
     validation_steps: 5000
     test_steps: 5000
-    test_mode: inline
     save_every_n_steps: 5000
     save_top_k: 100
+    val_repeat: 1
     eval_generation_metrics: true
     eval_num_runs: 10
     eval_seg_size: 20
@@ -151,7 +149,8 @@ model:
             - [0.0, 1]
 
 self_forcing_disable_replace: false
-control_loss_train_mode: 1
+body_aux_loss:
+    control_loss_train_mode: 1
 resume_reset_optimizer: true
 
 optimizer:

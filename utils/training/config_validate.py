@@ -70,6 +70,12 @@ def validate_stream_training_config(cfg) -> None:
     enabled = bool(OmegaConf.select(cfg, "stream_training.enabled", default=False))
     if not enabled:
         return
+    stream_cfg = OmegaConf.select(cfg, "stream_training", default={}) or {}
+    if "motion_aux_loss" in stream_cfg:
+        raise ValueError(
+            "stream_training.motion_aux_loss is no longer configurable; "
+            "full-prefix motion auxiliary loss is the stream-training default."
+        )
     chunk_size = int(OmegaConf.select(cfg, "model.params.chunk_size", default=5))
     context_tokens = int(OmegaConf.select(cfg, "stream_training.context_tokens", default=0))
     window_sampling_enabled = bool(
@@ -84,9 +90,6 @@ def validate_stream_training_config(cfg) -> None:
     )
     latent_source = str(
         OmegaConf.select(cfg, "stream_training.latent_source", default="precomputed_slice")
-    )
-    motion_aux_loss = str(
-        OmegaConf.select(cfg, "stream_training.motion_aux_loss", default="latent_only")
     )
     anchor_move = bool(
         OmegaConf.select(cfg, "stream_training.anchor_move_in_rollout", default=False)
@@ -147,11 +150,6 @@ def validate_stream_training_config(cfg) -> None:
                 f"got {latent_source!r}. VAE window re-encoding is intentionally "
                 "not part of the window-local training contract."
             )
-        if motion_aux_loss not in {"latent_only", "full_prefix", "disabled"}:
-            raise ValueError(
-                "stream_training.motion_aux_loss must be 'latent_only', "
-                f"'full_prefix', or 'disabled'; got {motion_aux_loss!r}."
-            )
         if anchor_move:
             raise ValueError(
                 "stream_training.anchor_move_in_rollout=true is not implemented yet. "
@@ -184,11 +182,6 @@ def validate_stream_training_config(cfg) -> None:
             f"got {latent_source!r}. VAE window re-encoding is intentionally "
             "not part of the window-local training contract."
         )
-    if motion_aux_loss not in {"latent_only", "full_prefix", "disabled"}:
-        raise ValueError(
-            "stream_training.motion_aux_loss must be 'latent_only', "
-            f"'full_prefix', or 'disabled'; got {motion_aux_loss!r}."
-        )
     if anchor_move:
         raise ValueError(
             "stream_training.anchor_move_in_rollout=true is not implemented yet. "
@@ -197,47 +190,8 @@ def validate_stream_training_config(cfg) -> None:
         )
 
 
-def validate_stream_eval_config(cfg) -> None:
-    """Validate optional async stream-eval checkpoint gate settings."""
-    enabled = bool(OmegaConf.select(cfg, "validation.stream_eval.enabled", default=False))
-    if not enabled:
-        return
-    stream_mode = str(
-        OmegaConf.select(
-            cfg,
-            "validation.stream_eval.stream_mode",
-            default="stream_generate_step",
-        )
-    )
-    num_runs = int(OmegaConf.select(cfg, "validation.stream_eval.num_runs", default=1))
-    max_samples = int(
-        OmegaConf.select(cfg, "validation.stream_eval.max_samples", default=5)
-    )
-    max_batches = int(
-        OmegaConf.select(cfg, "validation.stream_eval.max_batches", default=0)
-    )
-    if stream_mode not in {"stream_generate", "stream_generate_step"}:
-        raise ValueError(
-            "validation.stream_eval.stream_mode must be 'stream_generate' or "
-            f"'stream_generate_step'; got {stream_mode!r}."
-        )
-    if num_runs <= 0:
-        raise ValueError(
-            f"validation.stream_eval.num_runs must be > 0, got {num_runs}"
-        )
-    if max_samples < 0:
-        raise ValueError(
-            f"validation.stream_eval.max_samples must be >= 0, got {max_samples}"
-        )
-    if max_batches < 0:
-        raise ValueError(
-            f"validation.stream_eval.max_batches must be >= 0, got {max_batches}"
-        )
-
-
 __all__ = [
     "validate_traj_dim_consistency",
     "validate_7d_requires_self_forcing",
-    "validate_stream_eval_config",
     "validate_stream_training_config",
 ]

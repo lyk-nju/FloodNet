@@ -13,7 +13,7 @@ from scripts.stream_training_smoke import (
 )
 
 
-def test_build_train_command_enables_stream_training_window_sampling_full_prefix(tmp_path):
+def test_build_train_command_enables_stream_training_window_sampling(tmp_path):
     cfg = SmokeRunConfig(
         config="configs/ldf.yaml",
         python="python",
@@ -25,7 +25,6 @@ def test_build_train_command_enables_stream_training_window_sampling_full_prefix
         max_steps=318000,
         devices="1",
         accelerator="cpu",
-        motion_aux_loss="full_prefix",
         context_tokens=30,
         history_tokens_min=0,
         history_tokens_max="auto",
@@ -41,7 +40,9 @@ def test_build_train_command_enables_stream_training_window_sampling_full_prefix
     assert cmd[:4] == ["python", "train_ldf.py", "--config", "configs/ldf.yaml"]
     overrides = set(cmd[5:])
     assert "stream_training.enabled=true" in overrides
-    assert "stream_training.motion_aux_loss=full_prefix" in overrides
+    assert not any(
+        item.startswith("stream_training.motion_aux_loss=") for item in overrides
+    )
     assert "stream_training.context_tokens=30" in overrides
     assert "stream_training.window_sampling.enabled=true" in overrides
     assert "stream_training.window_sampling.history_tokens_min=0" in overrides
@@ -49,6 +50,13 @@ def test_build_train_command_enables_stream_training_window_sampling_full_prefix
     assert "stream_training.window_sampling.horizon_tokens_min=5" in overrides
     assert "stream_training.window_sampling.horizon_tokens_max=25" in overrides
     assert not any(item.startswith("horizon_sim.") for item in overrides)
+    assert not any(
+        item.startswith("stream_training.anchor_move_in_rollout=")
+        for item in overrides
+    )
+    assert not any(
+        item.startswith("stream_training.latent_source=") for item in overrides
+    )
     assert "trainer.accelerator=cpu" in overrides
     assert "trainer.devices=1" in overrides
     assert "trainer.max_steps=318000" in overrides
@@ -96,24 +104,15 @@ def test_build_validation_plan_expands_required_stream_training_stages(tmp_path)
         max_steps=318000,
         devices="1",
         accelerator="cpu",
-        motion_aux_loss="full_prefix",
         context_tokens=30,
     )
 
     plan = build_validation_plan(base)
 
     assert [entry.stage for entry in plan] == [
-        "01_smoke_latent",
-        "02_overfit_latent",
+        "01_smoke_full_prefix",
+        "02_overfit_full_prefix",
         "03_overfit_full_prefix",
-    ]
-    assert [
-        entry.config.motion_aux_loss
-        for entry in plan
-    ] == [
-        "latent_only",
-        "latent_only",
-        "full_prefix",
     ]
     assert plan[2].config.exp_name == "stream_validation_03_overfit_full_prefix"
     assert plan[2].config.output_dir == str(
@@ -122,7 +121,9 @@ def test_build_validation_plan_expands_required_stream_training_stages(tmp_path)
 
     cmd = build_train_command(plan[2].config)
     overrides = set(cmd[5:])
-    assert "stream_training.motion_aux_loss=full_prefix" in overrides
+    assert not any(
+        item.startswith("stream_training.motion_aux_loss=") for item in overrides
+    )
     assert "stream_training.window_sampling.enabled=true" in overrides
 
 
@@ -138,10 +139,10 @@ def test_validation_plan_print_only_outputs_all_stages_without_preflight(capsys)
 
     out = capsys.readouterr().out
     assert rc == 0
-    assert "# 01_smoke_latent:" in out
-    assert "# 02_overfit_latent:" in out
+    assert "# 01_smoke_full_prefix:" in out
+    assert "# 02_overfit_full_prefix:" in out
     assert "# 03_overfit_full_prefix:" in out
-    assert "stream_training.motion_aux_loss=full_prefix" in out
+    assert "stream_training.motion_aux_loss=" not in out
     assert "stream_training.window_sampling.enabled=true" in out
 
 
@@ -176,13 +177,14 @@ def test_validation_plan_writes_manifest_for_dry_run(tmp_path):
     assert payload["base"]["max_steps"] == 318000
     assert payload["base"]["raw_data_root"] == str(raw_root)
     assert [stage["stage"] for stage in payload["stages"]] == [
-        "01_smoke_latent",
-        "02_overfit_latent",
+        "01_smoke_full_prefix",
+        "02_overfit_full_prefix",
         "03_overfit_full_prefix",
     ]
-    assert payload["stages"][2]["config"]["motion_aux_loss"] == "full_prefix"
+    assert "motion_aux_loss" not in payload["base"]
+    assert "motion_aux_loss" not in payload["stages"][2]["config"]
     assert payload["stages"][2]["missing_paths"] == []
-    assert "stream_training.motion_aux_loss=full_prefix" in payload["stages"][2]["command"]
+    assert "stream_training.motion_aux_loss=" not in payload["stages"][2]["command"]
 
 
 def test_validation_manifest_includes_stream_eval_and_report_commands(tmp_path):

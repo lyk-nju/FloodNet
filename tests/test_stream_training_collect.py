@@ -77,7 +77,7 @@ def test_collect_validation_status_reports_passed_stages_and_newest_ckpt(tmp_pat
         "passed" for _ in payload["stages"]
     ]
     assert status["stages"][0]["candidate_ckpt"].endswith(
-        "01_smoke_latent/checkpoints/last.ckpt"
+        "01_smoke_full_prefix/checkpoints/last.ckpt"
     )
     candidate_argv = status["stages"][0]["commands"]["candidate_eval"]["argv"]
     assert "{candidate_ckpt}" not in candidate_argv

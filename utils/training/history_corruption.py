@@ -32,8 +32,9 @@ def should_apply_corruption(global_step: int, total_steps: int, hc_cfg: dict) ->
 
     - disabled → False.
     - apply_prob not None → Bernoulli(apply_prob) (overrides curriculum).
-    - else curriculum (if enabled): early/mid/late prob by training progress
-      (global_step / total_steps split into thirds). curriculum disabled → False.
+    - else curriculum: early/mid/late prob by training progress
+      (global_step / total_steps split into thirds). Explicit
+      curriculum.enabled=false disables it.
     """
     if not hc_cfg.get("enabled", False):
         return False
@@ -41,7 +42,7 @@ def should_apply_corruption(global_step: int, total_steps: int, hc_cfg: dict) ->
     if apply_prob is not None:
         return float(torch.rand(())) < float(apply_prob)
     cur = hc_cfg.get("curriculum", {}) or {}
-    if not cur.get("enabled", False):
+    if cur.get("enabled", True) is False:
         return False
     progress = (global_step / total_steps) if total_steps else 1.0
     if progress < 1.0 / 3.0:

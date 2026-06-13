@@ -22,6 +22,7 @@ try:
     from FloodNet.utils.training import (
         build_generation_eval_cfg,
         ckpt_step_info,
+        control_loss_train_mode,
         resolve_test_probe_tag,
     )
 except ImportError:  # pragma: no cover - script entrypoints use top-level imports
@@ -40,6 +41,7 @@ except ImportError:  # pragma: no cover - script entrypoints use top-level impor
     from utils.training import (
         build_generation_eval_cfg,
         ckpt_step_info,
+        control_loss_train_mode,
         resolve_test_probe_tag,
     )
 
@@ -157,7 +159,7 @@ def _gather_payloads(local_payloads):
     return local_payloads
 
 
-def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0):
+def run_validation_generation_eval(module, batch, batch_idx=None, test_loader_idx=0):
     # Fix seed for reproducible test generation, but save/restore the training RNG so
     # that training noise stays i.i.d. when the training loop resumes after validation.
     py_state = random.getstate()
@@ -201,14 +203,14 @@ def run_inline_generation_eval(module, batch, batch_idx=None, test_loader_idx=0)
                         sample_batch=sample_batch,
                         vae=module.vae,
                         device=module.device,
-                        train_mode=int(module.cfg.get("control_loss_train_mode", 3)),
+                        train_mode=control_loss_train_mode(module.cfg),
                         chunk_size_tokens=getattr(module.model, "chunk_size", None),
                         window_mode=eval_cfg["forward_ctrl_window_mode"],
                         model_batch_builder=prepare_ldf_eval_model_batch,
                     )
                 except Exception as e:
                     rank_zero_info(
-                        f"[inline fwd_ctrl_loss] sample={sample_name} deterministic eval failed: {e}"
+                        f"[validation fwd_ctrl_loss] sample={sample_name} deterministic eval failed: {e}"
                     )
 
             _debug = os.environ.get("FLOODNET_DEBUG", "") == "1"

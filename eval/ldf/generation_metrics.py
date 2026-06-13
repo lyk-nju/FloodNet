@@ -42,6 +42,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from metrics.t2m import T2MMetrics
+from utils.training import control_loss_train_mode, t2m_metric_enabled
 from metrics.traj import (
     _average_control_metrics,
     _average_traj_metrics,
@@ -397,8 +398,8 @@ def main():
     if args.num_workers is not None:
         cfg.config.data.num_workers = args.num_workers
 
-    # Resolve whether to run T2M (CLI flag OR yaml key)
-    run_t2m = args.t2m_metric or bool(cfg.config.get("t2m_metric", False))
+    # Resolve whether to run T2M (CLI flag OR validation yaml key).
+    run_t2m = args.t2m_metric or t2m_metric_enabled(cfg.config)
 
     # ── Merge mode: load shard embeddings → compute FID, then exit ────────────
     if args.t2m_merge_dir:
@@ -427,7 +428,7 @@ def main():
     model = _load_model(cfg, ckpt_path, device=device, use_ema=not args.no_ema)
     vae   = _load_vae(cfg, device=device)
     chunk_size_tokens = getattr(model, "chunk_size", None)
-    control_loss_train_mode = int(cfg.get("control_loss_train_mode", 3))
+    control_mode = control_loss_train_mode(cfg.config)
     val_cfg = cfg.get("validation", {})
     fwd_ctrl_window_mode = str(val_cfg.get("eval_forward_control_loss_window_mode", "mean_chunk_windows"))
 
@@ -475,7 +476,7 @@ def main():
     if args.forward_control_loss:
         print(
             f"[eval] forward_control_loss: ON  "
-            f"(chunk_size={chunk_size_tokens}, mode={control_loss_train_mode}, window_mode={fwd_ctrl_window_mode})"
+            f"(chunk_size={chunk_size_tokens}, mode={control_mode}, window_mode={fwd_ctrl_window_mode})"
         )
     if args.traj_ablation:
         print(f"[eval] traj_ablation: ON")
@@ -532,7 +533,7 @@ def main():
                         sample_batch=sample_batch,
                         vae=vae,
                         device=device,
-                        train_mode=control_loss_train_mode,
+                        train_mode=control_mode,
                         chunk_size_tokens=chunk_size_tokens,
                         window_mode=fwd_ctrl_window_mode,
                         model_batch_builder=prepare_ldf_eval_model_batch,

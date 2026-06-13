@@ -27,8 +27,6 @@ test_setting:
             - "${dirs.raw_data}/HumanML3D/animations"
         compare_names:
             - "Ground Truth"
-val_repeat: 1
-
 logger:
     wandb:
         wandb_key: "${wandb_info.key}"
@@ -46,6 +44,7 @@ validation:
     test_steps: 5000
     save_every_n_steps: 5000
     save_top_k: 100
+    val_repeat: 1
 metrics:
     dim: 263
     t2m:

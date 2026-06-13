@@ -18,6 +18,7 @@ from utils.training.history_corruption import (
     apply_history_corruption,
     should_apply_corruption,
 )
+from utils.training.validation_eval_runtime import control_loss_train_mode
 from utils.training.horizon_sched import sample_random_horizon_tokens
 from lightning.pytorch.utilities import rank_zero_info
 
@@ -160,19 +161,8 @@ class SelfForcingTrainer:
             ):
                 if key in model_batch:
                     loss_batch[key] = model_batch[key]
-            motion_aux_mode = st_cfg.get("motion_aux_loss", "latent_only")
-            if motion_aux_mode in (False, None, "latent_only", "disabled"):
-                for key in (
-                    "traj", "traj_cond", "traj_cond_7d", "traj_mask",
-                    "traj_cond_mask", "traj_loss_mask", "traj_features",
-                    "traj_loss_gt",
-                ):
-                    loss_batch.pop(key, None)
-            elif motion_aux_mode not in ("full_prefix",):
-                raise ValueError(
-                    "stream_training.motion_aux_loss must be 'latent_only', "
-                    f"'disabled', or 'full_prefix'; got {motion_aux_mode!r}"
-                )
+            # Full-prefix motion auxiliary supervision is the stream-training
+            # contract; keep trajectory fields in the loss batch.
             return self._self_forcing_step(loss_batch, model_batch)
 
         model_batch = prepare_model_input(batch)
@@ -478,7 +468,7 @@ class SelfForcingTrainer:
         self._last_sample_loss_mask = None
         ac_cfg = self._module.cfg.get("anchor_canonicalize", {}) or {}
         traj_feats = model_batch.get("traj_features")
-        if (ac_cfg.get("enabled", False)
+        if (ac_cfg.get("enabled", True)
                 and not bool(model_batch.get("_window_local_traj", False))
                 and torch.is_tensor(traj_feats)
                 and traj_feats.shape[-1] == 7):
@@ -1076,7 +1066,7 @@ def _compute_control_loss(pred_list, batch, module):
     traj = traj_loss_gt
     traj_mask = batch.get("traj_loss_mask", batch.get("traj_mask"))
     traj_length = batch["traj_length"]
-    train_mode = module.cfg.get("control_loss_train_mode", 3)
+    train_mode = control_loss_train_mode(module.cfg)
     chunk_size_tokens = getattr(module.model, "chunk_size", None)
     return compute_control_loss_xz(
         pred_list,

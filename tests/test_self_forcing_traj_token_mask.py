@@ -133,6 +133,63 @@ def test_run_rollout_unpacks_four_tuple_from_prepare_traj_condition():
     assert model._prepare_traj_condition.call_count == 1
 
 
+def test_run_rollout_canonicalizes_7d_traj_by_default(monkeypatch):
+    trainer, _, model_batch, _ = _make_trainer()
+    cfg = SimpleNamespace()
+    cfg.get = lambda key, default=None: {
+        "horizon_sim": {"enabled": False},
+        "history_corruption": {},
+        "self_forcing_disable_replace": True,
+    }.get(key, default)
+    trainer._module.cfg = cfg
+    traj_features = torch.zeros(_BATCH, _SEQ_LEN, 7)
+    canon = torch.ones_like(traj_features)
+    called = {}
+
+    def fake_canonicalize(traj_cond_7d, *args, **kwargs):
+        called["traj_cond_7d"] = traj_cond_7d
+        return canon, torch.ones(_BATCH)
+
+    monkeypatch.setattr(sf_mod, "apply_body_window_canonicalize", fake_canonicalize)
+
+    trainer._run_rollout(
+        {
+            **model_batch,
+            "traj_features": traj_features,
+            "traj_length": torch.tensor([_SEQ_LEN], dtype=torch.long),
+        },
+        progress=1.0,
+    )
+
+    assert called["traj_cond_7d"] is traj_features
+    assert torch.equal(trainer._last_sample_loss_mask, torch.ones(_BATCH))
+
+
+def test_run_rollout_anchor_canonicalize_ablation_override_disables(monkeypatch):
+    trainer, _, model_batch, _ = _make_trainer()
+    cfg = SimpleNamespace()
+    cfg.get = lambda key, default=None: {
+        "anchor_canonicalize": {"enabled": False},
+        "horizon_sim": {"enabled": False},
+        "history_corruption": {},
+        "self_forcing_disable_replace": True,
+    }.get(key, default)
+    trainer._module.cfg = cfg
+    canonicalize = MagicMock()
+    monkeypatch.setattr(sf_mod, "apply_body_window_canonicalize", canonicalize)
+
+    trainer._run_rollout(
+        {
+            **model_batch,
+            "traj_features": torch.zeros(_BATCH, _SEQ_LEN, 7),
+            "traj_length": torch.tensor([_SEQ_LEN], dtype=torch.long),
+        },
+        progress=1.0,
+    )
+
+    canonicalize.assert_not_called()
+
+
 def test_plan_rollout_respects_stream_training_min_history_tokens():
     model = MagicMock(name="model")
     model.chunk_size = 1

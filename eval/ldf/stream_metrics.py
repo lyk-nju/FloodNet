@@ -245,7 +245,7 @@ def _resolve_meta_paths_and_probe_tag(args, cfg) -> tuple[list[str], str]:
     """Resolve stream-eval meta paths.
 
     Supports the standalone legacy `data.test_meta_paths` shape and the LDF
-    probe layout `data.test_probe_meta_paths` used by run_eval/eval_watcher.
+    probe layout `data.test_probe_meta_paths` used by run_eval.
     CLI `--meta_paths` remains the highest-priority override.
     """
     if args.meta_paths:

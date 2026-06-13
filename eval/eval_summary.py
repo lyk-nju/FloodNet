@@ -25,7 +25,7 @@ except ImportError:  # pragma: no cover - script entrypoints use top-level impor
     from utils.visualize import make_composite_compare_videos, render_video
 
 
-def flatten_inline_eval_summary(summary: dict, prefix: str) -> dict:
+def flatten_validation_eval_summary(summary: dict, prefix: str) -> dict:
     flat_metrics = {}
     for key, value in summary.items():
         log_key = f"{prefix}/{key}"
@@ -232,7 +232,7 @@ def _log_probe_summary(module, dataset_id, probe_tag, step_tag, summary):
         f"ControlL2={summary.get('control/Control_L2_dist_mean', float('nan')):.4f}"
     )
 
-    flat_metrics = flatten_inline_eval_summary(
+    flat_metrics = flatten_validation_eval_summary(
         summary,
         prefix=f"eval/{probe_tag}/{dataset_id}",
     )
@@ -243,7 +243,7 @@ def _log_probe_summary(module, dataset_id, probe_tag, step_tag, summary):
         )
 
 
-def process_inline_generation_results(module):
+def process_validation_generation_results(module):
     step_tag = ckpt_step_info(module).step_tag
     for dataset_id in os.listdir(module.cfg.save_dir):
         feature_root = Path(module.cfg.save_dir) / dataset_id / "feature"
@@ -273,7 +273,7 @@ def process_inline_generation_results(module):
 
 
 # ------------------------------------------------------------------
-# Artifact I/O (moved from inline_eval_artifacts.py)
+# Artifact I/O for validation generation eval.
 # ------------------------------------------------------------------
 
 
@@ -296,7 +296,7 @@ def save_eval_payloads(module, payloads, probe_tag, step_tag):
     if module.trainer.global_rank != 0:
         return
 
-    seen = module._inline_eval_dedup.setdefault((probe_tag, step_tag), set())
+    seen = module._validation_eval_dedup.setdefault((probe_tag, step_tag), set())
     for payload in payloads:
         sample_id = payload["name"]
         dataset_id = payload["dataset_id"]

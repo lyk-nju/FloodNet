@@ -43,7 +43,7 @@ def test_all_on_keeps_every_subitem_enabled():
     assert c.stream_training.window_sampling.enabled is True
     assert c.stream_training.window_sampling.horizon_tokens_min == 5
     assert c.stream_training.window_sampling.horizon_tokens_max == 25
-    assert c.anchor_canonicalize.enabled is True
+    assert "anchor_canonicalize" not in c
     assert c.body_aux_loss.enabled is True
     assert c.body_aux_loss.weights.heading > 0
 
@@ -53,7 +53,7 @@ def test_each_no_x_disables_exactly_its_subitem():
     assert c.history_corruption.enabled is False
     assert c.stream_training.window_sampling.horizon_tokens_min == 5
     assert c.stream_training.window_sampling.horizon_tokens_max == 25
-    assert c.anchor_canonicalize.enabled is True
+    assert "anchor_canonicalize" not in c
 
     c = _applied("no_horizon_sim")
     assert "horizon_sim" not in c

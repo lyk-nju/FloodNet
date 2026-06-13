@@ -15,6 +15,21 @@ def build_generation_eval_cfg(cfg):
     }
 
 
+def t2m_metric_enabled(cfg) -> bool:
+    val_cfg = cfg.get("validation", {})
+    return bool(val_cfg.get("t2m_metric", False))
+
+
+def validation_repeat_count(cfg) -> int:
+    val_cfg = cfg.get("validation", {})
+    return int(val_cfg.get("val_repeat", 1))
+
+
+def control_loss_train_mode(cfg) -> int:
+    body_cfg = cfg.get("body_aux_loss", {}) or {}
+    return int(body_cfg.get("control_loss_train_mode", 3))
+
+
 def get_test_probe_tags(module) -> list[str]:
     tags = getattr(module, "test_loader_tags", None)
     if tags:

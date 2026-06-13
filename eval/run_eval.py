@@ -3,8 +3,9 @@ import os
 import sys
 from pathlib import Path
 
-# Async eval runs beside an 8-rank training job. Keep BLAS/OpenMP libraries from
-# spawning large CPU thread pools and exhausting per-user process limits.
+# Standalone validation eval can run beside training jobs. Keep BLAS/OpenMP
+# libraries from spawning large CPU thread pools and exhausting per-user
+# process limits.
 for _thread_env_key in (
     "OPENBLAS_NUM_THREADS",
     "OMP_NUM_THREADS",
@@ -31,7 +32,7 @@ from utils.training import build_probe_loaders, load_resume_step_offset  # noqa:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run FloodNet inline generation eval from a checkpoint outside the training loop."
+        description="Run FloodNet validation generation eval from a checkpoint outside the training loop."
     )
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--ckpt", type=str, required=True)
@@ -65,7 +66,6 @@ def main():
         {
             "train": "false",
             "save_dir": artifact_root,
-            "validation.test_mode": "inline",
         },
     )
     OmegaConf.update(cfg.config, "save_dir", artifact_root)
@@ -80,7 +80,7 @@ def main():
     test_probe_loaders, test_loader_tags, total_probe_samples = build_probe_loaders(
         cfg, collate_fn
     )
-    rank_zero_info(f"[async-inline-eval] total probe samples: {total_probe_samples}")
+    rank_zero_info(f"[validation-eval] total probe samples: {total_probe_samples}")
 
     model = CustomLightningModule(cfg=cfg.config)
     model.test_loader_tags = test_loader_tags

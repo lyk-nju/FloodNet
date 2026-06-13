@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from utils.token_frame import token_range_to_frame_slice, token_start_frame
+from utils.traj_batch import encode_traj_batch
 from utils.training.self_forcing import SelfForcingTrainer
 import utils.training.self_forcing as sf_mod
 from utils.training.window_local import (
@@ -25,6 +26,19 @@ def _make_motion263(batch_size: int, num_frames: int) -> torch.Tensor:
         motion[b, :, 2] = 0.05 * (b + 1)
         motion[b, :, 3] = 1.0 + 0.1 * b
     return motion
+
+
+class _MeanLocalTrajEncoder(torch.nn.Module):
+    def forward(
+        self,
+        feats_4: torch.Tensor,
+        frame_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if frame_mask is None:
+            return feats_4.mean(dim=2)
+        weights = frame_mask.unsqueeze(-1).to(dtype=feats_4.dtype)
+        denom = weights.sum(dim=2).clamp_min(1.0)
+        return (feats_4 * weights).sum(dim=2) / denom
 
 
 def test_window_local_traj_batch_uses_prefix_and_arbitrary_frame_lengths():
@@ -328,6 +342,62 @@ def test_window_local_model_batch_v2_uses_active_left_history_and_horizon_metada
     assert torch.count_nonzero(out["feature"][1, 9:]) == 0
 
 
+def test_window_local_v2_future_horizon_survives_traj_token_mask_when_source_has_token_mask():
+    token = torch.arange(1 * 40 * 3, dtype=torch.float32).view(1, 40, 3)
+    raw = _make_motion263(batch_size=1, num_frames=200)
+    batch = {
+        "token": token,
+        "token_length": torch.tensor([40]),
+        "token_mask": torch.ones(1, 40),
+        "feature": raw,
+        "feature_length": torch.tensor([200]),
+        "text": ["walk"],
+    }
+
+    out = build_window_local_model_batch(
+        batch,
+        context_tokens=30,
+        horizon_tokens=0,
+        window_sampling={
+            "enabled": True,
+            "history_tokens_min": 0,
+            "history_tokens_max": "auto",
+            "horizon_tokens_min": 5,
+            "horizon_tokens_max": 25,
+        },
+        chunk_size=5,
+        rollout_span=4,
+        active_left_tokens=torch.tensor([10]),
+        history_tokens=torch.tensor([3]),
+        sampled_horizon_tokens=torch.tensor([7]),
+    )
+
+    latent_len = int(out["feature_length"][0].item())
+    traj_len = int(out["traj_num_tokens"][0].item())
+    assert latent_len == 12
+    assert traj_len == 19
+    assert "token_mask" not in out
+    assert out["latent_token_mask"].shape == (1, traj_len)
+    assert torch.count_nonzero(out["latent_token_mask"][0, :latent_len]) == latent_len
+    assert torch.count_nonzero(out["latent_token_mask"][0, latent_len:]) == 0
+
+    _, traj_token_mask = encode_traj_batch(
+        out,
+        traj_len,
+        "cpu",
+        _MeanLocalTrajEncoder(),
+        torch.nn.Identity(),
+        return_token_mask=True,
+    )
+
+    assert traj_token_mask is not None
+    assert traj_token_mask.shape == (1, traj_len)
+    assert torch.allclose(traj_token_mask[0, :traj_len], torch.ones(traj_len))
+    assert torch.count_nonzero(traj_token_mask[0, latent_len:traj_len]) == (
+        traj_len - latent_len
+    )
+
+
 def test_window_local_model_batch_fills_uncovered_text_tail_with_empty_text():
     token = torch.arange(1 * 6 * 3, dtype=torch.float32).view(1, 6, 3)
     raw = _make_motion263(batch_size=1, num_frames=40)
@@ -446,7 +516,6 @@ def test_training_step_uses_window_local_model_batch_when_enabled():
             "enabled": True,
             "context_tokens": 4,
             "horizon_tokens": 2,
-            "motion_aux_loss": "latent_only",
         },
     }.get(key, default)
     module = SimpleNamespace(cfg=cfg, trainer=None)
@@ -459,7 +528,8 @@ def test_training_step_uses_window_local_model_batch_when_enabled():
 
     assert float(out.item()) == 3.0
     loss_batch, model_batch = trainer._self_forcing_step.call_args.args
-    assert "traj_cond_7d" not in loss_batch
+    assert "traj_cond_7d" in loss_batch
+    assert "traj_length" in loss_batch
     assert model_batch["_window_local_traj"] is True
     assert model_batch["feature"].shape == (1, 6, 3)
     assert model_batch["feature_length"].tolist() == [4]
@@ -689,7 +759,7 @@ def test_forward_single_window_returns_pred_latents_for_window_local_traj_featur
     assert out["pred_x0_latent_list"][0].shape == (2, 3)
 
 
-def test_stream_training_latent_only_smoke_with_real_tiny_model(tmp_path, monkeypatch):
+def test_stream_training_default_full_prefix_smoke_with_real_tiny_model(tmp_path, monkeypatch):
     from models.diffusion_forcing_wan import DiffForcingWanModel
     import models.tools.wan_model as wan_model_mod
 
@@ -761,7 +831,6 @@ def test_stream_training_latent_only_smoke_with_real_tiny_model(tmp_path, monkey
             "context_tokens": 4,
             "min_history_tokens": 1,
             "horizon_tokens": 2,
-            "motion_aux_loss": "latent_only",
         },
         "anchor_canonicalize": {"enabled": True},
         "horizon_sim": {"enabled": False},
@@ -868,7 +937,6 @@ def test_stream_training_full_prefix_motion_aux_smoke_with_real_tiny_model(tmp_p
             "context_tokens": 4,
             "min_history_tokens": 1,
             "horizon_tokens": 2,
-            "motion_aux_loss": "full_prefix",
         },
         "anchor_canonicalize": {"enabled": True},
         "horizon_sim": {"enabled": False},
