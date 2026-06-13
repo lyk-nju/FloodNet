@@ -67,6 +67,7 @@ from eval.root_refiner.metrics import (  # noqa: E402
     compute_sample_metrics,
 )
 from utils.refiner.path_feature_stats import compute_sampling_config_hash  # noqa: E402
+from utils.refiner.runtime import _state_dict_has_pace_duration  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -1121,11 +1122,33 @@ def _load_model_from_ckpt(ckpt_path: str, device: str):
     """Load RootRefiner weights from a Lightning checkpoint or raw state_dict."""
     from train_refiner import RefinerLightningModule
 
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = torch.load(ckpt_path, map_location="cpu")
     if "hyper_parameters" in ckpt and "cfg" in ckpt["hyper_parameters"]:
         cfg = ckpt["hyper_parameters"]["cfg"]
         module = RefinerLightningModule(cfg)
-        module.load_state_dict(ckpt["state_dict"])
+        state_dict = ckpt["state_dict"]
+        has_pace_duration = _state_dict_has_pace_duration(state_dict)
+        try:
+            module.load_state_dict(state_dict)
+        except RuntimeError:
+            incompatible = module.load_state_dict(state_dict, strict=False)
+            allowed_missing_prefixes = (
+                "refiner.sample_mode_emb.",
+                "refiner.pace_text_proj.",
+                "refiner.pace_feature_proj.",
+                "refiner.pace_head.",
+            )
+            unexpected = list(incompatible.unexpected_keys)
+            missing = list(incompatible.missing_keys)
+            disallowed_missing = [
+                key
+                for key in missing
+                if not key.startswith(allowed_missing_prefixes)
+            ]
+            if has_pace_duration or unexpected or disallowed_missing:
+                raise
+            if hasattr(module.refiner, "use_pace_duration"):
+                module.refiner.use_pace_duration = False
         return module.refiner, module.text_encoder, cfg
     raise ValueError(
         f"checkpoint {ckpt_path} missing hyper_parameters.cfg; "

@@ -18,6 +18,7 @@ import torch
 
 from datasets.humanml3d_refiner import HumanML3DRefinerDataset as RefinerDataset
 from eval.root_refiner.benchmark import (
+    _load_model_from_ckpt,
     _write_root_refiner_sample_artifacts,
     _resolve_cli_force_path_mode,
     build_eval_task_specs,
@@ -129,6 +130,82 @@ def _make_clip(T: int, *, raw_id: str | None = None, split_index: int | None = N
             }
         )
     return clip
+
+
+def _tiny_lightning_cfg():
+    return {
+        "model": {
+            "target": "models.root_refiner.RootRefiner",
+            "ema_decay": None,
+            "params": {
+                "d_model": 32,
+                "n_layers": 2,
+                "n_heads": 4,
+                "ff_dim": 64,
+                "max_tokens": 8,
+                "min_tokens": 2,
+                "frames_per_token": 4,
+                "n_path": 16,
+                "n_hist": 8,
+                "text_emb_dim": 16,
+                "path_features_dim": 5,
+                "dropout": 0.0,
+            },
+        },
+        "data": {
+            "target": "datasets.humanml3d_refiner.HumanML3DRefinerDataset",
+            "collate_fn": "datasets.humanml3d_refiner.refiner_collate",
+            "train_bs": 4,
+            "val_bs": 4,
+            "num_workers": 0,
+        },
+        "optimizer": {
+            "target": "AdamW",
+            "params": {"lr": 1e-3, "weight_decay": 0.01},
+        },
+        "lr_scheduler": {"target": None, "params": {}},
+        "loss": {"heading_form": "cosine"},
+        "loss_weights": {
+            "pace": 0.5,
+            "num_token_pace": 0.1,
+            "num_token_cls": 0.2,
+            "num_token_soft_cls": 0.02,
+            "xyz": 5.0,
+            "heading": 1.0,
+            "fwd_delta": 0.5,
+            "yaw_delta": 0.5,
+            "path_control": 0.0,
+            "smoothness": 0.0,
+        },
+        "text_encoder": {"debug_stub": True},
+    }
+
+
+def test_load_model_from_ckpt_accepts_legacy_without_pace_duration(tmp_path):
+    from train_refiner import RefinerLightningModule
+
+    cfg = _tiny_lightning_cfg()
+    module = RefinerLightningModule(cfg)
+    state_dict = {
+        key: value
+        for key, value in module.state_dict().items()
+        if not key.startswith(
+            (
+                "refiner.sample_mode_emb.",
+                "refiner.pace_text_proj.",
+                "refiner.pace_feature_proj.",
+                "refiner.pace_head.",
+            )
+        )
+    }
+    ckpt_path = tmp_path / "legacy_no_pace.ckpt"
+    torch.save({"hyper_parameters": {"cfg": cfg}, "state_dict": state_dict}, ckpt_path)
+
+    refiner, text_encoder, loaded_cfg = _load_model_from_ckpt(str(ckpt_path), "cpu")
+
+    assert loaded_cfg == cfg
+    assert getattr(refiner, "use_pace_duration") is False
+    assert text_encoder is not None
 
 
 def _save_refiner_stats(tmp_path):

@@ -133,6 +133,44 @@ def test_validation_step_logs_suite_and_duration_prefixes():
     assert all(kwargs["add_dataloader_idx"] is False for kwargs in log_kwargs.values())
 
 
+def test_validation_step_filters_wandb_metrics_with_log_keys():
+    cfg = _cfg()
+    cfg["validation"]["log_keys"] = [
+        "loss",
+        "pace",
+        "num_token_pace",
+        "num_token_pace_mae",
+        "num_token_pace_acc_pm1",
+        "num_token_pace_acc_pm2",
+        "xyz_ADE_m",
+        "xyz_FDE_m",
+        "heading",
+        "fwd_delta",
+        "yaw_delta",
+    ]
+    module = RefinerLightningModule(cfg)
+    batch = _batch(module)
+    logged = {}
+    module.log = types.MethodType(
+        lambda self, key, value, **kwargs: logged.__setitem__(key, value),
+        module,
+    )
+
+    module.validation_step(batch, 0, dataloader_idx=0)
+
+    assert "val_full_dense_max/groundtruth_duration/loss" in logged
+    assert "val_full_dense_max/groundtruth_duration/num_token_pace_mae" in logged
+    assert "val_full_dense_max/groundtruth_duration/num_token_pace_acc_pm1" in logged
+    assert "val_full_dense_max/groundtruth_duration/num_token_pace_acc_pm2" in logged
+    assert "val_full_dense_max/groundtruth_duration/fwd_delta" in logged
+    assert "val_full_dense_max/groundtruth_duration/yaw_delta" in logged
+    assert "val_full_dense_max/groundtruth_duration/num_token_soft_cls" not in logged
+    assert "val_full_dense_max/groundtruth_duration/num_token_cls_argmax_mae" not in logged
+    assert "val_full_dense_max/groundtruth_duration/num_token_cls_soft_mae" not in logged
+    suffixes = {key.rsplit("/", 1)[-1] for key in logged}
+    assert suffixes <= set(cfg["validation"]["log_keys"])
+
+
 def test_training_step_logs_physical_xyz_metrics():
     module = RefinerLightningModule(_cfg())
     batch = _batch(module, B=1)
@@ -148,6 +186,7 @@ def test_training_step_logs_physical_xyz_metrics():
         "waypoints": pred,
         "num_token_logits": torch.zeros(1, module.max_tokens - module.min_tokens + 1),
         "pred_log_pace": torch.zeros(1),
+        "pred_num_tokens_float": torch.tensor([3.0]),
         "pred_num_tokens_cls": torch.tensor([3]),
         "pred_num_tokens_pace": torch.tensor([3]),
         "pred_num_tokens": torch.tensor([3]),
@@ -164,6 +203,36 @@ def test_training_step_logs_physical_xyz_metrics():
 
     assert "train/xyz_ADE_m" in logged
     assert torch.allclose(logged["train/xyz_ADE_m"], torch.tensor(1.0))
+
+
+def test_training_step_excludes_configured_wandb_metrics():
+    cfg = _cfg()
+    cfg["logger"] = {
+        "wandb": {
+            "train_exclude_log_keys": [
+                "num_token_soft_cls",
+                "num_token_cls_argmax_mae",
+                "num_token_cls_soft_mae",
+            ]
+        }
+    }
+    module = RefinerLightningModule(cfg)
+    batch = _batch(module, B=1)
+    batch["num_tokens"] = torch.tensor([3])
+    logged = {}
+    module.log = types.MethodType(
+        lambda self, key, value, **kwargs: logged.__setitem__(key, value),
+        module,
+    )
+
+    module.training_step(batch, 0)
+
+    assert "train/loss" in logged
+    assert "train/num_token_cls" in logged
+    assert "train/num_token_pace_mae" in logged
+    assert "train/num_token_soft_cls" not in logged
+    assert "train/num_token_cls_argmax_mae" not in logged
+    assert "train/num_token_cls_soft_mae" not in logged
 
 
 def test_physical_xyz_metrics_report_meter_ade_fde_and_common_prefix():

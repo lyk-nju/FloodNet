@@ -515,9 +515,12 @@ class RootRefiner(nn.Module):
             path_features_raw[:, 0].clamp_min(0.0)
             + path_features_raw[:, 3].clamp_min(0.0)
         )
-        pred_num_tokens_pace = (
+        pred_num_tokens_float = (
             1.0 + pred_log_pace.clamp(-8.0, 8.0).exp() * effective_length
-        ).round().long().clamp(self.min_tokens, self.max_tokens)
+        )
+        pred_num_tokens_pace = (
+            pred_num_tokens_float.round().long().clamp(self.min_tokens, self.max_tokens)
+        )
         pred_num_tokens = (
             pred_num_tokens_pace
             if bool(getattr(self, "use_pace_duration", True))
@@ -590,6 +593,7 @@ class RootRefiner(nn.Module):
             "expected_num_tokens_cls": expected_num_tokens_cls,
             "pred_num_tokens_cls": pred_num_tokens_cls,
             "pred_log_pace": pred_log_pace,
+            "pred_num_tokens_float": pred_num_tokens_float,
             "pred_num_tokens_pace": pred_num_tokens_pace,
             "pred_num_tokens": pred_num_tokens,
             "used_num_tokens": used_num_tokens,

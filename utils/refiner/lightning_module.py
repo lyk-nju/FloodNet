@@ -134,6 +134,12 @@ class RootRefinerLightningModule(pl.LightningModule):
             reduction="none",
         )
         L_pace = masked_mean(pace_terms, pace_valid)
+        num_token_pace_terms = F.smooth_l1_loss(
+            out["pred_num_tokens_float"],
+            target_tokens,
+            reduction="none",
+        )
+        L_num_token_pace = masked_mean(num_token_pace_terms, pace_valid)
 
         L_xyz = smooth_l1_masked(out["waypoints"][..., 0:3], target_wp[..., 0:3], target_mask)
 
@@ -170,8 +176,9 @@ class RootRefinerLightningModule(pl.LightningModule):
             L_path_control = self._compute_path_control_loss(out, batch, target_mask)
         loss = (
             w.get("pace", 0.0) * L_pace
-            + w.get("num_token", 1.0) * L_num
-            + w.get("num_token_soft", 0.1) * L_num_soft
+            + w.get("num_token_pace", w.get("num_token_float", 0.0)) * L_num_token_pace
+            + w.get("num_token_cls", w.get("num_token", 1.0)) * L_num
+            + w.get("num_token_soft_cls", w.get("num_token_soft", 0.1)) * L_num_soft
             + w.get("xyz", 5.0) * L_xyz
             + w.get("heading", 1.0) * L_head
             + w.get("fwd_delta", 0.5) * L_fwd_delta
@@ -182,38 +189,46 @@ class RootRefinerLightningModule(pl.LightningModule):
 
         with torch.no_grad():
             pred_class = out["num_token_logits"].argmax(dim=-1)
-            pred_token_class = out["pred_num_tokens"].to(target_class.device) - self.min_tokens
-            pred_token_class_pace = (
-                out["pred_num_tokens_pace"].to(target_class.device) - self.min_tokens
-            )
             pred_token_class_cls = (
                 out["pred_num_tokens_cls"].to(target_class.device) - self.min_tokens
             )
-            err = (pred_token_class - target_class).abs().float()
-            pace_err = (pred_token_class_pace - target_class).abs().float()
+            target_tokens_for_metric = batch["num_tokens"].to(
+                device=target_class.device,
+                dtype=out["pred_num_tokens_float"].dtype,
+            )
             cls_err = (pred_token_class_cls - target_class).abs().float()
             argmax_err = (pred_class - target_class).abs().float()
             soft_err = (expected_class - target_class.to(expected_class.dtype)).abs()
+            float_err = (
+                out["pred_num_tokens_float"].to(target_class.device)
+                - target_tokens_for_metric
+            ).abs()
+            float_err_mean = masked_mean(float_err, pace_valid.to(float_err.device))
             physical_metrics = self._compute_physical_xyz_metrics(out, batch, target_mask)
         return {
             "loss": loss,
             "pace": L_pace,
-            "num_token": L_num,
-            "num_token_soft": L_num_soft,
+            "num_token_pace": L_num_token_pace,
+            "num_token_cls": L_num,
+            "num_token_soft_cls": L_num_soft,
             "xyz": L_xyz,
             "heading": L_head,
             "fwd_delta": L_fwd_delta,
             "yaw_delta": L_yaw_delta,
             "path_control": L_path_control,
             "smoothness": L_smooth,
-            "num_token_acc": (err == 0).float().mean(),
-            "num_token_acc_pm1": (err <= 1).float().mean(),
-            "num_token_acc_pm2": (err <= 2).float().mean(),
-            "num_token_mae": err.mean(),
-            "num_token_mae_pace": pace_err.mean(),
-            "num_token_mae_cls": cls_err.mean(),
-            "num_token_argmax_mae": argmax_err.mean(),
-            "num_token_soft_mae_cls": soft_err.mean(),
+            "num_token_cls_mae": cls_err.mean(),
+            "num_token_cls_argmax_mae": argmax_err.mean(),
+            "num_token_cls_soft_mae": soft_err.mean(),
+            "num_token_pace_mae": float_err_mean,
+            "num_token_pace_acc_pm1": masked_mean(
+                (float_err <= 1.0).to(float_err.dtype),
+                pace_valid.to(float_err.device),
+            ),
+            "num_token_pace_acc_pm2": masked_mean(
+                (float_err <= 2.0).to(float_err.dtype),
+                pace_valid.to(float_err.device),
+            ),
             **physical_metrics,
         }
 
@@ -287,14 +302,12 @@ class RootRefinerLightningModule(pl.LightningModule):
         return torch.stack(losses).mean()
 
     METRIC_KEYS = (
-        "num_token_acc",
-        "num_token_acc_pm1",
-        "num_token_acc_pm2",
-        "num_token_mae",
-        "num_token_mae_pace",
-        "num_token_mae_cls",
-        "num_token_argmax_mae",
-        "num_token_soft_mae_cls",
+        "num_token_cls_mae",
+        "num_token_cls_argmax_mae",
+        "num_token_cls_soft_mae",
+        "num_token_pace_mae",
+        "num_token_pace_acc_pm1",
+        "num_token_pace_acc_pm2",
         "xyz_ADE_m",
         "xyz_FDE_m",
     )
@@ -406,7 +419,14 @@ class RootRefinerLightningModule(pl.LightningModule):
             )
             self.log("train/nonfinite_skip", 1.0, prog_bar=False, on_step=True, on_epoch=False)
             return None
+        logger_cfg = self.cfg.get("logger") or {}
+        wandb_cfg = logger_cfg.get("wandb") or {}
+        exclude_log_keys = set(
+            str(key) for key in (wandb_cfg.get("train_exclude_log_keys") or [])
+        )
         for k, v in losses.items():
+            if k in exclude_log_keys:
+                continue
             self.log(f"train/{k}", v, prog_bar=True, on_step=True, on_epoch=False)
         return loss
 
@@ -419,6 +439,9 @@ class RootRefinerLightningModule(pl.LightningModule):
             suite_name = self.validation_suite_names[dataloader_idx]
         else:
             suite_name = f"suite_{dataloader_idx}"
+        validation_cfg = self.cfg.get("validation") or {}
+        log_keys_cfg = validation_cfg.get("log_keys")
+        log_keys = set(str(key) for key in log_keys_cfg) if log_keys_cfg else None
         batch_size = int(batch["num_tokens"].shape[0])
         first_loss = None
         for mode in modes:
@@ -432,6 +455,8 @@ class RootRefinerLightningModule(pl.LightningModule):
             if first_loss is None:
                 first_loss = losses["loss"]
             for k, v in losses.items():
+                if log_keys is not None and k not in log_keys:
+                    continue
                 self.log(
                     f"val_{suite_name}/{mode}/{k}",
                     v,

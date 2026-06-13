@@ -309,7 +309,10 @@ def _tiny_cfg():
         "lr_scheduler": {"target": None, "params": {}},
         "loss": {"heading_form": "cosine"},
         "loss_weights": {
-            "pace": 0.5, "num_token": 0.2, "num_token_soft": 0.02,
+            "pace": 0.5,
+            "num_token_pace": 0.1,
+            "num_token_cls": 0.2,
+            "num_token_soft_cls": 0.02,
             "xyz": 5.0, "heading": 1.0,
             "fwd_delta": 0.5, "yaw_delta": 0.5, "path_control": 0.0,
             "smoothness": 0.0,
@@ -368,7 +371,7 @@ def test_loss_dict_keys_match_config_weights_and_no_speed():
     out = module(batch)
     losses = module._compute_loss(out, batch)
     # Loss-term keys + the logged-only num_token diagnostic metrics.
-    expected = {"loss", "pace", "num_token", "num_token_soft", "xyz", "heading",
+    expected = {"loss", "pace", "num_token_pace", "num_token_cls", "num_token_soft_cls", "xyz", "heading",
                 "fwd_delta", "yaw_delta", "path_control", "smoothness"}
     expected |= set(RefinerLightningModule.METRIC_KEYS)
     assert set(losses.keys()) == expected
@@ -392,6 +395,7 @@ def test_num_token_metrics_follow_actual_pred_num_tokens_not_argmax():
         "expected_num_tokens_cls": torch.tensor([5.0, 5.0]),
         "pred_num_tokens_cls": torch.tensor([2, 2]),
         "pred_log_pace": torch.zeros(2),
+        "pred_num_tokens_float": torch.tensor([5.0, 5.0]),
         "pred_num_tokens_pace": torch.tensor([5, 5]),
         "pred_num_tokens": torch.tensor([5, 5]),
         "used_num_tokens": batch["num_tokens"],
@@ -401,8 +405,36 @@ def test_num_token_metrics_follow_actual_pred_num_tokens_not_argmax():
 
     losses = module._compute_loss(out, batch)
 
-    assert losses["num_token_mae"].item() == 0.0
-    assert losses["num_token_argmax_mae"].item() > 0.0
+    assert losses["num_token_pace_mae"].item() == 0.0
+    assert losses["num_token_cls_argmax_mae"].item() > 0.0
+    assert "num_token_pred_round_mae" not in losses
+    assert "num_token_pace_round_mae" not in losses
+
+
+def test_num_token_logs_exclude_batch_mean_diagnostics():
+    module = RefinerLightningModule(_tiny_cfg())
+    batch = _make_batch(module, B=2)
+    batch["num_tokens"] = torch.tensor([4, 8])
+    out = {
+        "num_token_logits": torch.zeros(2, module.max_tokens - module.min_tokens + 1),
+        "expected_num_tokens": torch.tensor([3.0, 7.0]),
+        "expected_num_tokens_cls": torch.tensor([3.0, 7.0]),
+        "pred_num_tokens_cls": torch.tensor([3, 7]),
+        "pred_log_pace": torch.zeros(2),
+        "pred_num_tokens_float": torch.tensor([4.25, 7.75]),
+        "pred_num_tokens_pace": torch.tensor([4, 8]),
+        "pred_num_tokens": torch.tensor([4, 8]),
+        "used_num_tokens": batch["num_tokens"],
+        "waypoints": batch["waypoints"].clone(),
+    }
+
+    losses = module._compute_loss(out, batch)
+
+    assert "num_token_gt_mean" not in losses
+    assert "num_token_pace_mean" not in losses
+    assert "num_token_cls_mean" not in losses
+    assert "num_token_pred_round_mean" not in losses
+    assert "num_token_pace_round_mean" not in losses
 
 
 def test_pace_loss_uses_path_length_plus_start_distance():
@@ -416,6 +448,7 @@ def test_pace_loss_uses_path_length_plus_start_distance():
         "expected_num_tokens_cls": torch.tensor([4.0]),
         "pred_num_tokens_cls": torch.tensor([4]),
         "pred_log_pace": target_log_pace.clone(),
+        "pred_num_tokens_float": torch.tensor([6.0]),
         "pred_num_tokens_pace": torch.tensor([6]),
         "pred_num_tokens": torch.tensor([6]),
         "used_num_tokens": batch["num_tokens"],
@@ -425,9 +458,10 @@ def test_pace_loss_uses_path_length_plus_start_distance():
     losses = module._compute_loss(out, batch)
 
     assert losses["pace"].item() == pytest.approx(0.0, abs=1e-6)
-    assert losses["num_token_mae"].item() == 0.0
-    assert losses["num_token_mae_pace"].item() == 0.0
-    assert losses["num_token_mae_cls"].item() == 2.0
+    assert losses["num_token_pace_mae"].item() == 0.0
+    assert "num_token_pred_round_mae" not in losses
+    assert "num_token_pace_round_mae" not in losses
+    assert losses["num_token_cls_mae"].item() == 2.0
 
 
 def test_pace_loss_masks_very_short_effective_length():
@@ -439,6 +473,7 @@ def test_pace_loss_masks_very_short_effective_length():
         "expected_num_tokens_cls": torch.tensor([4.0]),
         "pred_num_tokens_cls": torch.tensor([4]),
         "pred_log_pace": torch.tensor([100.0]),
+        "pred_num_tokens_float": torch.tensor([8.0]),
         "pred_num_tokens_pace": torch.tensor([8]),
         "pred_num_tokens": torch.tensor([8]),
         "used_num_tokens": batch["num_tokens"],
@@ -448,6 +483,28 @@ def test_pace_loss_masks_very_short_effective_length():
     losses = module._compute_loss(out, batch)
 
     assert losses["pace"].item() == 0.0
+    assert losses["num_token_pace"].item() == 0.0
+    assert losses["num_token_pace_mae"].item() == 0.0
+
+
+def test_num_token_pace_loss_aligns_pace_with_token_space():
+    module = RefinerLightningModule(_tiny_cfg())
+    batch = _make_batch(module, B=1)
+    batch["num_tokens"] = torch.tensor([8])
+    batch["path_features_raw"] = torch.tensor([[10.0, 0.0, 0.0, 0.0, 10.0]])
+    out = module(batch)
+    out["pred_num_tokens_float"] = torch.tensor([6.0])
+    out["pred_num_tokens_pace"] = torch.tensor([6])
+    out["pred_num_tokens"] = torch.tensor([6])
+
+    losses = module._compute_loss(out, batch)
+
+    assert "num_token_pace" in losses
+    assert "num_token_pace_mae" in losses
+    assert losses["num_token_pace"].item() == pytest.approx(1.5, abs=1e-6)
+    assert losses["num_token_pace_mae"].item() == pytest.approx(2.0, abs=1e-6)
+    assert losses["num_token_pace_acc_pm1"].item() == pytest.approx(0.0, abs=1e-6)
+    assert losses["num_token_pace_acc_pm2"].item() == pytest.approx(1.0, abs=1e-6)
 
 
 def test_delta_helper_unnormalizes_waypoints_before_deriving_physical_7d():
@@ -465,19 +522,19 @@ def test_delta_helper_unnormalizes_waypoints_before_deriving_physical_7d():
     assert torch.allclose(physical[0, 1, :3], torch.tensor([12.0, 0.0, -1.0]))
 
 
-def test_num_token_soft_term_present_and_differentiable():
+def test_num_token_soft_cls_term_present_and_differentiable():
     """The soft-argmax expected-token aux term is a weighted loss term, finite,
     and its gradient reaches num_token_head (so it actually shapes the logits)."""
     module = RefinerLightningModule(_tiny_cfg())
     batch = _make_batch(module)
     losses = module._compute_loss(module(batch), batch)
-    assert "num_token_soft" in losses and "num_token_soft_mae_cls" in losses
+    assert "num_token_soft_cls" in losses and "num_token_cls_soft_mae" in losses
     assert "num_token_soft_mae" not in losses
-    assert torch.isfinite(losses["num_token_soft"]).all()
-    assert "num_token_soft" not in RefinerLightningModule.METRIC_KEYS      # weighted loss term
+    assert torch.isfinite(losses["num_token_soft_cls"]).all()
+    assert "num_token_soft_cls" not in RefinerLightningModule.METRIC_KEYS  # weighted loss term
     assert "num_token_soft_mae" not in RefinerLightningModule.METRIC_KEYS  # ambiguous old alias
-    assert "num_token_soft_mae_cls" in RefinerLightningModule.METRIC_KEYS  # logged-only cls metric
-    losses["num_token_soft"].backward()
+    assert "num_token_cls_soft_mae" in RefinerLightningModule.METRIC_KEYS  # logged-only cls metric
+    losses["num_token_soft_cls"].backward()
     assert any(
         p.grad is not None
         for p in module.refiner.num_token_head.parameters()

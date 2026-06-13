@@ -136,8 +136,9 @@ def test_loss_and_loss_weights():
     weights = cfg["loss_weights"]
     expected_w = {
         "pace": 0.5,
-        "num_token": 0.2,
-        "num_token_soft": 0.02,
+        "num_token_pace": 0.1,
+        "num_token_cls": 0.2,
+        "num_token_soft_cls": 0.02,
         "xyz": 5.0,
         "heading": 1.0,
         "fwd_delta": 0.5,

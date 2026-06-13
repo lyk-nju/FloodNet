@@ -11,11 +11,15 @@ logger:
     wandb_key: "${wandb_info.key}"
     project: "${refiner_wandb_info.project}"
     entity: "${wandb_info.entity}"
+    train_exclude_log_keys:
+      - num_token_soft_cls
+      - num_token_cls_argmax_mae
+      - num_token_cls_soft_mae
 
 trainer:
   max_steps: 200000
   accelerator: auto
-  devices: [0, 1, 2, 3]
+  devices: [2, 3]
   log_every_n_steps: 50
   precision: bf16-mixed
   gradient_clip_val: 1.0
@@ -26,6 +30,18 @@ validation:
   save_top_k: -1
   save_last: true
   eval_modes: [groundtruth_duration, pred_duration]
+  log_keys:
+    - loss
+    - pace
+    - num_token_pace
+    - num_token_pace_mae
+    - num_token_pace_acc_pm1
+    - num_token_pace_acc_pm2
+    - xyz_ADE_m
+    - xyz_FDE_m
+    - heading
+    - fwd_delta
+    - yaw_delta
 
   suites:
     - name: full_dense_max
@@ -107,11 +123,12 @@ loss:
   ordinal_sigma: 1.0
 
 loss_weights:
-  pace: 0.5
+  pace: 1.0
+  num_token_pace: 0.1
 
   # classification head 只作为辅助对照，不再作为主 duration planner
-  num_token: 0.3
-  num_token_soft: 0.02
+  num_token_cls: 0.0
+  num_token_soft_cls: 0.0
 
   # 第一轮只验证 xyz/head + pace，不混入 dynamics loss
   xyz: 5.0
@@ -132,9 +149,9 @@ text_encoder:
 data:
   target: datasets.humanml3d_refiner.HumanML3DRefinerDataset
   collate_fn: datasets.humanml3d_refiner.refiner_collate
-  train_bs: 64
-  val_bs: 64
-  test_bs: 64
+  train_bs: 128
+  val_bs: 128
+  test_bs: 128
   num_workers: 4
 
   raw_data_dir: /data1/yuankai/text2Motion/FloodDiffusion/raw_data

@@ -51,7 +51,14 @@ def test_root_refiner_accepts_new_forward_contract_and_returns_used_tokens():
     assert out["expected_num_tokens_cls"].shape == (3,)
     assert out["pred_num_tokens_cls"].shape == (3,)
     assert out["pred_log_pace"].shape == (3,)
+    assert out["pred_num_tokens_float"].shape == (3,)
     assert out["pred_num_tokens_pace"].shape == (3,)
+    effective_length = (
+        inputs["path_features_raw"][:, 0].clamp_min(0.0)
+        + inputs["path_features_raw"][:, 3].clamp_min(0.0)
+    )
+    expected_float = 1.0 + out["pred_log_pace"].clamp(-8.0, 8.0).exp() * effective_length
+    assert torch.allclose(out["pred_num_tokens_float"], expected_float)
     assert torch.equal(out["used_num_tokens"], num_tokens)
     assert torch.equal(out["pred_num_tokens"], out["pred_num_tokens_pace"])
     assert out["pred_num_tokens"].shape == (3,)
