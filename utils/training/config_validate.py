@@ -144,11 +144,10 @@ def validate_stream_training_config(cfg) -> None:
                 "stream_training.window_sampling.enabled=true; variable horizon "
                 "is sampled by window_sampling in stream-training v2."
             )
-        if latent_source != "precomputed_slice":
+        if latent_source not in {"precomputed_slice", "online_encode"}:
             raise ValueError(
-                "stream_training.latent_source must be 'precomputed_slice' for v2; "
-                f"got {latent_source!r}. VAE window re-encoding is intentionally "
-                "not part of the window-local training contract."
+                "stream_training.latent_source must be 'precomputed_slice' or "
+                f"'online_encode' for v2; got {latent_source!r}."
             )
         if anchor_move:
             raise ValueError(
@@ -176,11 +175,10 @@ def validate_stream_training_config(cfg) -> None:
             "stream_training.sample_policy must be 'variable_history' or "
             f"'fixed_window'; got {sample_policy!r}."
         )
-    if latent_source != "precomputed_slice":
+    if latent_source not in {"precomputed_slice", "online_encode"}:
         raise ValueError(
-            "stream_training.latent_source must be 'precomputed_slice' for v1; "
-            f"got {latent_source!r}. VAE window re-encoding is intentionally "
-            "not part of the window-local training contract."
+            "stream_training.latent_source must be 'precomputed_slice' or "
+            f"'online_encode' for v1; got {latent_source!r}."
         )
     if anchor_move:
         raise ValueError(

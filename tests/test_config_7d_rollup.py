@@ -287,7 +287,20 @@ def test_stream_training_rejects_exposed_motion_aux_loss():
         validate_stream_training_config(cfg)
 
 
-def test_stream_training_rejects_non_precomputed_latent_source():
+def test_stream_training_accepts_online_encode_latent_source():
+    cfg = OmegaConf.create({
+        "model": {"params": {"chunk_size": 5}},
+        "stream_training": {
+            "enabled": True,
+            "context_tokens": 30,
+            "min_history_tokens": 8,
+            "latent_source": "online_encode",
+        },
+    })
+    validate_stream_training_config(cfg)
+
+
+def test_stream_training_rejects_unknown_latent_source():
     cfg = OmegaConf.create({
         "model": {"params": {"chunk_size": 5}},
         "stream_training": {

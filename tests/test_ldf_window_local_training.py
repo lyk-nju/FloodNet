@@ -5,7 +5,12 @@ import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from utils.token_frame import token_range_to_frame_slice, token_start_frame
+from utils.token_frame import (
+    num_frames_for_tokens,
+    num_tokens_for_frame_len,
+    token_range_to_frame_slice,
+    token_start_frame,
+)
 from utils.traj_batch import encode_traj_batch
 from utils.local_frame import canonicalize_7d
 from utils.motion_process import recover_root_rot_pos, root_to_traj_feats_7d
@@ -19,6 +24,7 @@ from utils.training.self_forcing import (
     _collect_window_local_metrics,
     _splice_window_local_pred_to_prefix,
 )
+from utils.training.sample_creator import SampleCreator
 
 
 def _make_motion263(batch_size: int, num_frames: int) -> torch.Tensor:
@@ -41,6 +47,22 @@ class _MeanLocalTrajEncoder(torch.nn.Module):
         weights = frame_mask.unsqueeze(-1).to(dtype=feats_4.dtype)
         denom = weights.sum(dim=2).clamp_min(1.0)
         return (feats_4 * weights).sum(dim=2) / denom
+
+
+class _RecordingVAE:
+    def __init__(self, latent_dim: int = 3):
+        self.latent_dim = int(latent_dim)
+        self.encode_inputs: list[torch.Tensor] = []
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        self.encode_inputs.append(x.detach().clone())
+        n_tokens = num_tokens_for_frame_len(int(x.shape[1]))
+        values = torch.arange(
+            n_tokens * self.latent_dim,
+            device=x.device,
+            dtype=x.dtype,
+        ).view(1, n_tokens, self.latent_dim)
+        return values.expand(x.shape[0], -1, -1).clone()
 
 
 def test_window_local_traj_batch_uses_prefix_and_arbitrary_frame_lengths():
@@ -374,6 +396,35 @@ def test_window_local_model_batch_v2_uses_active_left_history_and_horizon_metada
     assert torch.count_nonzero(out["feature"][1, 9:]) == 0
 
 
+def test_sample_creator_maps_token_space_sample_to_motion_space_prefix_lengths():
+    creator = SampleCreator(
+        context_tokens=30,
+        horizon_tokens=0,
+        window_sampling={
+            "enabled": True,
+            "history_tokens_min": 0,
+            "history_tokens_max": "auto",
+            "horizon_tokens_min": 5,
+            "horizon_tokens_max": 25,
+        },
+        chunk_size=5,
+        rollout_span=4,
+        active_left_tokens=torch.tensor([10]),
+        history_tokens=torch.tensor([3]),
+        sampled_horizon_tokens=torch.tensor([7]),
+    )
+
+    sample = creator.create(torch.tensor([40]))
+
+    assert sample.global_start_tokens.tolist() == [7]
+    assert sample.local_start_tokens.tolist() == [0]
+    assert sample.latent_tokens.tolist() == [12]
+    assert sample.traj_tokens.tolist() == [19]
+    assert sample.global_start_frames.tolist() == [token_start_frame(7)]
+    assert sample.latent_frame_lengths.tolist() == [num_frames_for_tokens(12)]
+    assert sample.traj_frame_lengths.tolist() == [num_frames_for_tokens(19)]
+
+
 def test_window_local_model_batch_force_start_zero_overrides_v2_window_origin():
     token = torch.arange(2 * 40 * 3, dtype=torch.float32).view(2, 40, 3)
     raw = _make_motion263(batch_size=2, num_frames=200)
@@ -414,6 +465,154 @@ def test_window_local_model_batch_force_start_zero_overrides_v2_window_origin():
     for b in range(2):
         valid = int(out["feature_length"][b].item())
         assert torch.allclose(out["feature"][b, :valid], token[b, :valid])
+
+
+def test_window_local_model_batch_online_encode_uses_motion_window_and_preserves_token_count():
+    token = torch.full((1, 40, 3), -999.0)
+    raw = _make_motion263(batch_size=1, num_frames=200)
+    raw[0, :, 10] = torch.arange(200, dtype=raw.dtype)
+    batch = {
+        "token": token,
+        "token_length": torch.tensor([40]),
+        "feature": raw,
+        "feature_length": torch.tensor([200]),
+        "text": ["walk"],
+    }
+    vae = _RecordingVAE(latent_dim=3)
+
+    out = build_window_local_model_batch(
+        batch,
+        context_tokens=30,
+        horizon_tokens=0,
+        window_sampling={
+            "enabled": True,
+            "history_tokens_min": 0,
+            "history_tokens_max": "auto",
+            "horizon_tokens_min": 5,
+            "horizon_tokens_max": 25,
+        },
+        chunk_size=5,
+        rollout_span=4,
+        active_left_tokens=torch.tensor([10]),
+        history_tokens=torch.tensor([3]),
+        sampled_horizon_tokens=torch.tensor([7]),
+        latent_source="online_encode",
+        vae=vae,
+    )
+
+    global_start = token_start_frame(7)
+    latent_tokens = 12
+    traj_tokens = 19
+    assert len(vae.encode_inputs) == 1
+    assert vae.encode_inputs[0].shape == (1, num_frames_for_tokens(latent_tokens), 263)
+    assert float(vae.encode_inputs[0][0, 0, 10].item()) == float(global_start)
+    assert torch.equal(out["feature_length"], torch.tensor([latent_tokens]))
+    expected_feature = torch.arange(
+        latent_tokens * 3,
+        dtype=out["feature"].dtype,
+    ).view(latent_tokens, 3)
+    assert torch.allclose(out["feature"][0, :latent_tokens], expected_feature)
+    assert out["_window_global_start_token"].tolist() == [7]
+    assert out["_window_local_latent_start_token"].tolist() == [0]
+    assert out["traj_start_token"].tolist() == [0]
+    assert out["traj_length"].tolist() == [num_frames_for_tokens(traj_tokens)]
+    assert torch.allclose(out["traj_features"][0, 0, [0, 2]], torch.zeros(2))
+    assert torch.allclose(out["traj_features"][0, 0, 3:5], torch.tensor([1.0, 0.0]))
+    assert torch.allclose(out["traj_features"][0, 0, 5:7], torch.zeros(2))
+
+
+def test_window_local_model_batch_online_encode_matches_precomputed_when_start_zero():
+    raw = _make_motion263(batch_size=1, num_frames=200)
+    latent_tokens = 12
+    latent_dim = 3
+    vae_for_precompute = _RecordingVAE(latent_dim=latent_dim)
+    precomputed_prefix = vae_for_precompute.encode(
+        raw[:, :num_frames_for_tokens(latent_tokens), :]
+    )
+    token = torch.zeros(1, 40, latent_dim)
+    token[:, :latent_tokens, :] = precomputed_prefix
+    batch = {
+        "token": token,
+        "token_length": torch.tensor([40]),
+        "feature": raw,
+        "feature_length": torch.tensor([200]),
+        "text": ["walk"],
+    }
+    sampling_kwargs = dict(
+        context_tokens=30,
+        horizon_tokens=0,
+        window_sampling={
+            "enabled": True,
+            "history_tokens_min": 0,
+            "history_tokens_max": "auto",
+            "horizon_tokens_min": 5,
+            "horizon_tokens_max": 25,
+        },
+        chunk_size=5,
+        rollout_span=4,
+        active_left_tokens=torch.tensor([3]),
+        history_tokens=torch.tensor([3]),
+        sampled_horizon_tokens=torch.tensor([7]),
+    )
+
+    precomputed = build_window_local_model_batch(
+        batch,
+        latent_source="precomputed_slice",
+        **sampling_kwargs,
+    )
+    online = build_window_local_model_batch(
+        batch,
+        latent_source="online_encode",
+        vae=_RecordingVAE(latent_dim=latent_dim),
+        **sampling_kwargs,
+    )
+
+    assert precomputed["_window_global_start_token"].tolist() == [0]
+    assert online["_window_global_start_token"].tolist() == [0]
+    assert precomputed["feature_length"].tolist() == [latent_tokens]
+    assert online["feature_length"].tolist() == [latent_tokens]
+    assert torch.allclose(
+        online["feature"][0, :latent_tokens],
+        precomputed["feature"][0, :latent_tokens],
+    )
+
+
+def test_window_local_model_batch_online_encode_rejects_token_count_mismatch():
+    class BadLengthVAE(_RecordingVAE):
+        def encode(self, x: torch.Tensor) -> torch.Tensor:
+            encoded = super().encode(x)
+            return encoded[:, :-1, :]
+
+    token = torch.zeros(1, 40, 3)
+    raw = _make_motion263(batch_size=1, num_frames=200)
+    batch = {
+        "token": token,
+        "token_length": torch.tensor([40]),
+        "feature": raw,
+        "feature_length": torch.tensor([200]),
+        "text": ["walk"],
+    }
+
+    with pytest.raises(ValueError, match="token count mismatch"):
+        build_window_local_model_batch(
+            batch,
+            context_tokens=30,
+            horizon_tokens=0,
+            window_sampling={
+                "enabled": True,
+                "history_tokens_min": 0,
+                "history_tokens_max": "auto",
+                "horizon_tokens_min": 5,
+                "horizon_tokens_max": 25,
+            },
+            chunk_size=5,
+            rollout_span=4,
+            active_left_tokens=torch.tensor([10]),
+            history_tokens=torch.tensor([3]),
+            sampled_horizon_tokens=torch.tensor([7]),
+            latent_source="online_encode",
+            vae=BadLengthVAE(latent_dim=3),
+        )
 
 
 def test_window_local_v2_future_horizon_survives_traj_token_mask_when_source_has_token_mask():
@@ -653,6 +852,73 @@ def test_training_step_passes_force_start_zero_to_window_local_builder(monkeypat
     assert torch.allclose(model_batch["feature"][0, :4], token[0, :4])
 
 
+def test_training_step_online_encode_passes_vae_and_uses_local_body_aux_gt(monkeypatch):
+    token = torch.arange(1 * 10 * 3, dtype=torch.float32).view(1, 10, 3)
+    raw = _make_motion263(batch_size=1, num_frames=80)
+    original_gt = torch.full((1, 80, 7), -1.0)
+    local_gt = torch.full((1, 21, 7), 2.0)
+    local_length = torch.tensor([21])
+    batch = {
+        "token": token,
+        "token_length": torch.tensor([10]),
+        "feature": raw,
+        "feature_length": torch.tensor([80]),
+        "traj_cond_7d": original_gt,
+        "traj_length": torch.tensor([80]),
+        "text": ["walk"],
+    }
+    vae = object()
+    captured = {}
+
+    def fake_builder(*args, **kwargs):
+        captured["latent_source"] = kwargs.get("latent_source")
+        captured["vae"] = kwargs.get("vae")
+        return {
+            "feature": torch.zeros(1, 4, 3),
+            "feature_length": torch.tensor([4]),
+            "token": torch.zeros(1, 4, 3),
+            "token_length": torch.tensor([4]),
+            "traj_features": local_gt.clone(),
+            "traj_cond_7d": local_gt,
+            "traj_length": local_length,
+            "traj_num_tokens": torch.tensor([6]),
+            "_window_local_traj": True,
+            "_window_global_start_token": torch.tensor([3]),
+            "_window_local_latent_start_token": torch.tensor([0]),
+            "_window_local_latent_valid_len": torch.tensor([4]),
+            "_window_local_latent_source": "online_encode",
+            "_window_local_body_aux_mode": "local_decode",
+        }
+
+    monkeypatch.setattr(sf_mod, "build_window_local_model_batch", fake_builder)
+    cfg = SimpleNamespace()
+    cfg.get = lambda key, default=None: {
+        "stream_training": {
+            "enabled": True,
+            "context_tokens": 4,
+            "horizon_tokens": 2,
+            "latent_source": "online_encode",
+        },
+    }.get(key, default)
+    module = SimpleNamespace(cfg=cfg, trainer=None, vae=vae)
+    trainer = SelfForcingTrainer.__new__(SelfForcingTrainer)
+    trainer._module = module
+    trainer._preconditions_checked = False
+    trainer._self_forcing_step = MagicMock(return_value=torch.tensor(3.0))
+
+    out = trainer.training_step(batch)
+
+    assert float(out.item()) == 3.0
+    assert captured["latent_source"] == "online_encode"
+    assert captured["vae"] is vae
+    loss_batch, model_batch = trainer._self_forcing_step.call_args.args
+    assert loss_batch["traj_cond_7d"] is local_gt
+    assert loss_batch["traj_length"] is local_length
+    assert not torch.equal(loss_batch["traj_cond_7d"], original_gt[:, :21])
+    assert loss_batch["_window_local_body_aux_mode"] == "local_decode"
+    assert model_batch["_window_local_latent_source"] == "online_encode"
+
+
 def test_splice_window_local_pred_to_prefix_preserves_prefix_context():
     token = torch.arange(1 * 8 * 2, dtype=torch.float32).view(1, 8, 2)
     local_pred = [torch.full((3, 2), 100.0, requires_grad=True)]
@@ -737,7 +1003,11 @@ def test_body_aux_wrapper_splices_window_local_pred_before_decode(monkeypatch):
         return torch.tensor(1.25), {"root_xz": 1.25}
 
     monkeypatch.setattr(sf_mod, "compute_body_aux_loss", fake_compute_body_aux_loss)
-    module = SimpleNamespace(device=torch.device("cpu"), vae=None, model=SimpleNamespace(chunk_size=1))
+    module = SimpleNamespace(
+        device=torch.device("cpu"),
+        vae=None,
+        model=SimpleNamespace(chunk_size=1),
+    )
 
     loss, terms = sf_mod._compute_body_aux_loss(
         local_pred,
@@ -753,6 +1023,46 @@ def test_body_aux_wrapper_splices_window_local_pred_before_decode(monkeypatch):
     assert torch.allclose(captured["pred"][0][:2], token[0, :2])
     assert torch.allclose(captured["pred"][0][2:], local_pred[0])
     assert captured["window_start_tokens"].tolist() == [2]
+
+
+def test_body_aux_wrapper_online_encode_uses_local_decode_without_splice(monkeypatch):
+    pred = [torch.full((3, 2), 100.0, requires_grad=True)]
+    local_gt = torch.zeros(1, 20, 7)
+    batch = {
+        "token": torch.randn(1, 8, 2),
+        "_window_local_latent_start_token": torch.tensor([5]),
+        "_window_local_body_aux_mode": "local_decode",
+        "traj_cond_7d": local_gt,
+        "traj_length": torch.tensor([20]),
+    }
+    captured = {}
+
+    def forbidden_splice(*args, **kwargs):
+        raise AssertionError("online_encode body_aux must not splice full prefix")
+
+    def fake_compute_body_aux_loss(pred_list, gt, *args, **kwargs):
+        captured["pred"] = pred_list
+        captured["gt"] = gt
+        captured["window_start_tokens"] = kwargs.get("window_start_tokens")
+        return torch.tensor(2.0), {"root_xz": 2.0}
+
+    monkeypatch.setattr(sf_mod, "_splice_window_local_pred_to_prefix", forbidden_splice)
+    monkeypatch.setattr(sf_mod, "compute_body_aux_loss", fake_compute_body_aux_loss)
+    module = SimpleNamespace(device=torch.device("cpu"), vae=None, model=SimpleNamespace(chunk_size=1))
+
+    loss, terms = sf_mod._compute_body_aux_loss(
+        pred,
+        batch,
+        module,
+        sample_loss_mask=None,
+        ba_cfg={"weights": {}},
+    )
+
+    assert float(loss.item()) == 2.0
+    assert terms == {"root_xz": 2.0}
+    assert captured["pred"] is pred
+    assert captured["gt"] is local_gt
+    assert captured["window_start_tokens"] is None
 
 
 def test_collect_window_local_metrics_summarizes_sampling_contract():
@@ -1067,6 +1377,121 @@ def test_stream_training_full_prefix_motion_aux_smoke_with_real_tiny_model(tmp_p
         cfg=cfg,
         device=torch.device("cpu"),
         vae=DummyVAE(),
+        trainer=None,
+        global_step=0,
+        _resume_step_offset=0,
+        optimizers=lambda: optimizer,
+        lr_schedulers=lambda: None,
+        manual_backward=lambda loss: loss.backward(),
+        _log_step_metrics=lambda *args, **kwargs: None,
+    )
+    trainer = SelfForcingTrainer(module)
+
+    loss = trainer.training_step(batch)
+
+    assert torch.isfinite(loss)
+    assert loss.requires_grad
+
+
+def test_stream_training_online_encode_motion_aux_smoke_with_real_tiny_model(tmp_path, monkeypatch):
+    from models.diffusion_forcing_wan import DiffForcingWanModel
+    import models.tools.wan_model as wan_model_mod
+    from utils.token_frame import num_frames_for_tokens, num_tokens_for_frame_len
+
+    def cpu_flash_attention(q, k, v, q_lens=None, k_lens=None, **kwargs):
+        outs = []
+        for b in range(q.shape[0]):
+            q_len = int(q_lens[b].item()) if q_lens is not None else q.shape[1]
+            k_len = int(k_lens[b].item()) if k_lens is not None else k.shape[1]
+            qb = q[b:b + 1, :q_len].transpose(1, 2)
+            kb = k[b:b + 1, :k_len].transpose(1, 2)
+            vb = v[b:b + 1, :k_len].transpose(1, 2)
+            out = torch.nn.functional.scaled_dot_product_attention(qb, kb, vb)
+            out = out.transpose(1, 2)
+            if q_len < q.shape[1]:
+                pad = q.new_zeros(1, q.shape[1] - q_len, q.shape[2], v.shape[-1])
+                out = torch.cat([out, pad], dim=1)
+            outs.append(out)
+        return torch.cat(outs, dim=0)
+
+    class DummyOnlineVAE:
+        def encode(self, motion):
+            n_tokens = num_tokens_for_frame_len(int(motion.shape[1]))
+            latent = motion.new_zeros(motion.shape[0], n_tokens, 3)
+            latent[..., 0] = motion[:, :1, 3]
+            return latent
+
+        def decode(self, latents):
+            frames = num_frames_for_tokens(int(latents.shape[1]))
+            out = latents.new_zeros(latents.shape[0], frames, 263)
+            out[..., 3] = 1.0
+            return out + latents.sum() * 0.0
+
+    monkeypatch.setattr(wan_model_mod, "flash_attention", cpu_flash_attention)
+    text_dim = 4096
+    text_path = tmp_path / "text.pt"
+    torch.save(
+        {
+            "embeddings": {
+                "": torch.zeros(2, text_dim),
+                "walk": torch.ones(2, text_dim) * 0.01,
+            },
+            "text_dim": text_dim,
+        },
+        text_path,
+    )
+    model = DiffForcingWanModel(
+        input_dim=3,
+        hidden_dim=32,
+        ffn_dim=64,
+        freq_dim=32,
+        num_heads=2,
+        num_layers=1,
+        text_len=4,
+        chunk_size=1,
+        traj_encoder_in_dim=7,
+        traj_out_dim=32,
+        traj_dropout=0.0,
+        text_dropout=0.0,
+        freeze_backbone=False,
+        use_precomputed_text_emb=True,
+        precomputed_text_emb_path=str(text_path),
+        self_forcing_enabled=True,
+        self_forcing_k_schedule=((0.0, 1),),
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    raw = _make_motion263(batch_size=1, num_frames=80)
+    batch = {
+        "token": torch.randn(1, 8, 3),
+        "token_length": torch.tensor([8]),
+        "feature": raw,
+        "feature_length": torch.tensor([80]),
+        "traj_cond_7d": torch.zeros(1, 80, 7),
+        "traj_length": torch.tensor([80]),
+        "text": ["walk"],
+    }
+    cfg = SimpleNamespace()
+    cfg.model = SimpleNamespace(params={"control_loss_weight": 0.1})
+    cfg.get = lambda key, default=None: {
+        "stream_training": {
+            "enabled": True,
+            "context_tokens": 4,
+            "min_history_tokens": 1,
+            "horizon_tokens": 2,
+            "latent_source": "online_encode",
+        },
+        "anchor_canonicalize": {"enabled": True},
+        "horizon_sim": {"enabled": False},
+        "history_corruption": {},
+        "body_aux_loss": {"enabled": True, "weights": {}},
+        "self_forcing_disable_replace": False,
+        "self_forcing_grad_clip": 1.0,
+    }.get(key, default)
+    module = SimpleNamespace(
+        model=model,
+        cfg=cfg,
+        device=torch.device("cpu"),
+        vae=DummyOnlineVAE(),
         trainer=None,
         global_step=0,
         _resume_step_offset=0,

@@ -720,16 +720,16 @@ def main():
     # train or validate
     ##############################
     if cfg.train:
-        if cfg.resume_ckpt:
-            rank_zero_info(
-                f"[eval-on-resume] running test on resume ckpt: {cfg.resume_ckpt}"
-            )
-            trainer.test(
-                model,
-                dataloaders=test_probe_loaders,
-                ckpt_path=cfg.resume_ckpt,
-                weights_only=False,
-            )
+        # if cfg.resume_ckpt:
+        #     rank_zero_info(
+        #         f"[eval-on-resume] running test on resume ckpt: {cfg.resume_ckpt}"
+        #     )
+        #     trainer.test(
+        #         model,
+        #         dataloaders=test_probe_loaders,
+        #         ckpt_path=cfg.resume_ckpt,
+        #         weights_only=False,
+        #     )
         trainer.fit(
             model,
             train_dataloader,

@@ -149,11 +149,16 @@ class SelfForcingTrainer:
                 chunk_size=getattr(module_model, "chunk_size", None),
                 rollout_span=rollout_span,
                 force_start_token_zero=bool(st_cfg.get("force_start_token_zero", False)),
+                latent_source=st_cfg.get("latent_source", "precomputed_slice"),
+                vae=getattr(self._module, "vae", None),
             )
             loss_batch = batch.copy()
             for key in (
+                "_window_global_start_token",
                 "_window_local_latent_start_token",
                 "_window_local_latent_valid_len",
+                "_window_local_latent_source",
+                "_window_local_body_aux_mode",
                 "_window_local_traj",
                 "_window_sampling_active_left_token",
                 "_window_sampling_history_tokens",
@@ -162,8 +167,11 @@ class SelfForcingTrainer:
             ):
                 if key in model_batch:
                     loss_batch[key] = model_batch[key]
-            # Full-prefix motion auxiliary supervision is the stream-training
-            # contract; keep trajectory fields in the loss batch.
+            if model_batch.get("_window_local_body_aux_mode") == "local_decode":
+                loss_batch["traj_cond_7d"] = model_batch["traj_cond_7d"]
+                loss_batch["traj_length"] = model_batch["traj_length"]
+            # precomputed_slice keeps full-prefix body aux supervision; online_encode
+            # replaces it with the local 7D recovered from the encoded motion window.
             return self._self_forcing_step(loss_batch, model_batch)
 
         model_batch = prepare_model_input(batch)
@@ -490,9 +498,8 @@ class SelfForcingTrainer:
 
         st_cfg = self._module.cfg.get("stream_training", {}) or {}
         stream_training_enabled = bool(st_cfg.get("enabled", False))
-        window_sampling_enabled = bool(
-            (st_cfg.get("window_sampling", {}) or {}).get("enabled", False)
-        )
+        window_sampling_cfg = st_cfg.get("window_sampling", {}) or {}
+        window_sampling_enabled = bool(window_sampling_cfg.get("enabled", False))
         use_window_sampling_horizon = (
             stream_training_enabled
             and window_sampling_enabled
@@ -520,11 +527,11 @@ class SelfForcingTrainer:
             # Legacy horizon path: compute one mask for the final supervised step
             # and reuse it across the rollout. Stream-training v2 bypasses this.
             st_visible_horizon = None
-            if stream_training_enabled:
+            if stream_training_enabled and not window_sampling_enabled:
                 st_visible_horizon = int(st_cfg.get("horizon_tokens", 0))
                 horizon_tokens = st_visible_horizon
             hs_cfg = self._module.cfg.get("horizon_sim", {}) or {}
-            if hs_cfg.get("enabled", False):
+            if (not window_sampling_enabled) and hs_cfg.get("enabled", False):
                 sampled_horizon = sample_random_horizon_tokens(
                     progress, 1.0, seq_len, hs_cfg,
                 )
@@ -796,7 +803,10 @@ def _compute_body_aux_loss(pred_list, batch, module, sample_loss_mask, ba_cfg):
     frame as the decoded pred (both clip-local recovery). Returns (loss, terms)."""
     if pred_list is None or "traj_cond_7d" not in batch:
         return None, {}
-    if "_window_local_latent_start_token" in batch:
+    body_aux_mode = str(batch.get("_window_local_body_aux_mode", "full_prefix_splice"))
+    if body_aux_mode == "local_decode":
+        window_start_tokens = None
+    elif "_window_local_latent_start_token" in batch:
         window_start_tokens = batch["_window_local_latent_start_token"]
         pred_list = _splice_window_local_pred_to_prefix(
             pred_list, batch, module.device
@@ -833,6 +843,12 @@ def _collect_window_local_metrics(model_batch: dict) -> dict[str, float]:
     if starts is not None:
         starts_t = torch.as_tensor(starts, dtype=torch.float32)
         metrics["stream_training/window_start_mean"] = float(starts_t.mean().item())
+    global_starts = model_batch.get("_window_global_start_token")
+    if global_starts is not None:
+        global_starts_t = torch.as_tensor(global_starts, dtype=torch.float32)
+        metrics["stream_training/global_window_start_mean"] = float(
+            global_starts_t.mean().item()
+        )
     lengths = model_batch.get("_window_local_latent_valid_len")
     if lengths is not None:
         lengths_t = torch.as_tensor(lengths, dtype=torch.float32)
