@@ -148,6 +148,7 @@ class SelfForcingTrainer:
                 window_sampling=window_sampling_cfg if window_sampling_enabled else None,
                 chunk_size=getattr(module_model, "chunk_size", None),
                 rollout_span=rollout_span,
+                force_start_token_zero=bool(st_cfg.get("force_start_token_zero", False)),
             )
             loss_batch = batch.copy()
             for key in (

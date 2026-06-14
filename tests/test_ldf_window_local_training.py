@@ -374,6 +374,48 @@ def test_window_local_model_batch_v2_uses_active_left_history_and_horizon_metada
     assert torch.count_nonzero(out["feature"][1, 9:]) == 0
 
 
+def test_window_local_model_batch_force_start_zero_overrides_v2_window_origin():
+    token = torch.arange(2 * 40 * 3, dtype=torch.float32).view(2, 40, 3)
+    raw = _make_motion263(batch_size=2, num_frames=200)
+    batch = {
+        "token": token,
+        "token_length": torch.tensor([40, 40]),
+        "feature": raw,
+        "feature_length": torch.tensor([200, 200]),
+        "text": ["walk", "run"],
+    }
+
+    out = build_window_local_model_batch(
+        batch,
+        context_tokens=30,
+        horizon_tokens=0,
+        window_sampling={
+            "enabled": True,
+            "history_tokens_min": 0,
+            "history_tokens_max": "auto",
+            "horizon_tokens_min": 20,
+            "horizon_tokens_max": 20,
+        },
+        chunk_size=5,
+        rollout_span=4,
+        force_start_token_zero=True,
+    )
+
+    assert out["_window_local_sample_policy"] == "active_left"
+    assert out["_window_local_latent_start_token"].tolist() == [0, 0]
+    assert torch.equal(
+        out["_window_sampling_active_left_token"],
+        out["_window_sampling_history_tokens"],
+    )
+    assert out["_window_sampling_horizon_tokens"].tolist() == [20, 20]
+    expected_len = out["_window_sampling_history_tokens"] + 5 + 4
+    assert torch.equal(out["feature_length"], expected_len)
+    assert torch.equal(out["traj_num_tokens"], expected_len + 20)
+    for b in range(2):
+        valid = int(out["feature_length"][b].item())
+        assert torch.allclose(out["feature"][b, :valid], token[b, :valid])
+
+
 def test_window_local_v2_future_horizon_survives_traj_token_mask_when_source_has_token_mask():
     token = torch.arange(1 * 40 * 3, dtype=torch.float32).view(1, 40, 3)
     raw = _make_motion263(batch_size=1, num_frames=200)
@@ -566,6 +608,49 @@ def test_training_step_uses_window_local_model_batch_when_enabled():
     assert model_batch["feature"].shape == (1, 6, 3)
     assert model_batch["feature_length"].tolist() == [4]
     assert model_batch["traj_num_tokens"].tolist() == [6]
+
+
+def test_training_step_passes_force_start_zero_to_window_local_builder(monkeypatch):
+    token = torch.arange(1 * 10 * 3, dtype=torch.float32).view(1, 10, 3)
+    raw = _make_motion263(batch_size=1, num_frames=80)
+    batch = {
+        "token": token,
+        "token_length": torch.tensor([10]),
+        "feature": raw,
+        "feature_length": torch.tensor([80]),
+        "traj_cond_7d": torch.zeros(1, 80, 7),
+        "traj_length": torch.tensor([80]),
+        "text": ["walk"],
+    }
+    captured = {}
+    real_builder = sf_mod.build_window_local_model_batch
+
+    def wrapped_builder(*args, **kwargs):
+        captured["force_start_token_zero"] = kwargs.get("force_start_token_zero")
+        return real_builder(*args, **kwargs)
+
+    monkeypatch.setattr(sf_mod, "build_window_local_model_batch", wrapped_builder)
+    cfg = SimpleNamespace()
+    cfg.get = lambda key, default=None: {
+        "stream_training": {
+            "enabled": True,
+            "context_tokens": 4,
+            "horizon_tokens": 2,
+            "force_start_token_zero": True,
+        },
+    }.get(key, default)
+    module = SimpleNamespace(cfg=cfg, trainer=None)
+    trainer = SelfForcingTrainer.__new__(SelfForcingTrainer)
+    trainer._module = module
+    trainer._preconditions_checked = False
+    trainer._self_forcing_step = MagicMock(return_value=torch.tensor(3.0))
+
+    trainer.training_step(batch)
+
+    _, model_batch = trainer._self_forcing_step.call_args.args
+    assert captured["force_start_token_zero"] is True
+    assert model_batch["_window_local_latent_start_token"].tolist() == [0]
+    assert torch.allclose(model_batch["feature"][0, :4], token[0, :4])
 
 
 def test_splice_window_local_pred_to_prefix_preserves_prefix_context():

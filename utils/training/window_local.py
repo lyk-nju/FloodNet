@@ -162,6 +162,7 @@ def build_window_local_model_batch(
     active_left_tokens=None,
     history_tokens=None,
     sampled_horizon_tokens=None,
+    force_start_token_zero: bool = False,
 ) -> dict:
     """Build a model batch for window-local limited-history training.
 
@@ -184,10 +185,18 @@ def build_window_local_model_batch(
 
     ws_cfg = window_sampling or {}
     window_sampling_enabled = bool(ws_cfg.get("enabled", False))
+    force_start_token_zero = bool(force_start_token_zero)
     stream_sample: dict | None = None
     if window_sampling_enabled:
         if chunk_size is None:
             raise ValueError("chunk_size is required when window_sampling is enabled")
+        if force_start_token_zero and (
+            active_left_tokens is not None or history_tokens is not None
+        ):
+            raise ValueError(
+                "force_start_token_zero cannot be combined with explicit "
+                "active_left_tokens/history_tokens overrides"
+            )
         stream_sample = sample_stream_window_indices(
             token_length,
             context_tokens=context_tokens,
@@ -201,6 +210,46 @@ def build_window_local_model_batch(
             history_tokens=history_tokens,
             horizon_tokens=sampled_horizon_tokens,
         )
+        if force_start_token_zero:
+            history_min = int(ws_cfg.get("history_tokens_min", 0))
+            history_max_eff = int(stream_sample["history_tokens_max_effective"])
+            horizons = stream_sample["horizon_tokens"]
+            high_active = token_length - int(chunk_size) - int(rollout_span) - horizons
+            history_high = torch.minimum(
+                torch.full_like(token_length, history_max_eff),
+                high_active,
+            )
+            if bool((history_high < history_min).any()):
+                raise ValueError(
+                    "force_start_token_zero found no valid zero-start history "
+                    "length; "
+                    f"history_high={history_high.tolist()}, "
+                    f"history_tokens_min={history_min}"
+                )
+            forced_history = torch.stack(
+                [
+                    torch.randint(
+                        history_min,
+                        int(history_high[b].item()) + 1,
+                        (1,),
+                        device=device,
+                    )[0]
+                    for b in range(batch_size)
+                ]
+            ).to(dtype=torch.long)
+            stream_sample = sample_stream_window_indices(
+                token_length,
+                context_tokens=context_tokens,
+                chunk_size=int(chunk_size),
+                rollout_span=int(rollout_span),
+                history_tokens_min=history_min,
+                history_tokens_max=ws_cfg.get("history_tokens_max", "auto"),
+                horizon_tokens_min=int(ws_cfg.get("horizon_tokens_min", 0)),
+                horizon_tokens_max=int(ws_cfg.get("horizon_tokens_max", 0)),
+                active_left_tokens=forced_history,
+                history_tokens=forced_history,
+                horizon_tokens=horizons,
+            )
         starts = stream_sample["window_left_tokens"]
         latent_lengths = stream_sample["latent_num_tokens"]
         traj_token_lengths = stream_sample["traj_num_tokens"]
@@ -225,7 +274,14 @@ def build_window_local_model_batch(
                 f"min_history_tokens={min_history_tokens}"
             )
 
-        if sample_policy == "fixed_window":
+        if force_start_token_zero:
+            if start_tokens is not None or end_tokens is not None:
+                raise ValueError(
+                    "force_start_token_zero cannot be combined with explicit "
+                    "start_tokens/end_tokens overrides"
+                )
+            starts = torch.zeros_like(token_length)
+        elif sample_policy == "fixed_window":
             if end_tokens is None:
                 if bool((token_length < min_history_tokens).any()):
                     raise ValueError(
@@ -275,7 +331,7 @@ def build_window_local_model_batch(
             torch.full_like(token_length, context_tokens),
             token_length - starts,
         )
-        if sample_policy == "fixed_window":
+        if sample_policy == "fixed_window" and not force_start_token_zero:
             latent_lengths = ends - starts
         if bool((latent_lengths <= 0).any()):
             raise ValueError(
