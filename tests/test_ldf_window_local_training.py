@@ -7,6 +7,8 @@ from unittest.mock import MagicMock
 
 from utils.token_frame import token_range_to_frame_slice, token_start_frame
 from utils.traj_batch import encode_traj_batch
+from utils.local_frame import canonicalize_7d
+from utils.motion_process import recover_root_rot_pos, root_to_traj_feats_7d
 from utils.training.self_forcing import SelfForcingTrainer
 import utils.training.self_forcing as sf_mod
 from utils.training.window_local import (
@@ -58,7 +60,7 @@ def test_window_local_traj_batch_uses_prefix_and_arbitrary_frame_lengths():
     assert out["traj_start_token"].tolist() == [0, 5]
 
 
-def test_window_local_traj_batch_recovers_from_window_origin():
+def test_window_local_traj_batch_anchors_xz_and_heading_to_window_origin():
     raw = _make_motion263(batch_size=1, num_frames=40)
     out = build_window_local_traj_batch(
         raw_feature_263=raw,
@@ -70,7 +72,37 @@ def test_window_local_traj_batch_recovers_from_window_origin():
 
     assert torch.allclose(traj[0, [0, 2]], torch.zeros(2))
     assert torch.allclose(traj[0, 3:5], torch.tensor([1.0, 0.0]))
-    assert torch.allclose(traj[0, 5:7], torch.zeros(2))
+    assert torch.allclose(traj[0, 5:7], torch.tensor([0.05, 0.0]), atol=1e-6)
+
+
+def test_window_local_traj_batch_preserves_full_clip_delta_at_window_start():
+    raw = _make_motion263(batch_size=1, num_frames=48)
+    raw[0, :, 0] = 0.03
+    start = 5
+    num_tokens = 3
+
+    out = build_window_local_traj_batch(
+        raw_feature_263=raw,
+        raw_feature_length=torch.tensor([48]),
+        start_tokens=torch.tensor([start]),
+        num_tokens=torch.tensor([num_tokens]),
+    )
+
+    quat, xyz = recover_root_rot_pos(raw)
+    full7 = root_to_traj_feats_7d(quat, xyz)[0]
+    frame_slice = token_range_to_frame_slice(start, num_tokens)
+    anchor_f = token_start_frame(start)
+    anchor_xz = full7[anchor_f:anchor_f + 1, [0, 2]]
+    anchor_yaw = torch.atan2(full7[anchor_f:anchor_f + 1, 4], full7[anchor_f:anchor_f + 1, 3])
+    expected = canonicalize_7d(
+        full7[frame_slice].unsqueeze(0),
+        anchor_xz,
+        anchor_yaw,
+    )[0]
+
+    valid = int(out["traj_length"][0].item())
+    assert not torch.allclose(expected[0, 5:7], torch.zeros(2), atol=1e-6)
+    assert torch.allclose(out["traj_features"][0, :valid], expected[:valid], atol=1e-5)
 
 
 def test_window_local_traj_batch_masks_unavailable_future_tail():

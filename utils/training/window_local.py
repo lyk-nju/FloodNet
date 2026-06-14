@@ -1,14 +1,16 @@
 """Window-local LDF training helpers.
 
 These helpers build the trajectory side of the limited-history training batch.
-They intentionally reconstruct 7D root trajectory from raw 263D motion for the
-sampled token window instead of cropping an existing full-clip 7D tensor.
+They recover the full raw 263D root trajectory, slice the sampled token window,
+and anchor it to the window origin so window-local training matches runtime
+RootPlan slicing, including boundary fwd/yaw delta channels.
 """
 
 from __future__ import annotations
 
 import torch
 
+from utils.local_frame import canonicalize_7d
 from utils.motion_process import recover_root_rot_pos, root_to_traj_feats_7d
 from utils.token_frame import token_range_to_frame_slice, token_start_frame
 from utils.training.window_sampling import sample_stream_window_indices
@@ -103,14 +105,23 @@ def build_window_local_traj_batch(
         expected_len = int(frame_slice.stop - frame_slice.start)
         available_stop = min(int(frame_slice.stop), raw_len)
         available_len = max(0, available_stop - int(frame_slice.start))
-        raw_window = raw_feature_263[b : b + 1, frame_slice.start:available_stop, :]
-        if raw_window.shape[1] <= 0:
+        raw_full = raw_feature_263[b : b + 1, :raw_len, :]
+        if raw_full.shape[1] <= 0:
             raise ValueError(
                 "window-local trajectory produced an empty raw window; "
                 f"sample={b}, frame_slice={frame_slice}, raw_feature_length={raw_len}"
             )
-        root_quat, root_xyz = recover_root_rot_pos(raw_window)
-        traj7 = root_to_traj_feats_7d(root_quat, root_xyz).squeeze(0)
+        root_quat, root_xyz = recover_root_rot_pos(raw_full)
+        full_traj7 = root_to_traj_feats_7d(root_quat, root_xyz).squeeze(0)
+        traj7_world = full_traj7[frame_slice.start:available_stop]
+        anchor = full_traj7[origin_frame:origin_frame + 1]
+        anchor_xz = anchor[..., [0, 2]]
+        anchor_yaw = torch.atan2(anchor[..., 4], anchor[..., 3])
+        traj7 = canonicalize_7d(
+            traj7_world.unsqueeze(0),
+            anchor_xz,
+            anchor_yaw,
+        ).squeeze(0)
         expected_lengths.append(expected_len)
         available_lengths.append(available_len)
         traj_windows.append(traj7)
