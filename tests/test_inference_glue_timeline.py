@@ -12,7 +12,7 @@ import logging
 import pytest
 import torch
 
-from utils.inference_glue import (
+from utils.inference.glue import (
     InferenceGlueState,
     InferenceGlueTimeline,
 )

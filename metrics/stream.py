@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Sequence
-
 import numpy as np
 import torch
+
+from typing import Dict, Iterable, List, Sequence
 
 try:
     from FloodNet.eval.eval_summary import build_eval_summary

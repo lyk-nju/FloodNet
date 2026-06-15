@@ -2,7 +2,7 @@
 
 Wires config loading, dataset construction, WandB, checkpointing, and Lightning
 Trainer setup. Model-specific forward and loss logic lives in
-``utils.refiner.lightning_module``.
+``utils.training.root_refiner.lightning_module``.
 """
 
 from __future__ import annotations
@@ -13,10 +13,10 @@ import logging
 import os
 import sys
 import time
-from pathlib import Path
-
 import lightning.pytorch as pl
 import torch
+
+from pathlib import Path
 from lightning.pytorch.utilities import rank_zero_info
 from torch.utils.data import DataLoader
 
@@ -24,24 +24,23 @@ _REPO_ROOT = Path(__file__).resolve().parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from datasets.humanml3d_refiner import refiner_collate  # noqa: E402
+from utils.training.root_refiner import collate_fn  # noqa: E402
 from utils.initialize import (  # noqa: E402
     get_function,
     get_shared_run_time,
     instantiate,
     save_config_and_codes,
 )
-from utils.refiner.config_validate import validate_refiner_config  # noqa: E402
-from utils.refiner.lightning_module import (  # noqa: E402
+from utils.training.root_refiner.config_validate import validate_refiner_config  # noqa: E402
+from utils.training.root_refiner.lightning_module import (  # noqa: E402
     RefinerLightningModule,
     RootRefinerLightningModule,
 )
-from utils.refiner.losses import (  # noqa: E402
+from utils.training.root_refiner.losses import (  # noqa: E402
     masked_mean,
     second_order_diff_l2,
     smooth_l1_masked,
 )
-from utils.text_encoder_resolver import FrozenStubTextEncoder  # noqa: E402,F401
 
 log = logging.getLogger(__name__)
 
@@ -321,98 +320,17 @@ def _build_one_dataset(
     validation_suite: dict | None = None,
 ):
     """Build one RootRefiner dataset split."""
-    from scripts.compute_5d_stats import load_clips_from_dir
+    from utils.training.root_refiner import build_root_refiner_dataset
 
-    data_cfg = cfg.get("data", {})
-    raw_dir = data_cfg["raw_data_dir"]
-    stats_dir = data_cfg.get("stats_dir")
-    normalize = bool(data_cfg.get("normalize", False))
-    if normalize:
-        if not stats_dir or not Path(stats_dir).is_dir():
-            raise FileNotFoundError(
-                f"data.normalize is true but stats_dir={stats_dir!r} does not exist. "
-                f"Run scripts/compute_5d_stats.py first, or set data.normalize: false."
-            )
-    clips = load_clips_from_dir(
-        raw_dir,
-        dataset=data_cfg.get("dataset", "humanml3d"),
-        split_file=split_file,
-        feature_path=data_cfg.get("feature_path"),
-        text_path=data_cfg.get("text_path"),
-    )
-    model_cfg = cfg["model"]["params"]
-    sampling_cfg = cfg.get("sampling") or {}
-    path_condition_cfg = (sampling_cfg.get("path_condition") or {})
-    offset_cfg = (path_condition_cfg.get("offset_start") or {})
-    sparse_cfg = (path_condition_cfg.get("sparse_path") or {})
-    path_feature_stats_dir = data_cfg.get("path_feature_stats_dir") if normalize else None
-    path_feature_stats_hash = None
-    if path_feature_stats_dir is not None:
-        from utils.refiner.path_feature_stats import compute_sampling_config_hash
-
-        path_feature_stats_hash = compute_sampling_config_hash(cfg)
-    dataset_target = data_cfg.get(
-        "target",
-        "datasets.humanml3d_refiner.HumanML3DRefinerDataset",
-    )
-    full_plan_ratio = sampling_cfg.get("full_plan_ratio", 0.5)
-    horizon_policy = sampling_cfg.get("horizon_policy", "random")
-    path_condition_policy = path_condition_cfg.get("policy", "dense_path")
-    path_condition_ratios = path_condition_cfg.get("ratios")
-    offset_start_enabled = bool(offset_cfg.get("enabled", False))
-    offset_start_prob = float(offset_cfg.get("prob", 0.0))
-    if validation_suite is not None:
-        full_plan_ratio = validation_suite.get("full_plan_ratio", full_plan_ratio)
-        horizon_policy = validation_suite.get("horizon_policy", horizon_policy)
-        path_condition_policy = validation_suite.get(
-            "path_condition_policy", path_condition_policy
-        )
-        path_condition_ratios = validation_suite.get(
-            "path_condition_ratios", path_condition_ratios
-        )
-        offset_start_enabled = bool(
-            validation_suite.get("offset_start_enabled", offset_start_enabled)
-        )
-        default_offset_prob = offset_start_prob if offset_start_enabled else 0.0
-        offset_start_prob = float(
-            validation_suite.get("offset_start_prob", default_offset_prob)
-        )
-
-    dataset = instantiate(
-        target=dataset_target,
-        cfg=None,
-        hfstyle=False,
-        clips=clips,
-        n_hist=model_cfg["n_hist"],
-        n_path=model_cfg["n_path"],
-        max_tokens=model_cfg["max_tokens"],
-        min_tokens=model_cfg["min_tokens"],
-        frames_per_token=model_cfg["frames_per_token"],
-        full_plan_ratio=full_plan_ratio,
-        horizon_policy=horizon_policy,
-        path_condition_policy=path_condition_policy,
-        path_condition_ratios=path_condition_ratios,
-        offset_start_enabled=offset_start_enabled,
-        offset_start_prob=offset_start_prob,
-        offset_start_max_frames=int(offset_cfg.get("max_frames", 40)),
-        offset_start_apply_to=tuple(
-            offset_cfg.get("apply_to", ("dense_path", "sparse_path"))
-        ),
-        sparse_path_point_range=tuple(sparse_cfg.get("point_range", (3, 8))),
-        normalize=normalize,
-        stats_dir=stats_dir if normalize else None,
-        path_feature_stats_dir=path_feature_stats_dir,
-        sampling_config_hash=path_feature_stats_hash,
+    split_name = "val" if validation_suite is not None else "train"
+    return build_root_refiner_dataset(
+        cfg,
+        split_file,
+        split=split_name,
         seed=seed,
         randomize_caption=randomize_caption,
+        validation_suite=validation_suite,
     )
-    if validation_suite is not None and validation_suite.get("mode_policy") == "sliding":
-        if hasattr(dataset, "valid_indices") and hasattr(dataset, "sliding_eligible_indices"):
-            dataset.valid_indices = [
-                idx for idx in dataset.valid_indices
-                if idx in dataset.sliding_eligible_indices
-            ]
-    return dataset
 
 
 def build_datasets(cfg: dict, seed: int | None = None):
@@ -448,9 +366,9 @@ def apply_fixed_overfit_datasets(train_ds, val_suites, cfg: dict):
     if not fixed_cfg.get("enabled", False):
         return train_ds, val_suites
 
-    from datasets.humanml3d_refiner import (
+    from utils.training.root_refiner import (
         FixedRefinerSampleDataset,
-        build_fixed_refiner_samples,
+        build_fixed_samples,
     )
 
     kwargs = {
@@ -459,13 +377,13 @@ def apply_fixed_overfit_datasets(train_ds, val_suites, cfg: dict):
         "force_no_path_aug": bool(fixed_cfg.get("force_no_path_aug", True)),
         "force_text_idx": fixed_cfg.get("force_text_idx", 0),
     }
-    train_samples = build_fixed_refiner_samples(train_ds, **kwargs)
+    train_samples = build_fixed_samples(train_ds, **kwargs)
     fixed_train = FixedRefinerSampleDataset(train_samples)
 
     if bool(fixed_cfg.get("val_on_train", True)) or not val_suites:
         fixed_val = FixedRefinerSampleDataset(train_samples)
     else:
-        val_samples = build_fixed_refiner_samples(val_suites[0]["dataset"], **kwargs)
+        val_samples = build_fixed_samples(val_suites[0]["dataset"], **kwargs)
         fixed_val = FixedRefinerSampleDataset(val_samples)
 
     log.info(
@@ -489,9 +407,9 @@ def apply_default_fixed_validation_dataset(train_ds, val_suites):
     """Replace validation with deterministic fixed samples."""
     if not val_suites:
         return train_ds, []
-    from datasets.humanml3d_refiner import (
+    from utils.training.root_refiner import (
         FixedRefinerSampleDataset,
-        build_fixed_refiner_samples,
+        build_fixed_samples,
     )
     fixed_suites = []
     for suite in val_suites:
@@ -510,7 +428,7 @@ def apply_default_fixed_validation_dataset(train_ds, val_suites):
                 and hasattr(dataset, "n_hist")
             ):
                 force_anchor_frame = int(dataset.n_hist) - 1
-            val_samples = build_fixed_refiner_samples(
+            val_samples = build_fixed_samples(
                 dataset,
                 num_samples=len(dataset),
                 mode_policy=suite.get("mode_policy", "random"),
@@ -600,7 +518,7 @@ def main(argv=None):
     cfg.setdefault("validation", {})["suites"] = [
         {"name": suite["name"]} for suite in val_suites
     ]
-    from datasets.humanml3d_refiner import refiner_worker_init_fn
+    from utils.training.root_refiner import worker_init_fn
     data_cfg = cfg["data"]
     collate_fn = get_function(data_cfg["collate_fn"])
     train_loader = DataLoader(
@@ -610,7 +528,7 @@ def main(argv=None):
         num_workers=data_cfg["num_workers"],
         collate_fn=collate_fn,
         drop_last=True,
-        worker_init_fn=refiner_worker_init_fn,
+        worker_init_fn=worker_init_fn,
     )
     val_loaders = []
     for suite in val_suites:

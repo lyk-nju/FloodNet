@@ -10,12 +10,11 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 import pytest
 import torch
 
+from pathlib import Path
 from models.diffusion_forcing_wan import (
     _BACKWARD_COMPAT_OPTIONAL_NAMES,
     _is_optional_compat_key,

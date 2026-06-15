@@ -39,7 +39,7 @@ logger:
 trainer: # lightning trainer
     max_steps: 700000
     accelerator: gpu
-    devices: [0,1,2,3,4,5,6,7]
+    devices: [4]
     log_every_n_steps: 100
     precision: bf16-mixed
 
@@ -101,7 +101,6 @@ data:
     val_bs: 32
     test_bs: 4
     num_workers: 8
-    mask_ratio: 1.0
     traj_feat_dim: 7
 
     train_meta_paths:

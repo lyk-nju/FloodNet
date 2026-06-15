@@ -4,7 +4,7 @@ from pathlib import Path
 
 from omegaconf import OmegaConf
 
-from utils.training.test_probes import build_val_dataloaders
+from utils.training.ldf.test_probes import build_val_dataloaders
 
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -48,7 +48,7 @@ def test_validation_eval_uses_validation_function_names():
 
 
 def test_t2m_metric_enabled_is_validation_scoped():
-    from utils.training.validation_eval_runtime import t2m_metric_enabled
+    from utils.training.ldf.validation_eval_runtime import t2m_metric_enabled
 
     assert t2m_metric_enabled(
         OmegaConf.create({"validation": {"t2m_metric": True}})
@@ -62,7 +62,7 @@ def test_t2m_metric_enabled_is_validation_scoped():
 
 
 def test_val_repeat_is_validation_scoped():
-    from utils.training.validation_eval_runtime import validation_repeat_count
+    from utils.training.ldf.validation_eval_runtime import validation_repeat_count
 
     assert validation_repeat_count(
         OmegaConf.create({"validation": {"val_repeat": 3}})
@@ -72,7 +72,7 @@ def test_val_repeat_is_validation_scoped():
 
 
 def test_control_loss_train_mode_is_body_aux_scoped():
-    from utils.training.validation_eval_runtime import control_loss_train_mode
+    from utils.training.ldf.validation_eval_runtime import control_loss_train_mode
 
     assert control_loss_train_mode(
         OmegaConf.create({"body_aux_loss": {"control_loss_train_mode": 6}})

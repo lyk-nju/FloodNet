@@ -1,8 +1,8 @@
 import csv
 import json
-from pathlib import Path
-
 import pytest
+
+from pathlib import Path
 
 
 def test_common_eval_contracts_are_serializable(tmp_path):

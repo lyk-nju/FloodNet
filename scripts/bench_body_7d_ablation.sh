@@ -5,7 +5,7 @@
 # (all_on, no_corruption, no_horizon_sim, no_anchor_canonical, no_heading_loss)
 # it (1) fine-tunes a variant from the base ckpt with that ablation's
 # config overrides, then (2) runs stream_benchmark predroot on the result. The
-# override sets come from utils/training/ablation.py (single source of truth).
+# override sets come from utils/training/ldf/ablation.py (single source of truth).
 #
 # Usage:  scripts/bench_body_7d_ablation.sh [RESUME_CKPT] [MAX_STEPS] [VAE_CKPT] [RAW_DATA_DIR]
 set -euo pipefail
@@ -25,7 +25,7 @@ ABLATIONS="all_on no_corruption no_horizon_sim no_anchor_canonical no_heading_lo
 
 for name in $ABLATIONS; do
   echo "==================== ablation: ${name} ===================="
-  overrides="$("$PY" -m utils.training.ablation "$name")"
+  overrides="$("$PY" -m utils.training.ldf.ablation "$name")"
   exp="body_ft_${name}"
   out="${ROOT_OUT}/${name}"
 

@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from types import SimpleNamespace
-
 import numpy as np
 import torch
 
+from pathlib import Path
+from types import SimpleNamespace
 from eval.runtime.benchmark import (
     DEFAULT_RUNTIME_OUTPUT_DIR,
     _add_metric_target_aliases,
@@ -56,13 +55,13 @@ from eval.runtime.transforms import (
     rotate_xz_points,
     rotate_world_7d_about_anchor,
 )
-from utils.inference_glue import InferenceGlueState, InferenceGlueTimeline
+from utils.inference.glue import InferenceGlueState, InferenceGlueTimeline
 from utils.motion_process import append_traj_deltas_5d_to_7d
-from utils.runtime_rootplan import build_rootplan_stream_payload_from_buffer
-from utils.runtime_timeline import append_timeline_state_at_token_start_frame
-from utils.stream_traj import StreamTrajectoryPlan
+from utils.inference.root_plan import build_rootplan_stream_payload_from_buffer
+from utils.inference.timeline import append_timeline_state_at_token_start_frame
+from utils.inference.trajectory import StreamTrajectoryPlan
 from utils.token_frame import token_range_to_frame_slice, token_start_frame
-from utils.traj_stream_buffer import TrajStreamBuffer
+from utils.inference.buffer import TrajStreamBuffer
 
 
 def _timeline(num_commits: int) -> InferenceGlueTimeline:

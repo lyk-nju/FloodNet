@@ -32,12 +32,12 @@ import json
 import math
 import shutil
 import sys
+import numpy as np
+import torch
+
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-
-import numpy as np
-import torch
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -66,8 +66,7 @@ from eval.root_refiner.metrics import (  # noqa: E402
     _lateral_component,
     compute_sample_metrics,
 )
-from utils.refiner.path_feature_stats import compute_sampling_config_hash  # noqa: E402
-from utils.refiner.runtime import _state_dict_has_pace_duration  # noqa: E402
+from utils.inference.root_refiner import _state_dict_has_pace_duration  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -198,27 +197,41 @@ def _to_int(value, default: int = 0) -> int:
     return int(value)
 
 
-def _dataset_clip_for_eval_index(dataset, idx: int):
-    if not hasattr(dataset, "_clips"):
+def _dataset_raw_index_for_eval_index(dataset, idx: int) -> int:
+    return int(dataset.valid_indices[idx]) if hasattr(dataset, "valid_indices") else int(idx)
+
+
+def _dataset_record_for_eval_index(dataset, idx: int):
+    raw_dataset = getattr(dataset, "raw_dataset", None)
+    records = getattr(raw_dataset, "dataset", None)
+    if records is None:
         return None
-    clip_idx = (
-        int(dataset.valid_indices[idx]) if hasattr(dataset, "valid_indices") else int(idx)
-    )
-    return dataset._clips[clip_idx]
+    raw_idx = _dataset_raw_index_for_eval_index(dataset, idx)
+    if raw_idx >= len(records):
+        return None
+    return records[raw_idx]
 
 
 def _clip_metadata_for_eval_index(dataset, idx: int) -> dict:
-    clip = _dataset_clip_for_eval_index(dataset, idx)
-    if not isinstance(clip, Mapping):
+    record = _dataset_record_for_eval_index(dataset, idx)
+    if not isinstance(record, Mapping):
         return {}
     meta = {}
-    raw_id = clip.get("raw_id", clip.get("name"))
+    raw_id = record.get("raw_id", record.get("name"))
     if raw_id is not None:
         meta["raw_id"] = raw_id
-    for key in ("split_index", "split_file", "dataset"):
-        value = clip.get(key)
-        if value is not None:
-            meta[key] = value
+    meta["split_index"] = int(
+        record.get("split_index", _dataset_raw_index_for_eval_index(dataset, idx))
+    )
+    split_file = record.get("split_file")
+    raw_dataset = getattr(dataset, "raw_dataset", None)
+    if split_file is None and getattr(raw_dataset, "file_list", None):
+        split_file = Path(raw_dataset.file_list[0]).name
+    if split_file is not None:
+        meta["split_file"] = split_file
+    dataset_name = record.get("dataset")
+    if dataset_name is not None:
+        meta["dataset"] = dataset_name
     return meta
 
 
@@ -258,8 +271,8 @@ def build_eval_task_specs(dataset, max_samples: int = -1) -> list[dict]:
 
 
 def _max_tokens_for_full_route(dataset, idx: int, anchor_frame: int = 0) -> int:
-    clip = _dataset_clip_for_eval_index(dataset, idx)
-    if clip is None:
+    record = _dataset_record_for_eval_index(dataset, idx)
+    if record is None:
         sample = _get_eval_sample(
             dataset,
             idx,
@@ -269,8 +282,11 @@ def _max_tokens_for_full_route(dataset, idx: int, anchor_frame: int = 0) -> int:
             force_anchor_frame=anchor_frame,
         )
         return _to_int(sample.get("num_tokens"), default=0)
-    motion = clip["motion_263"]
-    T = int(motion.shape[0])
+    if "feature_length" in record:
+        T = int(record["feature_length"])
+    else:
+        motion = record.get("feature", record.get("motion_263"))
+        T = int(motion.shape[0])
     remaining = max(0, T - int(anchor_frame))
     frames_per_token = int(getattr(dataset, "frames_per_token", 4))
     max_tokens = int(getattr(dataset, "max_tokens", 49))
@@ -892,48 +908,21 @@ def _suite_sample_limit(
     return -1
 
 
-def build_refiner_dataset_from_clips(
+def build_refiner_dataset_from_config(
     cfg: dict,
-    clips,
     *,
-    dataset_cls,
+    split_file: str | None = None,
     seed: int = 0,
 ):
+    from utils.training.root_refiner import build_root_refiner_dataset
+
     data_cfg = cfg.get("data", {}) or {}
-    model_cfg = cfg["model"]["params"]
-    sampling_cfg = cfg.get("sampling", {}) or {}
-    path_condition_cfg = sampling_cfg.get("path_condition", {}) or {}
-    offset_cfg = path_condition_cfg.get("offset_start", {}) or {}
-    sparse_cfg = path_condition_cfg.get("sparse_path", {}) or {}
-    normalize = bool(data_cfg.get("normalize", False))
-    path_feature_stats_dir = data_cfg.get("path_feature_stats_dir") if normalize else None
-    return dataset_cls(
-        clips,
-        n_hist=model_cfg["n_hist"],
-        n_path=model_cfg["n_path"],
-        max_tokens=model_cfg["max_tokens"],
-        min_tokens=model_cfg["min_tokens"],
-        frames_per_token=model_cfg["frames_per_token"],
-        full_plan_ratio=sampling_cfg.get("full_plan_ratio", 0.5),
-        horizon_policy=sampling_cfg.get("horizon_policy", "random"),
-        path_condition_policy=path_condition_cfg.get("policy", "dense_path"),
-        path_condition_ratios=path_condition_cfg.get("ratios"),
-        offset_start_enabled=bool(offset_cfg.get("enabled", False)),
-        offset_start_prob=float(offset_cfg.get("prob", 0.0)),
-        offset_start_max_frames=int(offset_cfg.get("max_frames", 40)),
-        offset_start_apply_to=tuple(
-            offset_cfg.get("apply_to", ("dense_path", "sparse_path"))
-        ),
-        sparse_path_point_range=tuple(sparse_cfg.get("point_range", (3, 8))),
-        normalize=normalize,
-        stats_dir=data_cfg.get("stats_dir") if normalize else None,
-        path_feature_stats_dir=path_feature_stats_dir,
-        sampling_config_hash=(
-            compute_sampling_config_hash(cfg)
-            if path_feature_stats_dir is not None
-            else None
-        ),
+    return build_root_refiner_dataset(
+        cfg,
+        split_file or data_cfg.get("val_split_file") or data_cfg.get("train_split_file"),
+        split="val",
         seed=seed,
+        randomize_caption=False,
     )
 
 
@@ -1224,9 +1213,6 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
-    from datasets.humanml3d_refiner import HumanML3DRefinerDataset as RefinerDataset
-    from scripts.compute_5d_stats import load_clips_from_dir
-
     from train_refiner import resolve_cfg_interpolations
 
     from train_refiner import _load_cfg
@@ -1240,17 +1226,9 @@ def main(argv=None):
 
     data_cfg = cfg.get("data", {})
     split_file = args.split_file or data_cfg.get("val_split_file")
-    clips = load_clips_from_dir(
-        data_cfg["raw_data_dir"],
-        dataset=data_cfg.get("dataset", "humanml3d"),
-        split_file=split_file,
-        feature_path=data_cfg.get("feature_path"),
-        text_path=data_cfg.get("text_path"),
-    )
-    dataset = build_refiner_dataset_from_clips(
+    dataset = build_refiner_dataset_from_config(
         cfg,
-        clips,
-        dataset_cls=RefinerDataset,
+        split_file=split_file,
         seed=0,
     )
     task_specs = None

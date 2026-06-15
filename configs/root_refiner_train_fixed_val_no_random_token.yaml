@@ -1,0 +1,21 @@
+base_config: root_refiner_train.yaml
+
+exp_name: root_refiner_fixed_val_no_random_token
+
+validation:
+  suites:
+    - name: full_dense_max
+      mode_policy: full
+      full_plan_ratio: 1.0
+      horizon_policy: max
+      path_condition_policy: dense_path
+      offset_start_enabled: false
+      offset_start_prob: 0.0
+
+    - name: sliding_dense_max
+      mode_policy: sliding
+      full_plan_ratio: 0.0
+      horizon_policy: max
+      path_condition_policy: dense_path
+      offset_start_enabled: false
+      offset_start_prob: 0.0

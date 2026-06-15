@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Mapping
-
 import numpy as np
 import torch
 
+from dataclasses import dataclass, field
+from typing import Any, Mapping
 from eval.runtime.transforms import (
     build_eval_root_plan_from_points,
     build_eval_root_plan_from_world_7d,
@@ -18,21 +17,21 @@ from eval.runtime.transforms import (
     rotate_xz_points,
     rotate_world_7d_about_anchor,
 )
-from utils.inference_glue import InferenceGlueState, InferenceGlueTimeline
+from utils.inference.glue import InferenceGlueState, InferenceGlueTimeline
 from utils.motion_process import (
     StreamJointRecovery263,
     extract_root_traj_feats_7d_263,
     extract_root_trajectory_263,
 )
-from utils.runtime_rootplan import build_rootplan_stream_payload_from_buffer
-from utils.runtime_timeline import append_timeline_state_at_token_start_frame
-from utils.stream_rollout import (
+from utils.inference.root_plan import build_rootplan_stream_payload_from_buffer
+from utils.inference.timeline import append_timeline_state_at_token_start_frame
+from utils.inference.rollout import (
     StreamTextSegment,
     StreamTextRolloutController,
     build_stream_step_model_input,
     build_stream_suffix_conditioning,
 )
-from utils.stream_traj import (
+from utils.inference.trajectory import (
     StreamTrajectoryPlan,
     assign_uniform_timestamps,
     blend_future_trajs,

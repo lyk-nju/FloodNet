@@ -7,9 +7,9 @@ from torch_ema import ExponentialMovingAverage
 
 from utils.initialize import check_state_dict, instantiate, load_config
 from utils.motion_process import StreamJointRecovery263
-from utils.training.ckpt_compat import strip_legacy_traj_encoder_weights
-from utils.render_skeleton import get_humanml3d_chains, render_simple_skeleton_video
-from utils.visualize import render_single_video
+from utils.training.ldf.ckpt_compat import strip_legacy_traj_encoder_weights
+from utils.visualization.skeleton import get_humanml3d_chains, render_simple_skeleton_video
+from utils.visualization.video import render_single_video
 
 # Set tokenizers parallelism to false to avoid warnings in multiprocessing
 os.environ["TOKENIZERS_PARALLELISM"] = "false"

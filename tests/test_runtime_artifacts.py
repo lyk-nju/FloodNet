@@ -1,10 +1,9 @@
-from pathlib import Path
 import csv
 import json
-
 import numpy as np
 import pytest
 
+from pathlib import Path
 from eval.runtime.artifacts import (
     RuntimeArtifactLayout,
     infer_ckpt_tag,

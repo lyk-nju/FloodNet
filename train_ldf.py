@@ -1,15 +1,7 @@
-"""FloodNet training entrypoint.
-
-Wires dataset, model, VAE, EMA, and Lightning Trainer. Supports standard
-(auto opt) and self-forcing (manual opt) training with validation generation eval.
-"""
-
 import os
 import time
 
-# Keep CPU BLAS/OpenMP thread pools small. This process already uses DDP ranks,
-# dataloader workers, and optional eval workers; large default BLAS pools can
-# hit per-user thread limits during eval.
+
 for _thread_env_key in (
     "OPENBLAS_NUM_THREADS",
     "OMP_NUM_THREADS",
@@ -43,21 +35,21 @@ from utils.initialize import (
     load_config,
     save_config_and_codes,
 )
-from utils.lightning_module import BasicLightningModule
-from utils.training import (
+from utils.training.lightning_module import BasicLightningModule
+from utils.training import ckpt_step_info
+from utils.training.ldf import (
     prepare_model_input,
     build_probe_loaders,
     build_val_dataloaders,
     compute_control_loss_xz,
-    ckpt_step_info,
     resolve_sf_runtime,
     SelfForcingTrainer,
     t2m_metric_enabled,
     validation_repeat_count,
     control_loss_train_mode,
 )
-from utils.training.ckpt_compat import strip_legacy_traj_encoder_weights
-from utils.training.config_validate import (
+from utils.training.ldf.ckpt_compat import strip_legacy_traj_encoder_weights
+from utils.training.ldf.config_validate import (
     validate_7d_requires_self_forcing,
     validate_stream_training_config,
     validate_traj_dim_consistency,
@@ -75,18 +67,13 @@ class CustomLightningModule(BasicLightningModule):
     generation eval, and T2M metric computation.
     """
     def __init__(self, cfg):
-        # T_B_10: fail fast if the two 4D/7D traj-dim flags disagree, and if a 7D
-        # run lacks self-forcing (the only path that supervises the 7D heading
-        # channels and canonicalizes the traj cond — see validate_7d_requires_*).
         validate_traj_dim_consistency(cfg)
         validate_7d_requires_self_forcing(cfg)
         validate_stream_training_config(cfg)
         self._validation_eval_dedup = {}
         self._resume_step_offset = 0
         super().__init__(cfg)
-        # Must set AFTER super().__init__() because LightningModule.__init__
-        # forces automatic_optimization=True; setting it before is silently
-        # overwritten and crashes self.manual_backward at runtime.
+
         self_forcing_enabled = bool(
             cfg.model.params.get("self_forcing_enabled", False)
         )
@@ -94,9 +81,7 @@ class CustomLightningModule(BasicLightningModule):
         self._sf_trainer = (
             SelfForcingTrainer(self) if self_forcing_enabled else None
         )
-        # B-P0-1: load the cached-z latent stats into WanModel so history
-        # corruption's noisy branch uses the real per-channel sigma
-        # (noise_sigma = noise_sigma_factor * z_std), not the default z_std=1.
+
         z_stats_dir = (cfg.get("history_corruption", {}) or {}).get("z_stats_dir")
         inner = getattr(getattr(self, "model", None), "model", None)
         if z_stats_dir and hasattr(inner, "load_z_stats"):
@@ -235,11 +220,8 @@ class CustomLightningModule(BasicLightningModule):
                 f"[resume] loaded checkpoint global_step={self._resume_step_offset}"
             )
         ##############################
-        # state_dict (strict vs loose for ControlNet)
+        # state_dict
         ##############################
-        # 7D traj-encoder rewrite: strip legacy traj-encoder weights from the
-        # incoming ckpt when their shapes no longer match the model. The new
-        # traj encoder + traj_in_proj will train from scratch.
         n_traj_exp = strip_legacy_traj_encoder_weights(
             checkpoint["state_dict"], self.model.state_dict()
         )
@@ -250,10 +232,7 @@ class CustomLightningModule(BasicLightningModule):
             )
         ckpt_keys = set(checkpoint["state_dict"].keys())
         controlnet_missing = not any(k.startswith("controlnet.") for k in ckpt_keys)
-        # strict=False when EITHER (a) the ckpt has no ControlNet (base pretrain
-        # warm-start path) OR (b) we just stripped legacy traj-encoder weights —
-        # in both cases the live model has keys the ckpt doesn't carry, so a
-        # strict load would raise on missing keys.
+
         strict = not controlnet_missing and n_traj_exp == 0
         result = self.model.load_state_dict(checkpoint["state_dict"], strict=strict)
         has_new_cond_params = controlnet_missing and bool(result.missing_keys)
@@ -262,9 +241,7 @@ class CustomLightningModule(BasicLightningModule):
                 "Loaded pretrained LDF with strict=False (base checkpoint without ControlNet). "
                 f"Missing keys (new modules init from scratch): {result.missing_keys}"
             )
-        # Re-init ControlNet from the *loaded* backbone (not random init weights).
-        # __init__ runs before state_dict load, so init_from_backbone there copies
-        # random weights. Doing it here guarantees the pretrained backbone is used.
+
         if (controlnet_missing
                 and any("controlnet." in k for k in result.missing_keys)):
             self.model.controlnet.init_from_backbone(self.model.model)
@@ -276,10 +253,6 @@ class CustomLightningModule(BasicLightningModule):
         ##############################
         # EMA
         ##############################
-        # With new traj params, ema_state has wrong param count → reinit from scratch.
-        # Also reinit when traj weights were expanded 4D→7D (n_traj_exp>0): the old
-        # EMA shadow_params hold 4D traj-encoder shadows that can't map onto the
-        # expanded 7D params (count/shape mismatch in load/copy_to).
         if "ema_state" in checkpoint and not has_new_cond_params and n_traj_exp == 0:
             self.ema.load_state_dict(checkpoint["ema_state"])
             rank_zero_info("init ema from ckpt")
@@ -295,10 +268,7 @@ class CustomLightningModule(BasicLightningModule):
         # NOTE: Set to empty lists (not pop) so Lightning passes "key exists"
         # check but restores nothing, letting opt/sched follow current config.
         reset_optim_on_resume = bool(self.cfg.get("resume_reset_optimizer", False))
-        # n_traj_exp>0 means traj-encoder params were reshaped 4D→7D, so the
-        # saved Adam moments are 4D-shaped and would shape-mismatch the now-7D
-        # params on the first optimizer.step(). Reset the optimizer in that case
-        # too (mirrors the EMA guard above) — don't rely on resume_reset_optimizer.
+
         if has_new_cond_params or reset_optim_on_resume or n_traj_exp > 0:
             checkpoint["optimizer_states"] = []
             checkpoint["lr_schedulers"] = []
@@ -621,7 +591,7 @@ def main():
     )
 
     ##############################
-    # self-forcing runtime (SF rewrites trainer.max_steps on resume)
+    # self-forcing runtime (phase progress + optional scheduler phase horizon)
     ##############################
     trainer_absolute_max_steps = int(cfg.trainer.max_steps)
     model_self_forcing_enabled = bool(
@@ -634,6 +604,7 @@ def main():
         lr_params.get("num_training_steps", lr_params.get("T_max", 0))
     )
     if scheduler_training_steps > 0:
+        reset_optim_on_resume = bool(cfg.config.get("resume_reset_optimizer", False))
         (
             resume_step_offset,
             phase_max_steps,
@@ -643,6 +614,7 @@ def main():
             cfg.resume_ckpt if cfg.train else None,
             model_self_forcing_enabled,
             scheduler_training_steps,
+            reset_optimizer_on_resume=reset_optim_on_resume,
         )
         if runtime_scheduler_steps != scheduler_training_steps:
             key = (

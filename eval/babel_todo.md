@@ -340,7 +340,7 @@ outputs_babel_webdemo_long/
 
 使用已有：
 
-- `utils.visualize.render_single_video(...)`
+- `utils.visualization.video.render_single_video(...)`
 
 输入：
 

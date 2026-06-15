@@ -4,9 +4,9 @@
 # License: MIT
 
 import pickle
-from os.path import join as pjoin
-
 import numpy as np
+
+from os.path import join as pjoin
 
 POS_enumerator = {
     "VERB": 0,

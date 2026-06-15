@@ -11,7 +11,7 @@ from __future__ import annotations
 import torch
 
 from models.tools.traj_encoder import LocalTrajEncoder, TrajEncoder
-from utils.training.ckpt_compat import (
+from utils.training.ldf.ckpt_compat import (
     expand_traj_input_4d_to_7d,
     strip_legacy_traj_encoder_weights,
 )

@@ -317,7 +317,7 @@ def compute_plan_targets(
 
     Returns ``(target_time, target_arc)``, each shape ``(target_frames, 3)``.
     """
-    from utils.stream_traj import sample_plan_by_time
+    from utils.inference.trajectory import sample_plan_by_time
     frame_times = np.arange(target_frames, dtype=np.float32) / motion_fps
     target_time = sample_plan_by_time(
         np.asarray(plan_times, dtype=np.float32),

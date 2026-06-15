@@ -28,8 +28,8 @@ def _cfg() -> dict:
             },
         },
         "data": {
-            "target": "datasets.humanml3d_refiner.HumanML3DRefinerDataset",
-            "collate_fn": "datasets.humanml3d_refiner.refiner_collate",
+            "target": "datasets.humanml3d.HumanML3DDataset",
+            "collate_fn": "utils.training.root_refiner.collate_fn",
             "train_bs": 4,
             "val_bs": 4,
             "num_workers": 0,

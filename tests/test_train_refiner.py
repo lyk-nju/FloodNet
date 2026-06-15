@@ -5,16 +5,15 @@ from __future__ import annotations
 import torch
 import pytest
 
-from datasets.humanml3d_refiner import HumanML3DRefinerDataset
-from datasets.humanml3d_refiner import HumanML3DRefinerDataset as RefinerDataset
+from tests.helpers.humanml3d_fixture import make_root_refiner_from_samples
 from train_refiner import (
-    FrozenStubTextEncoder,
     RefinerLightningModule,
+    collate_fn,
     masked_mean,
-    refiner_collate,
     second_order_diff_l2,
     smooth_l1_masked,
 )
+from utils.training.root_refiner.text_encoder import FrozenStubTextEncoder
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +137,87 @@ def test_build_datasets_returns_train_and_val(tmp_path):
         "sliding_dense_random",
         "sliding_dense_max",
     ]
+
+
+def test_build_datasets_wraps_humanml3d_for_root_refiner(tmp_path):
+    from train_refiner import build_datasets
+    from utils.training.root_refiner import RootRefinerDataset
+
+    _make_fake_humanml3d(tmp_path, ["t1", "t2", "t3"], ["v1", "v2"])
+    cfg = _tiny_cfg()
+    cfg["data"].update(
+        {
+            "target": "datasets.humanml3d.HumanML3DDataset",
+            "collate_fn": "utils.training.root_refiner.collate_fn",
+            "raw_data_dir": str(tmp_path),
+            "dataset": "humanml3d",
+            "train_split_file": "train.txt",
+            "val_split_file": "val.txt",
+            "feature_path": "new_joint_vecs",
+            "token_path": None,
+            "text_path": "texts",
+            "min_length": 1,
+            "max_length": 200,
+            "random_length": 0,
+        }
+    )
+
+    train_ds, val_suites = build_datasets(cfg, seed=0)
+
+    assert isinstance(train_ds, RootRefinerDataset)
+    assert all(isinstance(suite["dataset"], RootRefinerDataset) for suite in val_suites)
+    sample = train_ds.get_sample(
+        0,
+        force_mode="full",
+        force_num_tokens=4,
+        force_path_mode="dense_path",
+        force_no_path_aug=True,
+        force_text_idx=0,
+    )
+    assert sample["mode"] == "full"
+    assert sample["path_mode"] == "dense_path"
+    assert sample["num_tokens"].item() == 4
+
+
+def test_build_datasets_train_split_force_text_idx_uses_all_captions(tmp_path):
+    from train_refiner import build_datasets
+
+    _make_fake_humanml3d(tmp_path, ["t1"], [])
+    text_file = tmp_path / "HumanML3D" / "texts" / "t1.txt"
+    text_file.write_text(
+        "first caption#x#0#0\n"
+        "second caption#x#0#0\n"
+        "third caption#x#0#0\n"
+    )
+    cfg = _tiny_cfg()
+    cfg["data"].update(
+        {
+            "target": "datasets.humanml3d.HumanML3DDataset",
+            "collate_fn": "utils.training.root_refiner.collate_fn",
+            "raw_data_dir": str(tmp_path),
+            "dataset": "humanml3d",
+            "train_split_file": "train.txt",
+            "val_split_file": None,
+            "feature_path": "new_joint_vecs",
+            "token_path": None,
+            "text_path": "texts",
+            "min_length": 1,
+            "max_length": 200,
+            "random_length": 0,
+        }
+    )
+
+    train_ds, _ = build_datasets(cfg, seed=0)
+    sample = train_ds.get_sample(
+        0,
+        force_mode="full",
+        force_num_tokens=4,
+        force_path_mode="dense_path",
+        force_no_path_aug=True,
+        force_text_idx=1,
+    )
+
+    assert sample["text"] == "second caption"
 
 
 def test_build_datasets_builds_fixed_validation_suites(tmp_path):
@@ -296,8 +376,8 @@ def _tiny_cfg():
             },
         },
         "data": {
-            "target": "datasets.humanml3d_refiner.HumanML3DRefinerDataset",
-            "collate_fn": "datasets.humanml3d_refiner.refiner_collate",
+            "target": "datasets.humanml3d.HumanML3DDataset",
+            "collate_fn": "utils.training.root_refiner.collate_fn",
             "train_bs": 4,
             "val_bs": 4,
             "num_workers": 0,
@@ -606,7 +686,7 @@ def test_path_control_supervision_intersects_target_mask(monkeypatch):
         return pred.new_zeros(())
 
     monkeypatch.setattr(
-        "utils.refiner.lightning_module.dense_path_control_loss",
+        "utils.training.root_refiner.lightning_module.dense_path_control_loss",
         _capture_dense_path_control_loss,
     )
 
@@ -682,13 +762,14 @@ def _make_clip(T: int):
     return {"motion_263": motion, "text": "walk"}
 
 
-def test_refiner_collate_stacks_tensors_and_keeps_text_list():
-    from datasets.humanml3d_refiner import refiner_collate as dataset_refiner_collate
-
-    ds = HumanML3DRefinerDataset([_make_clip(40) for _ in range(3)], full_plan_ratio=1.0, seed=0)
+def test_collate_fn_stacks_tensors_and_keeps_text_list():
+    ds = make_root_refiner_from_samples(
+        [_make_clip(40) for _ in range(3)],
+        full_plan_ratio=1.0,
+        seed=0,
+    )
     samples = [ds[0], ds[1], ds[2]]
-    assert dataset_refiner_collate is refiner_collate
-    batch = dataset_refiner_collate(samples)
+    batch = collate_fn(samples)
     assert isinstance(batch["text"], list) and len(batch["text"]) == 3
     assert batch["path"].shape[0] == 3
     assert batch["waypoints"].shape[0] == 3
@@ -705,9 +786,16 @@ def test_lightning_smoke_fit_runs_a_few_steps(tmp_path):
     from torch.utils.data import DataLoader
 
     clips = [_make_clip(50) for _ in range(8)]
-    ds = HumanML3DRefinerDataset(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
-                                  full_plan_ratio=1.0, seed=0)
-    loader = DataLoader(ds, batch_size=4, shuffle=True, collate_fn=refiner_collate,
+    ds = make_root_refiner_from_samples(
+        clips,
+        n_hist=8,
+        n_path=16,
+        max_tokens=8,
+        min_tokens=2,
+        full_plan_ratio=1.0,
+        seed=0,
+    )
+    loader = DataLoader(ds, batch_size=4, shuffle=True, collate_fn=collate_fn,
                          drop_last=True)
     module = RefinerLightningModule(_tiny_cfg())
 
@@ -730,9 +818,16 @@ def test_lightning_resume_from_checkpoint(tmp_path):
     from torch.utils.data import DataLoader
 
     clips = [_make_clip(50) for _ in range(8)]
-    ds = HumanML3DRefinerDataset(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
-                                  full_plan_ratio=1.0, seed=0)
-    loader = DataLoader(ds, batch_size=4, shuffle=True, collate_fn=refiner_collate,
+    ds = make_root_refiner_from_samples(
+        clips,
+        n_hist=8,
+        n_path=16,
+        max_tokens=8,
+        min_tokens=2,
+        full_plan_ratio=1.0,
+        seed=0,
+    )
+    loader = DataLoader(ds, batch_size=4, shuffle=True, collate_fn=collate_fn,
                          drop_last=True)
     module = RefinerLightningModule(_tiny_cfg())
 

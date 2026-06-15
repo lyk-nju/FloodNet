@@ -1,4 +1,4 @@
-"""Unit tests for utils/training/history_corruption.py (T_B_03).
+"""Unit tests for utils/training/ldf/history_corruption.py (T_B_03).
 
 Maps to the 5 Done-criteria tests in docs/TODO.md §T_B_03 + the gate logic.
 """
@@ -9,7 +9,7 @@ import math
 
 import torch
 
-from utils.training.history_corruption import (
+from utils.training.ldf.history_corruption import (
     apply_history_corruption,
     sample_focus_ratio,
     should_apply_corruption,

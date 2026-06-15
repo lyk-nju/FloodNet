@@ -7,10 +7,10 @@ from __future__ import annotations
 
 import torch
 
-from utils.inference_glue import InferenceGlueState
-from utils.root_plan import RootPlan
+from utils.inference.glue import InferenceGlueState
+from utils.inference.root_plan import RootPlan
 from utils.token_frame import num_frames_for_tokens, token_range_to_frame_slice, token_start_frame
-from utils.traj_stream_buffer import TrajStreamBuffer
+from utils.inference.buffer import TrajStreamBuffer
 
 
 def _state(commit_idx, xz=(0.0, 0.0), yaw=0.0):
@@ -154,7 +154,7 @@ def test_B05_dual_anchor_canonicalize():
 
 
 def test_B06_slice_decoupled(monkeypatch):
-    import utils.root_plan as rp
+    import utils.inference.root_plan as rp
     real = rp.slice_plan_with_mask
     captured = {}
 
@@ -238,7 +238,7 @@ def test_B08b_future_anchor_partially_masks_until_plan_anchor():
 
 
 def test_B09_expected_slice_overrides_H_only(monkeypatch):
-    import utils.root_plan as rp
+    import utils.inference.root_plan as rp
     real = rp.slice_plan_with_mask
     captured = {}
 

@@ -16,7 +16,7 @@ class Skeleton3D {
         this.trailGeometry = null;
         this.trailMaterial = null;
         
-        // HumanML3D skeleton chains (from render_skeleton.py)
+        // HumanML3D skeleton chains (from utils/visualization/skeleton.py)
         this.chains = [
             [0, 2, 5, 8, 11],      // Chain 0: spine
             [0, 1, 4, 7, 10],      // Chain 1: left leg  
@@ -37,7 +37,7 @@ class Skeleton3D {
         this.boneRadius = 0.015;  // Thin cylinder
         this.jointSize = 0.03;    // Small sphere
         
-        // Colors from render_skeleton.py
+        // Colors from utils/visualization/skeleton.py
         this.chainColors = [
             0xFEB21A,  // orange (chain 0 - spine)
             0x00AAFF,  // cyan (chain 1 - left leg)
@@ -286,4 +286,3 @@ class Skeleton3D {
 
 // Export for use in main.js
 window.Skeleton3D = Skeleton3D;
-

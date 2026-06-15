@@ -1,6 +1,7 @@
-"""Compute per-channel mean / std for RefinerDataset outputs (T_A_06).
+"""Compute per-channel mean / std for RootRefiner dataset outputs (T_A_06).
 
-Walks `RefinerDataset` with `normalize=False` and accumulates Welford
+Walks `HumanML3DDataset -> RootRefinerDataset` with `normalize=False` and
+accumulates Welford
 statistics over **canonicalized local-frame** values, separately for
 `current_motion` (5-dim) and `target_waypoints` (7-dim). Only positions where
 the corresponding mask (`history_mask` / `target_mask`) is True are counted.
@@ -28,17 +29,21 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from pathlib import Path
-
 import numpy as np
-import torch
 
-# Insert repo root so `python scripts/compute_5d_stats.py` can `import datasets.*`.
+from pathlib import Path
+from torch.utils.data import Dataset
+
+# Insert repo root so `python scripts/compute_5d_stats.py` can import project modules.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from datasets.humanml3d_refiner import HumanML3DRefinerDataset as RefinerDataset   # noqa: E402
+from utils.training.root_refiner.dataset_builder import (  # noqa: E402
+    DATASET_DEFAULTS,
+    build_root_refiner_dataset,
+    resolve_dataset_dir,
+)
 
 log = logging.getLogger(__name__)
 
@@ -94,9 +99,11 @@ class WelfordAccumulator:
         return self.mean.copy(), std
 
 
-def compute_stats(dataset: RefinerDataset,
-                   max_samples: int = -1,
-                   progress: bool = False) -> dict:
+def compute_stats(
+    dataset: Dataset,
+    max_samples: int = -1,
+    progress: bool = False,
+) -> dict:
     """Walk `dataset` and accumulate Welford stats over masked positions.
 
     Returns dict with keys:
@@ -157,157 +164,65 @@ def save_stats(stats: dict, output_dir: str | Path) -> None:
              out, stats["n_current_motion"], stats["n_waypoint"])
 
 
-# Per-dataset layout defaults, derived from the real repo structure
-# (configs/ldf.yaml + datasets/humanml3d.py / datasets/babel.py):
-#   <dataset_dir>/<split_file>           — one sample id per line
-#   <dataset_dir>/<feature_path>/<id>.npy — (T, 263) motion features
-#   <dataset_dir>/<text_path>/<id>.txt    — '#'-delimited caption lines
-# HumanML3D feature dir is `new_joint_vecs`; BABEL_streamed is `motions`.
-DATASET_DEFAULTS: dict[str, dict] = {
-    "humanml3d": {
-        "subdir": "HumanML3D",
-        "feature_path": "new_joint_vecs",
-        "text_path": "texts",
-        "split_file": "train.txt",
-    },
-    "babel": {
-        "subdir": "BABEL_streamed",
-        "feature_path": "motions",        # ⚠ NOT new_joint_vecs (HumanML3D only)
-        "text_path": "texts",
-        "split_file": "train_processed.txt",
-    },
-}
-
-
-def resolve_dataset_dir(raw_data_dir: str | Path, dataset: str) -> Path:
-    """Resolve the concrete dataset directory.
-
-    Accepts either the raw_data ROOT (which contains a `HumanML3D` /
-    `BABEL_streamed` subdir) OR the dataset directory itself. If
-    `<raw_data_dir>/<subdir>` exists it is used; otherwise `raw_data_dir` is
-    assumed to already be the dataset dir.
-    """
-    if dataset not in DATASET_DEFAULTS:
-        raise ValueError(f"unknown dataset {dataset!r}; expected one of {list(DATASET_DEFAULTS)}")
-    root = Path(raw_data_dir)
-    candidate = root / DATASET_DEFAULTS[dataset]["subdir"]
-    if candidate.is_dir():
-        return candidate
-    return root
-
-
-def _read_all_captions(text_file: Path) -> list[str]:
-    """All distinct non-empty captions from a HumanML3D/BABEL text file.
-
-    Text files are `#`-delimited: `caption#tokens#f_tag#to_tag` (see
-    datasets/humanml3d.py:load_text). Each line contributes the part before the
-    first `#` (or the whole line if no `#`). Duplicates are dropped while
-    preserving first-seen order, so `result[0]` is the first distinct caption.
-    Missing/empty file → empty list.
-    """
-    if not text_file.is_file():
-        return []
-    seen: set[str] = set()
-    caps: list[str] = []
-    with text_file.open() as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            cap = line.split("#", 1)[0].strip()
-            if cap and cap not in seen:
-                seen.add(cap)
-                caps.append(cap)
-    return caps
-
-
-def load_clips_from_dir(raw_data_dir: str | Path,
-                         *,
-                         dataset: str = "humanml3d",
-                         split_file: str | None = None,
-                         feature_path: str | None = None,
-                         text_path: str | None = None,
-                         max_samples: int = -1) -> list[dict]:
-    """Load clips from the real HumanML3D / BABEL layout.
-
-    Returns a list of `{"motion_263": Tensor[T, 263], "text": str, "texts": list[str]}`.
-    `text` is the first caption (backward compatible); `texts` holds every
-    distinct caption so RefinerDataset can randomly pick one per epoch (text
-    augmentation). The precomputed T5 cache contains all captions (see
-    tools/pretokenize_t5_text.py), so the encoder lookup always hits.
-
-    Layout (per dataset):
-        <dataset_dir>/<split_file>            one sample id per line
-        <dataset_dir>/<feature_path>/<id>.npy  (T, 263) motion features
-        <dataset_dir>/<text_path>/<id>.txt     '#'-delimited caption lines
-
-    `raw_data_dir` may be the raw_data root (containing `HumanML3D` /
-    `BABEL_streamed`) or the dataset dir itself (see `resolve_dataset_dir`).
-    `split_file` / `feature_path` / `text_path` default per-dataset
-    (DATASET_DEFAULTS). `max_samples > 0` stops after that many valid clips
-    (dry-run / stats speed-up). Samples with a missing / malformed motion file
-    are skipped with a warning; a missing text file yields an empty caption.
-    """
-    defaults = DATASET_DEFAULTS.get(dataset)
-    if defaults is None:
-        raise ValueError(f"unknown dataset {dataset!r}; expected one of {list(DATASET_DEFAULTS)}")
-    split_file = split_file or defaults["split_file"]
-    feature_path = feature_path or defaults["feature_path"]
-    text_path = text_path or defaults["text_path"]
-
-    dataset_dir = resolve_dataset_dir(raw_data_dir, dataset)
-    split_path = dataset_dir / split_file
-    if not split_path.is_file():
-        raise FileNotFoundError(
-            f"split file not found: {split_path} "
-            f"(dataset={dataset}, dataset_dir={dataset_dir})"
-        )
-
-    with split_path.open() as f:
-        names = [ln.strip() for ln in f if ln.strip()]
-
-    feature_dir = dataset_dir / feature_path
-    text_dir = dataset_dir / text_path
-
-    clips: list[dict] = []
-    n_missing_motion = 0
-    n_bad_shape = 0
-    for split_index, name in enumerate(names):
-        if max_samples > 0 and len(clips) >= max_samples:
-            break
-        motion_file = feature_dir / f"{name}.npy"
-        if not motion_file.is_file():
-            n_missing_motion += 1
-            log.warning("missing motion file %s, skipping clip", motion_file)
-            continue
-        motion = np.load(motion_file).astype(np.float32)
-        if motion.ndim != 2 or motion.shape[1] != 263:
-            n_bad_shape += 1
-            log.warning("clip %s has unexpected shape %s (expected [T, 263]), skipping",
-                        name, motion.shape)
-            continue
-        texts = _read_all_captions(text_dir / f"{name}.txt")
-        clips.append({
-            "motion_263": torch.from_numpy(motion),
-            "text": texts[0] if texts else "",   # first caption (backward compat)
-            "texts": texts,                       # all captions (RefinerDataset random pick)
-            "name": name,
-            "raw_id": name,
-            "split_index": split_index,
-            "split_file": split_file,
+def build_stats_dataset(
+    *,
+    raw_data_dir: str | Path,
+    dataset: str = "humanml3d",
+    split_file: str | None = None,
+    feature_path: str | None = None,
+    text_path: str | None = None,
+    seed: int = 0,
+):
+    defaults = DATASET_DEFAULTS[str(dataset).lower()]
+    cfg = {
+        "debug": False,
+        "data": {
+            "target": "datasets.humanml3d.HumanML3DDataset",
+            "raw_data_dir": str(raw_data_dir),
             "dataset": dataset,
-        })
-
-    if not clips:
-        log.warning(
-            "load_clips_from_dir produced 0 clips (dataset=%s, split=%s, "
-            "dataset_dir=%s, names_in_split=%d, missing_motion=%d, bad_shape=%d)",
-            dataset, split_file, dataset_dir, len(names), n_missing_motion, n_bad_shape,
-        )
-    else:
-        log.info("loaded %d clips (dataset=%s, split=%s, missing_motion=%d, bad_shape=%d)",
-                 len(clips), dataset, split_file, n_missing_motion, n_bad_shape)
-    return clips
+            "train_split_file": split_file or defaults["split_file"],
+            "feature_path": feature_path or defaults["feature_path"],
+            "text_path": text_path or defaults["text_path"],
+            "normalize": False,
+            "min_length": 1,
+            "max_length": 10 ** 9,
+            "window_length": 10 ** 9,
+            "random_length": 0,
+        },
+        "model": {
+            "params": {
+                "n_hist": 20,
+                "n_path": 64,
+                "max_tokens": 49,
+                "min_tokens": 4,
+                "frames_per_token": 4,
+            },
+        },
+        "sampling": {
+            "full_plan_ratio": 0.5,
+            "horizon_policy": "random",
+            "path_condition": {
+                "policy": "dense_path",
+                "offset_start": {
+                    "enabled": False,
+                    "prob": 0.0,
+                    "max_frames": 40,
+                    "apply_to": ["dense_path", "sparse_path"],
+                },
+                "sparse_path": {
+                    "point_range": [3, 8],
+                },
+            },
+        },
+    }
+    return build_root_refiner_dataset(
+        cfg,
+        split_file or defaults["split_file"],
+        split="val",
+        seed=seed,
+        randomize_caption=False,
+        normalize=False,
+    )
 
 
 def main(argv=None):
@@ -334,18 +249,14 @@ def main(argv=None):
 
     logging.basicConfig(level=args.log_level)
 
-    log.info("loading clips from %s (dataset=%s)", args.raw_data_dir, args.dataset)
-    clips = load_clips_from_dir(
-        args.raw_data_dir,
+    dataset = build_stats_dataset(
+        raw_data_dir=args.raw_data_dir,
         dataset=args.dataset,
         split_file=args.split_file,
         feature_path=args.feature_path,
         text_path=args.text_path,
-        max_samples=args.max_samples,
+        seed=args.seed,
     )
-    log.info("loaded %d clips", len(clips))
-
-    dataset = RefinerDataset(clips, normalize=False, seed=args.seed)
     log.info("dataset has %d eligible samples", len(dataset))
 
     stats = compute_stats(dataset, max_samples=args.max_samples, progress=True)

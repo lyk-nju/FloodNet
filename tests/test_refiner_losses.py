@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from utils.refiner.losses import (
+from utils.training.root_refiner.losses import (
     dense_path_control_loss,
     goal_point_control_loss,
     masked_mean,

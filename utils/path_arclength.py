@@ -15,9 +15,9 @@ Numpy in / numpy out. No torch / no FloodNet-module deps.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import numpy as np
+
+from dataclasses import dataclass
 
 
 @dataclass

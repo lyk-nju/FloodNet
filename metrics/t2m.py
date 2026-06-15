@@ -1,12 +1,10 @@
-from typing import List
-
 import numpy as np
 import torch
+
+from typing import List
 from torch import Tensor
 from torchmetrics import Metric
-
 from utils.initialize import instantiate
-
 from .tools.utils import (
     calculate_activation_statistics_np,
     calculate_diversity_np,

@@ -20,10 +20,10 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import Dict, Iterable, List, Optional, Set
-
 import torch
 import torch.distributed as dist
+
+from typing import Dict, Iterable, List, Optional, Set
 from lightning.pytorch.utilities import rank_zero_info
 from omegaconf import OmegaConf
 from tqdm import tqdm

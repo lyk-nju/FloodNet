@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import torch
 
+from types import SimpleNamespace
 from models.diffusion_forcing_wan import DiffForcingWanModel
 
 

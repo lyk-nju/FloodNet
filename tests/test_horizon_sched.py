@@ -1,4 +1,4 @@
-"""Unit tests for utils/training/horizon_sched.py (T_B_04).
+"""Unit tests for utils/training/ldf/horizon_sched.py (T_B_04).
 
 Covers the 3 Done-criteria tests from docs/TODO.md §T_B_04 + schedule bands.
 """
@@ -11,7 +11,7 @@ import torch
 
 from utils.token_frame import num_frames_for_tokens, token_start_frame
 from utils.traj_batch import encode_traj_batch
-from utils.training.horizon_sched import (
+from utils.training.ldf.horizon_sched import (
     apply_horizon_mask_tokens,
     sample_random_horizon_tokens,
 )

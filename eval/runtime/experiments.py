@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Mapping
-
 import numpy as np
 
+from dataclasses import dataclass, field
+from typing import Any, Mapping
 from eval.runtime.root_sources import normalize_root_source
 
 

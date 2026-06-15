@@ -63,7 +63,7 @@ try:
         StreamJointRecovery263,
         extract_root_trajectory_263_torch,
     )
-    from FloodNet.utils.stream_rollout import (
+    from FloodNet.utils.inference.rollout import (
         StreamTextRolloutController,
         build_stream_step_model_input,
         build_stream_suffix_conditioning,
@@ -99,7 +99,7 @@ except ImportError:  # pragma: no cover - script entrypoints use top-level impor
         StreamJointRecovery263,
         extract_root_trajectory_263_torch,
     )
-    from utils.stream_rollout import (
+    from utils.inference.rollout import (
         StreamTextRolloutController,
         build_stream_step_model_input,
         build_stream_suffix_conditioning,
@@ -974,7 +974,7 @@ def _render_eval_style_outputs(
     if not enabled:
         return
     try:
-        from utils.visualize import (
+        from utils.visualization.video import (
             make_composite_compare_videos,
             render_video as render_eval_video,
         )

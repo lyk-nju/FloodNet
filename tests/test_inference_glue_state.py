@@ -1,4 +1,4 @@
-"""Unit tests for utils/inference_glue.py InferenceGlueState + advance helper (T_A_03b).
+"""Unit tests for utils/runtime/glue.py InferenceGlueState + advance helper (T_A_03b).
 
 Covers G01-G08 per docs/TODO.md §T_A_03 Unit tests:
     G01-G04: commit_idx exclusive-end semantics
@@ -11,7 +11,7 @@ import math
 
 import torch
 
-from utils.inference_glue import (
+from utils.inference.glue import (
     InferenceGlueState,
     advance_head_from_body_window,
 )

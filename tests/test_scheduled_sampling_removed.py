@@ -14,7 +14,7 @@ import warnings
 
 import models.diffusion_forcing_wan as dfw
 from models.diffusion_forcing_wan import warn_scheduled_sampling_deprecated
-from utils.training.self_forcing import SelfForcingTrainer
+from utils.training.ldf.self_forcing import SelfForcingTrainer
 
 
 def test_zero_value_does_not_warn():

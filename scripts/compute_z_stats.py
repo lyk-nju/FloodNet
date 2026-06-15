@@ -24,9 +24,9 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from pathlib import Path
-
 import numpy as np
+
+from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:

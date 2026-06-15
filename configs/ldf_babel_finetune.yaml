@@ -97,7 +97,6 @@ data:
     val_bs: 4
     test_bs: 4
     num_workers: 8
-    mask_ratio: 1.0
     train_meta_paths:
         - ${dirs.raw_data}/BABEL_streamed/train_processed.txt
     val_meta_paths:

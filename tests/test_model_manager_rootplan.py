@@ -1,17 +1,16 @@
 from __future__ import annotations
 
 import threading
-from collections import deque
-from types import SimpleNamespace
-
 import torch
 import numpy as np
 
-from utils.inference_glue import InferenceGlueState, InferenceGlueTimeline
-from utils.root_plan import RootPlan
+from collections import deque
+from types import SimpleNamespace
+from utils.inference.glue import InferenceGlueState, InferenceGlueTimeline
+from utils.inference.root_plan import RootPlan
 from utils.token_frame import token_range_to_frame_slice, token_start_frame
-from utils.traj_stream_buffer import TrajStreamBuffer
-from utils.stream_traj import StreamTrajectoryPlan, TrajectoryUpdateEvent
+from utils.inference.buffer import TrajStreamBuffer
+from utils.inference.trajectory import StreamTrajectoryPlan, TrajectoryUpdateEvent
 from web_demo.model_manager import ModelManager
 
 

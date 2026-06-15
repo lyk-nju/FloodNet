@@ -7,7 +7,7 @@ import math
 import torch
 
 from utils.token_frame import token_body_window_left_frame, token_start_frame
-from utils.training.body_canonicalize import apply_body_window_canonicalize
+from utils.training.ldf.body_canonicalize import apply_body_window_canonicalize
 
 
 def _pose_feat(x, y, z, yaw, fwd=0.0, yawd=0.0):

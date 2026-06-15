@@ -6,12 +6,12 @@ from pathlib import Path
 
 from omegaconf import OmegaConf
 
-from utils.training.ablation import (
+from utils.training.ldf.ablation import (
     apply_overrides,
     body_ablation_overrides,
     overrides_to_cli,
 )
-from utils.training.config_validate import validate_traj_dim_consistency
+from utils.training.ldf.config_validate import validate_traj_dim_consistency
 
 _LDF = Path(__file__).resolve().parent.parent / "configs" / "ldf.yaml"
 _NAMES = {

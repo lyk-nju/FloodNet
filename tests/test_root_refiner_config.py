@@ -5,9 +5,9 @@ Locks the required keys + default values listed in docs/TODO.md §T_A_07.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import yaml
+
+from pathlib import Path
 
 _CFG_DIR = Path(__file__).resolve().parent.parent / "configs"
 CFG_PATH = _CFG_DIR / "root_refiner.yaml"
@@ -176,13 +176,14 @@ def test_text_encoder_block():
     assert te["freeze"] is True
 
 
-def test_data_block_has_required_paths():
-    cfg = _load()
-    data = cfg["data"]
-    assert data["target"] == "datasets.humanml3d_refiner.HumanML3DRefinerDataset"
-    assert data["collate_fn"] == "datasets.humanml3d_refiner.refiner_collate"
-    assert "raw_data_dir" in data
-    assert "stats_dir" in data
+def test_default_refiner_configs_use_humanml3d_adapter_path():
+    for path in (CFG_PATH, TRAIN_CFG_PATH):
+        cfg = _load(path)
+        data = cfg["data"]
+        assert data["target"] == "datasets.humanml3d.HumanML3DDataset"
+        assert data["collate_fn"] == "utils.training.root_refiner.collate_fn"
+        assert "raw_data_dir" in data
+        assert "stats_dir" in data
 
 
 # ---------------------------------------------------------------------------

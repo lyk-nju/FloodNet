@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import torch
 
-from datasets.humanml3d_refiner import HumanML3DRefinerDataset, refiner_collate
+from tests.helpers.humanml3d_fixture import make_root_refiner_from_samples
+from utils.training.root_refiner import collate_fn
 from utils.token_frame import num_frames_for_tokens
 
 
@@ -13,8 +14,8 @@ def _make_clip(T: int = 80) -> dict:
     return {"motion_263": motion, "text": "walk forward"}
 
 
-def test_humanml3d_refiner_sample_contract_has_new_keys_and_shapes():
-    ds = HumanML3DRefinerDataset(
+def test_root_refiner_sample_contract_has_new_keys_and_shapes():
+    ds = make_root_refiner_from_samples(
         [_make_clip()],
         full_plan_ratio=1.0,
         n_hist=8,
@@ -59,8 +60,8 @@ def test_humanml3d_refiner_sample_contract_has_new_keys_and_shapes():
     assert int(sample["waypoints_mask"].sum()) == num_frames_for_tokens(4)
 
 
-def test_refiner_collate_stacks_new_tensor_keys_and_keeps_modes_as_list():
-    ds = HumanML3DRefinerDataset(
+def test_collate_fn_stacks_new_tensor_keys_and_keeps_modes_as_list():
+    ds = make_root_refiner_from_samples(
         [_make_clip(), _make_clip()],
         full_plan_ratio=1.0,
         n_hist=8,
@@ -74,7 +75,7 @@ def test_refiner_collate_stacks_new_tensor_keys_and_keeps_modes_as_list():
         ds.get_sample(i, force_mode="full", force_num_tokens=3, force_no_path_aug=True)
         for i in range(2)
     ]
-    batch = refiner_collate(samples)
+    batch = collate_fn(samples)
 
     assert isinstance(batch["text"], list)
     assert isinstance(batch["path_mode"], list)

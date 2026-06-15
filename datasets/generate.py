@@ -1,14 +1,12 @@
 import os
-import random
-from typing import Dict, List
-
 import numpy as np
 import torch
+
+from typing import Dict, List
 from lightning.pytorch.utilities import rank_zero_info
-from omegaconf import ListConfig, OmegaConf
+from omegaconf import OmegaConf
 from torch.utils.data import Dataset
 from tqdm import tqdm
-
 from utils.motion_process import extract_root_trajectory_263
 from utils.traj_batch import root_to_traj_feats, smooth_root_xz
 
@@ -24,10 +22,6 @@ class GenerateDataset(Dataset):
         self.num_samples = cfg.data.num_samples
         self.dim = cfg.data.dim
         self.token_dim = cfg.data.token_dim
-        if self.split in ("val", "test"):
-            self.mask_ratio = cfg.data.get("val_mask_ratio", 1.0)
-        else:
-            self.mask_ratio = cfg.data.get("mask_ratio", 1.0)
         self.feature_fps = float(cfg.data.get("feature_fps", 20))
         self.token_fps = float(cfg.data.get("token_fps", 5))
         self.smooth_traj_sigma = float(cfg.data.get("smooth_traj_sigma", 0.0))
@@ -95,9 +89,7 @@ class GenerateDataset(Dataset):
         output["traj_loss_gt"] = traj
         output["traj_length"] = len(traj)
 
-        token_mask = self.sample_token_mask(token_length)
-        output["token_mask"] = token_mask
-        output["traj_mask"] = self.expand_token_mask_to_traj(token_mask, len(traj))
+        output["traj_mask"] = np.ones(len(traj), dtype=np.float32)
         output["traj_loss_mask"] = output["traj_mask"].copy()
 
         if self.smooth_traj_sigma > 0.0:
@@ -141,34 +133,6 @@ class GenerateDataset(Dataset):
             )
             start = end
         return text_data
-
-    @staticmethod
-    def expand_token_mask_to_traj(token_mask: np.ndarray, traj_length: int) -> np.ndarray:
-        traj_mask = np.zeros(traj_length, dtype=np.float32)
-        if len(token_mask) > 0:
-            traj_mask[0] = token_mask[0]
-        for k in range(1, len(token_mask)):
-            sf = 4 * k - 3
-            ef = min(4 * k + 1, traj_length)
-            if sf < traj_length:
-                traj_mask[sf:ef] = token_mask[k]
-        return traj_mask
-
-    def sample_token_mask(self, token_length: int) -> np.ndarray:
-        if token_length <= 0:
-            return np.zeros((0,), dtype=np.float32)
-        mask = np.zeros(token_length, dtype=np.float32)
-        r = self.mask_ratio
-        if isinstance(r, (list, tuple, ListConfig)) and len(r) == 2:
-            r0, r1 = float(r[0]), float(r[1])
-            keep_ratio = random.uniform(min(r0, r1), max(r0, r1))
-        else:
-            keep_ratio = float(r)
-        keep_ratio = max(0.0, min(1.0, keep_ratio))
-        n_keep = max(1, int(round(token_length * keep_ratio)))
-        indices = random.sample(range(token_length), n_keep)
-        mask[indices] = 1.0
-        return mask
 
     def generate_text(self):
         self.pool_text = [

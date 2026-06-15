@@ -10,13 +10,12 @@ Shared by:
 """
 import hashlib
 import random
-from typing import Any, Callable, Dict, List, Optional
-
 import numpy as np
 import torch
 
+from typing import Any, Callable, Dict, List, Optional
 from utils.motion_process import extract_root_trajectory_263_torch, recover_joint_positions_263
-from utils.training.model_batch import prepare_model_input
+from utils.training.ldf.model_batch import prepare_model_input
 
 
 # ─────────────────────────────────────────────────────────────────────────────

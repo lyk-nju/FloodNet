@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
-from omegaconf import OmegaConf
 
-from utils.training.config_validate import (
+from pathlib import Path
+from omegaconf import OmegaConf
+from utils.training.ldf.config_validate import (
     validate_7d_requires_self_forcing,
     validate_stream_training_config,
     validate_traj_dim_consistency,

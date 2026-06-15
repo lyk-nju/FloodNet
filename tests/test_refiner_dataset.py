@@ -1,4 +1,4 @@
-"""Unit tests for datasets/humanml3d_refiner.py (T_A_04).
+"""Unit tests for the RootRefiner HumanML3D adapter path (T_A_04).
 
 Covers T01-T15 per docs/TODO.md §T_A_04 Unit tests (T14 stats-side is deferred
 to T_A_06 compute_5d_stats).
@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 import torch
 
-from datasets.humanml3d_refiner import HumanML3DRefinerDataset as RefinerDataset
+from tests.helpers.humanml3d_fixture import make_root_refiner_from_samples
 from utils.motion_process import recover_root_rot_pos, root_to_traj_feats_7d
 from utils.token_frame import num_frames_for_tokens
 
@@ -29,7 +29,7 @@ def test_P0_2_normalize_false_ignores_stats_dir():
     """P0-2: with normalize=False the dataset must NOT touch stats_dir, even a
     nonexistent one — the benchmark now passes stats_dir=None when normalize is
     off (mirrors train_refiner), so constructing here must not raise."""
-    ds = RefinerDataset(
+    ds = make_root_refiner_from_samples(
         [_make_clip(T=50)], full_plan_ratio=1.0, seed=0,
         normalize=False, stats_dir="/does/not/exist/refiner_stats",
     )
@@ -39,7 +39,7 @@ def test_P0_2_normalize_false_ignores_stats_dir():
 def test_P0_2_normalize_true_requires_stats_dir():
     import pytest
     with pytest.raises(ValueError):
-        RefinerDataset([_make_clip(T=50)], normalize=True, stats_dir=None)
+        make_root_refiner_from_samples([_make_clip(T=50)], normalize=True, stats_dir=None)
 
 
 def _make_clip(T: int, *, text: str = "walk forward",
@@ -78,7 +78,7 @@ def _expected_anchor_world(motion_263: torch.Tensor, anchor_frame: int):
 
 def test_T01_full_plan_anchor_is_frame_zero_and_history_mask_only_last_slot():
     """full mode: anchor_frame=0, valid_history_frames=1, history_mask only [-1]=True."""
-    ds = RefinerDataset([_make_clip(T=50)], full_plan_ratio=1.0, seed=0)
+    ds = make_root_refiner_from_samples([_make_clip(T=50)], full_plan_ratio=1.0, seed=0)
     s = ds.get_sample(0, force_mode="full", force_no_path_aug=True)
     assert s["mode"] == "full"
     assert s["anchor_frame"] == 0
@@ -93,7 +93,7 @@ def test_T02_full_plan_anchor_duplicate_in_current_motion_and_target():
     (0, y_anchor, 0, 1, 0, *, *). y values match.
     """
     clip = _make_clip(T=50)
-    ds = RefinerDataset([clip], full_plan_ratio=1.0, seed=0)
+    ds = make_root_refiner_from_samples([clip], full_plan_ratio=1.0, seed=0)
     s = ds.get_sample(0, force_mode="full", force_no_path_aug=True)
     cm_last = s["current_motion"][-1]   # (x, y, z, cos, sin)
     tw_first = s["target_waypoints"][0]   # (x, y, z, cos, sin, fwd, yaw_delta)
@@ -122,7 +122,7 @@ def test_T03_sliding_window_history_mask_all_true_and_anchor_duplicate():
     """Sliding: history_mask all True, anchor duplicated at history[-1] and target[0]."""
     T = 60
     clip = _make_clip(T=T)
-    ds = RefinerDataset([clip], full_plan_ratio=0.0, seed=0)
+    ds = make_root_refiner_from_samples([clip], full_plan_ratio=0.0, seed=0)
     s = ds.get_sample(0, force_mode="sliding",
                        force_anchor_frame=30, force_no_path_aug=True)
     assert s["mode"] == "sliding"
@@ -141,7 +141,7 @@ def test_T04_root_y_preserved_across_canonicalize():
     y channel matches world root y in valid frames.
     """
     clip = _make_clip(T=50)
-    ds = RefinerDataset([clip], full_plan_ratio=1.0, seed=0)
+    ds = make_root_refiner_from_samples([clip], full_plan_ratio=1.0, seed=0)
     s = ds.get_sample(0, force_mode="full", force_no_path_aug=True)
 
     # Compute expected world y for the target frames.
@@ -160,7 +160,7 @@ def test_T04_root_y_preserved_across_canonicalize():
 def test_T05_target_frame_count_equals_num_frames_for_tokens():
     """num_tokens=1 → target_frame_count=1; =2 → 5; =3 → 9 (and target_mask matches)."""
     clip = _make_clip(T=100)
-    ds = RefinerDataset([clip], full_plan_ratio=1.0, max_tokens=49, min_tokens=1, seed=0)
+    ds = make_root_refiner_from_samples([clip], full_plan_ratio=1.0, max_tokens=49, min_tokens=1, seed=0)
     cases = {1: 1, 2: 5, 3: 9, 5: 17}
     for nt, expected_frames in cases.items():
         s = ds.get_sample(0, force_mode="full", force_num_tokens=nt,
@@ -176,7 +176,7 @@ def test_num_token_policy_max_disables_random_token_sampling():
     """Diagnostic training can disable random num_tokens by taking the maximum
     valid horizon for the selected anchor."""
     clip = _make_clip(T=80)
-    ds = RefinerDataset(
+    ds = make_root_refiner_from_samples(
         [clip],
         full_plan_ratio=1.0,
         max_tokens=49,
@@ -198,7 +198,7 @@ def test_T06_target_mask_sum_equals_num_frames_for_tokens_strict():
     """
     # Use min_tokens=1 so we can test num_tokens=2 without clamping.
     clip = _make_clip(T=200)
-    ds = RefinerDataset([clip], full_plan_ratio=1.0, min_tokens=1, seed=0)
+    ds = make_root_refiner_from_samples([clip], full_plan_ratio=1.0, min_tokens=1, seed=0)
     for nt in (2, 5, 10, 20, 30):
         s = ds.get_sample(0, force_mode="full", force_num_tokens=nt,
                            force_no_path_aug=True)
@@ -218,7 +218,7 @@ def test_T07_short_clip_filtered_from_valid_indices():
 
     short_clip = _make_clip(T=too_short)
     long_clip = _make_clip(T=long_enough + 10)
-    ds = RefinerDataset(
+    ds = make_root_refiner_from_samples(
         [short_clip, long_clip],
         min_tokens=min_tokens,
         full_plan_ratio=1.0,
@@ -240,7 +240,7 @@ def test_sliding_eligibility_split():
 
     full_only_clip = _make_clip(T=full_only_T)
     long_clip = _make_clip(T=full_and_sliding_T)
-    ds = RefinerDataset(
+    ds = make_root_refiner_from_samples(
         [full_only_clip, long_clip],
         n_hist=n_hist, min_tokens=min_tokens,
         full_plan_ratio=0.0,   # always draw sliding
@@ -282,8 +282,8 @@ def test_T13_cos_sin_invariant_under_selective_zscore(tmp_path):
     np.save(tmp_path / "waypoint_norm_indices.npy", wp_idx)
 
     clip = _make_clip(T=80)
-    ds_raw = RefinerDataset([clip], full_plan_ratio=1.0, seed=0, normalize=False)
-    ds_norm = RefinerDataset([clip], full_plan_ratio=1.0, seed=0,
+    ds_raw = make_root_refiner_from_samples([clip], full_plan_ratio=1.0, seed=0, normalize=False)
+    ds_norm = make_root_refiner_from_samples([clip], full_plan_ratio=1.0, seed=0,
                               normalize=True, stats_dir=tmp_path)
     s_raw = ds_raw.get_sample(0, force_mode="full", force_num_tokens=10,
                                 force_no_path_aug=True)
@@ -315,7 +315,7 @@ def test_waypoint_norm_indices_with_heading_channel_raises(tmp_path):
     np.save(tmp_path / "waypoint_std.npy", wp_std)
     np.save(tmp_path / "waypoint_norm_indices.npy", wp_idx)
     with pytest.raises(ValueError, match="heading channels 3/4"):
-        RefinerDataset([_make_clip(T=50)], normalize=True, stats_dir=tmp_path)
+        make_root_refiner_from_samples([_make_clip(T=50)], normalize=True, stats_dir=tmp_path)
 
 
 def test_current_motion_norm_indices_with_heading_channel_raises(tmp_path):
@@ -335,7 +335,7 @@ def test_current_motion_norm_indices_with_heading_channel_raises(tmp_path):
     np.save(tmp_path / "waypoint_std.npy", wp_std)
     np.save(tmp_path / "waypoint_norm_indices.npy", wp_idx)
     with pytest.raises(ValueError, match="heading channels 3/4"):
-        RefinerDataset([_make_clip(T=50)], normalize=True, stats_dir=tmp_path)
+        make_root_refiner_from_samples([_make_clip(T=50)], normalize=True, stats_dir=tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -349,7 +349,7 @@ def test_T15_fwd_delta_yaw_delta_invariant_under_canonicalize_via_pipeline():
     canonicalize_7d).
     """
     clip = _make_clip(T=80, local_vel_xz=(0.0, 0.1), rot_vel_t0=PI / 8)
-    ds = RefinerDataset([clip], full_plan_ratio=1.0, seed=0)
+    ds = make_root_refiner_from_samples([clip], full_plan_ratio=1.0, seed=0)
     s = ds.get_sample(0, force_mode="full", force_num_tokens=10,
                        force_no_path_aug=True)
     target_count = int(s["target_mask"].sum().item())
@@ -375,7 +375,7 @@ def test_T15_fwd_delta_yaw_delta_invariant_under_canonicalize_via_pipeline():
 
 def test_returned_dict_has_required_keys_and_shapes():
     clip = _make_clip(T=80)
-    ds = RefinerDataset([clip], full_plan_ratio=1.0, seed=0)
+    ds = make_root_refiner_from_samples([clip], full_plan_ratio=1.0, seed=0)
     s = ds.get_sample(0, force_mode="full", force_num_tokens=10,
                        force_no_path_aug=True)
     expected_keys = {
@@ -411,7 +411,7 @@ def test_uniform_shape_between_full_and_sliding_modes():
     """Network input tensor shapes must be identical regardless of mode."""
     T = 80
     clip = _make_clip(T=T)
-    ds = RefinerDataset([clip], full_plan_ratio=1.0, seed=0)
+    ds = make_root_refiner_from_samples([clip], full_plan_ratio=1.0, seed=0)
     s_full = ds.get_sample(0, force_mode="full", force_num_tokens=10,
                             force_no_path_aug=True)
     s_slide = ds.get_sample(0, force_mode="sliding", force_anchor_frame=30,
@@ -428,7 +428,7 @@ def test_len_excludes_short_clips():
     short = _make_clip(T=10)   # < num_frames_for_tokens(4) = 13
     long_a = _make_clip(T=50)
     long_b = _make_clip(T=70)
-    ds = RefinerDataset([short, long_a, long_b], full_plan_ratio=1.0, seed=0)
+    ds = make_root_refiner_from_samples([short, long_a, long_b], full_plan_ratio=1.0, seed=0)
     assert len(ds) == 2
 
 
@@ -436,7 +436,7 @@ def test_reset_rng_makes_get_sample_sequence_reproducible():
     """reset_rng() restores the base-seed RNG so a repeat pass draws the identical
     mode/anchor/num_tokens sequence (benchmark reproducibility)."""
     clips = [_make_clip(T=50) for _ in range(5)]
-    ds = RefinerDataset(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
+    ds = make_root_refiner_from_samples(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
                          full_plan_ratio=0.5, seed=0)
     first = [int(ds.get_sample(i)["num_tokens"].item()) for i in range(len(ds))]
     # Without reset, a second pass diverges (RNG advanced).
@@ -455,7 +455,7 @@ def test_reset_rng_makes_get_sample_sequence_reproducible():
 
 
 def _make_multicap_clip(T: int, texts: list[str]) -> dict:
-    """A clip carrying multiple captions in `texts` (load_clips_from_dir schema)."""
+    """A clip carrying multiple captions in `texts`."""
     clip = _make_clip(T=T, text=texts[0])
     clip["texts"] = list(texts)
     return clip
@@ -465,7 +465,7 @@ def test_random_caption_selection_uses_all_captions():
     """With a `texts` list, repeated sampling must surface more than one caption
     (text augmentation), and every drawn caption must come from the list."""
     texts = ["walk forward", "stroll ahead", "march onward", "step forward"]
-    ds = RefinerDataset([_make_multicap_clip(T=60, texts=texts)],
+    ds = make_root_refiner_from_samples([_make_multicap_clip(T=60, texts=texts)],
                          full_plan_ratio=1.0, seed=0)
     drawn = {ds.get_sample(0)["text"] for _ in range(40)}
     assert drawn.issubset(set(texts))
@@ -474,7 +474,7 @@ def test_random_caption_selection_uses_all_captions():
 
 def test_force_text_idx_pins_specific_caption():
     texts = ["walk forward", "stroll ahead", "march onward"]
-    ds = RefinerDataset([_make_multicap_clip(T=60, texts=texts)],
+    ds = make_root_refiner_from_samples([_make_multicap_clip(T=60, texts=texts)],
                          full_plan_ratio=1.0, seed=0)
     for i, cap in enumerate(texts):
         s = ds.get_sample(0, force_text_idx=i)
@@ -486,19 +486,19 @@ def test_randomize_caption_false_pins_first_and_consumes_no_rng():
     consume no caption RNG, so the mode/num_tokens draw order is identical to a
     single-caption clip — keeping val/loss comparable across epochs."""
     texts = ["walk forward", "stroll ahead", "march onward", "step forward"]
-    ds_fixed = RefinerDataset([_make_multicap_clip(T=60, texts=texts)],
+    ds_fixed = make_root_refiner_from_samples([_make_multicap_clip(T=60, texts=texts)],
                                full_plan_ratio=0.5, seed=0, randomize_caption=False)
     # Always the first caption, never a random one.
     assert {ds_fixed.get_sample(0)["text"] for _ in range(20)} == {"walk forward"}
 
     # No caption RNG consumed: the num_tokens sequence matches a clip that has
     # only `text` (the legacy, no-`texts` path) under the same seed.
-    multicap_seq = [int(RefinerDataset([_make_multicap_clip(T=60, texts=texts)],
+    multicap_seq = [int(make_root_refiner_from_samples([_make_multicap_clip(T=60, texts=texts)],
                                        full_plan_ratio=0.5, seed=0,
                                        randomize_caption=False)
                         .get_sample(0, force_no_path_aug=True)["num_tokens"])
                     for _ in range(5)]
-    legacy_seq = [int(RefinerDataset([_make_clip(T=60, text="walk forward")],
+    legacy_seq = [int(make_root_refiner_from_samples([_make_clip(T=60, text="walk forward")],
                                      full_plan_ratio=0.5, seed=0)
                       .get_sample(0, force_no_path_aug=True)["num_tokens"])
                   for _ in range(5)]
@@ -512,7 +512,7 @@ def test_clip_without_texts_falls_back_to_single_text():
     existing T01/T02/reset_rng tests separately lock in that the legacy draw order
     is unperturbed by the multi-caption change)."""
     def fresh():
-        return RefinerDataset([_make_clip(T=60, text="walk forward")],
+        return make_root_refiner_from_samples([_make_clip(T=60, text="walk forward")],
                               full_plan_ratio=0.5, seed=0)
 
     ds_a = fresh()

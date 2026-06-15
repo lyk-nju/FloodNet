@@ -44,14 +44,14 @@ from utils.motion_process import (
     StreamJointRecovery263,
     extract_root_trajectory_263,
 )
-from utils.stream_rollout import (
+from utils.inference.rollout import (
     StreamTextSegment,
     StreamTextRolloutController,
     build_stream_step_model_input,
     build_stream_suffix_conditioning,
     clip_traj_input_to_horizon,
 )
-from utils.stream_traj import (
+from utils.inference.trajectory import (
     build_remaining_polyline,
     build_recovery_future_traj,
     assign_times_by_arclength,
@@ -61,7 +61,7 @@ from utils.stream_traj import (
     sample_timestamped_trajectory,
 )
 from utils.traj_batch import root_to_traj_feats
-from utils.visualize import render_single_video
+from utils.visualization.video import render_single_video
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 

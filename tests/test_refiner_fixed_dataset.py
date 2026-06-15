@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import torch
 
-from datasets.humanml3d_refiner import HumanML3DRefinerDataset as RefinerDataset
-from datasets.humanml3d_refiner import (
+from tests.helpers.humanml3d_fixture import make_root_refiner_from_samples
+from utils.training.root_refiner import (
     FixedRefinerSampleDataset,
-    build_fixed_refiner_samples,
+    build_fixed_samples,
 )
 
 
@@ -27,13 +27,13 @@ def _assert_sample_equal(a, b):
 
 
 def test_fixed_refiner_samples_are_repeatable_even_when_source_is_random():
-    source = RefinerDataset(
+    source = make_root_refiner_from_samples(
         [_clip(T=90), _clip(T=100, text="turn left")],
         full_plan_ratio=0.5,
         seed=123,
     )
     fixed = FixedRefinerSampleDataset(
-        build_fixed_refiner_samples(
+        build_fixed_samples(
             source,
             num_samples=4,
             mode_policy="mixed",
@@ -48,7 +48,7 @@ def test_fixed_refiner_samples_are_repeatable_even_when_source_is_random():
 
 
 def test_fixed_refiner_dataset_returns_clones_not_cached_tensors():
-    sample = RefinerDataset([_clip()], full_plan_ratio=1.0, seed=0).get_sample(
+    sample = make_root_refiner_from_samples([_clip()], full_plan_ratio=1.0, seed=0).get_sample(
         0, force_mode="full", force_no_path_aug=True, force_text_idx=0
     )
     fixed = FixedRefinerSampleDataset([sample])

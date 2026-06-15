@@ -1,4 +1,4 @@
-"""Unit tests for utils/root_plan.py (T_A_03a).
+"""Unit tests for utils/stream/root_plan.py (T_A_03a).
 
 Covers G14-G22 per docs/TODO.md §T_A_03 Unit tests:
     G14-G17: dual anchor regression on plan_local→body_window_local
@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from utils.local_frame import canonicalize_7d, uncanonicalize_7d
-from utils.root_plan import (
+from utils.inference.root_plan import (
     RootPlan,
     plan_local_to_body_window_local,
     slice_plan_with_mask,

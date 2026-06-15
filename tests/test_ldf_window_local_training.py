@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import torch
 import pytest
+import utils.training.ldf.self_forcing as sf_mod
+
 from types import SimpleNamespace
 from unittest.mock import MagicMock
-
 from utils.token_frame import (
     num_frames_for_tokens,
     num_tokens_for_frame_len,
@@ -14,17 +15,16 @@ from utils.token_frame import (
 from utils.traj_batch import encode_traj_batch
 from utils.local_frame import canonicalize_7d
 from utils.motion_process import recover_root_rot_pos, root_to_traj_feats_7d
-from utils.training.self_forcing import SelfForcingTrainer
-import utils.training.self_forcing as sf_mod
-from utils.training.window_local import (
+from utils.training.ldf.self_forcing import SelfForcingTrainer
+from utils.training.ldf.window_local import (
     build_window_local_model_batch,
     build_window_local_traj_batch,
 )
-from utils.training.self_forcing import (
+from utils.training.ldf.self_forcing import (
     _collect_window_local_metrics,
     _splice_window_local_pred_to_prefix,
 )
-from utils.training.sample_creator import SampleCreator
+from utils.training.ldf.sample_creator import SampleCreator
 
 
 def _make_motion263(batch_size: int, num_frames: int) -> torch.Tensor:
@@ -726,7 +726,7 @@ def test_window_local_model_batch_rejects_malformed_segmented_text_schedule():
 
 def test_shifted_local_time_steps_match_global_prefix_beta_schedule():
     from models.diffusion_forcing_wan import DiffForcingWanModel
-    from utils.training.self_forcing import shifted_local_time_steps
+    from utils.training.ldf.self_forcing import shifted_local_time_steps
 
     model = DiffForcingWanModel.__new__(DiffForcingWanModel)
     torch.nn.Module.__init__(model)
@@ -1014,7 +1014,7 @@ def test_body_aux_wrapper_splices_window_local_pred_before_decode(monkeypatch):
         batch,
         module,
         sample_loss_mask=None,
-        ba_cfg={"weights": {}},
+        body_aux_cfg={"weights": {}},
     )
 
     assert float(loss.item()) == 1.25
@@ -1055,7 +1055,7 @@ def test_body_aux_wrapper_online_encode_uses_local_decode_without_splice(monkeyp
         batch,
         module,
         sample_loss_mask=None,
-        ba_cfg={"weights": {}},
+        body_aux_cfg={"weights": {}},
     )
 
     assert float(loss.item()) == 2.0

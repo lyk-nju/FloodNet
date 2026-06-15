@@ -1,9 +1,9 @@
 import json
 import os
-from pathlib import Path
-
 import numpy as np
 import wandb
+
+from pathlib import Path
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.utilities import rank_zero_info
 
@@ -12,17 +12,17 @@ try:
     from FloodNet.utils.training import (
         ckpt_step_info,
         compute_step_semantics,
-        get_test_probe_tags,
     )
-    from FloodNet.utils.visualize import make_composite_compare_videos, render_video
+    from FloodNet.utils.training.ldf import get_test_probe_tags
+    from FloodNet.utils.visualization.video import make_composite_compare_videos, render_video
 except ImportError:  # pragma: no cover - script entrypoints use top-level imports
     from metrics.traj import _get_metric_statistics
     from utils.training import (
         ckpt_step_info,
         compute_step_semantics,
-        get_test_probe_tags,
     )
-    from utils.visualize import make_composite_compare_videos, render_video
+    from utils.training.ldf import get_test_probe_tags
+    from utils.visualization.video import make_composite_compare_videos, render_video
 
 
 def flatten_validation_eval_summary(summary: dict, prefix: str) -> dict:

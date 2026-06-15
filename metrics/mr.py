@@ -1,9 +1,8 @@
-from typing import List
-
 import torch
+
+from typing import List
 from torch import Tensor
 from torchmetrics import Metric
-
 from .tools.utils import calc_accel, calc_mpjpe, calc_pampjpe
 
 

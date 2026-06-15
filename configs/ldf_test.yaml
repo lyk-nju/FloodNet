@@ -97,7 +97,6 @@ data:
     val_bs: 32
     test_bs: 1
     num_workers: 4
-    mask_ratio: 1.0
     traj_feat_dim: 7
 
     train_meta_paths:

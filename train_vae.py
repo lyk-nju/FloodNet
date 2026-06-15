@@ -21,9 +21,9 @@ from utils.initialize import (
     load_config,
     save_config_and_codes,
 )
-from utils.lightning_module import BasicLightningModule
+from utils.training.lightning_module import BasicLightningModule
 from utils.motion_process import convert_motion_to_joints
-from utils.visualize import (  # evaluate_video
+from utils.visualization.video import (  # evaluate_video
     make_composite_compare_videos,
     render_video,
 )

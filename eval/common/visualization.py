@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Mapping, Sequence
-
 import numpy as np
 
+from pathlib import Path
+from typing import Mapping, Sequence
 from eval.common.artifacts import ensure_dir
 
 
@@ -170,7 +169,7 @@ def render_motion_video(
     traj_xz=None,
     traj_mask=None,
 ) -> Path:
-    from utils.visualize import render_single_video
+    from utils.visualization.video import render_single_video
 
     out = Path(output_path)
     ensure_dir(out.parent)

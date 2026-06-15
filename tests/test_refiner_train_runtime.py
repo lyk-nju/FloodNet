@@ -11,13 +11,12 @@ These cover the pure config-resolution helpers (no Trainer, no live wandb):
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import torch
-
-from datasets.humanml3d_refiner import HumanML3DRefinerDataset as RefinerDataset
-from datasets.humanml3d_refiner import FixedRefinerSampleDataset
 import train_refiner as tr
+
+from pathlib import Path
+from tests.helpers.humanml3d_fixture import make_root_refiner_from_samples
+from utils.training.root_refiner import FixedRefinerSampleDataset
 
 _CFG_DIR = Path(__file__).resolve().parent.parent / "configs"
 
@@ -65,7 +64,7 @@ def test_load_cfg_supports_base_config_overlay(tmp_path):
 
 
 def test_apply_fixed_overfit_replaces_train_and_val_with_cached_samples():
-    source = RefinerDataset([_clip(), _clip(T=90)], seed=0)
+    source = make_root_refiner_from_samples([_clip(), _clip(T=90)], seed=0)
     cfg = {
         "fixed_overfit": {
             "enabled": True,
@@ -88,8 +87,8 @@ def test_apply_fixed_overfit_replaces_train_and_val_with_cached_samples():
 
 
 def test_apply_default_fixed_validation_replaces_only_val_with_all_samples():
-    train_source = RefinerDataset([_clip(), _clip(T=90)], seed=0)
-    val_source = RefinerDataset([_clip(T=100), _clip(T=110), _clip(T=120)], seed=1)
+    train_source = make_root_refiner_from_samples([_clip(), _clip(T=90)], seed=0)
+    val_source = make_root_refiner_from_samples([_clip(T=100), _clip(T=110), _clip(T=120)], seed=1)
 
     train_ds, val_suites = tr.apply_default_fixed_validation_dataset(
         train_source,

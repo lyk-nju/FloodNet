@@ -1,15 +1,14 @@
 import os
 import random
-from collections import defaultdict
-from typing import Dict, List, Tuple
-
 import numpy as np
 import torch
+
+from collections import defaultdict
+from typing import Dict, List, Tuple
 from lightning.pytorch.utilities import rank_zero_info
-from omegaconf import ListConfig, OmegaConf
+from omegaconf import OmegaConf
 from torch.utils.data import Dataset
 from tqdm import tqdm
-
 from utils.motion_process import (
     extract_root_traj_feats_7d_263,
     extract_root_trajectory_263,
@@ -25,10 +24,6 @@ class BabelDataset(Dataset):
     def __init__(self, cfg, split="train"):
         self.cfg = cfg
         self.split = split
-        if self.split in ("val", "test"):
-            self.mask_ratio = cfg.data.get("val_mask_ratio", 1.0)
-        else:
-            self.mask_ratio = cfg.data.get("mask_ratio", 1.0)
         if self.split == "train":
             self.file_list = cfg.data.train_meta_paths
             self.min_length = cfg.data.min_length
@@ -220,23 +215,10 @@ class BabelDataset(Dataset):
                 token_start = 0
             output["token"] = token
             output["token_length"] = token_length
-            ##############################
-            # mask (token-level sparsity expanded to frame-level VAE)
-            ##############################
-            token_mask = self.sample_token_mask(token_length)
-            output["token_mask"] = token_mask
 
             if "traj" in output:
-                # Causal VAE: token 0 → frame 0; token k≥1 → frames [4k-3, 4k]
                 traj_length = output["traj_length"]
-                traj_mask = np.zeros(traj_length, dtype=np.float32)
-                if len(token_mask) > 0:
-                    traj_mask[0] = token_mask[0]
-                for k in range(1, len(token_mask)):
-                    sf = 4 * k - 3
-                    ef = min(4 * k + 1, traj_length)
-                    if sf < traj_length:
-                        traj_mask[sf:ef] = token_mask[k]
+                traj_mask = np.ones(traj_length, dtype=np.float32)
                 output["traj_mask"] = traj_mask
                 output["traj_cond_mask"] = traj_mask.copy()
                 output["traj_loss_mask"] = traj_mask.copy()
@@ -474,23 +456,6 @@ class BabelDataset(Dataset):
         token_end_abs = (last_frame_abs + 3) // 4
         rel_count = token_end_abs - token_start + 1
         return max(0, min(token_length, rel_count))
-
-    def sample_token_mask(self, token_length: int) -> np.ndarray:
-        if token_length <= 0:
-            return np.zeros((0,), dtype=np.float32)
-        mask = np.zeros(token_length, dtype=np.float32)
-        r = self.mask_ratio
-        if isinstance(r, (list, tuple, ListConfig)) and len(r) == 2:
-            r0, r1 = float(r[0]), float(r[1])
-            keep_ratio = random.uniform(min(r0, r1), max(r0, r1))
-        else:
-            keep_ratio = float(r)
-        keep_ratio = max(0.0, min(1.0, keep_ratio))
-        n_keep = max(1, int(round(token_length * keep_ratio)))
-        indices = random.sample(range(token_length), n_keep)
-        mask[indices] = 1.0
-        return mask
-
 
 def collate_fn(batch):
     batch = [b for b in batch if b is not None]

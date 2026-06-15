@@ -1,10 +1,10 @@
-"""Unit tests for utils/runtime_glue.py (T_C_02 dual-anchor commit-slice math)."""
+"""Unit tests for utils/runtime/commit.py (T_C_02 dual-anchor commit-slice math)."""
 
 from __future__ import annotations
 
 import pytest
 
-from utils.runtime_glue import body_window_start_commit_idx, committed_frame_slice
+from utils.inference.commit import body_window_start_commit_idx, committed_frame_slice
 from utils.token_frame import token_end_frame, token_start_frame
 
 

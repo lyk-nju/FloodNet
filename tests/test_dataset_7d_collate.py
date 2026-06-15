@@ -16,7 +16,7 @@ from utils.motion_process import (
     recover_root_rot_pos,
     root_to_traj_feats_7d,
 )
-from utils.training.model_batch import prepare_model_input
+from utils.training.ldf.model_batch import prepare_model_input
 
 
 # ---------------------------------------------------------------------------

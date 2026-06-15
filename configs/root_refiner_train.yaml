@@ -1,4 +1,4 @@
-exp_name: root_refiner_pace_stream_base
+exp_name: root_refiner
 seed: 1234
 debug: false
 train: true
@@ -145,8 +145,8 @@ text_encoder:
   debug_stub: false
 
 data:
-  target: datasets.humanml3d_refiner.HumanML3DRefinerDataset
-  collate_fn: datasets.humanml3d_refiner.refiner_collate
+  target: datasets.humanml3d.HumanML3DDataset
+  collate_fn: utils.training.root_refiner.collate_fn
   train_bs: 128
   val_bs: 128
   test_bs: 128

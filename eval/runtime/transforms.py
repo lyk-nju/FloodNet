@@ -2,20 +2,19 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from utils.inference_glue import InferenceGlueState
+from typing import Any
+from utils.inference.glue import InferenceGlueState
 from utils.local_frame import (
     canonicalize_7d,
     uncanonicalize_7d,
 )
 from utils.motion_process import append_traj_deltas_5d_to_7d
-from utils.root_plan import RootPlan
-from utils.runtime_timeline import recovery_root_state_to_world
+from utils.inference.root_plan import RootPlan
+from utils.inference.timeline import recovery_root_state_to_world
 from utils.token_frame import num_tokens_for_frame_len, token_start_frame
 
 

@@ -15,14 +15,14 @@ import torch
 import numpy as np
 from torch_ema import ExponentialMovingAverage
 from utils.initialize import instantiate, load_config
-from utils.inference_glue import InferenceGlueState, InferenceGlueTimeline
+from utils.inference.glue import InferenceGlueState, InferenceGlueTimeline
 from utils.motion_process import StreamJointRecovery263, append_traj_deltas_5d_to_7d
-from utils.root_plan import RootPlan
-from utils.runtime_rootplan import build_rootplan_stream_payload_from_buffer
-from utils.runtime_timeline import append_timeline_state_at_token_start_frame
-from utils.stream_rollout import build_stream_step_model_input
+from utils.inference.root_plan import RootPlan
+from utils.inference.root_plan import build_rootplan_stream_payload_from_buffer
+from utils.inference.timeline import append_timeline_state_at_token_start_frame
+from utils.inference.rollout import build_stream_step_model_input
 from utils.token_frame import num_frames_for_tokens, token_start_frame
-from utils.stream_traj import (
+from utils.inference.trajectory import (
     StreamTrajectoryPlan,
     TrajectoryUpdateEvent,
     blend_future_trajs,
@@ -338,7 +338,7 @@ class ModelManager:
         if ckpt_path is None:
             raise ValueError("traj_mask.root_refiner.enabled=true requires ckpt")
         print(f"Loading RootRefiner runtime: config={refiner_config}, ckpt={ckpt_path}")
-        from utils.refiner.runtime import RootRefinerRuntime
+        from utils.inference.root_refiner import RootRefinerRuntime
 
         runtime = RootRefinerRuntime.from_config(
             config_path=refiner_config,
@@ -526,7 +526,7 @@ class ModelManager:
         return root_xyz
 
     def _estimate_token_step_distance(self) -> float:
-        """Thin wrapper — see ``utils.stream_traj.estimate_token_step_distance``."""
+        """Thin wrapper — see ``utils.inference.trajectory.estimate_token_step_distance``."""
         return estimate_token_step_distance(
             list(self.root_xz_history),
             default=self.default_token_step,
@@ -536,21 +536,21 @@ class ModelManager:
 
     @staticmethod
     def _project_point_to_polyline(point_xyz: np.ndarray, waypoints_xyz: np.ndarray):
-        """Thin wrapper — see ``utils.stream_traj.project_point_to_polyline``."""
+        """Thin wrapper — see ``utils.inference.trajectory.project_point_to_polyline``."""
         return project_point_to_polyline(point_xyz, waypoints_xyz)
 
     @staticmethod
     def _dedupe_polyline(points: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-        """Thin wrapper — see ``utils.stream_traj.dedupe_polyline``."""
+        """Thin wrapper — see ``utils.inference.trajectory.dedupe_polyline``."""
         return dedupe_polyline(points, eps)
 
     def _build_remaining_polyline(self, root_xyz: np.ndarray, waypoints_xyz: np.ndarray) -> np.ndarray:
-        """Thin wrapper — see ``utils.stream_traj.build_remaining_polyline``."""
+        """Thin wrapper — see ``utils.inference.trajectory.build_remaining_polyline``."""
         return build_remaining_polyline(root_xyz, waypoints_xyz)
 
     @staticmethod
     def _resample_polyline(points_xyz: np.ndarray, num_tokens: int, token_step: float) -> np.ndarray:
-        """Thin wrapper — see ``utils.stream_traj.resample_polyline``."""
+        """Thin wrapper — see ``utils.inference.trajectory.resample_polyline``."""
         return resample_polyline(points_xyz, num_tokens, token_step)
 
     def _sample_timestamped_with_repeat(

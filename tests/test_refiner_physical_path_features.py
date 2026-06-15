@@ -17,7 +17,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from datasets.humanml3d_refiner import HumanML3DRefinerDataset
+from tests.helpers.humanml3d_fixture import make_root_refiner_from_samples
 
 
 def _make_clip(T: int = 80) -> dict:
@@ -59,8 +59,8 @@ def test_path_features_are_physical_regardless_of_normalize(tmp_path):
         full_plan_ratio=1.0, n_hist=8, n_path=16,
         min_tokens=2, max_tokens=8, seed=0,
     )
-    ds_raw = HumanML3DRefinerDataset([_make_clip()], normalize=False, **common)
-    ds_norm = HumanML3DRefinerDataset(
+    ds_raw = make_root_refiner_from_samples([_make_clip()], normalize=False, **common)
+    ds_norm = make_root_refiner_from_samples(
         [_make_clip()], normalize=True, stats_dir=tmp_path, **common,
     )
 
@@ -81,8 +81,8 @@ def test_path_geometry_tokens_are_zscored_when_normalize(tmp_path):
         full_plan_ratio=1.0, n_hist=8, n_path=16,
         min_tokens=2, max_tokens=8, seed=0,
     )
-    ds_raw = HumanML3DRefinerDataset([_make_clip()], normalize=False, **common)
-    ds_norm = HumanML3DRefinerDataset(
+    ds_raw = make_root_refiner_from_samples([_make_clip()], normalize=False, **common)
+    ds_norm = make_root_refiner_from_samples(
         [_make_clip()], normalize=True, stats_dir=tmp_path, **common,
     )
 
@@ -96,7 +96,7 @@ def test_path_geometry_tokens_are_zscored_when_normalize(tmp_path):
 
 def test_path_features_match_waypoints_when_normalize_off(tmp_path):
     """Sanity: physical path_length ~ arclength of the physical future xz."""
-    ds = HumanML3DRefinerDataset(
+    ds = make_root_refiner_from_samples(
         [_make_clip()], full_plan_ratio=1.0, n_hist=8, n_path=16,
         min_tokens=2, max_tokens=8, seed=0, normalize=False,
     )

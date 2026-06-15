@@ -22,11 +22,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
-from pathlib import Path
-from typing import Dict, List, Tuple
-
 import numpy as np
 
+from pathlib import Path
+from typing import Dict, List, Tuple
 from utils.motion_process import extract_root_trajectory_263, extract_root_trajectory_length
 
 

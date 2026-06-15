@@ -16,14 +16,17 @@ import numpy as np
 import pytest
 import torch
 
-from datasets.humanml3d_refiner import HumanML3DRefinerDataset as RefinerDataset
+from tests.helpers.humanml3d_fixture import (
+    make_root_refiner_from_samples,
+    write_humanml3d_fixture,
+)
 from eval.root_refiner.benchmark import (
     _load_model_from_ckpt,
     _write_root_refiner_sample_artifacts,
     _resolve_cli_force_path_mode,
     build_eval_task_specs,
     build_full_route_task_specs,
-    build_refiner_dataset_from_clips,
+    build_refiner_dataset_from_config,
     compute_sample_metrics,
     resolve_suite_config,
     run_benchmark,
@@ -37,7 +40,7 @@ from eval.root_refiner.adapters import (
     ROOT_REFINER_ARTIFACT_NAMES,
 )
 from models.root_refiner import RootRefiner
-from train_refiner import FrozenStubTextEncoder
+from utils.training.root_refiner.text_encoder import FrozenStubTextEncoder
 
 
 # ---------------------------------------------------------------------------
@@ -153,8 +156,8 @@ def _tiny_lightning_cfg():
             },
         },
         "data": {
-            "target": "datasets.humanml3d_refiner.HumanML3DRefinerDataset",
-            "collate_fn": "datasets.humanml3d_refiner.refiner_collate",
+            "target": "datasets.humanml3d.HumanML3DDataset",
+            "collate_fn": "utils.training.root_refiner.collate_fn",
             "train_bs": 4,
             "val_bs": 4,
             "num_workers": 0,
@@ -225,7 +228,7 @@ def _save_refiner_stats(tmp_path):
 
 def test_run_benchmark_smoke_finite_metrics_and_report(tmp_path):
     clips = [_make_clip(50) for _ in range(6)]
-    ds = RefinerDataset(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
+    ds = make_root_refiner_from_samples(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
                          full_plan_ratio=1.0, seed=0)
     model = RootRefiner(d_model=32, n_layers=2, n_heads=4, ff_dim=64,
                          max_tokens=8, min_tokens=2, n_hist=8, n_path=16,
@@ -264,7 +267,7 @@ def test_run_benchmark_smoke_finite_metrics_and_report(tmp_path):
 
 def test_run_benchmark_writes_root_refiner_sample_artifacts(tmp_path):
     clips = [_make_clip(50) for _ in range(3)]
-    ds = RefinerDataset(
+    ds = make_root_refiner_from_samples(
         clips,
         n_hist=8,
         n_path=16,
@@ -332,7 +335,7 @@ def test_root_refiner_artifact_metadata_includes_raw_id_and_split(tmp_path):
         _make_clip(60, raw_id="000021", split_index=25),
         _make_clip(60, raw_id="004792", split_index=21),
     ]
-    ds = RefinerDataset(
+    ds = make_root_refiner_from_samples(
         clips,
         n_hist=8,
         n_path=16,
@@ -387,9 +390,9 @@ def test_root_refiner_artifact_metadata_includes_raw_id_and_split(tmp_path):
     )
     assert metadata["sample_id"] == "sample_000000"
     assert metadata["raw_id"] == "000021"
-    assert metadata["split_index"] == 25
-    assert metadata["split_file"] == "test.txt"
-    assert metadata["dataset"] == "humanml3d"
+    assert metadata["split_index"] == 0
+    assert metadata["split_file"] == "val.txt"
+    assert metadata["dataset"] == "HumanML3D"
     assert metadata["task_key"] == "000021:full:8:0"
 
 
@@ -404,8 +407,8 @@ def test_root_refiner_artifacts_use_physical_path_and_real_anchor(tmp_path):
         full_plan_ratio=1.0,
         seed=0,
     )
-    ds_raw = RefinerDataset(clips, normalize=False, **common)
-    ds_norm = RefinerDataset(clips, normalize=True, stats_dir=tmp_path, **common)
+    ds_raw = make_root_refiner_from_samples(clips, normalize=False, **common)
+    ds_norm = make_root_refiner_from_samples(clips, normalize=True, stats_dir=tmp_path, **common)
     task_specs = [
         {
             "idx": 0,
@@ -560,7 +563,7 @@ def test_run_benchmark_oracle_duration_mode():
     # A SINGLE shared dataset: run_benchmark calls dataset.reset_rng() at the start
     # so both passes see the identical sample sequence (this also exercises
     # reset_rng — otherwise the RNG would advance and the two runs would diverge).
-    ds = RefinerDataset(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
+    ds = make_root_refiner_from_samples(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
                          full_plan_ratio=1.0, seed=0)
     normal = run_benchmark(model, ds, text_encoder, device="cpu")["summary"]
     oracle = run_benchmark(model, ds, text_encoder, device="cpu",
@@ -579,7 +582,7 @@ def test_run_benchmark_oracle_duration_mode():
 
 def test_run_benchmark_max_samples_limit(tmp_path):
     clips = [_make_clip(50) for _ in range(10)]
-    ds = RefinerDataset(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
+    ds = make_root_refiner_from_samples(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
                          full_plan_ratio=1.0, seed=0)
     model = RootRefiner(d_model=32, n_layers=2, n_heads=4, ff_dim=64,
                          max_tokens=8, min_tokens=2, n_hist=8, n_path=16,
@@ -611,10 +614,25 @@ def test_resolve_suite_config_defines_root_refiner_eval_layers():
     assert full_route.force_no_path_aug is True
 
 
-def test_build_refiner_dataset_from_clips_uses_sampling_config():
-    clips = [_make_clip(50) for _ in range(3)]
+def test_build_refiner_dataset_from_config_uses_sampling_config(tmp_path):
+    write_humanml3d_fixture(
+        tmp_path,
+        [
+            {"name": f"s{i}", "motion_263": _make_clip(50)["motion_263"]}
+            for i in range(3)
+        ],
+        split_file="val.txt",
+    )
     cfg = {
-        "data": {"normalize": False},
+        "data": {
+            "target": "datasets.humanml3d.HumanML3DDataset",
+            "raw_data_dir": str(tmp_path),
+            "dataset": "humanml3d",
+            "val_split_file": "val.txt",
+            "feature_path": "new_joint_vecs",
+            "text_path": "texts",
+            "normalize": False,
+        },
         "model": {
             "params": {
                 "n_hist": 8,
@@ -645,7 +663,7 @@ def test_build_refiner_dataset_from_clips_uses_sampling_config():
         },
     }
 
-    ds = build_refiner_dataset_from_clips(cfg, clips, dataset_cls=RefinerDataset, seed=123)
+    ds = build_refiner_dataset_from_config(cfg, split_file="val.txt", seed=123)
 
     assert ds.full_plan_ratio == 0.25
     assert ds.num_token_policy == "max"
@@ -708,7 +726,7 @@ def test_validate_ckpt_eval_config_compatible_rejects_contract_mismatch():
 
 def test_build_eval_task_specs_freezes_underlying_tasks_before_path_modes():
     clips = [_make_clip(50) for _ in range(4)]
-    ds = RefinerDataset(
+    ds = make_root_refiner_from_samples(
         clips,
         n_hist=8,
         n_path=16,
@@ -733,7 +751,7 @@ def test_build_full_route_task_specs_selects_raw_id_and_max_horizon():
         _make_clip(50, raw_id="004792", split_index=21),
         _make_clip(179, raw_id="000021", split_index=25),
     ]
-    ds = RefinerDataset(
+    ds = make_root_refiner_from_samples(
         clips,
         n_hist=8,
         n_path=16,
@@ -747,11 +765,11 @@ def test_build_full_route_task_specs_selects_raw_id_and_max_horizon():
 
     assert specs == [
         {
-            "idx": 1,
-            "raw_id": "000021",
-            "split_index": 25,
-            "split_file": "test.txt",
-            "dataset": "humanml3d",
+                "idx": 1,
+                "raw_id": "000021",
+                "split_index": 1,
+                "split_file": "val.txt",
+                "dataset": "HumanML3D",
             "mode": "full",
             "num_tokens": 45,
             "anchor_frame": 0,
@@ -768,7 +786,7 @@ def test_cli_full_route_without_suite_forces_dense_path():
 
 def test_run_suite_benchmark_standard_emits_schema_and_path_mode_buckets(tmp_path):
     clips = [_make_clip(50) for _ in range(6)]
-    ds = RefinerDataset(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
+    ds = make_root_refiner_from_samples(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
                          full_plan_ratio=1.0, seed=0)
     model = RootRefiner(d_model=32, n_layers=2, n_heads=4, ff_dim=64,
                          max_tokens=8, min_tokens=2, n_hist=8, n_path=16,
@@ -816,7 +834,7 @@ def test_run_suite_benchmark_standard_emits_schema_and_path_mode_buckets(tmp_pat
 
 def test_run_suite_benchmark_oracle_suite_marks_duration_mode():
     clips = [_make_clip(50) for _ in range(6)]
-    ds = RefinerDataset(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
+    ds = make_root_refiner_from_samples(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
                          full_plan_ratio=1.0, seed=0)
     model = RootRefiner(d_model=32, n_layers=2, n_heads=4, ff_dim=64,
                          max_tokens=8, min_tokens=2, n_hist=8, n_path=16,

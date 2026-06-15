@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from utils.text_encoder_resolver import (
+from utils.training.root_refiner.text_encoder import (
     FrozenStubTextEncoder,
     PrecomputedT5PooledTextEncoder,
     resolve_text_encoder,
@@ -131,8 +131,8 @@ def test_refiner_module_with_precomputed_builds(t5_cache):
             },
         },
         "data": {
-            "target": "datasets.humanml3d_refiner.HumanML3DRefinerDataset",
-            "collate_fn": "datasets.humanml3d_refiner.refiner_collate",
+            "target": "datasets.humanml3d.HumanML3DDataset",
+            "collate_fn": "utils.training.root_refiner.collate_fn",
             "train_bs": 4, "val_bs": 4, "num_workers": 0,
         },
         "optimizer": {"target": "AdamW", "params": {"lr": 1e-3, "weight_decay": 0.01}},

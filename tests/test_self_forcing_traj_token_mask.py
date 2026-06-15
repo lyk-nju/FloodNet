@@ -16,13 +16,12 @@ about — no torch ckpts, no T5, no DDP.
 
 from __future__ import annotations
 
+import torch
+import utils.training.ldf.self_forcing as sf_mod
+
 from types import SimpleNamespace
 from unittest.mock import MagicMock
-
-import torch
-
-import utils.training.self_forcing as sf_mod
-from utils.training.self_forcing import RolloutPlan, SelfForcingTrainer
+from utils.training.ldf.self_forcing import RolloutPlan, SelfForcingTrainer
 
 
 _HIDDEN = 8

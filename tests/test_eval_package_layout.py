@@ -1,9 +1,9 @@
-from pathlib import Path
 import importlib
 import subprocess
 import sys
-
 import pytest
+
+from pathlib import Path
 
 
 def test_eval_common_types_have_stable_payloads(tmp_path):

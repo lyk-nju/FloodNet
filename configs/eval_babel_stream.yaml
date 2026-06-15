@@ -23,7 +23,6 @@ data:
     collate_fn: datasets.babel.collate_fn
     test_bs: 1
     num_workers: 4
-    val_mask_ratio: 1.0
     test_meta_paths:
         - ${dirs.raw_data}/BABEL_streamed/test_min_processed.txt
     feature_path: "motions"

@@ -7,11 +7,10 @@
 
 import math
 import warnings
-from typing import List, Optional
-
 import torch
 import torch.nn as nn
 
+from typing import List, Optional
 from .wan_model import (
     WanAttentionBlock,
     _embed_text_context,

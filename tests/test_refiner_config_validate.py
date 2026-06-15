@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 import yaml
 
-from utils.refiner.config_validate import validate_refiner_config
+from pathlib import Path
+from utils.training.root_refiner.config_validate import validate_refiner_config
 
 
 _CFG_DIR = Path(__file__).resolve().parent.parent / "configs"
@@ -37,8 +36,8 @@ def _minimal_cfg() -> dict:
             },
         },
         "data": {
-            "target": "datasets.humanml3d_refiner.HumanML3DRefinerDataset",
-            "collate_fn": "datasets.humanml3d_refiner.refiner_collate",
+            "target": "datasets.humanml3d.HumanML3DDataset",
+            "collate_fn": "utils.training.root_refiner.collate_fn",
             "train_bs": 64,
             "val_bs": 64,
             "num_workers": 0,
@@ -83,6 +82,7 @@ def _minimal_cfg() -> dict:
 def test_shipped_refiner_configs_are_valid():
     validate_refiner_config(_load("root_refiner.yaml"))
     validate_refiner_config(_load("root_refiner_train.yaml"))
+    validate_refiner_config(_load("root_refiner_train_humanml3d.yaml"))
     validate_refiner_config(_load("root_refiner_train_fixed_val_no_random_token.yaml"))
 
 

@@ -1,14 +1,13 @@
 import os
 import random
-from typing import Dict, List
-
 import numpy as np
 import torch
+
+from typing import Dict, List
 from lightning.pytorch.utilities import rank_zero_info
-from omegaconf import ListConfig, OmegaConf
+from omegaconf import OmegaConf
 from torch.utils.data import Dataset
 from tqdm import tqdm
-
 from utils.motion_process import (
     extract_root_traj_feats_7d_263,
     extract_root_trajectory_263,
@@ -25,15 +24,6 @@ class HumanML3DDataset(Dataset):
         self.cfg = cfg
         self.split = split
         self.stream_mode = cfg.data.get("stream_mode", False)
-        # Trajectory observation sparsity on token timeline (train uses mask_ratio).
-        # - float in (0,1]: keep exactly ratio of tokens
-        # - (min,max): keep a random ratio uniformly in [min,max] per sample (backwards compatible)
-        # val/test default to full trajectory (1.0) for metrics/video alignment with deployment;
-        # set data.val_mask_ratio to override (e.g. match train sparsity for ablations).
-        if self.split in ("val", "test"):
-            self.mask_ratio = cfg.data.get("val_mask_ratio", 1.0)
-        else:
-            self.mask_ratio = cfg.data.get("mask_ratio", (0.2, 0.3))
         if self.split == "train":
             self.file_list = cfg.data.train_meta_paths
             self.min_length = cfg.data.min_length
@@ -55,6 +45,7 @@ class HumanML3DDataset(Dataset):
         self.feature_path = cfg.data.get("feature_path", None)
         self.token_path = cfg.data.get("token_path", None)
         self.text_path = cfg.data.get("text_path", None)
+        self.return_text_all = bool(cfg.data.get("return_text_all", False))
         self.smooth_traj_sigma = float(cfg.data.get("smooth_traj_sigma", 0.0))
         # T_B_09 flag-gated 7D migration: 4 = legacy (default, unchanged);
         # 7 = also emit world-frame traj_cond_7d for the 7D fine-tune path.
@@ -200,23 +191,10 @@ class HumanML3DDataset(Dataset):
             )
             output["token"] = token
             output["token_length"] = token_length
-            ##############################
-            # mask (token-level sparsity expanded to frame-level VAE)
-            ##############################
-            token_mask = self.sample_token_mask(token_length)
-            output["token_mask"] = token_mask
 
             if "traj" in output:
-                # Causal VAE: token 0 → frame 0; token k≥1 → frames [4k-3, 4k]
                 traj_length = output["traj_length"]
-                traj_mask = np.zeros(traj_length, dtype=np.float32)
-                if len(token_mask) > 0:
-                    traj_mask[0] = token_mask[0]
-                for k in range(1, len(token_mask)):
-                    sf = 4 * k - 3
-                    ef = min(4 * k + 1, traj_length)
-                    if sf < traj_length:
-                        traj_mask[sf:ef] = token_mask[k]
+                traj_mask = np.ones(traj_length, dtype=np.float32)
                 output["traj_mask"] = traj_mask
                 output["traj_cond_mask"] = traj_mask.copy()
                 output["traj_loss_mask"] = traj_mask.copy()
@@ -237,8 +215,7 @@ class HumanML3DDataset(Dataset):
                 traj_xyz_for_cond = traj_xyz
             traj_features = root_to_traj_feats(traj_xyz_for_cond)
             output["traj_features"] = traj_features
-            # T_B_09: world-frame 7D traj cond (physical yaw), flag-gated.
-            # canonicalize (world→local) happens later in T_B_05.
+
             if self.traj_feat_dim == 7:
                 output["traj_cond_7d"] = extract_root_traj_feats_7d_263(feature)
 
@@ -250,12 +227,16 @@ class HumanML3DDataset(Dataset):
                 import hashlib
                 _idx = int(hashlib.md5(data["name"].encode()).hexdigest(), 16)
                 text_dict = data["text_data"][_idx % len(data["text_data"])]
-                # Also expose all captions so eval can iterate over all of them.
+            elif self.return_text_all:
+                text_dict = data["text_data"][0]
+            else:
+                text_dict = random.choice(data["text_data"])
+
+            if self.return_text_all or self.split in ("val", "test"):
                 output["text_all"] = [
                     self.process_text_dict(td)[0] for td in data["text_data"]
                 ]
-            else:
-                text_dict = random.choice(data["text_data"])
+
             text, text_tokens, f_tag, to_tag = self.process_text_dict(text_dict)
             if self.stream_mode:
                 output["text"] = [text]
@@ -307,23 +288,6 @@ class HumanML3DDataset(Dataset):
         to_tag = text_dict["to_tag"]
         return text, text_tokens, f_tag, to_tag
 
-    def sample_token_mask(self, token_length: int) -> np.ndarray:
-        if token_length <= 0:
-            return np.zeros((0,), dtype=np.float32)
-        mask = np.zeros(token_length, dtype=np.float32)
-        r = self.mask_ratio
-        if isinstance(r, (list, tuple, ListConfig)) and len(r) == 2:
-            r0, r1 = float(r[0]), float(r[1])
-            keep_ratio = random.uniform(min(r0, r1), max(r0, r1))
-        else:
-            keep_ratio = float(r)
-        keep_ratio = max(0.0, min(1.0, keep_ratio))
-        n_keep = max(1, int(round(token_length * keep_ratio)))
-        indices = random.sample(range(token_length), n_keep)
-        mask[indices] = 1.0
-        return mask
-
-
 def collate_fn(batch):
     batch = [b for b in batch if b is not None]
     if len(batch) == 0:
@@ -344,7 +308,7 @@ def collate_fn(batch):
                 items, batch_first=True, padding_value=0
             )
         elif key in ["traj_mask", "traj_cond_mask", "traj_loss_mask", "token_mask"]:
-            # Pad traj_mask to (B, T_max), padding 填 0
+
             items = [
                 torch.from_numpy(b[key])
                 if isinstance(b[key], np.ndarray)

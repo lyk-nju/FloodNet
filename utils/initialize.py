@@ -2,12 +2,12 @@ import argparse
 import os
 import shutil
 import time
+import torch
+
 from datetime import datetime
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Dict, Optional
-
-import torch
 from lightning.pytorch.utilities import rank_zero_info
 from omegaconf import OmegaConf
 

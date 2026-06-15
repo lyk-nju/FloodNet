@@ -11,17 +11,17 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from utils.inference_glue import InferenceGlueState, InferenceGlueTimeline
+from utils.inference.glue import InferenceGlueState, InferenceGlueTimeline
 from utils.local_frame import (
     canonicalize_7d,
     transform_xz_local_delta_to_world,
     wrap_angle,
 )
-from utils.root_plan import RootPlan
-from utils.runtime_rootplan import build_rootplan_stream_payload_from_buffer
+from utils.inference.root_plan import RootPlan
+from utils.inference.root_plan import build_rootplan_stream_payload_from_buffer
 from utils.token_frame import num_tokens_for_frame_len
-from utils.traj_stream_buffer import TrajStreamBuffer
-from utils.training.model_batch import prepare_model_input
+from utils.inference.buffer import TrajStreamBuffer
+from utils.training.ldf.model_batch import prepare_model_input
 
 
 def _as_tensor(value, *, device=None, dtype=torch.float32) -> torch.Tensor:

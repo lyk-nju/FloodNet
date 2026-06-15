@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import csv
 import json
+import numpy as np
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
-
-import numpy as np
-
 from eval.common.json import json_sanitize, write_json_strict
 
 

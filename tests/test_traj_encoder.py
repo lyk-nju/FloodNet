@@ -5,7 +5,7 @@ Contract:
   TrajEncoder    : (B, T, 128)   → (B, T, out_dim)    (LayerNorm + 2-layer MLP)
 
 The 4D legacy path is gone; legacy ckpts have their traj weights stripped at
-load time via utils.training.ckpt_compat.strip_legacy_traj_encoder_weights.
+load time via utils.training.ldf.ckpt_compat.strip_legacy_traj_encoder_weights.
 """
 
 from __future__ import annotations

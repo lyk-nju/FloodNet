@@ -62,7 +62,7 @@ from utils.motion_process import (
 from utils.token_frame import (
     token_start_frame,
 )
-from utils.render_skeleton import get_humanml3d_chains, render_simple_skeleton_video
+from utils.visualization.skeleton import get_humanml3d_chains, render_simple_skeleton_video
 from eval.runtime.cases import get_cases
 from eval.runtime.artifacts import (
     RuntimeArtifactLayout,
@@ -1486,7 +1486,7 @@ def main():
     if args.root_refiner_config or args.root_refiner_ckpt:
         if not (args.root_refiner_config and args.root_refiner_ckpt):
             p.error("--root_refiner_config and --root_refiner_ckpt must be provided together")
-        from utils.refiner.runtime import RootRefinerRuntime
+        from utils.inference.root_refiner import RootRefinerRuntime
 
         print("Loading RootRefiner runtime ...")
         root_refiner_runtime = RootRefinerRuntime.from_config(

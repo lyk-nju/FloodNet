@@ -100,7 +100,6 @@ data:
     feature_path: "new_joint_vecs"
     token_path: "TOKENS_20251030_085836_vae_wan_z4"
     text_path: "texts"
-    mask_ratio: 1.0
     random_length: 0
     min_length: 40
     max_length: 200

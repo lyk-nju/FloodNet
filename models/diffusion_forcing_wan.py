@@ -11,10 +11,10 @@ from .tools.wan_controlnet import WanControlNet
 
 try:
     from FloodNet.utils.traj_batch import encode_traj_batch
-    from FloodNet.utils.traj_stream_buffer import TrajStreamBuffer
+    from FloodNet.utils.inference.buffer import TrajStreamBuffer
 except ImportError:  # pragma: no cover - script entrypoints use top-level imports
     from utils.traj_batch import encode_traj_batch
-    from utils.traj_stream_buffer import TrajStreamBuffer
+    from utils.inference.buffer import TrajStreamBuffer
 
 
 _SCHEDULED_SAMPLING_WARNED = False
@@ -23,14 +23,8 @@ _SCHEDULED_SAMPLING_WARNED = False
 def warn_scheduled_sampling_deprecated(value) -> bool:
     """Warn once per process that ``scheduled_sampling_prob`` is deprecated.
 
-    T_B_01 removed scheduled sampling (replaced by history_corruption, see
-    design.md §2.1.4). The config key is kept for backward-compat (so existing
-    configs load without raising) but ignored.
-
-    Only warns when a **nonzero** value was requested — 0.0 (the historical
-    default in every shipped config) means scheduled sampling was already off,
-    so there is nothing to migrate and warning on it every run would be pure
-    noise. Returns True iff a warning was emitted.
+    The config key is still accepted for older configs, but the value is
+    ignored. A warning is emitted only for nonzero values.
     """
     global _SCHEDULED_SAMPLING_WARNED
     try:
@@ -39,9 +33,8 @@ def warn_scheduled_sampling_deprecated(value) -> bool:
         nonzero = False
     if nonzero and not _SCHEDULED_SAMPLING_WARNED:
         warnings.warn(
-            "scheduled_sampling_prob is deprecated and ignored (removed in "
-            "T_B_01); replaced by history_corruption.apply_prob (see "
-            "design.md §2.1.4).",
+            "scheduled_sampling_prob is deprecated and ignored; use "
+            "history_corruption.apply_prob instead.",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -50,46 +43,38 @@ def warn_scheduled_sampling_deprecated(value) -> bool:
     return False
 
 
-# Optional fields added by later phases (T_B_02: history-corruption support).
-# Old (4D) checkpoints predate them, so a strict load would raise on the missing
-# keys. We back-fill them from the freshly-initialized module so older ckpts load
-# unchanged — the new fields simply keep their init values (mask_emb at its
-# random init; z_mean/z_std at 0/1 until load_z_stats is called).
-# Matched by leaf name so both bare (`mask_emb`, WanModel loaded directly) and
-# prefixed (`model.mask_emb`, WanModel nested in DiffForcingWanModel) keys work.
-_BACKWARD_COMPAT_OPTIONAL_NAMES = ("mask_emb", "z_mean", "z_std")
+# Optional runtime fields that older checkpoints may not contain. They are
+# back-filled from the freshly initialized module before strict loading.
+_OPTIONAL_COMPAT_FIELD_NAMES = ("mask_emb", "z_mean", "z_std")
 
 
 def _is_optional_compat_key(key: str) -> bool:
-    """True if `key`'s final path component is a T_B_02 optional field name."""
-    return key.rsplit(".", 1)[-1] in _BACKWARD_COMPAT_OPTIONAL_NAMES
+    """Return True when ``key`` names an optional checkpoint field."""
+    return key.rsplit(".", 1)[-1] in _OPTIONAL_COMPAT_FIELD_NAMES
 
 
 def backfill_compat_state_dict(state_dict: dict, own_state: dict):
     """Return (filled_state_dict, n_backfilled).
 
-    Copies `state_dict`, then for every key in `own_state` that (a) is absent
-    from the incoming `state_dict` and (b) is an optional T_B_02 field (matched
-    by leaf name), fills it from `own_state`. All other keys are left untouched
-    so a subsequent strict load still catches genuine missing / unexpected /
-    shape-mismatch errors.
+    Only optional checkpoint fields are filled. All other keys remain untouched
+    so strict loading still catches real missing, unexpected, or mismatched keys.
     """
     filled = dict(state_dict)
-    n = 0
-    for k, v in own_state.items():
-        if k not in filled and _is_optional_compat_key(k):
-            filled[k] = v.clone() if hasattr(v, "clone") else v
-            n += 1
-    return filled, n
+    num_backfilled = 0
+    for key, value in own_state.items():
+        if key not in filled and _is_optional_compat_key(key):
+            filled[key] = value.clone() if hasattr(value, "clone") else value
+            num_backfilled += 1
+    return filled, num_backfilled
 
 
-def _expand_precomputed_caption_keys(emb: dict) -> dict:
+def _expand_precomputed_caption_keys(embeddings: dict) -> dict:
     """Alias strip() keys so table matches HumanML3D captions after .strip()."""
-    out = dict(emb)
-    for k, v in emb.items():
-        s = k.strip()
-        if s not in out:
-            out[s] = v
+    out = dict(embeddings)
+    for key, value in embeddings.items():
+        stripped_key = key.strip()
+        if stripped_key not in out:
+            out[stripped_key] = value
     return out
 
 
@@ -173,11 +158,7 @@ class DiffForcingWanModel(nn.Module):
             )
             use_traj_emb_cache = bool(use_traj_kv_cache)
         self.use_traj_emb_cache = use_traj_emb_cache
-        # T_B_01: scheduled_sampling is removed (replaced by history_corruption,
-        # design.md §2.1.4). The constructor param is retained so existing
-        # configs that still carry `scheduled_sampling_prob` load without raising
-        # (lightning_module splats **cfg.model.params), but it is ignored — warn
-        # if a caller actually requested a nonzero value.
+        # Keep the old config key accepted, but route users to history corruption.
         warn_scheduled_sampling_deprecated(scheduled_sampling_prob)
         self.scheduled_sampling_prob = 0.0
         self.self_forcing_enabled = bool(self_forcing_enabled)
@@ -223,15 +204,21 @@ class DiffForcingWanModel(nn.Module):
                     "use_precomputed_text_emb=True requires precomputed_text_emb_path "
                     "(run pretokenize_t5_text.py to build the .pt)."
                 )
-            blob = torch.load(precomputed_text_emb_path, map_location="cpu", weights_only=False)
-            self._precomputed_text_emb = _expand_precomputed_caption_keys(blob["embeddings"])
+            payload = torch.load(
+                precomputed_text_emb_path, map_location="cpu", weights_only=False
+            )
+            self._precomputed_text_emb = _expand_precomputed_caption_keys(
+                payload["embeddings"]
+            )
             if "" not in self._precomputed_text_emb:
                 raise KeyError(
                     'precomputed embeddings must include empty string key "" for CFG / dropout.'
                 )
-            td = int(blob.get("text_dim", self.text_dim))
-            if td != self.text_dim:
-                raise ValueError(f"precomputed text_dim {td} != model text_dim {self.text_dim}")
+            text_dim = int(payload.get("text_dim", self.text_dim))
+            if text_dim != self.text_dim:
+                raise ValueError(
+                    f"precomputed text_dim {text_dim} != model text_dim {self.text_dim}"
+                )
         else:
             self.text_encoder = T5EncoderModel(
                 text_len=self.text_len,
@@ -292,8 +279,7 @@ class DiffForcingWanModel(nn.Module):
         )
         self.controlnet.init_from_backbone(self.model)
 
-        # Local within-token Conv1d encoder over the 4 frames of a token, then
-        # a token-level LayerNorm + MLP. 7D-only — see models/tools/traj_encoder.py.
+        # Local within-token Conv1d encoder, then token-level LayerNorm + MLP.
         self.local_traj_encoder = LocalTrajEncoder(in_dim=self.traj_in_dim)
         self.traj_encoder = TrajEncoder(out_dim=self.traj_out_dim)
         self.param_dtype = torch.float32
@@ -307,26 +293,26 @@ class DiffForcingWanModel(nn.Module):
                 p.requires_grad = True
             for p in self.local_traj_encoder.parameters():
                 p.requires_grad = True
-            # B-P0-2: mask_emb is the LEARNABLE history-corruption replacement
-            # embedding (T_B_02/T_B_03); it lives inside self.model so the freeze
-            # loop above froze it. Keep it trainable for the 7D fine-tune.
+            # mask_emb lives in the frozen backbone but is trained by history
+            # corruption, so keep it trainable.
             if hasattr(self.model, "mask_emb"):
                 self.model.mask_emb.requires_grad_(True)
 
     def load_state_dict(self, state_dict, strict=True):
-        """Backward-compatible load: when loading an older ckpt (strict=True)
-        that predates the T_B_02 optional fields (model.mask_emb / model.z_mean /
-        model.z_std), back-fill them from this module's init values so the load
-        doesn't raise on missing keys. Genuine missing / unexpected / mismatched
-        keys are still caught by the strict load.
+        """Load older checkpoints that predate optional runtime fields.
+
+        Missing optional fields are copied from this module's initialized state.
+        Strict loading still catches real missing, unexpected, or mismatched keys.
         """
         if strict:
-            state_dict, n = backfill_compat_state_dict(state_dict, self.state_dict())
-            if n:
+            state_dict, num_backfilled = backfill_compat_state_dict(
+                state_dict, self.state_dict()
+            )
+            if num_backfilled:
                 warnings.warn(
-                    f"load_state_dict: back-filled {n} optional field(s) "
-                    f"(mask_emb/z_mean/z_std) from init — loading a checkpoint that "
-                    f"predates T_B_02. New fields keep init values until "
+                    f"load_state_dict: back-filled {num_backfilled} optional field(s) "
+                    f"(mask_emb/z_mean/z_std) from init; loading a checkpoint that "
+                    f"does not include them. New fields keep init values until "
                     f"load_z_stats() is called.",
                     stacklevel=2,
                 )
@@ -518,15 +504,8 @@ class DiffForcingWanModel(nn.Module):
         if base is None:
             return None
 
-        # B-P0-1: mask-aware truncation so ControlNet attention ignores
-        # out-of-horizon / overflow tail tokens (their traj_type_embed would leak
-        # otherwise). Reuses the SAME token mask as encode_traj_batch
-        # (build_traj_token_mask — single source). prefix_len_from_tail_invalid
-        # truncates ONLY a pure-suffix invalid region; a middle hole returns
-        # seq_len so min() keeps base (sparse holes must NOT shorten attention —
-        # they are handled by per-token embedding zeroing). The end-to-end
-        # ControlNet-residual value-invariance check (real VAE-latent shapes) is
-        # run on the runtime box; the truncation logic is unit-tested here.
+        # Truncate only invalid suffix tokens. Sparse holes stay at full length
+        # and are handled by token-level embedding masks.
         from utils.token_frame import prefix_len_from_tail_invalid
         from utils.traj_batch import build_traj_token_mask
         token_mask = build_traj_token_mask(
@@ -619,12 +598,8 @@ class DiffForcingWanModel(nn.Module):
         self, x, seq_len, device, traj_dropped_override=None, horizon_tokens=None,
         horizon_active_end=0,
     ):
-        # T_B_04 / B-P0-2: horizon_tokens (token-level) + horizon_active_end (the
-        # per-sample active-window token position, [B] tensor or int) are computed
-        # by the training outer loop (SelfForcingTrainer) and passed in — the model
-        # never reads global_step. horizon_active_end defaults to 0 (clip start)
-        # for non-SF callers; SF passes the supervised window position so horizon
-        # truncates relative to the current window, not the clip start.
+        # The training loop passes horizon_tokens and the active-window boundary;
+        # the model only applies the resulting trajectory mask.
         traj_emb = None
         traj_seq_lens = None
         traj_token_mask = None
@@ -694,11 +669,6 @@ class DiffForcingWanModel(nn.Module):
             noisy_feature_input,
             end_indices,
         ) = self._slice_diffusion_window(clean_feature, feature_length, time_steps)
-
-        # (T_B_01: scheduled-sampling forward branch removed — it was dead since
-        # scheduled_sampling_prob defaulted to 0.0 everywhere, so do_ss was always
-        # False and noisy_feature_input passed through unchanged. The
-        # `_scheduled_sampling_override` input key is no longer consumed.)
 
         # Always call ControlNet so gradients flow when backbone is frozen.
         # When traj_dropped=True, traj_emb is already None; ControlNet learns
@@ -811,11 +781,7 @@ class DiffForcingWanModel(nn.Module):
         }
 
     def _get_noise_levels(self, device, seq_len, time_steps):
-        """Get noise levels (Paper: vectorized schedule).
-        β^k_t = 1 - α^k_t, with α^k_t = clamp(t - k/n_s, 0, 1). So β^k_t = clamp(1 + k/n_s - t, 0, 1).
-        chunk_size = n_s (streaming step-size). Left of active window → β≈0 (clean), right → β≈1 (noise).
-        """
-        # noise_level[k] = β^k_t for position k
+        """Get vectorized triangular noise levels."""
         noise_level = torch.clamp(
             1
             + torch.arange(seq_len, device=device) / self.chunk_size
@@ -826,14 +792,15 @@ class DiffForcingWanModel(nn.Module):
         return noise_level
 
     def add_noise(self, x, noise_level):
-        """Add noise (Paper Eq.: x_t = α_t ⊙ z + β_t ⊙ ε).
+        """Add noise with x_t = alpha_t * z + beta_t * eps.
+
         Args:
             x: (B, T, D) clean latent z
-            noise_level: (B, T) β_t
+            noise_level: (B, T) beta_t
         """
         noise = torch.randn_like(x)
         noise_level = noise_level.unsqueeze(-1)
-        noisy_x = x * (1 - noise_level) + noise_level * noise  # α*z + β*ε
+        noisy_x = x * (1 - noise_level) + noise_level * noise
         return noisy_x, noise
 
     def forward(self, x):
@@ -996,7 +963,7 @@ class DiffForcingWanModel(nn.Module):
                 traj_token_mask=traj_mask_double,
             )
             if self.cfg_scale_traj > 0.0:
-                # Separated CFG — batch all 3 passes into a single 3B backbone forward.
+                # Separated CFG: batch all 3 passes into one 3B backbone forward.
                 # ControlNet runs on 2B with traj and on B with null traj so the
                 # uncond slot matches the project-wide no-traj semantics.
                 #   out = out_uncond

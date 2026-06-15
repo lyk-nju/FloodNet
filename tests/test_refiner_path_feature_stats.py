@@ -7,7 +7,7 @@ import pytest
 import torch
 import yaml
 
-from utils.refiner.path_feature_stats import (
+from utils.training.root_refiner.path_feature_stats import (
     PATH_FEATURE_NAMES,
     compute_sampling_config_hash,
     compute_stats_from_features,
@@ -88,7 +88,7 @@ def test_stats_files_are_numpy_and_json(tmp_path):
 
 def test_load_path_feature_stats_raises_on_hash_mismatch(tmp_path):
     import torch
-    from utils.refiner.path_feature_stats import (
+    from utils.training.root_refiner.path_feature_stats import (
         PATH_FEATURE_NAMES, save_path_feature_stats, load_path_feature_stats,
     )
     save_path_feature_stats(
@@ -177,7 +177,7 @@ def _tiny_clip(T=80):
 
 def _write_pf_stats(tmp_path, cfg_hash):
     import torch
-    from utils.refiner.path_feature_stats import PATH_FEATURE_NAMES, save_path_feature_stats
+    from utils.training.root_refiner.path_feature_stats import PATH_FEATURE_NAMES, save_path_feature_stats
     save_path_feature_stats(
         tmp_path,
         mean=torch.zeros(len(PATH_FEATURE_NAMES)),
@@ -188,10 +188,10 @@ def _write_pf_stats(tmp_path, cfg_hash):
 
 def test_dataset_stats_dir_without_hash_raises(tmp_path):
     import pytest
-    from datasets.humanml3d_refiner import HumanML3DRefinerDataset
+    from tests.helpers.humanml3d_fixture import make_root_refiner_from_samples
     _write_pf_stats(tmp_path, "H")
     with pytest.raises(ValueError, match="sampling_config_hash"):
-        HumanML3DRefinerDataset(
+        make_root_refiner_from_samples(
             [_tiny_clip()], n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
             full_plan_ratio=1.0, seed=0,
             path_feature_stats_dir=str(tmp_path),
@@ -200,10 +200,10 @@ def test_dataset_stats_dir_without_hash_raises(tmp_path):
 
 def test_dataset_stats_dir_wrong_hash_raises(tmp_path):
     import pytest
-    from datasets.humanml3d_refiner import HumanML3DRefinerDataset
+    from tests.helpers.humanml3d_fixture import make_root_refiner_from_samples
     _write_pf_stats(tmp_path, "GOOD")
     with pytest.raises(ValueError, match="hash mismatch"):
-        HumanML3DRefinerDataset(
+        make_root_refiner_from_samples(
             [_tiny_clip()], n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
             full_plan_ratio=1.0, seed=0,
             path_feature_stats_dir=str(tmp_path), sampling_config_hash="BAD",
@@ -211,9 +211,9 @@ def test_dataset_stats_dir_wrong_hash_raises(tmp_path):
 
 
 def test_dataset_stats_dir_correct_hash_loads(tmp_path):
-    from datasets.humanml3d_refiner import HumanML3DRefinerDataset
+    from tests.helpers.humanml3d_fixture import make_root_refiner_from_samples
     _write_pf_stats(tmp_path, "GOOD")
-    ds = HumanML3DRefinerDataset(
+    ds = make_root_refiner_from_samples(
         [_tiny_clip()], n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
         full_plan_ratio=1.0, seed=0,
         path_feature_stats_dir=str(tmp_path), sampling_config_hash="GOOD",

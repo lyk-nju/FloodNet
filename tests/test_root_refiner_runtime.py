@@ -3,9 +3,9 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from utils.inference_glue import InferenceGlueState
-from utils.refiner.runtime import RootRefinerRuntime, _state_dict_has_pace_duration
-from utils.stream_traj import StreamTrajectoryPlan
+from utils.inference.glue import InferenceGlueState
+from utils.inference.root_refiner import RootRefinerRuntime, _state_dict_has_pace_duration
+from utils.inference.trajectory import StreamTrajectoryPlan
 from utils.token_frame import num_frames_for_tokens
 
 

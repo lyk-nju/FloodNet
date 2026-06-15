@@ -5,16 +5,16 @@ from __future__ import annotations
 
 import argparse
 import sys
-from pathlib import Path
-
 import torch
+
+from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from train_refiner import _load_cfg, build_datasets, resolve_cfg_interpolations  # noqa: E402
-from utils.refiner.path_feature_stats import (  # noqa: E402
+from utils.training.root_refiner.path_feature_stats import (  # noqa: E402
     PATH_FEATURE_NAMES,
     compute_sampling_config_hash,
     compute_stats_from_features,

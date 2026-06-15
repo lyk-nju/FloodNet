@@ -1,18 +1,19 @@
 """
 Flask server for real-time 3D motion generation demo
 """
-from flask import Flask, render_template, jsonify, request
-from flask_cors import CORS
 import json
 import time
 import threading
 import argparse
 import os
 import numpy as np
+
+from flask import Flask, render_template, jsonify, request
+from flask_cors import CORS
 from omegaconf import OmegaConf
 from model_manager import get_model_manager
 from utils.motion_process import extract_root_trajectory_263
-from utils.stream_traj import resample_polyline
+from utils.inference.trajectory import resample_polyline
 
 app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0

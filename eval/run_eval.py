@@ -27,7 +27,8 @@ if PROJECT_ROOT not in sys.path:
 
 from train_ldf import CustomLightningModule  # noqa: E402
 from utils.initialize import get_function, load_config  # noqa: E402
-from utils.training import build_probe_loaders, load_resume_step_offset  # noqa: E402
+from utils.training import load_resume_step_offset  # noqa: E402
+from utils.training.ldf import build_probe_loaders  # noqa: E402
 
 
 def parse_args():

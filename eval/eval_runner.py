@@ -19,9 +19,9 @@ try:
     )
     from FloodNet.eval.ldf.conditioning import prepare_ldf_eval_model_batch
     from FloodNet.utils.traj_batch import root_to_traj_feats
-    from FloodNet.utils.training import (
+    from FloodNet.utils.training import ckpt_step_info
+    from FloodNet.utils.training.ldf import (
         build_generation_eval_cfg,
-        ckpt_step_info,
         control_loss_train_mode,
         resolve_test_probe_tag,
     )
@@ -38,9 +38,9 @@ except ImportError:  # pragma: no cover - script entrypoints use top-level impor
     )
     from eval.ldf.conditioning import prepare_ldf_eval_model_batch
     from utils.traj_batch import root_to_traj_feats
-    from utils.training import (
+    from utils.training import ckpt_step_info
+    from utils.training.ldf import (
         build_generation_eval_cfg,
-        ckpt_step_info,
         control_loss_train_mode,
         resolve_test_probe_tag,
     )

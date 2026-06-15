@@ -5,14 +5,13 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from datasets.humanml3d_refiner import HumanML3DRefinerDataset as RefinerDataset
+from tests.helpers.humanml3d_fixture import make_root_refiner_from_samples
 from scripts.compute_5d_stats import (
     CURRENT_MOTION_NORM_INDICES,
     WAYPOINT_NORM_INDICES,
     WelfordAccumulator,
-    _read_all_captions,
+    build_stats_dataset,
     compute_stats,
-    load_clips_from_dir,
     save_stats,
 )
 
@@ -95,7 +94,7 @@ def _make_clip(T: int, *, vx: float = 0.0, vz: float = 0.05) -> dict:
 
 def test_compute_stats_end_to_end_with_synthetic_dataset(tmp_path):
     clips = [_make_clip(T=40, vz=0.05 + 0.01 * i) for i in range(8)]
-    ds = RefinerDataset(clips, full_plan_ratio=1.0, normalize=False, seed=0)
+    ds = make_root_refiner_from_samples(clips, full_plan_ratio=1.0, normalize=False, seed=0)
     stats = compute_stats(ds, max_samples=-1, progress=False)
 
     # Shape sanity.
@@ -115,7 +114,7 @@ def test_compute_stats_end_to_end_with_synthetic_dataset(tmp_path):
 
 def test_save_stats_writes_six_files_and_norm_indices_have_expected_values(tmp_path):
     clips = [_make_clip(T=40) for _ in range(3)]
-    ds = RefinerDataset(clips, full_plan_ratio=1.0, normalize=False, seed=0)
+    ds = make_root_refiner_from_samples(clips, full_plan_ratio=1.0, normalize=False, seed=0)
     stats = compute_stats(ds, progress=False)
     save_stats(stats, tmp_path)
 
@@ -147,7 +146,7 @@ def test_save_stats_writes_six_files_and_norm_indices_have_expected_values(tmp_p
 def test_max_samples_dry_run_limits_iteration(tmp_path):
     """--max_samples 5 should accumulate stats only over 5 samples."""
     clips = [_make_clip(T=40) for _ in range(20)]
-    ds = RefinerDataset(clips, full_plan_ratio=1.0, normalize=False, seed=0)
+    ds = make_root_refiner_from_samples(clips, full_plan_ratio=1.0, normalize=False, seed=0)
     stats = compute_stats(ds, max_samples=5, progress=False)
     # Each sample contributes 1 history slot (full mode) + variable target.
     assert stats["n_current_motion"] == 5
@@ -155,24 +154,24 @@ def test_max_samples_dry_run_limits_iteration(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Integration with RefinerDataset(normalize=True): cos / sin invariance
+# Integration with make_root_refiner_from_samples(normalize=True): cos / sin invariance
 # ---------------------------------------------------------------------------
 
 
 def test_loaded_stats_pass_T_A_04_T13_cos_sin_invariance(tmp_path):
-    """Lock-in: after `save_stats` + RefinerDataset(normalize=True), the cos /
+    """Lock-in: after `save_stats` + make_root_refiner_from_samples(normalize=True), the cos /
     sin heading channels at [3], [4] must be bit-equal to the unnormalized
     values (norm_indices excludes them). Mirrors T_A_04 T13 with the actual
     stats file format produced by this script.
     """
     clips = [_make_clip(T=60)]
-    ds_compute = RefinerDataset(clips, full_plan_ratio=1.0, normalize=False, seed=0)
+    ds_compute = make_root_refiner_from_samples(clips, full_plan_ratio=1.0, normalize=False, seed=0)
     stats = compute_stats(ds_compute, progress=False)
     save_stats(stats, tmp_path)
 
     # Now build raw + normalized datasets and compare cos/sin channels.
-    ds_raw = RefinerDataset(clips, full_plan_ratio=1.0, normalize=False, seed=0)
-    ds_norm = RefinerDataset(clips, full_plan_ratio=1.0, normalize=True,
+    ds_raw = make_root_refiner_from_samples(clips, full_plan_ratio=1.0, normalize=False, seed=0)
+    ds_norm = make_root_refiner_from_samples(clips, full_plan_ratio=1.0, normalize=True,
                               stats_dir=tmp_path, seed=0)
     s_raw = ds_raw.get_sample(0, force_mode="full", force_num_tokens=8,
                                 force_no_path_aug=True)
@@ -220,32 +219,26 @@ def _write_fake_humanml3d(root, names, captions_by_name):
     return ds
 
 
-def test_read_all_captions_dedups_and_keeps_order(tmp_path):
-    f = tmp_path / "cap.txt"
-    f.write_text(
-        "a person walks#x#0#0\n"
-        "someone strolls forward#x#0#0\n"
-        "a person walks#x#0#0\n"   # duplicate of line 1
-        "\n"                        # blank line ignored
-    )
-    caps = _read_all_captions(f)
-    assert caps == ["a person walks", "someone strolls forward"]
-
-
-def test_load_clips_populates_texts_list_and_first_caption(tmp_path):
-    """load_clips_from_dir must expose every distinct caption in `texts`, with
-    `text` == the first one (backward compatible)."""
+def test_build_stats_dataset_reads_real_humanml3d_layout_and_texts(tmp_path):
     caps = {
         "c1": ["a person walks forward", "someone strides ahead", "walking"],
         "c2": ["a man jumps"],
     }
     _write_fake_humanml3d(tmp_path, ["c1", "c2"], caps)
-    clips = load_clips_from_dir(str(tmp_path), dataset="humanml3d",
-                                split_file="train.txt",
-                                feature_path="new_joint_vecs", text_path="texts")
-    by_first = {c["text"]: c for c in clips}
-    assert "a person walks forward" in by_first
-    assert "a man jumps" in by_first
-    c1 = by_first["a person walks forward"]
-    assert c1["texts"] == caps["c1"]          # all captions, in order
-    assert c1["text"] == caps["c1"][0]        # first caption mirrored into `text`
+    ds = build_stats_dataset(
+        raw_data_dir=tmp_path,
+        dataset="humanml3d",
+        split_file="train.txt",
+        feature_path="new_joint_vecs",
+        text_path="texts",
+        seed=0,
+    )
+
+    sample = ds.get_sample(
+        0,
+        force_mode="full",
+        force_num_tokens=4,
+        force_no_path_aug=True,
+        force_text_idx=1,
+    )
+    assert sample["text"] == caps["c1"][1]

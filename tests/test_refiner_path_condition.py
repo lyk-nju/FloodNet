@@ -4,7 +4,7 @@ import random
 
 import torch
 
-from utils.refiner.path_condition import (
+from utils.training.root_refiner.path_condition import (
     build_dense_path_condition,
     build_goal_point_condition,
     build_path_condition,

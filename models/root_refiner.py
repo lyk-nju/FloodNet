@@ -27,7 +27,7 @@ Architecture (redesigned — duration-first / trajectory-second):
       waypoints5 = frame_decoder(plan_token_hidden)    # [B, max_frames, 5] = [x,y,z,cos,sin]
       heading channels [3:5] L2-normalized.
     Why 5D output (not internal-7D append): the dataset z-scores xyz channels
-    (see datasets/humanml3d_refiner.py) but cos/sin stay raw unit vectors.
+    (see utils.training.root_refiner.sample_builder) but cos/sin stay raw unit vectors.
     Appending fwd_delta / yaw_delta inside the model — i.e. inside the
     normalized space — would emit deltas in NORMALIZED-xz units, while the
     GT delta channels are PHYSICAL-then-z-scored: scales and offsets do not
@@ -44,7 +44,7 @@ effective frame and tokens 1..N-1 as 4 frames each:
 
 Output keys include num_token_logits, pred_log_pace, pred_num_tokens_cls,
 pred_num_tokens_pace, pred_num_tokens, used_num_tokens, waypoints. Loss lives
-in utils.refiner.lightning_module.
+in utils.training.root_refiner.lightning_module.
 """
 
 from __future__ import annotations

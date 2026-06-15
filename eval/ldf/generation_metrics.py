@@ -29,11 +29,11 @@ import json
 import os
 import random
 import sys
-from pathlib import Path
-from typing import Dict, List, Optional
-
 import numpy as np
 import torch
+
+from pathlib import Path
+from typing import Dict, List, Optional
 from torch.utils.data import DataLoader
 from torch_ema import ExponentialMovingAverage
 
@@ -42,7 +42,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from metrics.t2m import T2MMetrics
-from utils.training import control_loss_train_mode, t2m_metric_enabled
+from utils.training.ldf import control_loss_train_mode, t2m_metric_enabled
 from metrics.traj import (
     _average_control_metrics,
     _average_traj_metrics,
@@ -58,8 +58,8 @@ from eval.ldf.conditioning import prepare_ldf_eval_model_batch
 from utils.initialize import get_function, instantiate, load_config
 from utils.motion_process import extract_root_trajectory_263_torch
 from utils.traj_batch import root_to_traj_feats
-from utils.training.ckpt_compat import strip_legacy_traj_encoder_weights
-from utils.visualize import make_composite_compare_videos, render_video
+from utils.training.ldf.ckpt_compat import strip_legacy_traj_encoder_weights
+from utils.visualization.video import make_composite_compare_videos, render_video
 
 
 def _default_output_dir() -> Path:
@@ -165,7 +165,7 @@ def _remove_traj_fields(batch: Dict) -> Dict:
     traj_keys = {
         "traj", "traj_length", "traj_mask", "traj_features",
         "traj_features_length", "token_mask",
-        # 7D pipeline keys consumed by utils.training.model_batch:
+        # 7D pipeline keys consumed by utils.training.ldf.model_batch:
         "traj_cond", "traj_cond_7d", "traj_cond_mask", "traj_loss_mask",
     }
     return {k: v for k, v in batch.items() if k not in traj_keys}

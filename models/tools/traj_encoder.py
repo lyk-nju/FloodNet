@@ -1,23 +1,14 @@
-"""7D trajectory encoder for FlexTraj-style traj tokens (feeds WanControlNet.traj_in_proj).
+"""7D trajectory encoder for WanControlNet trajectory tokens.
 
-7D input layout: [x, y, z, cos(yaw), sin(yaw), fwd_delta, yaw_delta] — physical
-root yaw + frame-to-frame deltas. The 4D legacy encoder was rewritten for the
-7D fine-tune; legacy ckpts have their traj-encoder / traj_in_proj weights
-stripped in `utils.training.ckpt_compat.strip_legacy_traj_encoder_weights`.
+Input layout: [x, y, z, cos(yaw), sin(yaw), fwd_delta, yaw_delta].
 """
 
 import torch
 import torch.nn as nn
 
-# Causal-VAE frames-per-token (token k>=1 spans 4 frames; token 0 padded to 4).
 _FRAMES_PER_TOKEN = 4
-
-# Hard-coded 7D contract — the layout this encoder is built for.
 _IN_DIM = 7
 
-# Default hidden / output widths for the 7D encoder. Kept as module-level
-# constants so external code (config validation, ckpt-compat tests) can refer
-# to them without import-time gymnastics.
 LOCAL_HIDDEN_DIM = 64
 LOCAL_OUT_DIM = 128
 TRAJ_OUT_DIM = 128
@@ -26,12 +17,9 @@ TRAJ_OUT_DIM = 128
 def _masked_mean(y: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Per-token mean over the frame axis with a frame-level mask.
 
-    y:    (B*T, C, L)
-    mask: (B*T, L)  in {0, 1}
+    y: (B*T, C, L)
+    mask: (B*T, L), where 1 means valid
     returns (B*T, C)
-
-    Tokens with zero valid frames return all-zeros (caller is expected to
-    multiply by a token-level mask anyway).
     """
     m = mask.unsqueeze(1).to(y.dtype)         # (B*T, 1, L)
     num = (y * m).sum(dim=-1)                  # (B*T, C)
@@ -42,10 +30,7 @@ def _masked_mean(y: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 class LocalTrajEncoder(nn.Module):
     """Within-token Conv1d encoder over the 4 frames of a token.
 
-    Conv1d 7→64, k=3, padding=1 → GELU → Conv1d 64→128, k=3, padding=1 → GELU
-    → masked mean pool over the 4 frames.
-
-    Input:  (B, T_token, 4, 7)
+    Input: (B, T_token, 4, 7)
     Output: (B, T_token, 128)
     """
 
@@ -80,10 +65,8 @@ class LocalTrajEncoder(nn.Module):
                 f"frame_mask shape {tuple(frame_mask.shape)} != (B,T,{n_frames}) "
                 f"= ({b},{t},{n_frames})"
             )
-        # Defense-in-depth: zero invalid frames BEFORE the conv. Otherwise any
-        # caller that passes frame_mask without pre-zeroing the frames would
-        # leak invalid-frame values into neighbors via the kernel-size-3 conv,
-        # and only the masked-mean pool below would see the mask.
+        # Zero invalid frames before Conv1d so padded values cannot leak through
+        # the kernel into neighboring valid frames.
         if frame_mask is not None:
             x = x * frame_mask.to(dtype=x.dtype).unsqueeze(-1)
         # (B,T,L,C) -> (B*T,C,L)
@@ -101,8 +84,8 @@ class LocalTrajEncoder(nn.Module):
 class TrajEncoder(nn.Module):
     """Token-level encoder: LayerNorm + 2-layer MLP, all width = `out_dim`.
 
-    Input:  (B, T_token, 128)  — output of LocalTrajEncoder
-    Output: (B, T_token, 128)  — fed into WanControlNet.traj_in_proj
+    Input: (B, T_token, 128)
+    Output: (B, T_token, 128)
     """
 
     def __init__(self, in_dim: int = LOCAL_OUT_DIM, hidden_dim: int = TRAJ_OUT_DIM,
