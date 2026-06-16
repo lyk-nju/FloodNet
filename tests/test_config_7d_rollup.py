@@ -8,7 +8,7 @@ from pathlib import Path
 from omegaconf import OmegaConf
 from utils.training.ldf.config_validate import (
     validate_7d_requires_self_forcing,
-    validate_stream_training_config,
+    validate_ldf_training_config,
     validate_traj_dim_consistency,
 )
 
@@ -30,10 +30,14 @@ def test_all_new_sections_present_and_readable():
     # T_B_03
     assert cfg.history_corruption.enabled is True
     assert "curriculum" in cfg.history_corruption
-    # Stream-training v2: horizon sampling lives under stream_training.window_sampling.
-    assert cfg.stream_training.window_sampling.enabled is True
-    assert cfg.stream_training.window_sampling.horizon_tokens_min == 5
-    assert cfg.stream_training.window_sampling.horizon_tokens_max == 25
+    # LDF training is always windowed. Rolling/prefix sampling lives under
+    # ldf_training, not a separate stream-training task config.
+    assert cfg.ldf_training.formulation == "windowed"
+    assert cfg.ldf_training.window_policy == "rolling"
+    assert cfg.ldf_training.window_sampling.enabled is True
+    assert cfg.ldf_training.window_sampling.horizon_tokens_min == 5
+    assert cfg.ldf_training.window_sampling.horizon_tokens_max == 25
+    assert "stream_training" not in cfg
     assert "horizon_sim" not in cfg
     assert "scheduled_sampling_prob" not in cfg.model.params
     assert "self_forcing_enabled" not in cfg.model.params
@@ -44,9 +48,9 @@ def test_all_new_sections_present_and_readable():
     assert cfg.self_forcing.stride_tokens == 1
     assert cfg.self_forcing.detach_between_steps is True
     assert cfg.self_forcing.k_schedule[0] == [0.0, 5]
-    assert "anchor_move_in_rollout" not in cfg.stream_training
-    assert "latent_source" not in cfg.stream_training
-    assert "motion_aux_loss" not in cfg.stream_training
+    assert "anchor_move_in_rollout" not in cfg.ldf_training
+    assert "latent_source" not in cfg.ldf_training
+    assert "motion_aux_loss" not in cfg.ldf_training
     assert "t2m_metric" not in cfg
     assert cfg.validation.t2m_metric is True
     assert "val_repeat" not in cfg
@@ -161,9 +165,9 @@ def test_shipped_ldf_passes_sf_guard():
     validate_7d_requires_self_forcing(cfg)   # no raise
 
 
-def test_shipped_stream_training_config_valid():
+def test_shipped_ldf_training_config_valid():
     cfg = OmegaConf.load(_LDF)
-    validate_stream_training_config(cfg)
+    validate_ldf_training_config(cfg)
 
 
 def test_shipped_ldf_does_not_expose_async_eval_gate():
@@ -180,15 +184,16 @@ def test_shipped_history_corruption_only_exposes_main_knobs():
     assert set(hc.curriculum.keys()) == {"early_prob", "mid_prob", "late_prob"}
 
 
-def test_stream_training_accepts_window_sampling_auto_history():
+def test_ldf_training_accepts_window_sampling_auto_history():
     cfg = OmegaConf.create({
         "model": {"params": {"chunk_size": 5}},
         "self_forcing": {
             "k_schedule": [[0.0, 5]],
             "stride_tokens": 1,
         },
-        "stream_training": {
-            "enabled": True,
+        "ldf_training": {
+            "formulation": "windowed",
+            "window_policy": "rolling",
             "context_tokens": 30,
             "window_sampling": {
                 "enabled": True,
@@ -201,14 +206,15 @@ def test_stream_training_accepts_window_sampling_auto_history():
         },
     })
 
-    validate_stream_training_config(cfg)
+    validate_ldf_training_config(cfg)
 
 
-def test_stream_training_window_sampling_rejects_invalid_horizon_range():
+def test_ldf_training_window_sampling_rejects_invalid_horizon_range():
     cfg = OmegaConf.create({
         "model": {"params": {"chunk_size": 5}},
-        "stream_training": {
-            "enabled": True,
+        "ldf_training": {
+            "formulation": "windowed",
+            "window_policy": "rolling",
             "context_tokens": 30,
             "window_sampling": {
                 "enabled": True,
@@ -221,99 +227,122 @@ def test_stream_training_window_sampling_rejects_invalid_horizon_range():
     })
 
     with pytest.raises(ValueError, match="horizon_tokens"):
-        validate_stream_training_config(cfg)
+        validate_ldf_training_config(cfg)
 
 
-def test_stream_training_rejects_min_history_below_chunk_size():
+def test_ldf_training_rejects_min_history_below_chunk_size():
     cfg = OmegaConf.create({
         "model": {"params": {"chunk_size": 5}},
-        "stream_training": {
-            "enabled": True,
+        "ldf_training": {
+            "formulation": "windowed",
+            "window_policy": "rolling",
             "context_tokens": 30,
             "min_history_tokens": 4,
         },
     })
     with pytest.raises(ValueError, match="min_history_tokens"):
-        validate_stream_training_config(cfg)
+        validate_ldf_training_config(cfg)
 
 
-def test_stream_training_rejects_context_below_min_history():
+def test_ldf_training_rejects_context_below_min_history():
     cfg = OmegaConf.create({
         "model": {"params": {"chunk_size": 5}},
-        "stream_training": {
-            "enabled": True,
+        "ldf_training": {
+            "formulation": "windowed",
+            "window_policy": "rolling",
             "context_tokens": 6,
             "min_history_tokens": 8,
         },
     })
     with pytest.raises(ValueError, match="context_tokens"):
-        validate_stream_training_config(cfg)
+        validate_ldf_training_config(cfg)
 
 
-def test_stream_training_accepts_fixed_window_sample_policy():
+def test_ldf_training_accepts_fixed_window_sample_policy():
     cfg = OmegaConf.create({
         "model": {"params": {"chunk_size": 5}},
-        "stream_training": {
-            "enabled": True,
+        "ldf_training": {
+            "formulation": "windowed",
+            "window_policy": "rolling",
             "context_tokens": 30,
             "min_history_tokens": 8,
             "sample_policy": "fixed_window",
         },
     })
-    validate_stream_training_config(cfg)
+    validate_ldf_training_config(cfg)
 
 
-def test_stream_training_rejects_unknown_sample_policy():
+def test_ldf_training_rejects_unknown_sample_policy():
     cfg = OmegaConf.create({
         "model": {"params": {"chunk_size": 5}},
-        "stream_training": {
-            "enabled": True,
+        "ldf_training": {
+            "formulation": "windowed",
+            "window_policy": "rolling",
             "context_tokens": 30,
             "min_history_tokens": 8,
             "sample_policy": "middle_window",
         },
     })
     with pytest.raises(ValueError, match="sample_policy"):
-        validate_stream_training_config(cfg)
+        validate_ldf_training_config(cfg)
 
 
-def test_stream_training_rejects_exposed_motion_aux_loss():
+def test_ldf_training_rejects_exposed_motion_aux_loss():
     cfg = OmegaConf.create({
         "model": {"params": {"chunk_size": 5}},
-        "stream_training": {
-            "enabled": True,
+        "ldf_training": {
+            "formulation": "windowed",
+            "window_policy": "rolling",
             "context_tokens": 30,
             "min_history_tokens": 8,
             "motion_aux_loss": "full_prefix",
         },
     })
     with pytest.raises(ValueError, match="motion_aux_loss"):
-        validate_stream_training_config(cfg)
+        validate_ldf_training_config(cfg)
 
 
-def test_stream_training_rejects_removed_latent_source():
+def test_ldf_training_rejects_removed_latent_source():
     cfg = OmegaConf.create({
         "model": {"params": {"chunk_size": 5}},
-        "stream_training": {
-            "enabled": True,
+        "ldf_training": {
+            "formulation": "windowed",
+            "window_policy": "rolling",
             "context_tokens": 30,
             "min_history_tokens": 8,
             "latent_source": "online_encode",
         },
     })
     with pytest.raises(ValueError, match="latent_source"):
-        validate_stream_training_config(cfg)
+        validate_ldf_training_config(cfg)
 
 
-def test_stream_training_rejects_anchor_move_in_rollout_until_supported():
+def test_ldf_training_rejects_anchor_move_in_rollout_until_supported():
     cfg = OmegaConf.create({
         "model": {"params": {"chunk_size": 5}},
-        "stream_training": {
-            "enabled": True,
+        "ldf_training": {
+            "formulation": "windowed",
+            "window_policy": "rolling",
             "context_tokens": 30,
             "min_history_tokens": 8,
             "anchor_move_in_rollout": True,
         },
     })
     with pytest.raises(ValueError, match="anchor_move_in_rollout"):
-        validate_stream_training_config(cfg)
+        validate_ldf_training_config(cfg)
+
+
+def test_stream_training_block_is_rejected_by_ldf_validator():
+    cfg = OmegaConf.create({
+        "ldf_training": {
+            "formulation": "windowed",
+            "window_policy": "rolling",
+            "context_tokens": 30,
+        },
+        "stream_training": {
+            "enabled": True,
+            "context_tokens": 30,
+        },
+    })
+    with pytest.raises(ValueError, match="stream_training"):
+        validate_ldf_training_config(cfg)

@@ -40,9 +40,9 @@ def test_all_on_keeps_every_subitem_enabled():
     c = _applied("all_on")
     assert c.history_corruption.enabled is True
     assert "horizon_sim" not in c
-    assert c.stream_training.window_sampling.enabled is True
-    assert c.stream_training.window_sampling.horizon_tokens_min == 5
-    assert c.stream_training.window_sampling.horizon_tokens_max == 25
+    assert c.ldf_training.window_sampling.enabled is True
+    assert c.ldf_training.window_sampling.horizon_tokens_min == 5
+    assert c.ldf_training.window_sampling.horizon_tokens_max == 25
     assert "anchor_canonicalize" not in c
     assert c.body_aux_loss.enabled is True
     assert c.body_aux_loss.weights.heading > 0
@@ -51,14 +51,14 @@ def test_all_on_keeps_every_subitem_enabled():
 def test_each_no_x_disables_exactly_its_subitem():
     c = _applied("no_corruption")
     assert c.history_corruption.enabled is False
-    assert c.stream_training.window_sampling.horizon_tokens_min == 5
-    assert c.stream_training.window_sampling.horizon_tokens_max == 25
+    assert c.ldf_training.window_sampling.horizon_tokens_min == 5
+    assert c.ldf_training.window_sampling.horizon_tokens_max == 25
     assert "anchor_canonicalize" not in c
 
     c = _applied("no_horizon_sim")
     assert "horizon_sim" not in c
-    assert c.stream_training.window_sampling.horizon_tokens_min == 20
-    assert c.stream_training.window_sampling.horizon_tokens_max == 20
+    assert c.ldf_training.window_sampling.horizon_tokens_min == 20
+    assert c.ldf_training.window_sampling.horizon_tokens_max == 20
     assert c.history_corruption.enabled is True
 
     c = _applied("no_anchor_canonical")

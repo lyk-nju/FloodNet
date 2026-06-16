@@ -22,30 +22,31 @@ def prepare_generate_condition(
     batch_size = len(feature_length)
     if seq_len is None:
         seq_len = _max_length(feature_length, device)
-    attn_len = int(seq_len) + int(model.chunk_size)
+    latent_len = int(seq_len) + int(model.chunk_size)
+    traj_len = _resolve_generate_traj_len(batch, latent_len, device)
 
-    text_context = prepare_generate_text_context(model, batch, attn_len, device)
+    text_context = prepare_generate_text_context(model, batch, latent_len, device)
     text_null_context = [
         item.to(model.param_dtype)
         for item in model.encode_text_with_cache([""] * batch_size, device)
     ]
     traj_emb, traj_token_mask = encode_traj_batch(
         batch,
-        attn_len,
+        traj_len,
         device,
         model.local_traj_encoder,
         model.traj_encoder,
         return_token_mask=True,
     )
-    traj_seq_lens = get_traj_seq_lens(batch, attn_len, device)
+    traj_seq_lens = get_traj_seq_lens(batch, traj_len, device)
     return LDFCondition(
         text_context=text_context,
         text_null_context=text_null_context,
         traj_emb=traj_emb,
         traj_seq_lens=traj_seq_lens,
         traj_token_mask=traj_token_mask,
-        seq_len=attn_len,
-        attn_len=attn_len,
+        seq_len=latent_len,
+        attn_len=traj_len,
     )
 
 
@@ -179,7 +180,7 @@ def build_stream_step_condition_provider(
             text_context,
             batch_size,
             model_sl,
-            attn_len,
+            model_sl,
         )
         return LDFCondition(
             text_context=text_context,
@@ -200,6 +201,22 @@ def _max_length(value, device) -> int:
     else:
         tensor = torch.as_tensor(value, device=device, dtype=torch.long)
     return int(tensor.reshape(-1).max().item())
+
+
+def _resolve_generate_traj_len(batch: dict, latent_len: int, device) -> int:
+    traj_len = int(latent_len)
+    for key in ("traj_num_tokens", "traj_features_length"):
+        value = batch.get(key)
+        if value is None:
+            continue
+        if torch.is_tensor(value):
+            tensor = value.to(device=device, dtype=torch.long)
+        else:
+            tensor = torch.as_tensor(value, device=device, dtype=torch.long)
+        if tensor.numel() > 0:
+            traj_len = max(traj_len, int(tensor.reshape(-1).max().item()))
+            break
+    return traj_len
 
 
 def _has_direct_traj_payload(step_input: dict) -> bool:

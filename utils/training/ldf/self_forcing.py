@@ -112,17 +112,17 @@ class SelfForcingTrainer:
         """Self-forcing K-step rollout training step."""
         self._check_preconditions()
 
-        stream_cfg = self._module.cfg.get("stream_training", {}) or {}
-        if bool(stream_cfg.get("enabled", False)):
+        ldf_cfg = self._module.cfg.get("ldf_training", {}) or {}
+        if str(ldf_cfg.get("window_policy", "prefix")) == "rolling":
             model = getattr(self._module, "model", None)
             default_context = getattr(model, "seq_len", batch["token"].shape[1])
             context_tokens = int(
-                stream_cfg.get(
+                ldf_cfg.get(
                     "context_tokens",
                     default_context,
                 )
             )
-            window_sampling_cfg = stream_cfg.get("window_sampling", {}) or {}
+            window_sampling_cfg = ldf_cfg.get("window_sampling", {}) or {}
             window_sampling_enabled = bool(window_sampling_cfg.get("enabled", False))
             stride_tokens = self_forcing_stride_tokens(self._module.cfg)
             if window_sampling_enabled:
@@ -131,20 +131,20 @@ class SelfForcingTrainer:
                 rollout_span = max(0, (target_k - 1) * stride_tokens)
             else:
                 rollout_span = 0
-            horizon_tokens = int(stream_cfg.get("horizon_tokens", 0))
+            horizon_tokens = int(ldf_cfg.get("horizon_tokens", 0))
             min_history_tokens = int(
-                stream_cfg.get("min_history_tokens", getattr(model, "chunk_size", 1))
+                ldf_cfg.get("min_history_tokens", getattr(model, "chunk_size", 1))
             )
             model_batch = SampleCreator(
                 stream_enabled=True,
                 context_tokens=context_tokens,
                 horizon_tokens=horizon_tokens,
-                sample_policy=stream_cfg.get("sample_policy", "variable_history"),
+                sample_policy=ldf_cfg.get("sample_policy", "variable_history"),
                 min_history_tokens=min_history_tokens,
                 window_sampling=window_sampling_cfg if window_sampling_enabled else None,
                 chunk_size=getattr(model, "chunk_size", None),
                 rollout_span=rollout_span,
-                force_start_token_zero=bool(stream_cfg.get("force_start_token_zero", False)),
+                force_start_token_zero=bool(ldf_cfg.get("force_start_token_zero", False)),
             ).create(batch, vae=getattr(self._module, "vae", None))
             loss_batch = batch.copy()
             for key in (
@@ -164,8 +164,29 @@ class SelfForcingTrainer:
                 loss_batch["traj_length"] = model_batch["traj_length"]
             return self._self_forcing_step(loss_batch, model_batch)
 
-        model_batch = SampleCreator().create(batch)
-        return self._self_forcing_step(batch, model_batch)
+        prefix_creator = getattr(self._module, "build_prefix_sample_creator", None)
+        if prefix_creator is not None:
+            model_batch = prefix_creator().create(batch)
+        else:
+            model_batch = SampleCreator().create(batch)
+        loss_batch = batch.copy()
+        for key in (
+            "_window_global_start_token",
+            "_window_local_latent_start_token",
+            "_window_local_latent_valid_len",
+            "_window_local_traj",
+            "traj_cond_7d",
+            "traj",
+            "traj_mask",
+            "traj_cond_mask",
+            "traj_loss_mask",
+            "traj_length",
+            "traj_num_tokens",
+            "traj_features_length",
+        ):
+            if key in model_batch:
+                loss_batch[key] = model_batch[key]
+        return self._self_forcing_step(loss_batch, model_batch)
 
     # ------------------------------------------------------------------
     # Self-forcing K-step rollout
@@ -197,21 +218,22 @@ class SelfForcingTrainer:
             self, "_last_corruption_applied", 0.0
         )
         last_horizon_tokens = getattr(self, "_last_horizon_tokens", -1.0)
-        stream_cfg = module.cfg.get("stream_training", {}) or {}
+        ldf_cfg = module.cfg.get("ldf_training", {}) or {}
+        rolling_enabled = str(ldf_cfg.get("window_policy", "prefix")) == "rolling"
         window_sampling_enabled = bool(
-            (stream_cfg.get("window_sampling", {}) or {}).get("enabled", False)
+            (ldf_cfg.get("window_sampling", {}) or {}).get("enabled", False)
         )
         horizon_sim_enabled = bool(
             (module.cfg.get("horizon_sim", {}) or {}).get("enabled", False)
         )
-        if bool(stream_cfg.get("enabled", False)) and window_sampling_enabled:
-            runtime_metrics["stream_training/runtime_horizon_tokens"] = (
+        if rolling_enabled and window_sampling_enabled:
+            runtime_metrics["ldf_training/runtime_horizon_tokens"] = (
                 last_horizon_tokens
             )
         elif horizon_sim_enabled:
             runtime_metrics["horizon_sim/horizon_tokens"] = last_horizon_tokens
-        elif bool(stream_cfg.get("enabled", False)):
-            runtime_metrics["stream_training/runtime_horizon_tokens"] = (
+        elif rolling_enabled:
+            runtime_metrics["ldf_training/runtime_horizon_tokens"] = (
                 last_horizon_tokens
             )
         sample_loss_mask = getattr(self, "_last_sample_loss_mask", None)
@@ -323,13 +345,13 @@ class SelfForcingTrainer:
         """
         model = self._module.model
         target_k = self.resolve_k(progress)
-        stream_cfg = self._module.cfg.get("stream_training", {}) or {}
-        stream_training_enabled = bool(stream_cfg.get("enabled", False))
+        ldf_cfg = self._module.cfg.get("ldf_training", {}) or {}
+        rolling_enabled = str(ldf_cfg.get("window_policy", "prefix")) == "rolling"
         window_sampling_enabled = bool(
-            (stream_cfg.get("window_sampling", {}) or {}).get("enabled", False)
+            (ldf_cfg.get("window_sampling", {}) or {}).get("enabled", False)
         )
         if (
-            stream_training_enabled
+            rolling_enabled
             and window_sampling_enabled
             and model_batch is not None
             and "_window_sampling_history_tokens" in model_batch
@@ -371,13 +393,14 @@ class SelfForcingTrainer:
                 phase_offset=phase_offset,
             )
         min_history_tokens = 1
-        if stream_training_enabled:
+        if rolling_enabled:
             min_history_tokens = int(
-                stream_cfg.get("min_history_tokens", getattr(model, "chunk_size", 1))
+                ldf_cfg.get("min_history_tokens", getattr(model, "chunk_size", 1))
             )
             if min_history_tokens < int(model.chunk_size):
                 raise ValueError(
-                    "stream_training.min_history_tokens must be >= chunk_size; "
+                    "ldf_training.min_history_tokens must be >= chunk_size "
+                    "for rolling training; "
                     f"got min_history_tokens={min_history_tokens}, "
                     f"chunk_size={int(model.chunk_size)}"
                 )
@@ -401,7 +424,7 @@ class SelfForcingTrainer:
             feature_length.to(device=device, dtype=torch.long) - effective_k + 1
         )
         start_end_indices = []
-        sample_policy = str(stream_cfg.get("sample_policy", "variable_history"))
+        sample_policy = str(ldf_cfg.get("sample_policy", "variable_history"))
         for b in range(feature_length.shape[0]):
             low = min_history_tokens
             high = int(max_start[b].item())
@@ -492,12 +515,12 @@ class SelfForcingTrainer:
             model_batch = {**model_batch, "traj_features": canonical_traj_features}
             self._last_sample_loss_mask = sample_loss_mask
 
-        stream_cfg = self._module.cfg.get("stream_training", {}) or {}
-        stream_training_enabled = bool(stream_cfg.get("enabled", False))
-        window_sampling_cfg = stream_cfg.get("window_sampling", {}) or {}
+        ldf_cfg = self._module.cfg.get("ldf_training", {}) or {}
+        rolling_enabled = str(ldf_cfg.get("window_policy", "prefix")) == "rolling"
+        window_sampling_cfg = ldf_cfg.get("window_sampling", {}) or {}
         window_sampling_enabled = bool(window_sampling_cfg.get("enabled", False))
         use_window_sampling_horizon = (
-            stream_training_enabled
+            rolling_enabled
             and window_sampling_enabled
             and "_window_sampling_horizon_tokens" in model_batch
         )
@@ -521,8 +544,8 @@ class SelfForcingTrainer:
         else:
             # Prefix training reuses one horizon mask across the rollout.
             st_visible_horizon = None
-            if stream_training_enabled and not window_sampling_enabled:
-                st_visible_horizon = int(stream_cfg.get("horizon_tokens", 0))
+            if rolling_enabled and not window_sampling_enabled:
+                st_visible_horizon = int(ldf_cfg.get("horizon_tokens", 0))
                 horizon_tokens = st_visible_horizon
             horizon_cfg = self._module.cfg.get("horizon_sim", {}) or {}
             if (not window_sampling_enabled) and horizon_cfg.get("enabled", False):
@@ -819,32 +842,32 @@ def _collect_window_local_metrics(model_batch: dict) -> dict[str, float]:
     if not bool(model_batch.get("_window_local_traj", False)):
         return {}
 
-    metrics: dict[str, float] = {"stream_training/enabled": 1.0}
+    metrics: dict[str, float] = {"ldf_training/enabled": 1.0}
     sample_policy = str(model_batch.get("_window_local_sample_policy", "variable_history"))
-    metrics["stream_training/sample_policy_fixed_window"] = (
+    metrics["ldf_training/sample_policy_fixed_window"] = (
         1.0 if sample_policy == "fixed_window" else 0.0
     )
 
     starts = model_batch.get("_window_local_latent_start_token")
     if starts is not None:
         starts_t = torch.as_tensor(starts, dtype=torch.float32)
-        metrics["stream_training/window_start_mean"] = float(starts_t.mean().item())
+        metrics["ldf_training/window_start_mean"] = float(starts_t.mean().item())
     global_starts = model_batch.get("_window_global_start_token")
     if global_starts is not None:
         global_starts_t = torch.as_tensor(global_starts, dtype=torch.float32)
-        metrics["stream_training/global_window_start_mean"] = float(
+        metrics["ldf_training/global_window_start_mean"] = float(
             global_starts_t.mean().item()
         )
     lengths = model_batch.get("_window_local_latent_valid_len")
     if lengths is not None:
         lengths_t = torch.as_tensor(lengths, dtype=torch.float32)
-        metrics["stream_training/window_len_mean"] = float(lengths_t.mean().item())
-        metrics["stream_training/window_len_min"] = float(lengths_t.min().item())
-        metrics["stream_training/window_len_max"] = float(lengths_t.max().item())
+        metrics["ldf_training/window_len_mean"] = float(lengths_t.mean().item())
+        metrics["ldf_training/window_len_min"] = float(lengths_t.min().item())
+        metrics["ldf_training/window_len_max"] = float(lengths_t.max().item())
     traj_tokens = model_batch.get("traj_num_tokens")
     if traj_tokens is not None:
         traj_tokens_t = torch.as_tensor(traj_tokens, dtype=torch.float32)
-        metrics["stream_training/traj_tokens_mean"] = float(traj_tokens_t.mean().item())
+        metrics["ldf_training/traj_tokens_mean"] = float(traj_tokens_t.mean().item())
     return metrics
 
 
@@ -892,50 +915,50 @@ def _collect_window_local_rollout_metrics(
     final_active_end = plan.start_end_indices.to(dtype=torch.long) + rollout_span
     active_len = final_active_end.to(dtype=torch.float32)
     metrics = {
-        "stream_training/active_history_len_mean": float(active_len.mean().item()),
-        "stream_training/active_history_len_min": float(active_len.min().item()),
-        "stream_training/active_history_len_max": float(active_len.max().item()),
+        "ldf_training/active_history_len_mean": float(active_len.mean().item()),
+        "ldf_training/active_history_len_min": float(active_len.min().item()),
+        "ldf_training/active_history_len_max": float(active_len.max().item()),
     }
     history_tokens = model_batch.get("_window_sampling_history_tokens")
     if history_tokens is not None:
         hist_t = torch.as_tensor(history_tokens, dtype=torch.float32).view(-1)
-        metrics["stream_training/history_tokens_mean"] = float(hist_t.mean().item())
-        metrics["stream_training/history_tokens_min"] = float(hist_t.min().item())
-        metrics["stream_training/history_tokens_max"] = float(hist_t.max().item())
+        metrics["ldf_training/history_tokens_mean"] = float(hist_t.mean().item())
+        metrics["ldf_training/history_tokens_min"] = float(hist_t.min().item())
+        metrics["ldf_training/history_tokens_max"] = float(hist_t.max().item())
     horizon_tokens = model_batch.get("_window_sampling_horizon_tokens")
     if horizon_tokens is not None:
         hor_t = torch.as_tensor(horizon_tokens, dtype=torch.float32).view(-1)
-        metrics["stream_training/horizon_tokens_mean"] = float(hor_t.mean().item())
-        metrics["stream_training/horizon_tokens_min"] = float(hor_t.min().item())
-        metrics["stream_training/horizon_tokens_max"] = float(hor_t.max().item())
+        metrics["ldf_training/horizon_tokens_mean"] = float(hor_t.mean().item())
+        metrics["ldf_training/horizon_tokens_min"] = float(hor_t.min().item())
+        metrics["ldf_training/horizon_tokens_max"] = float(hor_t.max().item())
     horizon_cap_clip = model_batch.get("_window_sampling_horizon_cap_clip")
     if horizon_cap_clip is not None:
         cap_t = torch.as_tensor(horizon_cap_clip, dtype=torch.float32).view(-1)
-        metrics["stream_training/horizon_cap_clip_mean"] = float(cap_t.mean().item())
+        metrics["ldf_training/horizon_cap_clip_mean"] = float(cap_t.mean().item())
     horizon_short_fallback = model_batch.get("_window_sampling_horizon_short_fallback")
     if horizon_short_fallback is not None:
         fallback_t = torch.as_tensor(
             horizon_short_fallback, dtype=torch.float32
         ).view(-1)
-        metrics["stream_training/horizon_short_fallback_rate"] = float(
+        metrics["ldf_training/horizon_short_fallback_rate"] = float(
             fallback_t.mean().item()
         )
     if "_window_sampling_rollout_span" in model_batch:
-        metrics["stream_training/rollout_span"] = float(rollout_span)
+        metrics["ldf_training/rollout_span"] = float(rollout_span)
     if "_window_sampling_history_tokens_max_effective" in model_batch:
-        metrics["stream_training/history_tokens_max_effective"] = float(
+        metrics["ldf_training/history_tokens_max_effective"] = float(
             model_batch["_window_sampling_history_tokens_max_effective"]
         )
     lengths = model_batch.get("_window_local_latent_valid_len")
     if lengths is not None:
         final_len = torch.as_tensor(lengths, dtype=torch.float32).view(-1)
-        metrics["stream_training/final_visible_latent_len_mean"] = float(
+        metrics["ldf_training/final_visible_latent_len_mean"] = float(
             final_len.mean().item()
         )
     active_left = model_batch.get("_window_sampling_active_left_token")
     if active_left is not None:
         active_left_t = torch.as_tensor(active_left, dtype=torch.float32).view(-1)
-        metrics["stream_training/active_left_mean"] = float(active_left_t.mean().item())
+        metrics["ldf_training/active_left_mean"] = float(active_left_t.mean().item())
     starts = model_batch.get("_window_local_latent_start_token")
     if starts is not None:
         starts_t = torch.as_tensor(
@@ -945,7 +968,7 @@ def _collect_window_local_rollout_metrics(
             starts_t = starts_t.expand_as(final_active_end)
         if starts_t.numel() == final_active_end.numel():
             abs_end = starts_t + final_active_end
-            metrics["stream_training/active_abs_end_mean"] = float(
+            metrics["ldf_training/active_abs_end_mean"] = float(
                 abs_end.to(dtype=torch.float32).mean().item()
             )
     return metrics

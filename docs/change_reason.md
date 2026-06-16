@@ -4,6 +4,9 @@
 
 - 删除旧 `mask_ratio` 机制。
 - LDF stream train 引入 `SampleCreator + online_encode` 的局部窗口链路。
+- LDF `SampleCreator` 收敛为从 dataset batch 到 model forward batch 的统一入口。
+- LDF training step / self-forcing / conditioning 从 `DiffForcingWanModel` 迁到
+  `utils/training/ldf`，模型层只消费 prepared condition。
 - LDF resume ckpt 时明确 `resume_reset_optimizer` 对 optimizer / scheduler / LR
   的恢复语义。
 - RootRefiner 不再使用独立的 `datasets.humanml3d_refiner`，统一消费
@@ -87,24 +90,14 @@ RootRefiner 引入后，LDF 的职责发生了变化：
 - 再由统一的 token/frame 规则推出 motion-space clip。
 - 不在 dataset 内部做另一个独立的随机 mask 或隐式裁剪规则。
 
-### 2. latent_source 决定 latent 构造方式
+### 2. Stream train 固定使用 online encode
 
-`utils/training/ldf/window_local.py` 目前支持两种 latent source。
+旧版 stream train 曾经支持 `precomputed_slice`：直接从离线 VAE latent 里按窗口切片。
+这条路径后来被移除，因为它会把“完整原始样本编码得到的 latent slice”和“以当前窗口为
+origin 的 local motion-space GT”混在一起，容易让 MSE/body auxiliary/control loss 出现
+非模型因素导致的异常。
 
-#### precomputed_slice
-
-`precomputed_slice` 使用离线预计算 latent：
-
-1. 从原始 batch 的 `token` 里按 `global_start_tokens` 切片。
-2. raw motion 7D GT 通过 window-local 逻辑对齐到同一个 sampled origin。
-3. body auxiliary loss 使用 `full_prefix_splice`：把预测窗口拼回 full-prefix，再按
-   原始 full motion 语义 decode/监督。
-
-这条路径保留旧训练语义，适合做 ablation 或复现旧问题。
-
-#### online_encode
-
-`online_encode` 使用 motion-space clip 在线编码：
+当前 stream train 固定使用 motion-space clip 在线编码：
 
 1. 根据 `global_start_tokens` 找到 `token_start_frame(S)`。
 2. 从 raw HumanML3D 263D motion 中截取 local clip。
@@ -154,7 +147,6 @@ local motion clip。
 3. 随机稀疏 mask 会和 horizon/window/rootplan mask 混在一起，导致训练异常难定位。
 4. val/test 本来就应该尽量反映真实条件输入，不应该被 dataset 随机遮挡。
 5. 当前 stream train 的主要变量应该是：
-   - `latent_source`
    - sampled history/horizon
    - online/local encode 对齐
    - body auxiliary loss
@@ -167,10 +159,10 @@ local motion clip。
 正常训练建议：
 
 ```yaml
-stream_training:
-  enabled: true
+ldf_training:
+  formulation: windowed
+  window_policy: rolling
   context_tokens: 30
-  latent_source: online_encode
   force_start_token_zero: false
   window_sampling:
     enabled: true
@@ -183,19 +175,13 @@ stream_training:
 对照实验可以用：
 
 ```yaml
-stream_training:
-  latent_source: precomputed_slice
-```
-
-或者：
-
-```yaml
-stream_training:
-  latent_source: online_encode
+ldf_training:
   force_start_token_zero: true
 ```
 
-但这些应被视为 debug/ablation，不是最终默认目标。
+它应被视为 debug/ablation，不是最终默认目标。旧的 `stream_training` 训练配置入口和
+`stream_training.latent_source` 已经不再是合法主路径；runtime 文件名里的 `stream_*`
+只表示 rolling runtime，不表示另一套训练任务。
 
 ## Resume Optimizer 和 LR 语义
 
@@ -263,6 +249,99 @@ self-forcing 使用 manual optimization，当前 step 的 LR 应该记录在
 这样 resume 后看日志时，可以区分“本步实际训练 LR”和“下一步将使用的 LR”，避免把
 日志时序误判成 LR 恢复错误。
 
+## LDF 训练主链路重构
+
+近期把 LDF 训练链路按职责重新分层，核心目标是让模型层不再解释 raw batch，也不再管理
+训练窗口/self-forcing 的策略细节。
+
+### SampleCreator 成为 batch creation 正门
+
+`utils/training/ldf/sample_creator.py` 现在是 LDF 从 dataset batch 到 model forward batch
+的统一入口：
+
+- prefix-window batch：从 clip 起点采样 `latent=z[0:R]`，并构造
+  `traj=tau[0:R+H]`。
+- rolling-window batch：采样 token window，裁剪 raw 263D motion，在线 VAE encode，构造
+  window-local 7D trajectory condition，裁剪 segmented text。
+- `_sample_window()` / prefix sampling 只负责 token-space 窗口采样。
+- `_create_online_batch()` 负责 stream 训练的 online encode batch 构造。
+
+因此旧的 `model_batch.py`、`window_sampling.py`、`window_local.py` 不再作为独立主路径文件
+保留。这样 batch 构造入口更接近我们的设计目标：`SampleCreator` 产出模型能直接消费的
+训练 batch，而不是只产出一个中间 sampling plan。
+
+### model_step 承接训练窗口、loss 和 x0 估计
+
+`utils/training/ldf/model_step.py` 承接原来放在 `DiffForcingWanModel.forward()` 里的训练
+step 逻辑：
+
+- `run_model_step(model, batch)`：执行一次 LDF training step。
+- `run_training_window(...)`：执行单个 diffusion training window。
+- `_prepare_training_window(...)`：构造 noisy window、reference tensor 和 end indices。
+- 两套 x0 估计公式和对应说明随训练 step 一起保留在 training 层。
+
+模型的 `forward()` 保持可用，但训练窗口构造和 self-forcing 多步 rollout 的实现不再散落在
+模型类里。这样 `DiffForcingWanModel` 更接近网络模块本身：负责 denoise、ControlNet、
+CFG、text/traj embedding 资源，而训练策略在 `utils/training/ldf` 管理。
+
+### Conditioning 显式接口化
+
+新增 `utils/ldf_condition.py`，只定义模型边界能看到的 prepared condition contract：
+
+- `LDFCondition`
+- `LDFTrainingCondition`
+
+训练侧由 `utils/training/ldf/conditioning.py` 把 raw training batch 转成
+`PreparedCondition / LDFCondition`，包含：
+
+- text dropout / text context 展开。
+- traj dropout。
+- `traj_emb / traj_seq_lens / traj_token_mask` 的组织。
+- horizon/self-forcing 下的 trajectory mask/lens 语义。
+
+推理侧由 `utils/inference/ldf_conditioning.py` 和
+`utils/inference/stream_conditioning.py` 准备 offline generation / stream step condition。
+这样模型层不再 import inference runtime，也不直接解析 stream direct 7D payload。
+
+### DiffForcingWanModel 只保留模型职责
+
+`models/diffusion_forcing_wan.py` 做了低风险瘦身：
+
+- 删除已废弃的 `scheduled_sampling_prob` 相关逻辑。
+- 删除训练专属的 self-forcing 配置字段。
+- 删除模型内部的训练窗口/loss/x0 估计实现，改由 `model_step.py` 承接。
+- 删除训练 condition 准备 helper，改由 `utils/training/ldf/conditioning.py` 承接。
+- 保留 `_denoise_with_cfg`、`_controlnet_forward`、text encode cache 和 trajectory encoder
+  模块，因为它们属于模型推理/网络调用资源。
+- 保留 `local_traj_encoder + traj_encoder` 的 checkpoint key 结构，避免影响现有
+  `step_485000` 权重加载。
+
+这次没有把 `LocalTrajEncoder` 和 `TrajEncoder` 合并成一个 wrapper。虽然从接口设计上可以
+这么做，但会改变 checkpoint key，例如 `local_traj_encoder.* / traj_encoder.*` 变成新的
+嵌套 key，恢复训练和评测风险较高，因此当前阶段保持原结构。
+
+### LDF 训练文件归属
+
+当前 LDF 训练分支主要文件：
+
+```text
+utils/training/ldf/
+  sample_creator.py          # dataset batch -> model forward batch
+  conditioning.py            # raw training batch -> LDFCondition
+  model_step.py              # training forward/loss/x0 estimate
+  self_forcing.py            # self-forcing rollout
+  self_forcing_config.py     # self-forcing 配置解析
+  losses.py                  # control/body auxiliary loss
+  model_factory.py           # model factory / precomputed text embedding helpers
+  config_validate.py         # LDF config validation
+  validation_eval_runtime.py # validation/test probe dataloader helpers
+```
+
+不属于训练主链路的工具移到 `tools/`：
+
+- `tools/ldf_ckpt_compat.py`
+- `tools/ldf_body_ablation.py`
+
 ## 测试覆盖
 
 相关测试应覆盖：
@@ -270,13 +349,14 @@ self-forcing 使用 manual optimization，当前 step 的 LR 应该记录在
 - LDF datasets 不再读取或输出 `mask_ratio` 相关随机 mask。
 - dataset 输出 dense `traj_mask / traj_cond_mask / traj_loss_mask`。
 - token-space sample 推导出的 motion-space start/length 正确。
-- `online_encode` 的 local clip encode 后 token 数必须等于采样的 token 数，否则 fail-fast。
-- `S=0` 时 online encode latent 应接近 precomputed latent，用于验证 VAE encode 语义。
+- online encode 的 local clip encode 后 token 数必须等于采样的 token 数，否则 fail-fast。
 - `online_encode` 的 body auxiliary loss 不走 full-prefix splice。
-- `precomputed_slice` 仍保留旧语义，作为对照实验。
 - `resume_reset_optimizer=false` 时不重写 scheduler horizon，保证恢复 optimizer 后
   LR 语义和 checkpoint 连续。
 - `resume_reset_optimizer=true` 时允许把 scheduler horizon 重写成当前 resume phase。
+- `DiffForcingWanModel` 不再保留训练窗口/conditioning wrapper 方法。
+- `LDFCondition` 能被 train/eval/stream 路径显式构造并透传到模型边界。
+- stream horizon 下 `traj_emb / traj_seq_lens / traj_token_mask` 的长度语义正确。
 
 本轮与 `mask_ratio` 删除直接相关的验证：
 
@@ -305,12 +385,14 @@ utils/training/
 
   ldf/
     sample_creator.py
-    window_local.py
+    conditioning.py
+    model_step.py
     self_forcing.py
-    model_batch.py
-    control_loss.py
+    self_forcing_config.py
+    losses.py
+    model_factory.py
     config_validate.py
-    ...
+    validation_eval_runtime.py
 
   root_refiner/
     dataset_builder.py
@@ -447,7 +529,7 @@ git add -A
 
 如果后续出现 stream train loss 尖峰，优先按以下顺序排查：
 
-1. `latent_source=online_encode` 是否仍异常。
+1. online encode 主路径是否仍异常。
 2. `force_start_token_zero=true` 是否显著改善。
 3. 尖峰样本的 `global_start_tokens / horizon_tokens / active_left_tokens` 是否异常。
 4. body auxiliary 的 `root_xz / heading / end_xz` 是哪一项爆掉。
@@ -455,30 +537,32 @@ git add -A
 
 不要再通过 `mask_ratio` 解释 LDF stream train 异常；该机制已经不在代码路径中。
 
-## FlexTraj/RoPE 和 Horizon 语义修复
+## Windowed Formulation 和 Horizon 语义
 
-近期把 FlexTraj 的 future horizon 语义从两个布尔开关改成由输入张量本身决定：
+新主线把 LDF training / eval / runtime 统一成 windowed formulation：
 
-- 删除 `use_future_traj_attention`。
-- 删除 `use_traj_token_mask_in_attention`。
-- `latent_pad_len` 只表示 latent segment 的 tensor padding 长度。
-- `traj_pad_len` 由 `traj_emb.shape[1]` / `traj_num_tokens` 决定，可以大于 latent 长度。
-- `traj_token_mask` 一旦存在，就同时用于 projection zeroing 和 attention hard mask。
-- RoPE position 仍由 token 的 local index 决定，mask 只表示有效性，不压缩 position。
-
-这解决了之前靠开关区分 legacy / future horizon 的问题。旧写法容易让人误以为
-`use_future_traj_attention=false` 就一定看不到 horizon。实际更本质的判断应该是：
+- latent side 只包含 history + active。
+- trajectory side 包含 history + active + future horizon。
+- 只要 `H > 0`，就允许 `traj_len > latent_len`。
+- `LDFCondition.seq_len` 永远表示 latent segment 长度。
+- `LDFCondition.attn_len` 只记录总可见条件长度，不能作为模型 latent `seq_len` 传入。
 
 ```text
-latent segment: [0, latent_pad_len)
-traj segment:   [0, traj_pad_len)
+prefix-window:
+  latent = z[0:R]
+  traj   = tau[0:R+H]
 
-如果 traj_seq_lens_i > latent_seq_lens_i，说明该样本存在真实 future horizon。
+rolling-window:
+  latent = z[B:R]
+  traj   = tau[B:R+H]
 ```
 
-### Window-local training 的长度语义
+旧 padded-horizon checkpoint 不在 `FloodNet` 新主线内兼容；需要评测旧 checkpoint 时，
+应使用 `Floodold` 或历史分支。
 
-stream window-local batch 也对应改成 latent 和 trajectory 分开 padding：
+### Training 的长度语义
+
+prefix 和 rolling batch 都对应 latent 和 trajectory 分开 padding：
 
 - `feature.shape[1] == max(latent_lengths)`
 - `feature_length == latent_lengths`
@@ -487,6 +571,20 @@ stream window-local batch 也对应改成 latent 和 trajectory 分开 padding�
 
 也就是说，feature 不再为了 horizon 把 latent tail 补到 `latent_len + horizon`。
 trajectory horizon 由单独的 `traj_emb / traj_seq_lens / traj_token_mask` 表达。
+
+### Runtime / eval 的长度语义
+
+`generate()`、`stream_generate()` 和 `stream_generate_step()` 都必须遵守同一个边界：
+
+- `_denoise_with_cfg(..., seq_len=...)` 里的 `seq_len` 是 latent window 长度
+  （offline generate 中是 generation latent buffer 长度，stream step 中是 `model_sl`）。
+- `t_scaled.shape[1] == latent_len`。
+- frame-aligned `text_context` 只展开到 `batch_size * latent_len`。
+- future trajectory horizon 只通过 `traj_emb / traj_seq_lens / traj_token_mask`
+  表达。
+
+这个约束很重要。否则 runtime 会把 `latent_len + horizon` 误当成 latent segment 长度，
+形成 train/runtime mismatch。
 
 ### Cross-attention 语义
 
@@ -500,22 +598,8 @@ x = [latent_tokens || traj_tokens]
 因此 `WanCrossAttention` 不再要求 `x` 长度只能是 `L` 或 `2L`，而是允许
 `L_lat + L_traj`，并只更新前 `L_lat` 个 latent token。
 
-### 485000 checkpoint 验证
+### 训练解读
 
-使用新版代码对 `step_485000` 跑了一次 HumanML3D stream 测评，结果正常。
-
-评测输出目录：
-
-```text
-eval/output_eval/ldf_compare_step_485000_20260616_172307/stream/HumanML3D/metrics/test/step_485000
-```
-
-这次评测覆盖了以下改动后的实际推理链路：
-
-- latent / traj pad length 分离。
-- trajectory horizon 通过 `traj_num_tokens` 和 `traj_token_mask` 保留。
-- `traj_token_mask` 默认进入 attention hard mask。
-- frame-aligned text 只更新 latent segment。
-
-因此当前判断是：上述 FlexTraj/RoPE 语义修复没有导致 `step_485000` 的 stream
-HumanML3D 评测出现异常退化。
+新版 windowed formulation 与旧 full-sequence / padded-horizon 训练任务不是完全同一
+任务。旧 checkpoint 可以作为权重初始化参考，但不能被视为语义完全兼容的 checkpoint；
+新主线指标应以 windowed formulation 下重新训练或 finetune 的 checkpoint 为准。

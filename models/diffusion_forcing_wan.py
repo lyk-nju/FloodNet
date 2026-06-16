@@ -550,13 +550,16 @@ class DiffForcingWanModel(nn.Module):
         total_steps = int(max_t / dt)
 
         gen_seq_len = seq_len + self.chunk_size
-        attn_len = condition.resolved_len()
         generated_length = feature_length
         full_text = x.get("output_text", x.get("text", [""] * batch_size))
         if isinstance(full_text, list) and full_text and isinstance(full_text[0], list):
             full_text = [" ////////// ".join(map(str, item)) for item in full_text]
 
         # Progressively advance from t=0 to t=max_t
+        latent_attn_len = condition.seq_len
+        if latent_attn_len is None:
+            latent_attn_len = gen_seq_len
+        latent_attn_len = int(latent_attn_len)
         for step in range(total_steps):
             # Current time step
             t = step * dt
@@ -574,17 +577,17 @@ class DiffForcingWanModel(nn.Module):
             for i in range(batch_size):
                 noisy_input.append(generated[i, :, :end_index, ...])
 
-            if attn_len == gen_seq_len:
+            if latent_attn_len == gen_seq_len:
                 noise_level_for_attn = noise_level
             else:
                 noise_level_for_attn = self._get_noise_levels(
-                    device, attn_len, time_steps
+                    device, latent_attn_len, time_steps
                 )
             t_scaled = noise_level_for_attn * self.time_embedding_scale
             predicted_result = self._denoise_with_cfg(
                 noisy_input, t_scaled,
                 condition.text_context, condition.text_null_context,
-                condition.traj_emb, condition.traj_seq_lens, attn_len, batch_size,
+                condition.traj_emb, condition.traj_seq_lens, latent_attn_len, batch_size,
                 traj_token_mask=condition.traj_token_mask,
             )
 
@@ -669,7 +672,6 @@ class DiffForcingWanModel(nn.Module):
         total_steps = int(max_t / dt)
 
         gen_seq_len = seq_len + self.chunk_size
-        attn_len = condition.resolved_len()
         generated_length = feature_length
         full_text = x.get("output_text", x.get("text", [""] * batch_size))
         if isinstance(full_text, list) and full_text and isinstance(full_text[0], list):
@@ -677,6 +679,10 @@ class DiffForcingWanModel(nn.Module):
 
         commit_index = 0
         # Progressively advance from t=0 to t=max_t
+        latent_attn_len = condition.seq_len
+        if latent_attn_len is None:
+            latent_attn_len = gen_seq_len
+        latent_attn_len = int(latent_attn_len)
         for step in range(total_steps):
             # Current time step
             t = step * dt
@@ -694,17 +700,17 @@ class DiffForcingWanModel(nn.Module):
             for i in range(batch_size):
                 noisy_input.append(generated[i, :, :end_index, ...])
 
-            if attn_len == gen_seq_len:
+            if latent_attn_len == gen_seq_len:
                 noise_level_for_attn = noise_level
             else:
                 noise_level_for_attn = self._get_noise_levels(
-                    device, attn_len, time_steps
+                    device, latent_attn_len, time_steps
                 )
             t_scaled = noise_level_for_attn * self.time_embedding_scale
             predicted_result = self._denoise_with_cfg(
                 noisy_input, t_scaled,
                 condition.text_context, condition.text_null_context,
-                condition.traj_emb, condition.traj_seq_lens, attn_len, batch_size,
+                condition.traj_emb, condition.traj_seq_lens, latent_attn_len, batch_size,
                 traj_token_mask=condition.traj_token_mask,
             )
 
@@ -845,21 +851,17 @@ class DiffForcingWanModel(nn.Module):
                 time_steps=time_steps,
                 device=device,
             )
-            attn_sl = step_condition.resolved_len()
-            if attn_sl == model_sl:
-                noise_level_for_attn = noise_level
-            else:
-                noise_level_attn_full = self._get_noise_levels(
-                    device,
-                    window_start_token + attn_sl,
-                    time_steps,
+            condition_seq_len = step_condition.seq_len
+            if condition_seq_len is not None and int(condition_seq_len) != int(model_sl):
+                raise ValueError(
+                    "stream condition seq_len must match the latent window length: "
+                    f"got {condition_seq_len}, expected {model_sl}"
                 )
-                noise_level_for_attn = noise_level_attn_full[:, -attn_sl:]
-            t_scaled = noise_level_for_attn * self.time_embedding_scale
+            t_scaled = noise_level * self.time_embedding_scale
             predicted_result = self._denoise_with_cfg(
                 noisy_input, t_scaled,
                 step_condition.text_context, step_condition.text_null_context,
-                step_condition.traj_emb, step_condition.traj_seq_lens, attn_sl,
+                step_condition.traj_emb, step_condition.traj_seq_lens, model_sl,
                 self.batch_size,
                 traj_token_mask=step_condition.traj_token_mask,
             )

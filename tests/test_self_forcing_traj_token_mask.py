@@ -216,14 +216,14 @@ def test_run_rollout_anchor_canonicalize_ablation_override_disables(monkeypatch)
     canonicalize.assert_not_called()
 
 
-def test_plan_rollout_respects_stream_training_min_history_tokens():
+def test_plan_rollout_respects_ldf_training_min_history_tokens():
     model = MagicMock(name="model")
     model.chunk_size = 1
     cfg = SimpleNamespace()
     cfg.self_forcing = SimpleNamespace(k_schedule=[(0.0, 1)], stride_tokens=1)
     cfg.get = lambda key, default=None: {
-        "stream_training": {
-            "enabled": True,
+        "ldf_training": {
+            "window_policy": "rolling",
             "min_history_tokens": 4,
         },
     }.get(key, default)
@@ -246,8 +246,8 @@ def test_plan_rollout_right_aligns_fixed_window_policy():
     cfg = SimpleNamespace()
     cfg.self_forcing = SimpleNamespace(k_schedule=[(0.0, 3)], stride_tokens=1)
     cfg.get = lambda key, default=None: {
-        "stream_training": {
-            "enabled": True,
+        "ldf_training": {
+            "window_policy": "rolling",
             "sample_policy": "fixed_window",
             "min_history_tokens": 4,
         },
@@ -272,8 +272,8 @@ def test_plan_rollout_uses_window_sampling_history_as_step0_active_right():
     cfg = SimpleNamespace()
     cfg.self_forcing = SimpleNamespace(k_schedule=[(0.0, 5)], stride_tokens=1)
     cfg.get = lambda key, default=None: {
-        "stream_training": {
-            "enabled": True,
+        "ldf_training": {
+            "window_policy": "rolling",
             "window_sampling": {"enabled": True},
         },
     }.get(key, default)
@@ -342,8 +342,8 @@ def test_run_rollout_window_sampling_rebuilds_traj_condition_each_step_with_fixe
 
     cfg = SimpleNamespace()
     cfg.get = lambda key, default=None: {
-        "stream_training": {
-            "enabled": True,
+        "ldf_training": {
+            "window_policy": "rolling",
             "window_sampling": {"enabled": True},
         },
         "anchor_canonicalize": {"enabled": False},
@@ -384,7 +384,7 @@ def test_run_rollout_window_sampling_rebuilds_traj_condition_each_step_with_fixe
     assert trainer._last_horizon_tokens == 4.0
 
 
-def test_run_rollout_uses_stream_training_horizon_when_horizon_sim_disabled(
+def test_run_rollout_uses_ldf_training_horizon_when_horizon_sim_disabled(
     monkeypatch,
 ):
     trainer, model, model_batch, _ = _make_trainer()
@@ -392,8 +392,8 @@ def test_run_rollout_uses_stream_training_horizon_when_horizon_sim_disabled(
 
     cfg = SimpleNamespace()
     cfg.get = lambda key, default=None: {
-        "stream_training": {
-            "enabled": True,
+        "ldf_training": {
+            "window_policy": "rolling",
             "horizon_tokens": 2,
         },
         "anchor_canonicalize": {"enabled": False},
@@ -424,14 +424,14 @@ def test_run_rollout_uses_stream_training_horizon_when_horizon_sim_disabled(
     assert trainer._last_horizon_tokens == 2.0
 
 
-def test_run_rollout_clamps_sampled_horizon_to_stream_training_horizon(monkeypatch):
+def test_run_rollout_clamps_sampled_horizon_to_ldf_training_horizon(monkeypatch):
     trainer, model, model_batch, _ = _make_trainer()
     _patch_run_training_window(monkeypatch, model)
 
     cfg = SimpleNamespace()
     cfg.get = lambda key, default=None: {
-        "stream_training": {
-            "enabled": True,
+        "ldf_training": {
+            "window_policy": "rolling",
             "horizon_tokens": 2,
         },
         "anchor_canonicalize": {"enabled": False},
@@ -482,12 +482,12 @@ def test_run_rollout_records_window_local_active_history_metrics(monkeypatch):
     trainer._run_rollout(model_batch, progress=1.0)
 
     metrics = trainer._last_window_local_rollout_metrics
-    assert metrics["stream_training/active_history_len_mean"] == 3.0
-    assert metrics["stream_training/active_history_len_min"] == 3.0
-    assert metrics["stream_training/active_history_len_max"] == 3.0
-    assert metrics["stream_training/active_abs_end_mean"] == 8.0
-    assert metrics["stream_training/horizon_cap_clip_mean"] == 2.0
-    assert metrics["stream_training/horizon_short_fallback_rate"] == 1.0
+    assert metrics["ldf_training/active_history_len_mean"] == 3.0
+    assert metrics["ldf_training/active_history_len_min"] == 3.0
+    assert metrics["ldf_training/active_history_len_max"] == 3.0
+    assert metrics["ldf_training/active_abs_end_mean"] == 8.0
+    assert metrics["ldf_training/horizon_cap_clip_mean"] == 2.0
+    assert metrics["ldf_training/horizon_short_fallback_rate"] == 1.0
 
 
 def test_run_rollout_replacement_diff_uses_clean_state_under_corruption(monkeypatch):

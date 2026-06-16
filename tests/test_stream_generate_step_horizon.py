@@ -121,7 +121,7 @@ def _condition_provider(model, step_input):
         text = model.encode_text_with_cache(["walk"], device)[0]
         text_null = model.encode_text_with_cache([""], device)
         return LDFCondition(
-            text_context=[text for _ in range(attn_sl)],
+            text_context=[text for _ in range(model_sl)],
             text_null_context=text_null,
             traj_emb=traj_emb,
             traj_seq_lens=traj_seq_lens,
@@ -133,7 +133,7 @@ def _condition_provider(model, step_input):
     return provider
 
 
-def test_stream_generate_step_uses_future_traj_length_for_denoise_attention():
+def test_stream_generate_step_keeps_latent_length_separate_from_future_traj():
     model = _make_stream_step_harness()
     step_input = {
         "text": ["walk"],
@@ -150,8 +150,11 @@ def test_stream_generate_step_uses_future_traj_length_for_denoise_attention():
         condition=_condition_provider(model, step_input),
     )
 
-    assert model.recorded.seq_lens == [3]
-    assert model.recorded.text_context_lens == [3]
+    assert model.recorded.model_sls == [1]
+    assert model.recorded.traj_lens == [3]
+    assert model.recorded.seq_lens == model.recorded.model_sls
+    assert model.recorded.t_lens == model.recorded.model_sls
+    assert model.recorded.text_context_lens == model.recorded.model_sls
 
 
 def test_stream_generate_step_reuses_direct_7d_payload_across_chunk_substeps():
@@ -182,6 +185,6 @@ def test_stream_generate_step_reuses_direct_7d_payload_across_chunk_substeps():
     assert model.recorded.model_sls == [30, 30, 30, 30, 30]
     assert model.recorded.noisy_lens == [30, 30, 30, 30, 30]
     assert model.recorded.traj_lens == [54, 53, 52, 51, 50]
-    assert model.recorded.seq_lens == model.recorded.traj_lens
-    assert model.recorded.t_lens == model.recorded.traj_lens
-    assert model.recorded.text_context_lens == model.recorded.traj_lens
+    assert model.recorded.seq_lens == model.recorded.model_sls
+    assert model.recorded.t_lens == model.recorded.model_sls
+    assert model.recorded.text_context_lens == model.recorded.model_sls

@@ -308,6 +308,7 @@ class SampleCreator:
         context_tokens: int | None = None,
         horizon_tokens: int = 0,
         sample_policy: str = "variable_history",
+        window_policy: str = "prefix",
         min_history_tokens: int = 1,
         window_sampling: dict | None = None,
         chunk_size: int | None = None,
@@ -324,6 +325,7 @@ class SampleCreator:
         self.context_tokens = None if context_tokens is None else int(context_tokens)
         self.horizon_tokens = int(horizon_tokens)
         self.sample_policy = str(sample_policy)
+        self.window_policy = str(window_policy)
         self.min_history_tokens = int(min_history_tokens)
         self.window_sampling = window_sampling or {}
         self.chunk_size = None if chunk_size is None else int(chunk_size)
@@ -342,12 +344,69 @@ class SampleCreator:
         return self._create_batch(batch)
 
     def _create_batch(self, batch: dict) -> dict:
+        token = batch["token"]
+        if token.ndim != 3:
+            raise ValueError(f"batch['token'] must be [B,T,D], got {tuple(token.shape)}")
+        batch_size = int(token.shape[0])
+        device = token.device
+        token_length = _as_long_1d(
+            batch["token_length"],
+            batch_size=batch_size,
+            device=device,
+            name="token_length",
+        )
+
+        if self.context_tokens is None or self.context_tokens <= 0:
+            starts = torch.zeros_like(token_length)
+            latent_lengths = token_length
+            traj_token_lengths = token_length + int(self.horizon_tokens)
+            sample = self._make_sample(
+                starts=starts,
+                latent_tokens=latent_lengths,
+                traj_tokens=traj_token_lengths,
+                sample_policy="prefix",
+                stream_sample=None,
+            )
+        else:
+            if self.window_policy != "prefix":
+                raise ValueError(
+                    "non-stream LDF batch creation only supports window_policy='prefix'; "
+                    f"got {self.window_policy!r}"
+                )
+            sample = self._sample_prefix_window(token_length, batch_size, device)
+            starts = sample.global_start_tokens.to(device=device)
+            latent_lengths = sample.latent_tokens.to(device=device)
+            traj_token_lengths = sample.traj_tokens.to(device=device)
+
+        max_latent_len = int(latent_lengths.max().item())
+        feature = token.new_zeros(batch_size, max_latent_len, int(token.shape[-1]))
+        for b in range(batch_size):
+            start = int(starts[b].item())
+            valid = int(latent_lengths[b].item())
+            feature[b, :valid, :] = token[b, start:start + valid, :]
+
         model_batch = batch.copy()
-        model_batch["feature"] = batch["token"]
-        model_batch["feature_length"] = batch["token_length"]
+        model_batch["feature"] = feature
+        model_batch["feature_length"] = latent_lengths
+        model_batch["token"] = feature
+        model_batch["token_length"] = latent_lengths
+        if "token_mask" in batch:
+            token_mask = batch["token_mask"].to(device=device, dtype=torch.float32)
+            token_mask_out = token_mask.new_zeros(batch_size, max_latent_len)
+            for b in range(batch_size):
+                start = int(starts[b].item())
+                valid = int(latent_lengths[b].item())
+                token_mask_out[b, :valid] = token_mask[b, start:start + valid]
+            model_batch["latent_token_mask"] = token_mask_out
+            model_batch["token_mask"] = token_mask_out
         if "token_text_end" in batch:
             model_batch["feature_text_end"] = batch["token_text_end"]
-        self._copy_trajectory_fields(batch, model_batch)
+        self._copy_prefix_trajectory_fields(batch, model_batch, traj_token_lengths)
+        self._crop_segmented_text_fields(model_batch, starts, latent_lengths)
+        model_batch["_window_global_start_token"] = starts
+        model_batch["_window_local_latent_start_token"] = torch.zeros_like(starts)
+        model_batch["_window_local_latent_valid_len"] = latent_lengths
+        model_batch["_window_local_sample_policy"] = sample.sample_policy
         return model_batch
 
     def _create_online_batch(self, batch: dict, *, vae) -> dict:
@@ -527,6 +586,61 @@ class SampleCreator:
         if bool(self.window_sampling.get("enabled", False)):
             return self._sample_active_window(lengths, batch_size, device)
         return self._sample_v1_window(lengths, batch_size, device)
+
+    def _sample_prefix_window(
+        self,
+        lengths: torch.Tensor,
+        batch_size: int,
+        device,
+    ) -> StreamSample:
+        if self.horizon_tokens < 0:
+            raise ValueError(f"horizon_tokens must be >= 0, got {self.horizon_tokens}")
+        horizon = int(self.horizon_tokens)
+        max_latent = torch.minimum(
+            torch.full_like(lengths, int(self.context_tokens)),
+            lengths - horizon,
+        )
+        if bool((max_latent <= 0).any()):
+            raise ValueError(
+                "prefix-window batch requires token_length > horizon_tokens; "
+                f"token_length={lengths.tolist()}, horizon_tokens={horizon}"
+            )
+        if self.end_tokens is not None:
+            latent_tokens = _as_long_1d(
+                self.end_tokens,
+                batch_size=batch_size,
+                device=device,
+                name="end_tokens",
+            )
+        else:
+            low = max(1, int(self.min_history_tokens))
+            if bool((max_latent < low).any()):
+                raise ValueError(
+                    "prefix-window batch found no valid latent window; "
+                    f"max_latent={max_latent.tolist()}, min_history_tokens={low}"
+                )
+            latent_tokens = torch.stack(
+                [
+                    torch.randint(low, int(max_latent[b].item()) + 1, (1,), device=device)[0]
+                    for b in range(batch_size)
+                ]
+            ).to(dtype=torch.long)
+        if bool((latent_tokens <= 0).any()):
+            raise ValueError(f"end_tokens must be > 0, got {latent_tokens.tolist()}")
+        if bool((latent_tokens > max_latent).any()):
+            raise ValueError(
+                "prefix-window latent length must fit context and future horizon; "
+                f"latent_tokens={latent_tokens.tolist()}, max_latent={max_latent.tolist()}, "
+                f"horizon_tokens={horizon}"
+            )
+        starts = torch.zeros_like(lengths)
+        return self._make_sample(
+            starts=starts,
+            latent_tokens=latent_tokens,
+            traj_tokens=latent_tokens + horizon,
+            sample_policy="prefix",
+            stream_sample=None,
+        )
 
     def _sample_active_window(
         self,
@@ -863,6 +977,91 @@ class SampleCreator:
             "traj_num_tokens": counts,
             "traj_features_length": counts,
         }
+
+    def _copy_prefix_trajectory_fields(
+        self,
+        batch: dict,
+        model_batch: dict,
+        traj_token_lengths: torch.Tensor,
+    ) -> None:
+        device = traj_token_lengths.device
+        batch_size = int(traj_token_lengths.numel())
+        max_traj_tokens = int(traj_token_lengths.max().item())
+        max_traj_frames = num_frames_for_tokens(max_traj_tokens, self.frames_per_token)
+
+        if "traj_cond_7d" in batch:
+            src7 = batch["traj_cond_7d"]
+            src_traj = batch.get("traj_cond", batch.get("traj"))
+            src_mask = batch.get(
+                "traj_cond_mask",
+                batch.get("traj_mask", batch.get("traj_loss_mask")),
+            )
+            traj_features = src7.new_zeros(batch_size, max_traj_frames, src7.shape[-1])
+            traj_mask = src7.new_zeros(batch_size, max_traj_frames)
+            for b in range(batch_size):
+                frames = num_frames_for_tokens(
+                    int(traj_token_lengths[b].item()),
+                    self.frames_per_token,
+                )
+                available = min(frames, int(src7.shape[1]))
+                traj_features[b, :available, :] = src7[b, :available, :]
+                if src_mask is not None:
+                    traj_mask[b, :available] = src_mask[b, :available].to(
+                        device=device,
+                        dtype=traj_mask.dtype,
+                    )
+                else:
+                    traj_mask[b, :available] = 1.0
+            model_batch["traj_features"] = traj_features
+            model_batch["traj_cond_7d"] = traj_features
+            if src_traj is not None:
+                traj = src_traj.new_zeros(batch_size, max_traj_frames, src_traj.shape[-1])
+                for b in range(batch_size):
+                    frames = num_frames_for_tokens(
+                        int(traj_token_lengths[b].item()),
+                        self.frames_per_token,
+                    )
+                    available = min(frames, int(src_traj.shape[1]))
+                    traj[b, :available, :] = src_traj[b, :available, :]
+                model_batch["traj"] = traj
+            model_batch["traj_mask"] = traj_mask
+            model_batch["traj_cond_mask"] = traj_mask
+            model_batch["traj_length"] = _frames_for_tokens_tensor(traj_token_lengths)
+            model_batch["traj_start_token"] = torch.zeros_like(traj_token_lengths)
+            model_batch["traj_num_tokens"] = traj_token_lengths
+            model_batch["traj_features_length"] = traj_token_lengths
+            return
+
+        if "traj_cond" in batch or "traj" in batch:
+            src_traj = batch.get("traj_cond", batch.get("traj"))
+            src_mask = batch.get(
+                "traj_cond_mask",
+                batch.get("traj_mask", batch.get("traj_loss_mask")),
+            )
+            traj = src_traj.new_zeros(batch_size, max_traj_frames, src_traj.shape[-1])
+            traj_mask = src_traj.new_zeros(batch_size, max_traj_frames)
+            for b in range(batch_size):
+                frames = num_frames_for_tokens(
+                    int(traj_token_lengths[b].item()),
+                    self.frames_per_token,
+                )
+                available = min(frames, int(src_traj.shape[1]))
+                traj[b, :available, :] = src_traj[b, :available, :]
+                if src_mask is not None:
+                    traj_mask[b, :available] = src_mask[b, :available].to(
+                        device=device,
+                        dtype=traj_mask.dtype,
+                    )
+                else:
+                    traj_mask[b, :available] = 1.0
+            model_batch["traj"] = traj
+            model_batch["traj_mask"] = traj_mask
+            model_batch["traj_length"] = _frames_for_tokens_tensor(traj_token_lengths)
+            model_batch["traj_start_token"] = torch.zeros_like(traj_token_lengths)
+            model_batch["traj_num_tokens"] = traj_token_lengths
+            return
+
+        self._copy_trajectory_fields(batch, model_batch)
 
     @staticmethod
     def _copy_trajectory_fields(batch, model_batch) -> None:

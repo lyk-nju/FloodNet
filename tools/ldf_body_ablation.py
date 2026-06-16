@@ -35,8 +35,8 @@ def body_ablation_overrides() -> dict[str, dict]:
         "no_corruption": {**base, "history_corruption.enabled": False},
         "no_horizon_sim": {
             **base,
-            "stream_training.window_sampling.horizon_tokens_min": 20,
-            "stream_training.window_sampling.horizon_tokens_max": 20,
+            "ldf_training.window_sampling.horizon_tokens_min": 20,
+            "ldf_training.window_sampling.horizon_tokens_max": 20,
         },
         "no_anchor_canonical": {**base, "anchor_canonicalize.enabled": False},
         # body_aux_loss can't be disabled in 7D (the heading channels need

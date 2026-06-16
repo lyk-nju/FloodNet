@@ -758,8 +758,8 @@ def test_training_step_uses_window_local_model_batch_when_enabled():
 
     cfg = SimpleNamespace()
     cfg.get = lambda key, default=None: {
-        "stream_training": {
-            "enabled": True,
+        "ldf_training": {
+            "window_policy": "rolling",
             "context_tokens": 4,
             "horizon_tokens": 2,
         },
@@ -796,8 +796,8 @@ def test_training_step_passes_force_start_zero_to_window_local_builder(monkeypat
     }
     cfg = SimpleNamespace()
     cfg.get = lambda key, default=None: {
-        "stream_training": {
-            "enabled": True,
+        "ldf_training": {
+            "window_policy": "rolling",
             "context_tokens": 4,
             "horizon_tokens": 2,
             "force_start_token_zero": True,
@@ -858,8 +858,8 @@ def test_training_step_online_encode_passes_vae_and_uses_local_body_aux_gt(monke
     monkeypatch.setattr(sf_mod.SampleCreator, "create", fake_create)
     cfg = SimpleNamespace()
     cfg.get = lambda key, default=None: {
-        "stream_training": {
-            "enabled": True,
+        "ldf_training": {
+            "window_policy": "rolling",
             "context_tokens": 4,
             "horizon_tokens": 2,
         },
@@ -927,11 +927,11 @@ def test_collect_window_local_metrics_summarizes_sampling_contract():
 
     metrics = _collect_window_local_metrics(batch)
 
-    assert metrics["stream_training/enabled"] == 1.0
-    assert metrics["stream_training/sample_policy_fixed_window"] == 1.0
-    assert metrics["stream_training/window_start_mean"] == 1.5
-    assert metrics["stream_training/window_len_mean"] == 3.5
-    assert metrics["stream_training/traj_tokens_mean"] == 5.5
+    assert metrics["ldf_training/enabled"] == 1.0
+    assert metrics["ldf_training/sample_policy_fixed_window"] == 1.0
+    assert metrics["ldf_training/window_start_mean"] == 1.5
+    assert metrics["ldf_training/window_len_mean"] == 3.5
+    assert metrics["ldf_training/traj_tokens_mean"] == 5.5
 
 
 def test_self_forcing_step_logs_window_local_metrics(monkeypatch):
@@ -960,10 +960,10 @@ def test_self_forcing_step_logs_window_local_metrics(monkeypatch):
     trainer._last_sample_loss_mask = None
     trainer._last_body_aux_terms = None
     trainer._last_window_local_rollout_metrics = {
-        "stream_training/active_history_len_mean": 4.0,
-        "stream_training/active_history_len_min": 4.0,
-        "stream_training/active_history_len_max": 4.0,
-        "stream_training/active_abs_end_mean": 7.0,
+        "ldf_training/active_history_len_mean": 4.0,
+        "ldf_training/active_history_len_min": 4.0,
+        "ldf_training/active_history_len_max": 4.0,
+        "ldf_training/active_abs_end_mean": 7.0,
     }
     trainer._build_runtime_metrics = lambda: (
         SimpleNamespace(progress=0.0),
@@ -991,11 +991,11 @@ def test_self_forcing_step_logs_window_local_metrics(monkeypatch):
     trainer._self_forcing_step({}, model_batch)
 
     extra = captured["extra_metrics"]
-    assert extra["stream_training/enabled"] == 1.0
-    assert extra["stream_training/sample_policy_fixed_window"] == 1.0
-    assert extra["stream_training/window_len_mean"] == 3.5
-    assert extra["stream_training/active_history_len_mean"] == 4.0
-    assert extra["stream_training/active_abs_end_mean"] == 7.0
+    assert extra["ldf_training/enabled"] == 1.0
+    assert extra["ldf_training/sample_policy_fixed_window"] == 1.0
+    assert extra["ldf_training/window_len_mean"] == 3.5
+    assert extra["ldf_training/active_history_len_mean"] == 4.0
+    assert extra["ldf_training/active_abs_end_mean"] == 7.0
 
 
 def test_run_training_window_returns_pred_latents_for_window_local_traj_features():
@@ -1045,7 +1045,7 @@ def test_run_training_window_returns_pred_latents_for_window_local_traj_features
     assert out["pred_x0_latent_list"][0].shape == (2, 3)
 
 
-def test_stream_training_default_full_prefix_smoke_with_real_tiny_model(tmp_path, monkeypatch):
+def test_ldf_training_default_rolling_smoke_with_real_tiny_model(tmp_path, monkeypatch):
     from models.diffusion_forcing_wan import DiffForcingWanModel
     import models.tools.wan_model as wan_model_mod
 
@@ -1116,8 +1116,8 @@ def test_stream_training_default_full_prefix_smoke_with_real_tiny_model(tmp_path
         detach_between_steps=True,
     )
     cfg.get = lambda key, default=None: {
-        "stream_training": {
-            "enabled": True,
+        "ldf_training": {
+            "window_policy": "rolling",
             "context_tokens": 4,
             "min_history_tokens": 1,
             "horizon_tokens": 2,
@@ -1149,7 +1149,7 @@ def test_stream_training_default_full_prefix_smoke_with_real_tiny_model(tmp_path
     assert loss.requires_grad
 
 
-def test_stream_training_full_prefix_motion_aux_smoke_with_real_tiny_model(tmp_path, monkeypatch):
+def test_ldf_training_rolling_motion_aux_smoke_with_real_tiny_model(tmp_path, monkeypatch):
     from models.diffusion_forcing_wan import DiffForcingWanModel
     import models.tools.wan_model as wan_model_mod
     from utils.token_frame import num_frames_for_tokens
@@ -1230,8 +1230,8 @@ def test_stream_training_full_prefix_motion_aux_smoke_with_real_tiny_model(tmp_p
         detach_between_steps=True,
     )
     cfg.get = lambda key, default=None: {
-        "stream_training": {
-            "enabled": True,
+        "ldf_training": {
+            "window_policy": "rolling",
             "context_tokens": 4,
             "min_history_tokens": 1,
             "horizon_tokens": 2,
@@ -1264,7 +1264,7 @@ def test_stream_training_full_prefix_motion_aux_smoke_with_real_tiny_model(tmp_p
     assert loss.requires_grad
 
 
-def test_stream_training_online_encode_motion_aux_smoke_with_real_tiny_model(tmp_path, monkeypatch):
+def test_ldf_training_rolling_online_encode_motion_aux_smoke_with_real_tiny_model(tmp_path, monkeypatch):
     from models.diffusion_forcing_wan import DiffForcingWanModel
     import models.tools.wan_model as wan_model_mod
     from utils.token_frame import num_frames_for_tokens, num_tokens_for_frame_len
@@ -1348,8 +1348,8 @@ def test_stream_training_online_encode_motion_aux_smoke_with_real_tiny_model(tmp
         detach_between_steps=True,
     )
     cfg.get = lambda key, default=None: {
-        "stream_training": {
-            "enabled": True,
+        "ldf_training": {
+            "window_policy": "rolling",
             "context_tokens": 4,
             "min_history_tokens": 1,
             "horizon_tokens": 2,

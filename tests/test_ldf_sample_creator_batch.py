@@ -31,7 +31,7 @@ class _RecordingVAE:
         return values.expand(x.shape[0], -1, -1).clone()
 
 
-def test_sample_creator_full_batch_routes_token_and_7d_traj():
+def test_sample_creator_default_prefix_routes_token_and_7d_traj():
     token = torch.zeros(2, 5, 4)
     traj7 = torch.randn(2, 20, 7)
     traj_xyz = torch.randn(2, 20, 3)
@@ -47,11 +47,47 @@ def test_sample_creator_full_batch_routes_token_and_7d_traj():
 
     out = SampleCreator().create(batch)
 
-    assert out["feature"] is token
+    assert torch.equal(out["feature"], token)
     assert torch.equal(out["feature_length"], batch["token_length"])
-    assert out["traj_features"] is traj7
-    assert out["traj"] is traj_xyz
-    assert out["traj_mask"] is batch["traj_cond_mask"]
+    assert out["traj_features"].shape == (2, num_frames_for_tokens(5), 7)
+    assert torch.equal(out["traj_features"][0], traj7[0, : num_frames_for_tokens(5)])
+    assert torch.equal(out["traj"][0], traj_xyz[0, : num_frames_for_tokens(5)])
+    assert out["traj_num_tokens"].tolist() == [5, 4]
+    assert out["traj_features_length"].tolist() == [5, 4]
+    assert out["traj_mask"][0].sum().item() == num_frames_for_tokens(5)
+    assert out["traj_mask"][1].sum().item() == num_frames_for_tokens(4)
+
+
+def test_sample_creator_prefix_window_splits_latent_and_future_traj():
+    token = torch.arange(10 * 4, dtype=torch.float32).view(1, 10, 4)
+    traj_tokens = 9
+    traj_frames = num_frames_for_tokens(traj_tokens)
+    traj7 = torch.arange(traj_frames * 7, dtype=torch.float32).view(1, traj_frames, 7)
+    batch = {
+        "token": token,
+        "token_length": torch.tensor([10]),
+        "traj_cond_7d": traj7,
+        "traj_cond": torch.zeros(1, traj_frames, 3),
+        "traj_length": torch.tensor([traj_frames]),
+        "traj_cond_mask": torch.ones(1, traj_frames),
+    }
+
+    out = SampleCreator(
+        context_tokens=6,
+        horizon_tokens=3,
+        sample_policy="fixed_window",
+        min_history_tokens=1,
+        end_tokens=torch.tensor([6]),
+    ).create(batch)
+
+    assert out["feature"].shape == (1, 6, 4)
+    assert out["feature_length"].tolist() == [6]
+    assert torch.equal(out["feature"], token[:, :6])
+    assert out["traj_features"].shape == (1, traj_frames, 7)
+    assert out["traj_num_tokens"].tolist() == [traj_tokens]
+    assert out["traj_features_length"].tolist() == [traj_tokens]
+    assert out["traj_start_token"].tolist() == [0]
+    assert torch.equal(out["traj_features"], traj7[:, :traj_frames])
 
 
 def test_sample_creator_stream_batch_online_encodes_motion_window():

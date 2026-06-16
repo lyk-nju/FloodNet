@@ -70,43 +70,74 @@ def validate_7d_requires_self_forcing(cfg) -> None:
         )
 
 
-def validate_stream_training_config(cfg) -> None:
-    """Validate optional window-local limited-history training settings."""
-    enabled = bool(OmegaConf.select(cfg, "stream_training.enabled", default=False))
-    if not enabled:
-        return
-    stream_cfg = OmegaConf.select(cfg, "stream_training", default={}) or {}
-    if "motion_aux_loss" in stream_cfg:
+def validate_ldf_training_config(cfg) -> None:
+    """Validate the windowed LDF training contract.
+
+    The new mainline has no separate full-sequence/full-latent training task.
+    ``ldf_training.window_policy`` selects prefix or rolling window sampling,
+    while runtime files may still use "stream" in their names.
+    """
+    if "stream_training" in cfg:
         raise ValueError(
-            "stream_training.motion_aux_loss is no longer configurable; "
-            "full-prefix motion auxiliary loss is the stream-training default."
+            "stream_training training config was removed; use "
+            "ldf_training.window_policy and ldf_training.window_sampling instead."
         )
-    if "latent_source" in stream_cfg:
+    ldf_cfg = OmegaConf.select(cfg, "ldf_training", default={}) or {}
+    if "motion_aux_loss" in ldf_cfg:
         raise ValueError(
-            "stream_training.latent_source was removed; stream training always "
-            "uses online VAE encode."
+            "ldf_training.motion_aux_loss is no longer configurable; "
+            "windowed body auxiliary loss is controlled by body_aux_loss."
+        )
+    if "latent_source" in ldf_cfg:
+        raise ValueError(
+            "ldf_training.latent_source was removed; rolling window training "
+            "always uses online VAE encode."
+        )
+    formulation = str(
+        OmegaConf.select(cfg, "ldf_training.formulation", default="windowed")
+    )
+    if formulation != "windowed":
+        raise ValueError(
+            "ldf_training.formulation must be 'windowed'; "
+            f"got {formulation!r}."
+        )
+    policy = str(OmegaConf.select(cfg, "ldf_training.window_policy", default="prefix"))
+    if policy not in {"prefix", "rolling"}:
+        raise ValueError(
+            "ldf_training.window_policy must be 'prefix' or 'rolling'; "
+            f"got {policy!r}."
         )
     chunk_size = int(OmegaConf.select(cfg, "model.params.chunk_size", default=5))
-    context_tokens = int(OmegaConf.select(cfg, "stream_training.context_tokens", default=0))
-    window_sampling_enabled = bool(
-        OmegaConf.select(cfg, "stream_training.window_sampling.enabled", default=False)
-    )
-    min_history_tokens = int(
-        OmegaConf.select(cfg, "stream_training.min_history_tokens", default=chunk_size)
-    )
-    horizon_tokens = int(OmegaConf.select(cfg, "stream_training.horizon_tokens", default=0))
-    sample_policy = str(
-        OmegaConf.select(cfg, "stream_training.sample_policy", default="variable_history")
-    )
-    anchor_move = bool(
-        OmegaConf.select(cfg, "stream_training.anchor_move_in_rollout", default=False)
-    )
+    context_tokens = int(OmegaConf.select(cfg, "ldf_training.context_tokens", default=1))
     if context_tokens <= 0:
         raise ValueError(
-            "stream_training.context_tokens must be > 0 when stream_training is enabled"
+            "ldf_training.context_tokens must be > 0; "
+            f"got {context_tokens}."
         )
+    window_sampling_enabled = bool(
+        OmegaConf.select(cfg, "ldf_training.window_sampling.enabled", default=False)
+    )
+    min_history_tokens = int(
+        OmegaConf.select(
+            cfg,
+            "ldf_training.min_history_tokens",
+            default=chunk_size if policy == "rolling" else 1,
+        )
+    )
+    horizon_tokens = int(OmegaConf.select(cfg, "ldf_training.horizon_tokens", default=0))
+    sample_policy = str(
+        OmegaConf.select(cfg, "ldf_training.sample_policy", default="variable_history")
+    )
+    anchor_move = bool(
+        OmegaConf.select(cfg, "ldf_training.anchor_move_in_rollout", default=False)
+    )
     if window_sampling_enabled:
-        ws_prefix = "stream_training.window_sampling"
+        if policy != "rolling":
+            raise ValueError(
+                "ldf_training.window_sampling.enabled=true requires "
+                "ldf_training.window_policy='rolling'."
+            )
+        ws_prefix = "ldf_training.window_sampling"
         history_min = int(OmegaConf.select(cfg, f"{ws_prefix}.history_tokens_min", default=0))
         history_max = OmegaConf.select(cfg, f"{ws_prefix}.history_tokens_max", default="auto")
         horizon_min = int(OmegaConf.select(cfg, f"{ws_prefix}.horizon_tokens_min", default=0))
@@ -144,38 +175,44 @@ def validate_stream_training_config(cfg) -> None:
         if hs_enabled:
             raise ValueError(
                 "horizon_sim.enabled=true must not be mixed with "
-                "stream_training.window_sampling.enabled=true; variable horizon "
-                "is sampled by window_sampling in stream-training v2."
+                "ldf_training.window_sampling.enabled=true; variable horizon "
+                "is sampled by windowed rolling training."
             )
         if anchor_move:
             raise ValueError(
-                "stream_training.anchor_move_in_rollout=true is not implemented yet. "
+                "ldf_training.anchor_move_in_rollout=true is not implemented yet. "
                 "Keep it false until trajectory/text/loss windows are rebuilt per "
                 "rollout step."
             )
         return
-    if min_history_tokens < chunk_size:
+    if min_history_tokens <= 0:
         raise ValueError(
-            "stream_training.min_history_tokens must be >= model.params.chunk_size; "
+            "ldf_training.min_history_tokens must be > 0; "
+            f"got min_history_tokens={min_history_tokens}"
+        )
+    if policy == "rolling" and min_history_tokens < chunk_size:
+        raise ValueError(
+            "ldf_training.min_history_tokens must be >= model.params.chunk_size "
+            "for rolling training; "
             f"got min_history_tokens={min_history_tokens}, chunk_size={chunk_size}"
         )
     if context_tokens < min_history_tokens:
         raise ValueError(
-            "stream_training.context_tokens must be >= min_history_tokens; "
+            "ldf_training.context_tokens must be >= min_history_tokens; "
             f"got context_tokens={context_tokens}, min_history_tokens={min_history_tokens}"
         )
     if horizon_tokens < 0:
         raise ValueError(
-            f"stream_training.horizon_tokens must be >= 0, got {horizon_tokens}"
+            f"ldf_training.horizon_tokens must be >= 0, got {horizon_tokens}"
         )
     if sample_policy not in {"variable_history", "fixed_window"}:
         raise ValueError(
-            "stream_training.sample_policy must be 'variable_history' or "
+            "ldf_training.sample_policy must be 'variable_history' or "
             f"'fixed_window'; got {sample_policy!r}."
         )
     if anchor_move:
         raise ValueError(
-            "stream_training.anchor_move_in_rollout=true is not implemented yet. "
+            "ldf_training.anchor_move_in_rollout=true is not implemented yet. "
             "Keep it false until trajectory/text/loss windows are rebuilt per "
             "rollout step."
         )
@@ -184,5 +221,5 @@ def validate_stream_training_config(cfg) -> None:
 __all__ = [
     "validate_traj_dim_consistency",
     "validate_7d_requires_self_forcing",
-    "validate_stream_training_config",
+    "validate_ldf_training_config",
 ]

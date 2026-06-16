@@ -14,7 +14,7 @@ fine-tune; see docs/TODO.md T_B_11):
   - one SF step: total loss + body_aux/* (root_xz/root_y/heading/fwd_delta/
     yaw_delta) are finite and decreasing;
   - anchor_canonicalize/valid_frac ~ 1.0 on normal-length clips;
-  - history_corruption/applied and stream_training/runtime_horizon_tokens log sane values;
+  - history_corruption/applied and ldf_training/runtime_horizon_tokens log sane values;
   - traj_encoder_in_dim=7 with body_aux_loss.enabled=false raises at startup.
 """
 
@@ -212,7 +212,7 @@ def test_4d_default_dataset_has_no_traj_cond_7d():
     assert "traj_features" in item               # legacy 4D feature still emitted
 
 
-def test_stream_training_bs8_contract_exposes_horizon_traj_to_controlnet():
+def test_ldf_rolling_bs8_contract_exposes_horizon_traj_to_controlnet():
     from datasets.humanml3d import HumanML3DDataset, collate_fn
     from omegaconf import OmegaConf
     from utils.training.ldf.conditioning import prepare_condition
@@ -251,9 +251,9 @@ def test_stream_training_bs8_contract_exposes_horizon_traj_to_controlnet():
     vae = _RecordingOnlineVAE(latent_dim=latent_dim)
     creator = SampleCreator(
         stream_enabled=True,
-        context_tokens=int(cfg.stream_training.context_tokens),
+        context_tokens=int(cfg.ldf_training.context_tokens),
         window_sampling=OmegaConf.to_container(
-            cfg.stream_training.window_sampling,
+            cfg.ldf_training.window_sampling,
             resolve=True,
         ),
         chunk_size=5,

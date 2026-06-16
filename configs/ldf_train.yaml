@@ -157,9 +157,11 @@ self_forcing:
     k_schedule:
         - [0.0, 5]
 
-stream_training:
-    enabled: true
+ldf_training:
+    formulation: windowed
+    window_policy: rolling
     context_tokens: 30
+    horizon_tokens: 25
     force_start_token_zero: false
     window_sampling:
         enabled: true

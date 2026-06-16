@@ -153,11 +153,12 @@ self_forcing:
     k_schedule:
         - [0.0, 5]
 
-stream_training:
-    enabled: true
+ldf_training:
+    formulation: windowed
+    window_policy: rolling
     context_tokens: 30
-    min_history_tokens: 8
     horizon_tokens: 20
+    min_history_tokens: 8
     sample_policy: variable_history
 
 body_aux_loss:

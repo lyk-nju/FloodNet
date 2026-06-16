@@ -79,7 +79,18 @@ def prepare_ldf_eval_model_batch(batch: dict, device, model=None) -> dict:
     canonicalize 7D world-frame trajectory conditions. Offline eval has no
     rolling body window, so the stable eval convention is clip-start-local.
     """
-    model_batch = SampleCreator().create(batch)
+    if model is not None:
+        model_batch = SampleCreator(
+            context_tokens=getattr(
+                model,
+                "ldf_window_context_tokens",
+                getattr(model, "seq_len", None),
+            ),
+            horizon_tokens=getattr(model, "ldf_window_horizon_tokens", 0),
+            window_policy="prefix",
+        ).create(batch)
+    else:
+        model_batch = SampleCreator().create(batch)
     if _has_7d_traj(model_batch):
         source = model_batch.get("traj_features", model_batch.get("traj_cond_7d"))
         canon = _canonicalize_7d_clip_start(source)

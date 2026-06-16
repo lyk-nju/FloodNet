@@ -53,7 +53,7 @@ from utils.training.ldf import (
 from utils.training.ldf.model_step import run_model_step
 from utils.training.ldf.config_validate import (
     validate_7d_requires_self_forcing,
-    validate_stream_training_config,
+    validate_ldf_training_config,
     validate_traj_dim_consistency,
 )
 
@@ -71,13 +71,14 @@ class CustomLightningModule(BasicLightningModule):
     def __init__(self, cfg):
         validate_traj_dim_consistency(cfg)
         validate_7d_requires_self_forcing(cfg)
-        validate_stream_training_config(cfg)
+        validate_ldf_training_config(cfg)
         self._validation_eval_dedup = {}
         self._resume_step_offset = 0
         super().__init__(cfg)
         validate_self_forcing_runtime_config(
             cfg, prediction_type=self.model.prediction_type
         )
+        self._configure_ldf_window_defaults()
 
         sf_enabled = self_forcing_enabled(cfg)
         self.automatic_optimization = not sf_enabled
@@ -90,6 +91,48 @@ class CustomLightningModule(BasicLightningModule):
         if z_stats_dir and hasattr(inner, "load_z_stats"):
             inner.load_z_stats(z_stats_dir)
             rank_zero_info(f"[z_stats] loaded cached-z stats from {z_stats_dir}")
+
+    def _configure_ldf_window_defaults(self) -> None:
+        context_tokens = int(
+            OmegaConf.select(
+                self.cfg,
+                "ldf_training.context_tokens",
+                default=getattr(self.model, "seq_len", 0),
+            )
+        )
+        horizon_tokens = int(
+            OmegaConf.select(self.cfg, "ldf_training.horizon_tokens", default=0)
+        )
+        self.model.ldf_window_context_tokens = context_tokens
+        self.model.ldf_window_horizon_tokens = horizon_tokens
+
+    def build_prefix_sample_creator(self) -> SampleCreator:
+        context_tokens = int(
+            OmegaConf.select(
+                self.cfg,
+                "ldf_training.context_tokens",
+                default=getattr(self.model, "seq_len", 0),
+            )
+        )
+        horizon_tokens = int(
+            OmegaConf.select(self.cfg, "ldf_training.horizon_tokens", default=0)
+        )
+        return SampleCreator(
+            context_tokens=context_tokens,
+            horizon_tokens=horizon_tokens,
+            window_policy="prefix",
+            sample_policy=str(
+                OmegaConf.select(
+                    self.cfg,
+                    "ldf_training.prefix_sample_policy",
+                    default="variable_history",
+                )
+            ),
+            min_history_tokens=int(
+                OmegaConf.select(self.cfg, "ldf_training.min_history_tokens", default=1)
+            ),
+            chunk_size=getattr(self.model, "chunk_size", None),
+        )
 
     def _log_step_metrics(
         self, loss_dict, optimizer, net_start_time, extra_metrics=None, lr_value=None
@@ -326,14 +369,16 @@ class CustomLightningModule(BasicLightningModule):
         return self
 
     def _step(self, batch, is_training=True, model_batch=None):
+        loss_batch = batch
         if model_batch is None:
-            model_batch = SampleCreator().create(batch)
+            model_batch = self.build_prefix_sample_creator().create(batch)
+            loss_batch = model_batch
         out = run_model_step(self.model, model_batch)
 
         ##############################
         # control loss (XZ trajectory alignment via VAE decode)
         ##############################
-        if "control_aux" in out and "traj" in batch:
+        if "control_aux" in out and "traj" in loss_batch:
             control_weight = self.cfg.model.params.get("control_loss_weight", 1.0)
             if control_weight > 0:
                 control_aux = out["control_aux"]
@@ -354,7 +399,7 @@ class CustomLightningModule(BasicLightningModule):
                         if pred_list is None:
                             continue
                         step_loss = self._compute_control_loss(
-                            pred_list, batch
+                            pred_list, loss_batch
                         )
                         if step_loss is None:
                             continue
@@ -372,7 +417,7 @@ class CustomLightningModule(BasicLightningModule):
                 else:
                     pred_list = control_aux["pred_x0_latent_list"]
                     loss_control = self._compute_control_loss(
-                        pred_list, batch
+                        pred_list, loss_batch
                     )
                 if loss_control is not None:
                     out["total"] = out["total"] + control_weight * loss_control

@@ -13,7 +13,7 @@ from scripts.stream_training_smoke import (
 )
 
 
-def test_build_train_command_enables_stream_training_window_sampling(tmp_path):
+def test_build_train_command_enables_ldf_training_window_sampling(tmp_path):
     cfg = SmokeRunConfig(
         config="configs/ldf.yaml",
         python="python",
@@ -39,23 +39,24 @@ def test_build_train_command_enables_stream_training_window_sampling(tmp_path):
 
     assert cmd[:4] == ["python", "train_ldf.py", "--config", "configs/ldf.yaml"]
     overrides = set(cmd[5:])
-    assert "stream_training.enabled=true" in overrides
+    assert "ldf_training.formulation=windowed" in overrides
+    assert "ldf_training.window_policy=rolling" in overrides
     assert not any(
-        item.startswith("stream_training.motion_aux_loss=") for item in overrides
+        item.startswith("ldf_training.motion_aux_loss=") for item in overrides
     )
-    assert "stream_training.context_tokens=30" in overrides
-    assert "stream_training.window_sampling.enabled=true" in overrides
-    assert "stream_training.window_sampling.history_tokens_min=0" in overrides
-    assert "stream_training.window_sampling.history_tokens_max=auto" in overrides
-    assert "stream_training.window_sampling.horizon_tokens_min=5" in overrides
-    assert "stream_training.window_sampling.horizon_tokens_max=25" in overrides
+    assert "ldf_training.context_tokens=30" in overrides
+    assert "ldf_training.window_sampling.enabled=true" in overrides
+    assert "ldf_training.window_sampling.history_tokens_min=0" in overrides
+    assert "ldf_training.window_sampling.history_tokens_max=auto" in overrides
+    assert "ldf_training.window_sampling.horizon_tokens_min=5" in overrides
+    assert "ldf_training.window_sampling.horizon_tokens_max=25" in overrides
     assert not any(item.startswith("horizon_sim.") for item in overrides)
     assert not any(
-        item.startswith("stream_training.anchor_move_in_rollout=")
+        item.startswith("ldf_training.anchor_move_in_rollout=")
         for item in overrides
     )
     assert not any(
-        item.startswith("stream_training.latent_source=") for item in overrides
+        item.startswith("ldf_training.latent_source=") for item in overrides
     )
     assert "trainer.accelerator=cpu" in overrides
     assert "trainer.devices=1" in overrides
@@ -122,9 +123,9 @@ def test_build_validation_plan_expands_required_stream_training_stages(tmp_path)
     cmd = build_train_command(plan[2].config)
     overrides = set(cmd[5:])
     assert not any(
-        item.startswith("stream_training.motion_aux_loss=") for item in overrides
+        item.startswith("ldf_training.motion_aux_loss=") for item in overrides
     )
-    assert "stream_training.window_sampling.enabled=true" in overrides
+    assert "ldf_training.window_sampling.enabled=true" in overrides
 
 
 def test_validation_plan_print_only_outputs_all_stages_without_preflight(capsys):
@@ -142,8 +143,8 @@ def test_validation_plan_print_only_outputs_all_stages_without_preflight(capsys)
     assert "# 01_smoke_full_prefix:" in out
     assert "# 02_overfit_full_prefix:" in out
     assert "# 03_overfit_full_prefix:" in out
-    assert "stream_training.motion_aux_loss=" not in out
-    assert "stream_training.window_sampling.enabled=true" in out
+    assert "ldf_training.motion_aux_loss=" not in out
+    assert "ldf_training.window_sampling.enabled=true" in out
 
 
 def test_validation_plan_writes_manifest_for_dry_run(tmp_path):
@@ -184,7 +185,7 @@ def test_validation_plan_writes_manifest_for_dry_run(tmp_path):
     assert "motion_aux_loss" not in payload["base"]
     assert "motion_aux_loss" not in payload["stages"][2]["config"]
     assert payload["stages"][2]["missing_paths"] == []
-    assert "stream_training.motion_aux_loss=" not in payload["stages"][2]["command"]
+    assert "ldf_training.motion_aux_loss=" not in payload["stages"][2]["command"]
 
 
 def test_validation_manifest_includes_stream_eval_and_report_commands(tmp_path):

@@ -151,9 +151,9 @@ def build_stream_direct_traj_condition(
     return traj_emb, traj_seq_lens, traj_token_mask
 
 
-def extend_stream_text_context(text_condition, batch_size: int, model_sl: int, attn_sl: int):
-    """Pad frame-aligned stream text context to the attention length."""
-    if attn_sl <= model_sl:
+def extend_stream_text_context(text_condition, batch_size: int, model_sl: int, target_sl: int):
+    """Pad frame-aligned stream text context to the latent segment length."""
+    if target_sl <= model_sl:
         return text_condition
     if len(text_condition) != batch_size * model_sl:
         if len(text_condition) == batch_size:
@@ -165,7 +165,7 @@ def extend_stream_text_context(text_condition, batch_size: int, model_sl: int, a
         if not segment:
             continue
         out.extend(segment)
-        out.extend([segment[-1]] * (attn_sl - model_sl))
+        out.extend([segment[-1]] * (target_sl - model_sl))
     return out
 
 
