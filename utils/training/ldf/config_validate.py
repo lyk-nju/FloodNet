@@ -108,15 +108,34 @@ def validate_ldf_training_config(cfg) -> None:
             f"got {policy!r}."
         )
     chunk_size = int(OmegaConf.select(cfg, "model.params.chunk_size", default=5))
-    context_tokens = int(OmegaConf.select(cfg, "ldf_training.context_tokens", default=1))
-    if context_tokens <= 0:
-        raise ValueError(
-            "ldf_training.context_tokens must be > 0; "
-            f"got {context_tokens}."
-        )
     window_sampling_enabled = bool(
         OmegaConf.select(cfg, "ldf_training.window_sampling.enabled", default=False)
     )
+    if policy == "prefix":
+        if "context_tokens" in ldf_cfg:
+            raise ValueError(
+                "ldf_training.context_tokens is not used for prefix training; "
+                "prefix active right is sampled from [1, token_length]."
+            )
+        if "horizon_tokens" in ldf_cfg:
+            raise ValueError(
+                "ldf_training.horizon_tokens is not used for prefix training; "
+                "prefix trajectory condition always extends to token_length."
+            )
+        if "window_sampling" in ldf_cfg:
+            raise ValueError(
+                "ldf_training.window_sampling is only used for rolling training; "
+                "prefix active right is sampled from [1, token_length]."
+            )
+    else:
+        context_tokens = int(
+            OmegaConf.select(cfg, "ldf_training.context_tokens", default=1)
+        )
+        if context_tokens <= 0:
+            raise ValueError(
+                "ldf_training.context_tokens must be > 0 for rolling training; "
+                f"got {context_tokens}."
+            )
     min_history_tokens = int(
         OmegaConf.select(
             cfg,
@@ -196,12 +215,12 @@ def validate_ldf_training_config(cfg) -> None:
             "for rolling training; "
             f"got min_history_tokens={min_history_tokens}, chunk_size={chunk_size}"
         )
-    if context_tokens < min_history_tokens:
+    if policy == "rolling" and context_tokens < min_history_tokens:
         raise ValueError(
             "ldf_training.context_tokens must be >= min_history_tokens; "
             f"got context_tokens={context_tokens}, min_history_tokens={min_history_tokens}"
         )
-    if horizon_tokens < 0:
+    if policy == "rolling" and horizon_tokens < 0:
         raise ValueError(
             f"ldf_training.horizon_tokens must be >= 0, got {horizon_tokens}"
         )

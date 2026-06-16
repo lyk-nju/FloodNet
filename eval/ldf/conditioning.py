@@ -81,12 +81,6 @@ def prepare_ldf_eval_model_batch(batch: dict, device, model=None) -> dict:
     """
     if model is not None:
         model_batch = SampleCreator(
-            context_tokens=getattr(
-                model,
-                "ldf_window_context_tokens",
-                getattr(model, "seq_len", None),
-            ),
-            horizon_tokens=getattr(model, "ldf_window_horizon_tokens", 0),
             window_policy="prefix",
         ).create(batch)
     else:

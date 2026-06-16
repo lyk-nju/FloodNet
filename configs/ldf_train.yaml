@@ -9,8 +9,8 @@ dirs:
     raw_data: /data1/yuankai/text2Motion/FloodDiffusion/raw_data
 
 save_dir: ./outputs
-resume_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/step_485000.ckpt
-test_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/step_485000.ckpt
+resume_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt
+test_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/20251107_021814_ldf_stream/step_step=240000.ckpt
 
 test_vae_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/vae_1d_z4_step=300000.ckpt
 test_vae:
@@ -39,14 +39,14 @@ logger:
 trainer: # lightning trainer
     max_steps: 700000
     accelerator: gpu
-    devices: [4]
-    log_every_n_steps: 50
+    devices: [1,2]
+    log_every_n_steps: 100
     precision: bf16-mixed
 
 validation:
-    validation_steps: 5000
-    test_steps: 5000
-    save_every_n_steps: 2500
+    validation_steps: 2000
+    test_steps: 2000
+    save_every_n_steps: 2000
     save_top_k: 100
 
     val_repeat: 1
@@ -115,8 +115,6 @@ data:
     test_probe_meta_paths:
         test:
             - ${dirs.raw_data}/HumanML3D/test_min.txt
-        train:
-            - ${dirs.raw_data}/HumanML3D/train_min.txt
 
     feature_path: "new_joint_vecs"
     token_path: "TOKENS_20251030_085836_vae_wan_z4"
@@ -159,16 +157,7 @@ self_forcing:
 
 ldf_training:
     formulation: windowed
-    window_policy: rolling
-    context_tokens: 30
-    horizon_tokens: 25
-    force_start_token_zero: false
-    window_sampling:
-        enabled: true
-        history_tokens_min: 0
-        history_tokens_max: auto
-        horizon_tokens_min: 5
-        horizon_tokens_max: 25
+    window_policy: prefix
 
 body_aux_loss:
     enabled: true
@@ -185,7 +174,7 @@ body_aux_loss:
         end_xz: 1.0
 
 history_corruption:
-    enabled: true
+    enabled: false
     z_stats_dir: /home/yuankai/Text2Motion/FloodNet/deps/body_stats
     curriculum:
         early_prob: 0.2         # progress < 1/3
@@ -203,7 +192,7 @@ optimizer:
 
 
 lr_scheduler:
-    target: diffusers.optimization.get_cosine_schedule_with_warmup
+    target: CosineAnnealingLR
     params:
-        num_warmup_steps: 2000
-        num_training_steps: ${trainer.max_steps}
+        T_max: 100000
+        eta_min: 1e-5

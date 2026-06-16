@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import torch
 
@@ -10,6 +11,7 @@ from eval.ldf.conditioning import (
     prepare_ldf_eval_model_batch,
 )
 from metrics.traj import _compute_deterministic_fwd_ctrl_loss_sample
+from utils.token_frame import num_frames_for_tokens
 
 
 def _make_7d_batch() -> dict:
@@ -68,6 +70,43 @@ def test_prepare_ldf_eval_model_batch_does_not_inject_no_traj_condition():
     assert "traj_features" not in model_batch
     assert "traj" not in model_batch
     assert "traj_mask" not in model_batch
+
+
+def test_prepare_ldf_eval_model_batch_prefix_window_uses_full_future_traj(monkeypatch):
+    traj_tokens = 5
+    traj_frames = num_frames_for_tokens(traj_tokens)
+    batch = {
+        "name": ["sample"],
+        "text": ["walk"],
+        "token": torch.zeros(1, traj_tokens, 4, dtype=torch.float32),
+        "token_length": torch.tensor([traj_tokens], dtype=torch.long),
+        "feature_length": torch.tensor([traj_frames], dtype=torch.long),
+        "traj_cond_7d": torch.zeros(1, traj_frames, 7, dtype=torch.float32),
+        "traj_cond": torch.zeros(1, traj_frames, 3, dtype=torch.float32),
+        "traj_length": torch.tensor([traj_frames], dtype=torch.long),
+        "traj_cond_mask": torch.ones(1, traj_frames, dtype=torch.float32),
+    }
+    model = SimpleNamespace(ldf_window_context_tokens=3, ldf_window_horizon_tokens=99)
+
+    monkeypatch.setattr(
+        "eval.ldf.conditioning.prepare_generate_condition",
+        lambda model_arg, model_batch, device: {"prepared": True},
+    )
+    monkeypatch.setattr(
+        torch,
+        "randint",
+        lambda low, high, size, device=None: torch.full(
+            size, int(high) - 1, device=device, dtype=torch.long
+        ),
+    )
+
+    model_batch = prepare_ldf_eval_model_batch(batch, torch.device("cpu"), model=model)
+
+    assert model_batch["feature_length"].tolist() == [traj_tokens]
+    assert model_batch["traj_num_tokens"].tolist() == [traj_tokens]
+    assert model_batch["traj_features_length"].tolist() == [traj_tokens]
+    assert model_batch["traj_features"].shape[1] == traj_frames
+    assert model_batch["ldf_condition"] == {"prepared": True}
 
 
 def test_build_gt_rootplan_from_batch_uses_first_frame_anchor():

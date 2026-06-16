@@ -356,27 +356,15 @@ class SampleCreator:
             name="token_length",
         )
 
-        if self.context_tokens is None or self.context_tokens <= 0:
-            starts = torch.zeros_like(token_length)
-            latent_lengths = token_length
-            traj_token_lengths = token_length + int(self.horizon_tokens)
-            sample = self._make_sample(
-                starts=starts,
-                latent_tokens=latent_lengths,
-                traj_tokens=traj_token_lengths,
-                sample_policy="prefix",
-                stream_sample=None,
+        if self.window_policy != "prefix":
+            raise ValueError(
+                "non-stream LDF batch creation only supports window_policy='prefix'; "
+                f"got {self.window_policy!r}"
             )
-        else:
-            if self.window_policy != "prefix":
-                raise ValueError(
-                    "non-stream LDF batch creation only supports window_policy='prefix'; "
-                    f"got {self.window_policy!r}"
-                )
-            sample = self._sample_prefix_window(token_length, batch_size, device)
-            starts = sample.global_start_tokens.to(device=device)
-            latent_lengths = sample.latent_tokens.to(device=device)
-            traj_token_lengths = sample.traj_tokens.to(device=device)
+        sample = self._sample_prefix_window(token_length, batch_size, device)
+        starts = sample.global_start_tokens.to(device=device)
+        latent_lengths = sample.latent_tokens.to(device=device)
+        traj_token_lengths = sample.traj_tokens.to(device=device)
 
         max_latent_len = int(latent_lengths.max().item())
         feature = token.new_zeros(batch_size, max_latent_len, int(token.shape[-1]))
@@ -593,17 +581,11 @@ class SampleCreator:
         batch_size: int,
         device,
     ) -> StreamSample:
-        if self.horizon_tokens < 0:
-            raise ValueError(f"horizon_tokens must be >= 0, got {self.horizon_tokens}")
-        horizon = int(self.horizon_tokens)
-        max_latent = torch.minimum(
-            torch.full_like(lengths, int(self.context_tokens)),
-            lengths - horizon,
-        )
+        max_latent = lengths
         if bool((max_latent <= 0).any()):
             raise ValueError(
-                "prefix-window batch requires token_length > horizon_tokens; "
-                f"token_length={lengths.tolist()}, horizon_tokens={horizon}"
+                "prefix-window batch requires positive token_length; "
+                f"token_length={lengths.tolist()}"
             )
         if self.end_tokens is not None:
             latent_tokens = _as_long_1d(
@@ -629,15 +611,14 @@ class SampleCreator:
             raise ValueError(f"end_tokens must be > 0, got {latent_tokens.tolist()}")
         if bool((latent_tokens > max_latent).any()):
             raise ValueError(
-                "prefix-window latent length must fit context and future horizon; "
-                f"latent_tokens={latent_tokens.tolist()}, max_latent={max_latent.tolist()}, "
-                f"horizon_tokens={horizon}"
+                "prefix-window latent length must fit token_length; "
+                f"latent_tokens={latent_tokens.tolist()}, max_latent={max_latent.tolist()}"
             )
         starts = torch.zeros_like(lengths)
         return self._make_sample(
             starts=starts,
             latent_tokens=latent_tokens,
-            traj_tokens=latent_tokens + horizon,
+            traj_tokens=lengths,
             sample_policy="prefix",
             stream_sample=None,
         )
@@ -1059,6 +1040,8 @@ class SampleCreator:
             model_batch["traj_length"] = _frames_for_tokens_tensor(traj_token_lengths)
             model_batch["traj_start_token"] = torch.zeros_like(traj_token_lengths)
             model_batch["traj_num_tokens"] = traj_token_lengths
+            model_batch.pop("traj_features", None)
+            model_batch.pop("traj_features_length", None)
             return
 
         self._copy_trajectory_fields(batch, model_batch)

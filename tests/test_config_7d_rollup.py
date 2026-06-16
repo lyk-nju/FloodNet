@@ -33,10 +33,10 @@ def test_all_new_sections_present_and_readable():
     # LDF training is always windowed. Rolling/prefix sampling lives under
     # ldf_training, not a separate stream-training task config.
     assert cfg.ldf_training.formulation == "windowed"
-    assert cfg.ldf_training.window_policy == "rolling"
-    assert cfg.ldf_training.window_sampling.enabled is True
-    assert cfg.ldf_training.window_sampling.horizon_tokens_min == 5
-    assert cfg.ldf_training.window_sampling.horizon_tokens_max == 25
+    assert cfg.ldf_training.window_policy == "prefix"
+    assert "context_tokens" not in cfg.ldf_training
+    assert "horizon_tokens" not in cfg.ldf_training
+    assert "window_sampling" not in cfg.ldf_training
     assert "stream_training" not in cfg
     assert "horizon_sim" not in cfg
     assert "scheduled_sampling_prob" not in cfg.model.params
@@ -207,6 +207,25 @@ def test_ldf_training_accepts_window_sampling_auto_history():
     })
 
     validate_ldf_training_config(cfg)
+
+
+def test_ldf_training_prefix_rejects_context_horizon_and_window_sampling():
+    for field, value in (
+        ("context_tokens", 30),
+        ("horizon_tokens", 25),
+        ("window_sampling", {"enabled": False}),
+    ):
+        cfg = OmegaConf.create({
+            "model": {"params": {"chunk_size": 5}},
+            "ldf_training": {
+                "formulation": "windowed",
+                "window_policy": "prefix",
+                field: value,
+            },
+        })
+
+        with pytest.raises(ValueError, match=field):
+            validate_ldf_training_config(cfg)
 
 
 def test_ldf_training_window_sampling_rejects_invalid_horizon_range():

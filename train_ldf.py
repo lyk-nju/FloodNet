@@ -78,8 +78,6 @@ class CustomLightningModule(BasicLightningModule):
         validate_self_forcing_runtime_config(
             cfg, prediction_type=self.model.prediction_type
         )
-        self._configure_ldf_window_defaults()
-
         sf_enabled = self_forcing_enabled(cfg)
         self.automatic_optimization = not sf_enabled
         self._sf_trainer = (
@@ -92,34 +90,8 @@ class CustomLightningModule(BasicLightningModule):
             inner.load_z_stats(z_stats_dir)
             rank_zero_info(f"[z_stats] loaded cached-z stats from {z_stats_dir}")
 
-    def _configure_ldf_window_defaults(self) -> None:
-        context_tokens = int(
-            OmegaConf.select(
-                self.cfg,
-                "ldf_training.context_tokens",
-                default=getattr(self.model, "seq_len", 0),
-            )
-        )
-        horizon_tokens = int(
-            OmegaConf.select(self.cfg, "ldf_training.horizon_tokens", default=0)
-        )
-        self.model.ldf_window_context_tokens = context_tokens
-        self.model.ldf_window_horizon_tokens = horizon_tokens
-
     def build_prefix_sample_creator(self) -> SampleCreator:
-        context_tokens = int(
-            OmegaConf.select(
-                self.cfg,
-                "ldf_training.context_tokens",
-                default=getattr(self.model, "seq_len", 0),
-            )
-        )
-        horizon_tokens = int(
-            OmegaConf.select(self.cfg, "ldf_training.horizon_tokens", default=0)
-        )
         return SampleCreator(
-            context_tokens=context_tokens,
-            horizon_tokens=horizon_tokens,
             window_policy="prefix",
             sample_policy=str(
                 OmegaConf.select(

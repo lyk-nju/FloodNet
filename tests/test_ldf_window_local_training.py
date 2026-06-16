@@ -782,6 +782,53 @@ def test_training_step_uses_window_local_model_batch_when_enabled():
     assert model_batch["traj_num_tokens"].tolist() == [6]
 
 
+def test_training_step_prefix_ignores_legacy_horizon_and_uses_full_future_traj():
+    token_length = 23
+    traj_frames = num_frames_for_tokens(token_length)
+    batch = {
+        "token": torch.arange(1 * token_length * 3, dtype=torch.float32).view(
+            1, token_length, 3
+        ),
+        "token_length": torch.tensor([token_length]),
+        "traj_cond_7d": torch.zeros(1, traj_frames, 7),
+        "traj_cond": torch.zeros(1, traj_frames, 3),
+        "traj_length": torch.tensor([traj_frames]),
+        "traj_cond_mask": torch.ones(1, traj_frames),
+        "text": ["walk"],
+    }
+    cfg = SimpleNamespace()
+    cfg.get = lambda key, default=None: {
+        "ldf_training": {
+            "window_policy": "prefix",
+            "context_tokens": 30,
+        },
+    }.get(key, default)
+
+    module = SimpleNamespace(cfg=cfg, trainer=None)
+    module.build_prefix_sample_creator = lambda: SampleCreator(
+        context_tokens=30,
+        horizon_tokens=25,
+        window_policy="prefix",
+        sample_policy="fixed_window",
+        min_history_tokens=1,
+        end_tokens=torch.tensor([token_length]),
+    )
+    trainer = SelfForcingTrainer.__new__(SelfForcingTrainer)
+    trainer._module = module
+    trainer._preconditions_checked = False
+    trainer._self_forcing_step = MagicMock(return_value=torch.tensor(3.0))
+
+    out = trainer.training_step(batch)
+
+    assert float(out.item()) == 3.0
+    loss_batch, model_batch = trainer._self_forcing_step.call_args.args
+    assert model_batch["feature_length"].tolist() == [token_length]
+    assert model_batch["traj_num_tokens"].tolist() == [token_length]
+    assert model_batch["traj_features_length"].tolist() == [token_length]
+    assert model_batch["traj_features"].shape[1] == traj_frames
+    assert loss_batch["traj_num_tokens"].tolist() == [token_length]
+
+
 def test_training_step_passes_force_start_zero_to_window_local_builder(monkeypatch):
     token = torch.arange(1 * 10 * 3, dtype=torch.float32).view(1, 10, 3)
     raw = _make_motion263(batch_size=1, num_frames=80)

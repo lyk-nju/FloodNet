@@ -16,6 +16,7 @@ from utils.motion_process import (
     recover_root_rot_pos,
     root_to_traj_feats_7d,
 )
+from utils.token_frame import num_frames_for_tokens
 from utils.training.ldf.sample_creator import SampleCreator
 
 
@@ -51,33 +52,42 @@ def test_extract_7d_matches_recover_plus_root_to_traj_feats_7d():
 
 
 def test_sample_creator_prefers_traj_cond_7d():
-    traj7 = np.random.randn(10, 7).astype(np.float32)
+    traj_frames = num_frames_for_tokens(4)
+    traj7 = torch.randn(1, traj_frames, 7)
+    traj_xyz = torch.randn(1, traj_frames, 3)
     batch = {
-        "token": torch.zeros(4, 8),
-        "token_length": 4,
+        "token": torch.zeros(1, 4, 8),
+        "token_length": torch.tensor([4]),
         "traj_cond_7d": traj7,
-        "traj_cond": np.random.randn(10, 3).astype(np.float32),
-        "traj": np.random.randn(10, 3).astype(np.float32),
-        "traj_length": 10,
-        "traj_cond_mask": np.ones(10, dtype=np.float32),
+        "traj_cond": traj_xyz,
+        "traj": torch.randn(1, traj_frames, 3),
+        "traj_length": torch.tensor([traj_frames]),
+        "traj_cond_mask": torch.ones(1, traj_frames),
     }
-    mb = SampleCreator().create(batch)
+    mb = SampleCreator(
+        sample_policy="fixed_window",
+        end_tokens=torch.tensor([4]),
+    ).create(batch)
     # 7D routed as the traj feature; raw xyz kept for control-loss GT.
-    assert mb["traj_features"] is traj7
+    assert torch.equal(mb["traj_features"], traj7)
     assert mb["traj"].shape[-1] == 3
 
 
 def test_sample_creator_falls_back_to_4d_without_7d():
+    traj_frames = num_frames_for_tokens(4)
     batch = {
-        "token": torch.zeros(4, 8),
-        "token_length": 4,
-        "traj_cond": np.random.randn(10, 3).astype(np.float32),
-        "traj": np.random.randn(10, 3).astype(np.float32),
-        "traj_length": 10,
-        "traj_cond_mask": np.ones(10, dtype=np.float32),
-        "traj_features": np.random.randn(10, 4).astype(np.float32),
+        "token": torch.zeros(1, 4, 8),
+        "token_length": torch.tensor([4]),
+        "traj_cond": torch.randn(1, traj_frames, 3),
+        "traj": torch.randn(1, traj_frames, 3),
+        "traj_length": torch.tensor([traj_frames]),
+        "traj_cond_mask": torch.ones(1, traj_frames),
+        "traj_features": torch.randn(1, traj_frames, 4),
     }
-    mb = SampleCreator().create(batch)
+    mb = SampleCreator(
+        sample_policy="fixed_window",
+        end_tokens=torch.tensor([4]),
+    ).create(batch)
     # 4D path: traj_features dropped so encode_traj_batch uses traj_cond xyz.
     assert "traj_features" not in mb
     assert mb["traj"].shape[-1] == 3
