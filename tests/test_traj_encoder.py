@@ -4,8 +4,8 @@ Contract:
   LocalTrajEncoder: (B, T, 4, 7) → (B, T, 128)        (Conv1d 7→64→128 + masked-mean)
   TrajEncoder    : (B, T, 128)   → (B, T, out_dim)    (LayerNorm + 2-layer MLP)
 
-The 4D legacy path is gone; legacy ckpts have their traj weights stripped at
-load time via utils.training.ldf.ckpt_compat.strip_legacy_traj_encoder_weights.
+The 4D legacy path is gone; the LDF training/eval path now expects 7D
+checkpoints and no longer auto-strips old trajectory encoder weights.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from models.tools.traj_encoder import (
     TrajEncoder,
 )
 from models.diffusion_forcing_wan import DiffForcingWanModel
+from utils.inference.stream_conditioning import build_stream_direct_traj_condition
 from utils.token_frame import (
     frames_to_token_mask,
     num_frames_for_tokens,
@@ -65,6 +66,19 @@ def _dummy_stream_model():
     model.local_traj_encoder = _KeepFirstChannelFourFrames()
     model.traj_encoder = torch.nn.Identity()
     return model
+
+
+def _build_direct_traj_condition(model, x, model_sl, window_start_token, device, traj_sl=None):
+    return build_stream_direct_traj_condition(
+        x,
+        model_sl,
+        window_start_token,
+        device,
+        batch_size=model.batch_size,
+        local_traj_encoder=model.local_traj_encoder,
+        traj_encoder=model.traj_encoder,
+        traj_sl=traj_sl,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +272,8 @@ def test_stream_direct_7d_payload_uses_window_start_token():
         "traj_start_token": 5,
     }
 
-    emb, lens, token_mask = model._build_stream_direct_traj_condition(
+    emb, lens, token_mask = _build_direct_traj_condition(
+        model,
         x, model_sl=3, window_start_token=5, device="cpu",
     )
 
@@ -286,7 +301,8 @@ def test_stream_direct_7d_payload_can_encode_future_horizon_tokens():
         "traj_start_token": 5,
     }
 
-    emb, lens, token_mask = model._build_stream_direct_traj_condition(
+    emb, lens, token_mask = _build_direct_traj_condition(
+        model,
         x, model_sl=3, window_start_token=5, device="cpu", traj_sl=5,
     )
 
@@ -319,7 +335,8 @@ def test_stream_direct_7d_payload_groups_frames_by_absolute_start_token():
         "traj_num_tokens": 2,
     }
 
-    emb, lens, token_mask = model._build_stream_direct_traj_condition(
+    emb, lens, token_mask = _build_direct_traj_condition(
+        model,
         x, model_sl=2, window_start_token=0, device="cpu",
     )
 
@@ -349,7 +366,8 @@ def test_stream_direct_7d_payload_rejects_payload_start_after_latent_window_star
     }
 
     with pytest.raises(ValueError, match="starts after current latent window start"):
-        model._build_stream_direct_traj_condition(
+        _build_direct_traj_condition(
+            model,
             x, model_sl=3, window_start_token=5, device="cpu",
         )
 
@@ -372,7 +390,8 @@ def test_stream_direct_7d_payload_accepts_runtime_history_plus_horizon_shape():
         "traj_num_tokens": traj_num_tokens,
     }
 
-    emb, lens, token_mask = model._build_stream_direct_traj_condition(
+    emb, lens, token_mask = _build_direct_traj_condition(
+        model,
         x,
         model_sl=model_sl,
         window_start_token=traj_start_token,
@@ -415,7 +434,8 @@ def test_stream_direct_7d_payload_selects_matching_substep_payload():
         ],
     }
 
-    emb, lens, token_mask = model._build_stream_direct_traj_condition(
+    emb, lens, token_mask = _build_direct_traj_condition(
+        model,
         x,
         model_sl=2,
         window_start_token=6,
@@ -438,7 +458,8 @@ def test_stream_direct_7d_payload_slices_from_earlier_payload_start():
         "traj_start_token": 5,
     }
 
-    emb, lens, token_mask = model._build_stream_direct_traj_condition(
+    emb, lens, token_mask = _build_direct_traj_condition(
+        model,
         x, model_sl=2, window_start_token=6, device="cpu",
     )
 

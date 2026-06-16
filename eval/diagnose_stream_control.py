@@ -33,6 +33,7 @@ import torch
 from lightning import seed_everything
 from torch_ema import ExponentialMovingAverage
 
+import utils.inference.ldf_conditioning as ldf_conditioning_mod
 from omegaconf import OmegaConf
 
 from utils.initialize import (
@@ -40,6 +41,7 @@ from utils.initialize import (
     instantiate,
     load_config,
 )
+from utils.traj_batch import encode_traj_batch, get_traj_seq_lens
 from utils.motion_process import (
     StreamJointRecovery263,
     extract_root_trajectory_263,
@@ -51,6 +53,11 @@ from utils.inference.rollout import (
     build_stream_suffix_conditioning,
     clip_traj_input_to_horizon,
 )
+from utils.inference.ldf_conditioning import (
+    build_stream_step_condition_provider,
+    prepare_generate_condition,
+)
+from utils.inference.stream_state import init_stream_generation
 from utils.inference.trajectory import (
     build_remaining_polyline,
     build_recovery_future_traj,
@@ -60,10 +67,34 @@ from utils.inference.trajectory import (
     resample_polyline,
     sample_timestamped_trajectory,
 )
+from utils.training.ldf.model_factory import instantiate_ldf_model
 from utils.traj_batch import root_to_traj_feats
 from utils.visualization.video import render_single_video
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+
+def _with_ldf_condition(model, model_batch: dict, device) -> dict:
+    model_batch["ldf_condition"] = prepare_generate_condition(
+        model,
+        model_batch,
+        device,
+    )
+    return model_batch
+
+
+def _stream_generate_step(model, step_payload: dict, *, first_chunk: bool, device):
+    provider = build_stream_step_condition_provider(
+        model,
+        step_payload,
+        first_chunk=first_chunk,
+        device=device,
+    )
+    return model.stream_generate_step(
+        step_payload,
+        first_chunk=first_chunk,
+        condition=provider,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -99,9 +130,7 @@ def _load_vae(cfg, device):
 
 
 def _load_model(cfg, ckpt_path, device):
-    model = instantiate(
-        target=cfg.model.target, cfg=None, hfstyle=False, **cfg.model.params
-    )
+    model = instantiate_ldf_model(cfg.model.target, cfg.model.params)
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     ckpt_keys = set(checkpoint["state_dict"].keys())
     controlnet_missing = not any(k.startswith("controlnet.") for k in ckpt_keys)
@@ -773,7 +802,7 @@ def _extend_path_by_last_velocity(root_xyz: np.ndarray, extra_frames: int) -> np
 @torch.no_grad()
 def run_generate_full(model, vae, sample, device):
     """Offline generate() baseline."""
-    model_batch = _make_model_batch(sample, device)
+    model_batch = _with_ldf_condition(model, _make_model_batch(sample, device), device)
     output = model.generate(model_batch, num_denoise_steps=10)
     generated = output["generated"][0]
     decoded = vae.decode(generated[None, :].to(device))[0].float().cpu().numpy()
@@ -784,7 +813,7 @@ def run_generate_full(model, vae, sample, device):
 @torch.no_grad()
 def run_stream_generate_full(model, vae, sample, device):
     """Offline stream_generate() sanity check — full sequence."""
-    model_batch = _make_model_batch(sample, device)
+    model_batch = _with_ldf_condition(model, _make_model_batch(sample, device), device)
     vae.clear_cache()
     all_chunks = []
     for output in model.stream_generate(model_batch, num_denoise_steps=10):
@@ -871,8 +900,11 @@ def run_stream_step(
         gt_polyline = sample["traj"].numpy()  # (T, 3) world-space GT polyline
 
     vae.clear_cache()
-    model.init_generated(
-        history_length, batch_size=1, num_denoise_steps=num_denoise_steps
+    init_stream_generation(
+        model,
+        history_length,
+        batch_size=1,
+        num_denoise_steps=num_denoise_steps,
     )
 
     all_decoded = []
@@ -981,7 +1013,12 @@ def run_stream_step(
 
         step_payload = build_stream_step_model_input(current_text, traj_input=traj_input)
 
-        output = model.stream_generate_step(step_payload, first_chunk=first_chunk)
+        output = _stream_generate_step(
+            model,
+            step_payload,
+            first_chunk=first_chunk,
+            device=device,
+        )
         generated = output["generated"]
         latent_token = generated[0].float().cpu().numpy()  # (C_latent,) or (,C_latent)
 
@@ -1114,8 +1151,12 @@ def _run_babel_long_session(args, model, vae, device, out_root):
         text_ctrl = StreamTextRolloutController(segments)
 
         vae.clear_cache()
-        model.init_generated(args.history_length, batch_size=1,
-                            num_denoise_steps=args.num_denoise_steps)
+        init_stream_generation(
+            model,
+            args.history_length,
+            batch_size=1,
+            num_denoise_steps=args.num_denoise_steps,
+        )
         model.generated = model.generated.to(device)
         stream_recovery = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
         all_dec, all_pr = [], []
@@ -1162,7 +1203,12 @@ def _run_babel_long_session(args, model, vae, device, out_root):
                         query_time_offset=plan["token_start"] * args.token_dt,
                     )
             sp = build_stream_step_model_input(cur_text, traj_input=ti)
-            out = model.stream_generate_step(sp, first_chunk=first_chunk)
+            out = _stream_generate_step(
+                model,
+                sp,
+                first_chunk=first_chunk,
+                device=device,
+            )
             dec = (vae.stream_decode(out["generated"][0][None, :].to(device),
                                      first_chunk=first_chunk)[0].float().cpu().numpy())
             first_chunk = False
@@ -1665,17 +1711,27 @@ def main():
         gen_seq_len = sample["token_length"] + model.chunk_size
 
         # 1. encode_traj_batch (used by generate / stream_generate)
-        emb_gen = model._build_traj_emb(_bs, gen_seq_len, device)
+        emb_gen = encode_traj_batch(
+            _bs,
+            gen_seq_len,
+            device,
+            model.local_traj_encoder,
+            model.traj_encoder,
+        )
         if emb_gen is not None:
-            print(f"  [generate path] _build_traj_emb: shape={tuple(emb_gen.shape)} "
+            print(f"  [generate path] build_traj_emb: shape={tuple(emb_gen.shape)} "
                   f"mean={emb_gen.mean().item():.6f} std={emb_gen.std().item():.6f} "
                   f"min={emb_gen.min().item():.6f} max={emb_gen.max().item():.6f}")
         else:
-            print("  [generate path] _build_traj_emb: None")
+            print("  [generate path] build_traj_emb: None")
 
         # 2. TrajStreamBuffer (used by stream_generate_step)
-        model.init_generated(args.history_length, batch_size=1,
-                            num_denoise_steps=args.num_denoise_steps)
+        init_stream_generation(
+            model,
+            args.history_length,
+            batch_size=1,
+            num_denoise_steps=args.num_denoise_steps,
+        )
         # Feed one GT-root step to populate the buffer.
         for ci in range(min(5, sample["token_length"])):
             ti = build_stream_suffix_conditioning(_bs, ci, prefer_xyz=True)
@@ -1683,7 +1739,12 @@ def main():
                 sample["text"] if isinstance(sample["text"], str) else sample["text"][0],
                 traj_input=ti,
             )
-            model.stream_generate_step(sp, first_chunk=(ci == 0))
+            _stream_generate_step(
+                model,
+                sp,
+                first_chunk=(ci == 0),
+                device=device,
+            )
 
         end_idx = min(5 + model.chunk_size,
                       model.commit_index + model.chunk_size)
@@ -1734,8 +1795,14 @@ def main():
         text_null = [u.to(model.param_dtype) for u in
                       model.encode_text_with_cache([""], device)]
 
-        traj_emb = model._build_traj_emb(_bs, seq_len + model.chunk_size, device)
-        traj_sl = model._get_traj_seq_lens(_bs, seq_len + model.chunk_size, device)
+        traj_emb = encode_traj_batch(
+            _bs,
+            seq_len + model.chunk_size,
+            device,
+            model.local_traj_encoder,
+            model.traj_encoder,
+        )
+        traj_sl = get_traj_seq_lens(_bs, seq_len + model.chunk_size, device)
         t_scaled = noise_level * model.time_embedding_scale
 
         # All ControlNet / backbone forwards inside the same autocast
@@ -1788,8 +1855,12 @@ def main():
               f"pred_delta={'LARGE' if delta_pred > 0.1 else 'small'}")
 
         # --- Compare latent tokens: generate() vs stream_generate_step() ---
-        model.init_generated(args.history_length, batch_size=1,
-                            num_denoise_steps=args.num_denoise_steps)
+        init_stream_generation(
+            model,
+            args.history_length,
+            batch_size=1,
+            num_denoise_steps=args.num_denoise_steps,
+        )
         vae.clear_cache()
         latents_step = []
         _bs2 = _wrap_flat_sample_for_suffix(sample)
@@ -1798,13 +1869,18 @@ def main():
         for ci in range(min(10, sample["token_length"])):
             ti = build_stream_suffix_conditioning(_bs2, ci, prefer_xyz=True)
             sp = build_stream_step_model_input(_txt, traj_input=ti)
-            out = model.stream_generate_step(sp, first_chunk=first_chunk)
+            out = _stream_generate_step(
+                model,
+                sp,
+                first_chunk=first_chunk,
+                device=device,
+            )
             latents_step.append(out["generated"][0].float().cpu())
             first_chunk = False
         latents_step = torch.cat(latents_step, dim=0)  # (N, C)
 
         # Compare with generate() latents (first N tokens)
-        model_batch = _make_model_batch(sample, device)
+        model_batch = _with_ldf_condition(model, _make_model_batch(sample, device), device)
         gen_out = model.generate(model_batch, num_denoise_steps=args.num_denoise_steps)
         latents_gen = gen_out["generated"][0].float().cpu()  # (T, C)
 
@@ -2334,8 +2410,12 @@ def main():
 
         # 1. Populate TrajStreamBuffer with a few steps (same xyz path as
         #    stream_generate_step), then capture the buffer's traj_emb.
-        model.init_generated(args.history_length, batch_size=1,
-                            num_denoise_steps=args.num_denoise_steps)
+        init_stream_generation(
+            model,
+            args.history_length,
+            batch_size=1,
+            num_denoise_steps=args.num_denoise_steps,
+        )
         model.generated = model.generated.to(device)
         _bs = _wrap_flat_sample_for_suffix(sample)
         _txt = sample["text"] if isinstance(sample["text"], str) else sample["text"][0]
@@ -2343,7 +2423,12 @@ def main():
         for ci in range(min(5, token_length)):
             ti = build_stream_suffix_conditioning(_bs, ci, prefer_xyz=True)
             sp = build_stream_step_model_input(_txt, traj_input=ti)
-            model.stream_generate_step(sp, first_chunk=first_chunk)
+            _stream_generate_step(
+                model,
+                sp,
+                first_chunk=first_chunk,
+                device=device,
+            )
             first_chunk = False
         _buf_emb = model._traj_buf.build_traj_emb(
             model.commit_index + model.chunk_size, model.seq_len, device
@@ -2352,20 +2437,32 @@ def main():
             model.commit_index + model.chunk_size, model.seq_len, device,
         )
 
-        # 2. Patch _build_traj_emb so generate() uses the buffer's emb,
+        # 2. Patch encode_traj_batch so generate() uses the buffer's emb,
         #    then call generate() which is known not to OOM.
-        _orig_build = model._build_traj_emb
-        def _patched_build(x, sl, dev, return_token_mask=False):
+        _orig_build = ldf_conditioning_mod.encode_traj_batch
+        def _patched_build(
+            x,
+            sl,
+            dev,
+            local_traj_encoder=None,
+            traj_encoder=None,
+            *,
+            horizon_tokens=None,
+            horizon_active_end_token=0,
+            return_token_mask=False,
+        ):
             # generate() now calls with return_token_mask=True and unpacks a
             # 2-tuple; this diagnostic doesn't gate tokens, so return a None mask.
             if return_token_mask:
                 return _buf_emb, None
             return _buf_emb
-        model._build_traj_emb = _patched_build
+        ldf_conditioning_mod.encode_traj_batch = _patched_build
 
-        model_batch = _make_model_batch(sample, device)
-        out = model.generate(model_batch, num_denoise_steps=args.num_denoise_steps)
-        model._build_traj_emb = _orig_build
+        model_batch = _with_ldf_condition(model, _make_model_batch(sample, device), device)
+        try:
+            out = model.generate(model_batch, num_denoise_steps=args.num_denoise_steps)
+        finally:
+            ldf_conditioning_mod.encode_traj_batch = _orig_build
         generated_latent = out["generated"][0]
         decoded = vae.decode(
             generated_latent[None, :].to(device)
@@ -2988,8 +3085,12 @@ def main():
                 plan_wp = _update_wp
                 plan_times = _update_times
             vae.clear_cache()
-            model.init_generated(args.history_length, batch_size=1,
-                                num_denoise_steps=args.num_denoise_steps)
+            init_stream_generation(
+                model,
+                args.history_length,
+                batch_size=1,
+                num_denoise_steps=args.num_denoise_steps,
+            )
             model.generated = model.generated.to(device)
             stream_rec = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
             all_dec, all_pr = [], []
@@ -3020,7 +3121,12 @@ def main():
                 sp = build_stream_step_model_input(
                     sample["text"] if isinstance(sample["text"], str) else sample["text"][0],
                     traj_input=ti)
-                out = model.stream_generate_step(sp, first_chunk=first_chunk)
+                out = _stream_generate_step(
+                    model,
+                    sp,
+                    first_chunk=first_chunk,
+                    device=device,
+                )
                 dec = (vae.stream_decode(out["generated"][0][None, :].to(device),
                                          first_chunk=first_chunk)[0].float().cpu().numpy())
                 first_chunk = False
@@ -3113,8 +3219,12 @@ def main():
         extra_tokens = args.trail_tokens
 
         vae.clear_cache()
-        model.init_generated(args.history_length, batch_size=1,
-                            num_denoise_steps=args.num_denoise_steps)
+        init_stream_generation(
+            model,
+            args.history_length,
+            batch_size=1,
+            num_denoise_steps=args.num_denoise_steps,
+        )
         model.generated = model.generated.to(device)
         stream_rec = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
         all_dec, all_pr = [], []
@@ -3135,7 +3245,12 @@ def main():
             sp = build_stream_step_model_input(
                 sample["text"] if isinstance(sample["text"], str) else sample["text"][0],
                 traj_input=ti)
-            out = model.stream_generate_step(sp, first_chunk=first_chunk)
+            out = _stream_generate_step(
+                model,
+                sp,
+                first_chunk=first_chunk,
+                device=device,
+            )
             dec = (vae.stream_decode(out["generated"][0][None, :].to(device),
                                      first_chunk=first_chunk)[0].float().cpu().numpy())
             first_chunk = False
@@ -3171,7 +3286,12 @@ def main():
             sp = build_stream_step_model_input(
                 sample["text"] if isinstance(sample["text"], str) else sample["text"][0],
                 traj_input=ti)
-            out = model.stream_generate_step(sp, first_chunk=first_chunk)
+            out = _stream_generate_step(
+                model,
+                sp,
+                first_chunk=first_chunk,
+                device=device,
+            )
             dec = (vae.stream_decode(out["generated"][0][None, :].to(device),
                                      first_chunk=first_chunk)[0].float().cpu().numpy())
             first_chunk = False
@@ -3270,7 +3390,7 @@ def main():
 
     # Encoding path labels per mode family.
     _TPATH_GENERATE = (
-        "traj_features (frame-level) -> _build_traj_emb"
+        "traj_features (frame-level) -> build_traj_emb"
         " -> frames_to_tokens -> LocalTrajEncoder -> TrajEncoder"
         " (no anchor-subtract)"
     )

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from omegaconf import OmegaConf
 
-from utils.training.ldf.ablation import (
+from tools.ldf_body_ablation import (
     apply_overrides,
     body_ablation_overrides,
     overrides_to_cli,

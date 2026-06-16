@@ -55,6 +55,7 @@ from eval.common.visualization import (
     yaw_from_root_path,
 )
 from utils.initialize import check_state_dict, instantiate, load_config
+from utils.training.ldf.model_factory import instantiate_ldf_model
 from utils.motion_process import (
     convert_motion_to_joints,
     extract_root_trajectory_263,
@@ -894,8 +895,7 @@ def _load_vae(cfg, device):
 
 
 def _load_model(cfg, ckpt_path, device):
-    model = instantiate(target=cfg.model.target, cfg=None, hfstyle=False,
-                        **cfg.model.params)
+    model = instantiate_ldf_model(cfg.model.target, cfg.model.params)
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     ckpt_keys = set(ckpt["state_dict"].keys())
     cn_missing = not any(k.startswith("controlnet.") for k in ckpt_keys)

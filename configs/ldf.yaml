@@ -148,10 +148,14 @@ model:
         control_loss_weight: 5.0
         cfg_scale_traj: 2.0
         cfg_scale_text: 2.0
-        self_forcing_enabled: true
-        # Thresholds are phase progress over [resume_ckpt.global_step, trainer.max_steps].
-        self_forcing_k_schedule:
-            - [0.0, 5]
+
+self_forcing:
+    enabled: true
+    stride_tokens: 1
+    detach_between_steps: true
+    # Thresholds are phase progress over [resume_ckpt.global_step, trainer.max_steps].
+    k_schedule:
+        - [0.0, 5]
 
 stream_training:
     enabled: true

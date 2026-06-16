@@ -1,6 +1,5 @@
 import warnings
 
-import numpy as np
 import torch
 import torch.nn as nn
 
@@ -8,83 +7,10 @@ from .tools.t5 import T5EncoderModel
 from .tools.traj_encoder import LocalTrajEncoder, TrajEncoder
 from .tools.wan_model import WanModel
 from .tools.wan_controlnet import WanControlNet
-
-try:
-    from FloodNet.utils.traj_batch import encode_traj_batch
-    from FloodNet.utils.inference.buffer import TrajStreamBuffer
-except ImportError:  # pragma: no cover - script entrypoints use top-level imports
-    from utils.traj_batch import encode_traj_batch
-    from utils.inference.buffer import TrajStreamBuffer
-
-
-_SCHEDULED_SAMPLING_WARNED = False
-
-
-def warn_scheduled_sampling_deprecated(value) -> bool:
-    """Warn once per process that ``scheduled_sampling_prob`` is deprecated.
-
-    The config key is still accepted for older configs, but the value is
-    ignored. A warning is emitted only for nonzero values.
-    """
-    global _SCHEDULED_SAMPLING_WARNED
-    try:
-        nonzero = float(value) != 0.0
-    except (TypeError, ValueError):
-        nonzero = False
-    if nonzero and not _SCHEDULED_SAMPLING_WARNED:
-        warnings.warn(
-            "scheduled_sampling_prob is deprecated and ignored; use "
-            "history_corruption.apply_prob instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        _SCHEDULED_SAMPLING_WARNED = True
-        return True
-    return False
-
-
-# Optional runtime fields that older checkpoints may not contain. They are
-# back-filled from the freshly initialized module before strict loading.
-_OPTIONAL_COMPAT_FIELD_NAMES = ("mask_emb", "z_mean", "z_std")
-
-
-def _is_optional_compat_key(key: str) -> bool:
-    """Return True when ``key`` names an optional checkpoint field."""
-    return key.rsplit(".", 1)[-1] in _OPTIONAL_COMPAT_FIELD_NAMES
-
-
-def backfill_compat_state_dict(state_dict: dict, own_state: dict):
-    """Return (filled_state_dict, n_backfilled).
-
-    Only optional checkpoint fields are filled. All other keys remain untouched
-    so strict loading still catches real missing, unexpected, or mismatched keys.
-    """
-    filled = dict(state_dict)
-    num_backfilled = 0
-    for key, value in own_state.items():
-        if key not in filled and _is_optional_compat_key(key):
-            filled[key] = value.clone() if hasattr(value, "clone") else value
-            num_backfilled += 1
-    return filled, num_backfilled
-
-
-def _expand_precomputed_caption_keys(embeddings: dict) -> dict:
-    """Alias strip() keys so table matches HumanML3D captions after .strip()."""
-    out = dict(embeddings)
-    for key, value in embeddings.items():
-        stripped_key = key.strip()
-        if stripped_key not in out:
-            out[stripped_key] = value
-    return out
+from utils.ldf_condition import LDFCondition
 
 
 class DiffForcingWanModel(nn.Module):
-    """Diffusion Forcing with streaming trajectory ControlNet conditioning.
-
-    Triangular noise schedule (left-clean, right-noisy) with per-sample time
-    steps. Supports velocity / x0 / noise prediction with CFG over text and
-    trajectory conditions.
-    """
     def __init__(
         self,
         checkpoint_path="deps/t5_umt5-xxl-enc-bf16/models_t5_umt5-xxl-enc-bf16.pth",
@@ -113,16 +39,7 @@ class DiffForcingWanModel(nn.Module):
         use_traj_kv_cache=None,
         control_loss_weight=1.0,
         freeze_backbone=True,
-        use_precomputed_text_emb=False,
-        precomputed_text_emb_path=None,
-        scheduled_sampling_prob=0.0,
-        self_forcing_enabled=False,
-        self_forcing_stride_tokens=1,
-        self_forcing_detach_between_steps=True,
-        self_forcing_k_schedule=((0.0, 2), (0.4, 3), (0.7, 5)),
-        self_forcing_start_step=None,
-        use_traj_token_mask_in_attention=False,
-        use_future_traj_attention=False,
+        build_text_encoder=True,
     ):
         super().__init__()
         if traj_encoder_in_dim is not None:
@@ -143,14 +60,12 @@ class DiffForcingWanModel(nn.Module):
         self.cfg_scale_traj = float(cfg_scale_traj)
         self.prediction_type = prediction_type
         self.causal = causal
+        self.freeze_backbone = bool(freeze_backbone)
+
         self.traj_out_dim = traj_out_dim
         self.traj_in_dim = traj_in_dim
         self.traj_dropout = traj_dropout
-        self.freeze_backbone = bool(freeze_backbone)
-        self.use_traj_token_mask_in_attention = bool(
-            use_traj_token_mask_in_attention
-        )
-        self.use_future_traj_attention = bool(use_future_traj_attention)
+
         if use_traj_kv_cache is not None:
             warnings.warn(
                 "`use_traj_kv_cache` is deprecated; use `use_traj_emb_cache`.",
@@ -158,68 +73,13 @@ class DiffForcingWanModel(nn.Module):
             )
             use_traj_emb_cache = bool(use_traj_kv_cache)
         self.use_traj_emb_cache = use_traj_emb_cache
-        # Keep the old config key accepted, but route users to history corruption.
-        warn_scheduled_sampling_deprecated(scheduled_sampling_prob)
-        self.scheduled_sampling_prob = 0.0
-        self.self_forcing_enabled = bool(self_forcing_enabled)
-        self.self_forcing_stride_tokens = int(self_forcing_stride_tokens)
-        self.self_forcing_detach_between_steps = bool(
-            self_forcing_detach_between_steps
-        )
-        self.self_forcing_k_schedule = [
-            (float(p), int(k)) for p, k in self_forcing_k_schedule
-        ]
-        if self_forcing_start_step is not None:
-            warnings.warn(
-                "`self_forcing_start_step` is deprecated and ignored. "
-                "When self_forcing_enabled=True, self-forcing now starts from the first step.",
-                stacklevel=2,
-            )
-
-        if self.self_forcing_stride_tokens != 1:
-            raise ValueError(
-                "v1 self-forcing only supports self_forcing_stride_tokens == 1"
-            )
-        if self.self_forcing_enabled and not self.self_forcing_detach_between_steps:
-            raise NotImplementedError(
-                "v1 self-forcing only supports detach_between_steps=True"
-            )
-        if self.self_forcing_enabled and self.prediction_type not in ("vel", "x0"):
-            raise ValueError(
-                "self-forcing only supports prediction_type in {'vel', 'x0'}"
-            )
-        if not self.self_forcing_k_schedule:
-            raise ValueError("self_forcing_k_schedule must not be empty")
-        self.self_forcing_k_schedule.sort(key=lambda x: x[0])
 
         self.text_dim = 4096
         self.text_len = text_len
-        self.use_precomputed_text_emb = bool(use_precomputed_text_emb)
         self._precomputed_text_emb = None
         self.text_encoder = None
 
-        if self.use_precomputed_text_emb:
-            if not precomputed_text_emb_path:
-                raise ValueError(
-                    "use_precomputed_text_emb=True requires precomputed_text_emb_path "
-                    "(run pretokenize_t5_text.py to build the .pt)."
-                )
-            payload = torch.load(
-                precomputed_text_emb_path, map_location="cpu", weights_only=False
-            )
-            self._precomputed_text_emb = _expand_precomputed_caption_keys(
-                payload["embeddings"]
-            )
-            if "" not in self._precomputed_text_emb:
-                raise KeyError(
-                    'precomputed embeddings must include empty string key "" for CFG / dropout.'
-                )
-            text_dim = int(payload.get("text_dim", self.text_dim))
-            if text_dim != self.text_dim:
-                raise ValueError(
-                    f"precomputed text_dim {text_dim} != model text_dim {self.text_dim}"
-                )
-        else:
+        if build_text_encoder:
             self.text_encoder = T5EncoderModel(
                 text_len=self.text_len,
                 dtype=torch.bfloat16,
@@ -252,8 +112,6 @@ class DiffForcingWanModel(nn.Module):
             eps=1e-6,
             causal=self.causal,
             traj_enc_dim=traj_enc_dim_backbone,
-            use_traj_token_mask_in_attention=self.use_traj_token_mask_in_attention,
-            use_future_traj_attention=self.use_future_traj_attention,
         )
 
         self.controlnet = WanControlNet(
@@ -274,8 +132,6 @@ class DiffForcingWanModel(nn.Module):
             eps=1e-6,
             causal=self.causal,
             traj_enc_dim=traj_enc_dim_controlnet,
-            use_traj_token_mask_in_attention=self.use_traj_token_mask_in_attention,
-            use_future_traj_attention=self.use_future_traj_attention,
         )
         self.controlnet.init_from_backbone(self.model)
 
@@ -298,26 +154,6 @@ class DiffForcingWanModel(nn.Module):
             if hasattr(self.model, "mask_emb"):
                 self.model.mask_emb.requires_grad_(True)
 
-    def load_state_dict(self, state_dict, strict=True):
-        """Load older checkpoints that predate optional runtime fields.
-
-        Missing optional fields are copied from this module's initialized state.
-        Strict loading still catches real missing, unexpected, or mismatched keys.
-        """
-        if strict:
-            state_dict, num_backfilled = backfill_compat_state_dict(
-                state_dict, self.state_dict()
-            )
-            if num_backfilled:
-                warnings.warn(
-                    f"load_state_dict: back-filled {num_backfilled} optional field(s) "
-                    f"(mask_emb/z_mean/z_std) from init; loading a checkpoint that "
-                    f"does not include them. New fields keep init values until "
-                    f"load_z_stats() is called.",
-                    stacklevel=2,
-                )
-        return super().load_state_dict(state_dict, strict=strict)
-
     def _controlnet_forward(
         self,
         noisy_input,
@@ -339,62 +175,55 @@ class DiffForcingWanModel(nn.Module):
             traj_token_mask=traj_token_mask,
         )
 
-    def _concat_text_for_cfg(
-        self, text_context, text_null_per_sample, batch_size, model_seq_len
-    ):
-        """Build text context list for MotionLCM-style double-batch CFG (cond || uncond).
+    def _resolve_condition(
+        self,
+        batch,
+        condition: LDFCondition | None,
+        *,
+        batch_size: int,
+    ) -> LDFCondition:
+        if condition is None:
+            condition = batch.get("ldf_condition") if isinstance(batch, dict) else None
+        if condition is None:
+            raise ValueError(
+                "DiffForcingWanModel requires prepared LDFCondition. "
+                "Build it outside the model before calling generate or stream_generate_step."
+            )
+        if condition.text_null_context is None:
+            raise ValueError("LDFCondition.text_null_context is required for CFG.")
+        condition.validate(batch_size=batch_size)
+        return condition
 
-        WanModel/WanControlNet accept either one global caption per sample (len == B)
-        or frame-aligned captions (len == B * model_seq_len). Returns None if the
-        layout does not match either (caller falls back to two backbone forwards).
-        """
-        b = batch_size
-        n = len(text_context)
-        if n == b:
-            return list(text_context) + list(text_null_per_sample)
-        if n == b * model_seq_len:
-            null_flat = []
-            for i in range(b):
-                ni = text_null_per_sample[i]
-                for _ in range(model_seq_len):
-                    null_flat.append(ni)
-            return list(text_context) + null_flat
-        return None
-
-    def _uncond_backbone_forward(
-        self, noisy_input, t_scaled, text_null_context, seq_len,
-    ):
-        """Single backbone forward with null text and no ControlNet residuals.
-
-        Used by separated CFG to obtain the fully unconditional prediction
-        (text OFF, traj OFF).  Returns a list of per-sample tensors.
-        """
-        return self.model(
-            noisy_input,
-            t_scaled,
-            text_null_context,
-            seq_len,
-            y=None,
-            traj_emb=None,
-            traj_seq_lens=None,
-            controlnet_residuals=None,
-        )
+    def _resolve_stream_condition(
+        self,
+        batch,
+        condition,
+        *,
+        end_index: int,
+        model_sl: int,
+        window_start_token: int,
+        time_steps,
+        device,
+    ) -> LDFCondition:
+        if condition is None and isinstance(batch, dict):
+            condition = batch.get("ldf_condition_provider", batch.get("ldf_condition"))
+        if callable(condition):
+            condition = condition(
+                end_index=end_index,
+                model_sl=model_sl,
+                window_start_token=window_start_token,
+                time_steps=time_steps,
+                device=device,
+            )
+        return self._resolve_condition({}, condition, batch_size=self.batch_size)
 
     def encode_text_with_cache(self, text_list, device):
-        """Encode text using cache
-        Args:
-            text_list: List[str], list of texts
-            device: torch.device
-        Returns:
-            List[Tensor]: List of encoded text features
-        """
         if self._precomputed_text_emb is not None:
             out = []
-            d = self._precomputed_text_emb
             for text in text_list:
-                row = d.get(text)
+                row = self._precomputed_text_emb.get(text)
                 if row is None:
-                    row = d.get(text.strip())
+                    row = self._precomputed_text_emb.get(text.strip())
                 if row is None:
                     preview = text.replace("\n", "\\n")
                     if len(preview) > 160:
@@ -412,26 +241,18 @@ class DiffForcingWanModel(nn.Module):
         indices_to_encode = []
         texts_to_encode = []
 
-        # Check cache
         for i, text in enumerate(text_list):
             if text in self.text_cache:
-                # Get from cache and move to correct device
-                cached_feature = self.text_cache[text].to(device)
-                text_features.append(cached_feature)
+                text_features.append(self.text_cache[text].to(device))
             else:
-                # Need to encode
                 text_features.append(None)
                 indices_to_encode.append(i)
                 texts_to_encode.append(text)
 
-        # Batch encode uncached texts
         if texts_to_encode:
             self.text_encoder.model.to(device)
             encoded = self.text_encoder(texts_to_encode, device)
-
-            # Store in cache and update results
             for idx, text, feature in zip(indices_to_encode, texts_to_encode, encoded):
-                # Cache to CPU to save GPU memory
                 self.text_cache[text] = feature.cpu()
                 text_features[idx] = feature
 
@@ -446,339 +267,6 @@ class DiffForcingWanModel(nn.Module):
         # (bs, C, T, 1, 1) ->  (bs, T, C)
         x = x.permute(0, 2, 1, 3, 4).contiguous().view(x.size(0), x.size(2), -1)
         return x
-
-    def _build_traj_emb(self, x, seq_len, device, horizon_tokens=None,
-                        horizon_active_end=0, return_token_mask=False):
-        if self.traj_encoder is None:
-            return (None, None) if return_token_mask else None
-        return encode_traj_batch(
-            x, seq_len, device, self.local_traj_encoder, self.traj_encoder,
-            horizon_tokens=horizon_tokens,
-            horizon_active_end_token=horizon_active_end,
-            return_token_mask=return_token_mask,
-        )
-
-    def _get_traj_seq_lens(self, x, seq_len, device, horizon_tokens=None,
-                           horizon_active_end=0):
-        def _infer_batch_size():
-            for key in ("traj_features", "traj_cond_7d_frame", "traj_cond", "traj", "feature"):
-                value = x.get(key)
-                if torch.is_tensor(value) and value.ndim > 0:
-                    return int(value.shape[0])
-            value = x.get("feature_length")
-            if torch.is_tensor(value) and value.ndim > 0:
-                return int(value.numel())
-            return None
-
-        batch_size = _infer_batch_size()
-
-        def _length_tensor(value):
-            if value is None:
-                return None
-            if torch.is_tensor(value):
-                out = value.to(device=device, dtype=torch.long)
-            else:
-                out = torch.tensor([int(value)], device=device, dtype=torch.long)
-            if out.ndim == 0:
-                out = out.view(1)
-            if batch_size is not None and out.numel() == 1 and batch_size > 1:
-                out = out.expand(batch_size)
-            return out.clamp(min=0, max=seq_len)
-
-        # Base token length. Window-local training uses feature_length for latent
-        # validity only, so explicit trajectory lengths must take precedence.
-        base = _length_tensor(x.get("traj_num_tokens"))
-        if base is None:
-            base = _length_tensor(x.get("traj_features_length"))
-        if base is None and x.get("traj_length") is not None:
-            tl = x["traj_length"].to(device=device, dtype=torch.long)
-            # Vectorized mirror of token_frame.num_tokens_for_frame_len
-            # (= frame_idx_to_token_idx(tl-1)+1): 0 for tl<=0, 1 for tl==1,
-            # (tl-2)//4 + 2 for tl>=2. Replaces the old opaque (tl+2)//4+1.
-            tokens = torch.where(
-                tl <= 1, tl.clamp(min=0, max=1), (tl - 2) // 4 + 2,
-            )
-            base = tokens.clamp(min=0, max=seq_len)
-        if base is None:
-            base = _length_tensor(x.get("feature_length"))
-        if base is None:
-            return None
-
-        # Truncate only invalid suffix tokens. Sparse holes stay at full length
-        # and are handled by token-level embedding masks.
-        from utils.token_frame import prefix_len_from_tail_invalid
-        from utils.traj_batch import build_traj_token_mask
-        token_mask = build_traj_token_mask(
-            x, seq_len, device, horizon_tokens=horizon_tokens,
-            horizon_active_end_token=horizon_active_end,
-        )
-        if token_mask is None:
-            return base
-        prefix = prefix_len_from_tail_invalid(token_mask).to(device=device)
-        return torch.minimum(base, prefix)
-
-    def _decide_text_dropout(self, batch_size: int, device) -> list:
-        """Sample per-sample text-dropout flags, synced across DDP ranks."""
-        if not self.training:
-            return [False] * batch_size
-        drop = torch.empty(batch_size, device=device).uniform_()
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.broadcast(drop, src=0)
-        return (drop < self.text_dropout).tolist()
-
-    def _prepare_text_context(self, x, seq_len, device, text_dropped_flags=None):
-        if self.use_text_cond and "text" in x:
-            text_list = x["text"]  # List[str] or List[List[str]]
-            if isinstance(text_list[0], list):
-                text_end_list = x["feature_text_end"]
-                all_text_context = []
-                for i, (single_text_list, single_text_end_list) in enumerate(
-                    zip(text_list, text_end_list)
-                ):
-                    sample_dropped = (
-                        text_dropped_flags[i]
-                        if text_dropped_flags is not None
-                        else False
-                    )
-                    if (not self.training) or (not sample_dropped):
-                        single_text_end_list = [0] + [
-                            min(t, seq_len) for t in single_text_end_list
-                        ]
-                    else:
-                        single_text_list = [""]
-                        single_text_end_list = [0, seq_len]
-                    single_text_length_list = [
-                        t - b
-                        for t, b in zip(
-                            single_text_end_list[1:], single_text_end_list[:-1]
-                        )
-                    ]
-                    single_text_context = self.encode_text_with_cache(
-                        single_text_list, device
-                    )
-                    single_text_context = [
-                        u.to(self.param_dtype) for u in single_text_context
-                    ]
-                    for u, duration in zip(
-                        single_text_context, single_text_length_list
-                    ):
-                        all_text_context.extend([u for _ in range(duration)])
-                    all_text_context.extend(
-                        [
-                            single_text_context[-1]
-                            for _ in range(seq_len - single_text_end_list[-1])
-                        ]
-                    )
-            else:
-                if self.training and text_dropped_flags is not None:
-                    all_text_context = [
-                        ("" if text_dropped_flags[i] else u)
-                        for i, u in enumerate(text_list)
-                    ]
-                else:
-                    all_text_context = list(text_list)
-                all_text_context = self.encode_text_with_cache(all_text_context, device)
-                all_text_context = [u.to(self.param_dtype) for u in all_text_context]
-        else:
-            all_text_context = [""] * x["feature"].shape[0]
-            all_text_context = self.encode_text_with_cache(all_text_context, device)
-            all_text_context = [u.to(self.param_dtype) for u in all_text_context]
-        return all_text_context
-
-    def _decide_traj_dropout(self, device):
-        traj_dropped = False
-        if self.training:
-            drop = torch.empty(1, device=device).uniform_()
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                torch.distributed.broadcast(drop, src=0)
-            traj_dropped = drop.item() < self.traj_dropout
-        return traj_dropped
-
-    def _prepare_traj_condition(
-        self, x, seq_len, device, traj_dropped_override=None, horizon_tokens=None,
-        horizon_active_end=0,
-    ):
-        # The training loop passes horizon_tokens and the active-window boundary;
-        # the model only applies the resulting trajectory mask.
-        traj_emb = None
-        traj_seq_lens = None
-        traj_token_mask = None
-        if traj_dropped_override is None:
-            traj_dropped = self._decide_traj_dropout(device)
-        else:
-            traj_dropped = bool(traj_dropped_override)
-
-        if not traj_dropped:
-            traj_emb, traj_token_mask = self._build_traj_emb(
-                x, seq_len, device, horizon_tokens=horizon_tokens,
-                horizon_active_end=horizon_active_end,
-                return_token_mask=True,
-            )
-            traj_seq_lens = self._get_traj_seq_lens(
-                x, seq_len, device, horizon_tokens=horizon_tokens,
-                horizon_active_end=horizon_active_end,
-            )
-
-        return traj_emb, traj_seq_lens, traj_dropped, traj_token_mask
-
-    def _slice_diffusion_window(self, clean_feature, feature_length, time_steps):
-        batch_size, seq_len, _ = clean_feature.shape
-        device = clean_feature.device
-
-        noise_level = self._get_noise_levels(device, seq_len, time_steps)
-        noisy_feature, noise = self.add_noise(clean_feature, noise_level)
-
-        feature = self.preprocess(clean_feature)
-        noisy_feature = self.preprocess(noisy_feature)
-        noise = self.preprocess(noise)
-
-        feature_ref = []
-        noise_ref = []
-        noisy_feature_input = []
-        end_indices = []
-        for i in range(batch_size):
-            end_index = int(self.chunk_size * time_steps[i].item()) + 1
-            valid_len = int(feature_length[i].item())
-            end_index = min(valid_len, end_index)
-            feature_ref.append(feature[i, :, :end_index, ...])
-            noise_ref.append(noise[i, :, :end_index, ...])
-            noisy_feature_input.append(noisy_feature[i, :, :end_index, ...])
-            end_indices.append(end_index)
-
-        return noise_level, feature_ref, noise_ref, noisy_feature_input, end_indices
-
-    def _forward_single_window(
-        self,
-        x,
-        clean_feature,
-        time_steps,
-        all_text_context,
-        traj_emb,
-        traj_seq_lens,
-        traj_dropped,
-        enable_scheduled_sampling=True,
-        traj_token_mask=None,
-    ):
-        feature_length = x["feature_length"]
-        batch_size, seq_len, _ = clean_feature.shape
-
-        (
-            noise_level,
-            feature_ref,
-            noise_ref,
-            noisy_feature_input,
-            end_indices,
-        ) = self._slice_diffusion_window(clean_feature, feature_length, time_steps)
-
-        # Always call ControlNet so gradients flow when backbone is frozen.
-        # When traj_dropped=True, traj_emb is already None; ControlNet learns
-        # to produce near-zero residuals for null-traj input, which closely
-        # approximates the zero residuals used by pred_uncond at inference.
-        controlnet_residuals = self._controlnet_forward(
-            noisy_feature_input,
-            noise_level * self.time_embedding_scale,
-            all_text_context,
-            seq_len,
-            traj_emb,
-            traj_seq_lens,
-            traj_token_mask=traj_token_mask,
-        )
-        predicted_result = self.model(
-            noisy_feature_input,
-            noise_level * self.time_embedding_scale,
-            all_text_context,
-            seq_len,
-            y=None,
-            traj_emb=None,
-            traj_seq_lens=None,
-            controlnet_residuals=controlnet_residuals,
-        )
-
-        loss = 0.0
-        # Two lists with different x0-recovery formulas, each tuned to its
-        # consumer (both formulas are mathematically valid; they differ only in
-        # how prediction error δ propagates):
-        #
-        #   loss_x0_list  (Formula 1, "z = pred_vel + ε"):
-        #     error  = δ           (β-independent, fully exposes the model's
-        #                           velocity-prediction error)
-        #     ∂x0/∂pred_vel = 1    (full-strength gradient at every position)
-        #     → used by control loss so the gradient signal is not damped at
-        #       low β, where Formula 2 would let noisy_x carry the loss with
-        #       almost no gradient flowing back into the model.
-        #
-        #   sf_x0_list  (Formula 2, "z = noisy_x + β·pred_vel"):
-        #     error  = β·δ         (low-variance estimate of z, especially
-        #                           important at low β)
-        #     ∂x0/∂pred_vel = β    (β-attenuated gradient — irrelevant here,
-        #                           because SF rollout consumes the *value*
-        #                           after .detach())
-        #     → used by self-forcing rollout to substitute the chunk's
-        #       leftmost token where β ≈ 1/cs is small; Formula 1 there
-        #       collapses to z + ε (pure noise injection) and corrupts the
-        #       next rollout step's context.
-        loss_x0_list = []
-        sf_x0_list = []
-        for b in range(batch_size):
-            t_b = noisy_feature_input[b].shape[1]
-            if self.prediction_type == "vel":
-                vel = feature_ref[b] - noise_ref[b]
-                squared_error = (
-                    predicted_result[b][:, -self.chunk_size :, ...]
-                    - vel[:, -self.chunk_size :, ...]
-                ) ** 2
-            elif self.prediction_type == "x0":
-                squared_error = (
-                    predicted_result[b][:, -self.chunk_size :, ...]
-                    - feature_ref[b][:, -self.chunk_size :, ...]
-                ) ** 2
-            elif self.prediction_type == "noise":
-                squared_error = (
-                    predicted_result[b][:, -self.chunk_size :, ...]
-                    - noise_ref[b][:, -self.chunk_size :, ...]
-                ) ** 2
-                loss_x0_list.append(None)
-                sf_x0_list.append(None)
-            else:
-                raise ValueError(
-                    f"Unsupported prediction_type={self.prediction_type!r}"
-                )
-            sample_loss = squared_error.mean()
-            loss += sample_loss
-            if self.prediction_type == "vel":
-                # Formula 1 — full-gradient estimate, for control loss.
-                pred_x0_loss = predicted_result[b] + noise_ref[b]
-                loss_x0_list.append(pred_x0_loss[:, :, 0, 0].permute(1, 0))
-                # Formula 2 — low-variance estimate, for SF rollout.
-                beta_b = noise_level[b, :t_b].view(1, -1, 1, 1)
-                pred_x0_sf = noisy_feature_input[b] + beta_b * predicted_result[b]
-                sf_x0_list.append(pred_x0_sf[:, :, 0, 0].permute(1, 0))
-            elif self.prediction_type == "x0":
-                # x0-prediction: model directly outputs z, so the two formulas
-                # coincide. Share the same tensor for both consumers.
-                pred_x0 = predicted_result[b]
-                latent = pred_x0[:, :, 0, 0].permute(1, 0)
-                loss_x0_list.append(latent)
-                sf_x0_list.append(latent)
-        loss = loss / batch_size
-
-        pred_x0_latent_list = None
-        has_traj_condition = (
-            ("traj" in x and x.get("traj") is not None)
-            or ("traj_features" in x and x.get("traj_features") is not None)
-            or bool(x.get("_window_local_traj", False))
-        )
-        if has_traj_condition and (self.prediction_type in ("vel", "x0")) and not traj_dropped:
-            pred_x0_latent_list = loss_x0_list
-
-        return {
-            "loss": loss,
-            # Consumed by control loss → Formula 1 (full-gradient).
-            "pred_x0_latent_list": pred_x0_latent_list,
-            # Consumed by self-forcing rollout → Formula 2 (low-variance).
-            "x0_latent_list": sf_x0_list,
-            "end_indices": end_indices,
-        }
 
     def _get_noise_levels(self, device, seq_len, time_steps):
         """Get vectorized triangular noise levels."""
@@ -803,60 +291,38 @@ class DiffForcingWanModel(nn.Module):
         noisy_x = x * (1 - noise_level) + noise_level * noise
         return noisy_x, noise
 
-    def forward(self, x):
-        feature = x["feature"]  # (B, T, C)
-        feature_length = x["feature_length"]  # (B,)
-        batch_size, seq_len, _ = feature.shape
-        device = feature.device
-
-        time_steps_override = x.get("_time_steps_override", None)
-        if time_steps_override is not None:
-            if not torch.is_tensor(time_steps_override):
-                time_steps = torch.as_tensor(
-                    time_steps_override, device=device, dtype=torch.float32
-                )
-            else:
-                time_steps = time_steps_override.to(device=device, dtype=torch.float32)
-            if time_steps.ndim == 0:
-                time_steps = time_steps.repeat(batch_size)
-            if time_steps.shape[0] != batch_size:
-                raise ValueError(
-                    f"_time_steps_override batch mismatch: got {tuple(time_steps.shape)} "
-                    f"for batch_size={batch_size}"
-                )
-        else:
-            # Randomly use a time step
-            time_steps = []
-            for i in range(batch_size):
-                valid_len = feature_length[i].item()
-                # Random float from 0 to valid_len/chunk_size, not an integer
-                max_time = valid_len / self.chunk_size
-                time_steps.append(torch.FloatTensor(1).uniform_(0, max_time).item())
-            time_steps = torch.tensor(time_steps, device=device)  # (B,)
-        text_dropped_flags = self._decide_text_dropout(batch_size, device)
-        all_text_context = self._prepare_text_context(x, seq_len, device, text_dropped_flags)
-        traj_emb, traj_seq_lens, traj_dropped, traj_token_mask = self._prepare_traj_condition(
-            x, seq_len, device
+    def forward(
+        self,
+        noisy_input,
+        t_scaled,
+        text_context,
+        seq_len,
+        *,
+        traj_emb=None,
+        traj_seq_lens=None,
+        traj_token_mask=None,
+        controlnet_residuals=None,
+    ):
+        if controlnet_residuals is None:
+            controlnet_residuals = self._controlnet_forward(
+                noisy_input,
+                t_scaled,
+                text_context,
+                seq_len,
+                traj_emb,
+                traj_seq_lens,
+                traj_token_mask=traj_token_mask,
+            )
+        return self.model(
+            noisy_input,
+            t_scaled,
+            text_context,
+            seq_len,
+            y=None,
+            traj_emb=None,
+            traj_seq_lens=None,
+            controlnet_residuals=controlnet_residuals,
         )
-
-        single_result = self._forward_single_window(
-            x,
-            feature,
-            time_steps,
-            all_text_context,
-            traj_emb,
-            traj_seq_lens,
-            traj_dropped,
-            enable_scheduled_sampling=True,
-            traj_token_mask=traj_token_mask,
-        )
-
-        loss_dict = {"total": single_result["loss"], "mse": single_result["loss"]}
-        if single_result["pred_x0_latent_list"] is not None:
-            loss_dict["control_aux"] = {
-                "pred_x0_latent_list": single_result["pred_x0_latent_list"]
-            }
-        return loss_dict
 
     def _denoise_with_cfg(
         self,
@@ -878,11 +344,19 @@ class DiffForcingWanModel(nn.Module):
           - Unconditioned (cfg_scale_text == 1)
         Returns a list of per-sample predicted tensors (C, T, 1, 1).
         """
-        ctx_double = (
-            self._concat_text_for_cfg(text_cond_ctx, text_null_ctx, batch_size, seq_len)
-            if self.cfg_scale_text != 1.0
-            else None
-        )
+        ctx_double = None
+        if self.cfg_scale_text != 1.0:
+            # Text CFG supports per-sample context (B) and token-expanded
+            # stream context (B * seq_len).
+            n_text_ctx = len(text_cond_ctx)
+            if n_text_ctx == batch_size:
+                ctx_double = list(text_cond_ctx) + list(text_null_ctx)
+            elif n_text_ctx == batch_size * seq_len:
+                null_flat = []
+                for i in range(batch_size):
+                    for _ in range(seq_len):
+                        null_flat.append(text_null_ctx[i])
+                ctx_double = list(text_cond_ctx) + null_flat
 
         if traj_emb is None:
             if ctx_double is not None:
@@ -1041,7 +515,7 @@ class DiffForcingWanModel(nn.Module):
                 ]
             return pred
 
-    def generate(self, x, num_denoise_steps=None):
+    def generate(self, x, *, condition: LDFCondition | None = None, num_denoise_steps=None):
         """
         Generation - Diffusion Forcing inference
         Uses triangular noise schedule, progressively generating from left to right
@@ -1054,6 +528,7 @@ class DiffForcingWanModel(nn.Module):
         feature_length = x["feature_length"]
         batch_size = len(feature_length)
         seq_len = max(feature_length).item()
+        condition = self._resolve_condition(x, condition, batch_size=batch_size)
 
         if num_denoise_steps is None:
             num_denoise_steps = self.noise_steps
@@ -1074,77 +549,12 @@ class DiffForcingWanModel(nn.Module):
         dt = 1 / num_denoise_steps
         total_steps = int(max_t / dt)
 
-        # Encode text condition (using cache)
-        if self.use_text_cond and "text" in x:
-            text_list = x["text"]  # List[str] or List[List[str]]
-            if isinstance(text_list[0], list):
-                generated_length = []
-                text_end_list = x["feature_text_end"]
-                full_text = []
-                all_text_context = []
-                for single_text_list, single_text_end_list in zip(
-                    text_list, text_end_list
-                ):
-                    single_text_end_list = [0] + [
-                        min(t, seq_len) for t in single_text_end_list
-                    ]
-                    generated_length.append(single_text_end_list[-1])
-                    single_text_length_list = [
-                        t - b
-                        for t, b in zip(
-                            single_text_end_list[1:], single_text_end_list[:-1]
-                        )
-                    ]
-                    full_text.append(
-                        " ////////// ".join(
-                            [
-                                f"{u} //dur:{t}"
-                                for u, t in zip(
-                                    single_text_list, single_text_length_list
-                                )
-                            ]
-                        )
-                    )
-                    single_text_context = self.encode_text_with_cache(
-                        single_text_list, device
-                    )
-                    single_text_context = [
-                        u.to(self.param_dtype) for u in single_text_context
-                    ]
-                    for u, duration in zip(
-                        single_text_context, single_text_length_list
-                    ):
-                        all_text_context.extend([u for _ in range(duration)])
-                    all_text_context.extend(
-                        [
-                            single_text_context[-1]
-                            for _ in range(
-                                seq_len + self.chunk_size - single_text_end_list[-1]
-                            )
-                        ]
-                    )
-            else:
-                generated_length = feature_length
-                full_text = text_list
-                all_text_context = self.encode_text_with_cache(text_list, device)
-                all_text_context = [u.to(self.param_dtype) for u in all_text_context]
-        else:
-            generated_length = feature_length
-            full_text = [""] * batch_size
-            all_text_context = [""] * batch_size
-            all_text_context = self.encode_text_with_cache(all_text_context, device)
-            all_text_context = [u.to(self.param_dtype) for u in all_text_context]
-
-        # Get empty text condition encoding (for CFG)
-        text_null_list = [""] * batch_size
-        text_null_context = self.encode_text_with_cache(text_null_list, device)
-        text_null_context = [u.to(self.param_dtype) for u in text_null_context]
-
         gen_seq_len = seq_len + self.chunk_size
-        traj_emb, traj_token_mask = self._build_traj_emb(
-            x, gen_seq_len, device, return_token_mask=True,
-        )
-        traj_seq_lens = self._get_traj_seq_lens(x, gen_seq_len, device)
+        attn_len = condition.resolved_len()
+        generated_length = feature_length
+        full_text = x.get("output_text", x.get("text", [""] * batch_size))
+        if isinstance(full_text, list) and full_text and isinstance(full_text[0], list):
+            full_text = [" ////////// ".join(map(str, item)) for item in full_text]
 
         # Progressively advance from t=0 to t=max_t
         for step in range(total_steps):
@@ -1164,13 +574,18 @@ class DiffForcingWanModel(nn.Module):
             for i in range(batch_size):
                 noisy_input.append(generated[i, :, :end_index, ...])
 
-            gen_sl = seq_len + self.chunk_size
-            t_scaled = noise_level * self.time_embedding_scale
+            if attn_len == gen_seq_len:
+                noise_level_for_attn = noise_level
+            else:
+                noise_level_for_attn = self._get_noise_levels(
+                    device, attn_len, time_steps
+                )
+            t_scaled = noise_level_for_attn * self.time_embedding_scale
             predicted_result = self._denoise_with_cfg(
                 noisy_input, t_scaled,
-                all_text_context, text_null_context,
-                traj_emb, traj_seq_lens, gen_sl, batch_size,
-                traj_token_mask=traj_token_mask,
+                condition.text_context, condition.text_null_context,
+                condition.traj_emb, condition.traj_seq_lens, attn_len, batch_size,
+                traj_token_mask=condition.traj_token_mask,
             )
 
             for i in range(batch_size):
@@ -1219,7 +634,7 @@ class DiffForcingWanModel(nn.Module):
         return out
 
     @torch.no_grad()
-    def stream_generate(self, x, num_denoise_steps=None):
+    def stream_generate(self, x, *, condition: LDFCondition | None = None, num_denoise_steps=None):
         """
         Streaming generation - Diffusion Forcing inference
         Uses triangular noise schedule, progressively generating from left to right
@@ -1232,6 +647,7 @@ class DiffForcingWanModel(nn.Module):
         feature_length = x["feature_length"]
         batch_size = len(feature_length)
         seq_len = max(feature_length).item()
+        condition = self._resolve_condition(x, condition, batch_size=batch_size)
 
         if num_denoise_steps is None:
             num_denoise_steps = self.noise_steps
@@ -1252,80 +668,12 @@ class DiffForcingWanModel(nn.Module):
         dt = 1 / num_denoise_steps
         total_steps = int(max_t / dt)
 
-        # Encode text condition (using cache)
-        if self.use_text_cond and "text" in x:
-            text_list = x["text"]  # List[str] or List[List[str]]
-            if isinstance(text_list[0], list):
-                generated_length = []
-                text_end_list = x["feature_text_end"]
-                full_text = []
-                all_text_context = []
-                for single_text_list, single_text_end_list in zip(
-                    text_list, text_end_list
-                ):
-                    single_text_end_list = [0] + [
-                        min(t, seq_len) for t in single_text_end_list
-                    ]
-                    generated_length.append(single_text_end_list[-1])
-                    single_text_length_list = [
-                        t - b
-                        for t, b in zip(
-                            single_text_end_list[1:], single_text_end_list[:-1]
-                        )
-                    ]
-                    full_text.append(
-                        " ////////// ".join(
-                            [
-                                f"{u} //dur:{t}"
-                                for u, t in zip(
-                                    single_text_list, single_text_length_list
-                                )
-                            ]
-                        )
-                    )
-                    single_text_context = self.encode_text_with_cache(
-                        single_text_list, device
-                    )
-                    single_text_context = [
-                        u.to(self.param_dtype) for u in single_text_context
-                    ]
-                    for u, duration in zip(
-                        single_text_context, single_text_length_list
-                    ):
-                        all_text_context.extend([u for _ in range(duration)])
-                    all_text_context.extend(
-                        [
-                            single_text_context[-1]
-                            for _ in range(
-                                seq_len + self.chunk_size - single_text_end_list[-1]
-                            )
-                        ]
-                    )
-            else:
-                generated_length = feature_length
-                full_text = text_list
-                all_text_context = self.encode_text_with_cache(text_list, device)
-                all_text_context = [u.to(self.param_dtype) for u in all_text_context]
-        else:
-            generated_length = feature_length
-            full_text = [""] * batch_size
-            all_text_context = [""] * batch_size
-            all_text_context = self.encode_text_with_cache(all_text_context, device)
-            all_text_context = [u.to(self.param_dtype) for u in all_text_context]
-
-        # Get empty text condition encoding (for CFG)
-        text_null_list = [""] * batch_size
-        text_null_context = self.encode_text_with_cache(text_null_list, device)
-        text_null_context = [u.to(self.param_dtype) for u in text_null_context]
-
         gen_seq_len = seq_len + self.chunk_size
-        traj_emb = None
-        traj_seq_lens = None
-        traj_token_mask = None
-        traj_emb, traj_token_mask = self._build_traj_emb(
-            x, gen_seq_len, device, return_token_mask=True,
-        )
-        traj_seq_lens = self._get_traj_seq_lens(x, gen_seq_len, device)
+        attn_len = condition.resolved_len()
+        generated_length = feature_length
+        full_text = x.get("output_text", x.get("text", [""] * batch_size))
+        if isinstance(full_text, list) and full_text and isinstance(full_text[0], list):
+            full_text = [" ////////// ".join(map(str, item)) for item in full_text]
 
         commit_index = 0
         # Progressively advance from t=0 to t=max_t
@@ -1346,13 +694,18 @@ class DiffForcingWanModel(nn.Module):
             for i in range(batch_size):
                 noisy_input.append(generated[i, :, :end_index, ...])
 
-            gen_sl = seq_len + self.chunk_size
-            t_scaled = noise_level * self.time_embedding_scale
+            if attn_len == gen_seq_len:
+                noise_level_for_attn = noise_level
+            else:
+                noise_level_for_attn = self._get_noise_levels(
+                    device, attn_len, time_steps
+                )
+            t_scaled = noise_level_for_attn * self.time_embedding_scale
             predicted_result = self._denoise_with_cfg(
                 noisy_input, t_scaled,
-                all_text_context, text_null_context,
-                traj_emb, traj_seq_lens, gen_sl, batch_size,
-                traj_token_mask=traj_token_mask,
+                condition.text_context, condition.text_null_context,
+                condition.traj_emb, condition.traj_seq_lens, attn_len, batch_size,
+                traj_token_mask=condition.traj_token_mask,
             )
 
             for i in range(batch_size):
@@ -1417,7 +770,13 @@ class DiffForcingWanModel(nn.Module):
         out["generated"] = y_hat_out
         yield out
 
-    def init_generated(self, seq_len, batch_size=1, num_denoise_steps=None):
+    def init_generated(
+        self,
+        seq_len,
+        batch_size=1,
+        num_denoise_steps=None,
+        traj_buffer=None,
+    ):
         self.seq_len = seq_len
         self.batch_size = batch_size
         if num_denoise_steps is None:
@@ -1433,204 +792,10 @@ class DiffForcingWanModel(nn.Module):
         )
         self.generated = self.preprocess(self.generated)  # (B, C, T, 1, 1)
         self.commit_index = 0
-        self._traj_buf = TrajStreamBuffer(
-            batch_size=batch_size,
-            buf_len=self.seq_len * 2 + self.chunk_size,
-            local_traj_encoder=self.local_traj_encoder,
-            traj_encoder=self.traj_encoder,
-            use_emb_cache=self.use_traj_emb_cache,
-        )
-
-    def _build_stream_direct_traj_condition(
-        self,
-        x: dict,
-        model_sl: int,
-        window_start_token: int,
-        device,
-        traj_sl: int | None = None,
-    ):
-        """Encode an explicit frame-level 7D stream trajectory payload.
-
-        The payload must already be window-relative and body-window-local. This
-        helper only validates shape/start-token consistency and routes it
-        through the same 7D encoder path used by training.
-        """
-        subpayloads = x.get("traj_substep_payloads")
-        if subpayloads:
-            selected = None
-            for subpayload in subpayloads:
-                if int(subpayload.get("traj_start_token", -1)) == int(window_start_token):
-                    selected = subpayload
-                    break
-            if selected is None:
-                starts = [
-                    int(subpayload.get("traj_start_token", -1))
-                    for subpayload in subpayloads
-                ]
-                raise ValueError(
-                    "stream_generate_step 7D payload has no substep payload "
-                    f"for window_start_token={window_start_token}; available "
-                    f"starts={starts}."
-                )
-            x = selected
-
-        from utils.token_frame import (
-            frame_idx_to_token_idx,
-            prefix_len_from_tail_invalid,
-            token_range_to_frame_slice,
-            token_start_frame,
-        )
-
-        traj_frame = x["traj_cond_7d_frame"]
-        if isinstance(traj_frame, np.ndarray):
-            traj_frame = torch.from_numpy(traj_frame).float()
-        traj_frame = traj_frame.to(device=device)
-        if traj_frame.dim() == 2:
-            traj_frame = traj_frame.unsqueeze(0)
-        if traj_frame.dim() != 3 or traj_frame.shape[-1] != 7:
-            raise ValueError(
-                "traj_cond_7d_frame must be [B,T_frame,7] or [T_frame,7], "
-                f"got {tuple(traj_frame.shape)}"
-            )
-        if traj_frame.shape[0] != self.batch_size:
-            raise ValueError(
-                f"traj_cond_7d_frame batch size {traj_frame.shape[0]} does not "
-                f"match stream batch_size {self.batch_size}"
-            )
-
-        payload_local_start = int(x.get("traj_start_token", window_start_token))
-        payload_abs_start = int(x.get("traj_abs_start_token", payload_local_start))
-        if payload_local_start > window_start_token:
-            raise ValueError(
-                "stream_generate_step 7D payload starts after current latent "
-                "window start; got traj_start_token="
-                f"{payload_local_start}, window_start_token={window_start_token}. "
-                "Build direct 7D payloads from the earliest denoise substep "
-                "window start or earlier."
-            )
-        payload_num_tokens = x.get("traj_num_tokens", None)
-        if payload_num_tokens is not None:
-            payload_num_tokens = int(payload_num_tokens)
-            if payload_num_tokens < model_sl:
-                raise ValueError(
-                    "stream traj_num_tokens must be >= model_sl; got "
-                    f"traj_num_tokens={payload_num_tokens}, model_sl={model_sl}."
-                )
-        if traj_sl is None:
-            if payload_num_tokens is not None:
-                traj_sl = payload_num_tokens
-            elif traj_frame.shape[1] <= 0:
-                traj_sl = model_sl
-            else:
-                origin_frame = token_start_frame(payload_abs_start)
-                payload_last_frame = origin_frame + int(traj_frame.shape[1]) - 1
-                payload_end_token = frame_idx_to_token_idx(payload_last_frame) + 1
-                window_abs_start = payload_abs_start + (
-                    window_start_token - payload_local_start
-                )
-                traj_sl = max(model_sl, payload_end_token - window_abs_start)
-        traj_sl = int(traj_sl)
-        if traj_sl < model_sl:
-            raise ValueError(
-                f"stream traj_sl must be >= model_sl; got traj_sl={traj_sl}, "
-                f"model_sl={model_sl}."
-            )
-
-        window_abs_start = payload_abs_start + (
-            window_start_token - payload_local_start
-        )
-        if payload_local_start < window_start_token:
-            crop_tokens = window_start_token - payload_local_start
-            if payload_num_tokens is not None:
-                traj_sl = max(model_sl, payload_num_tokens - crop_tokens)
-            origin_frame = token_start_frame(payload_abs_start)
-            needed = token_range_to_frame_slice(window_abs_start, traj_sl)
-            rel_start = needed.start - origin_frame
-            rel_stop = needed.stop - origin_frame
-            if rel_start >= traj_frame.shape[1]:
-                traj_frame = traj_frame[:, :0, :]
-            else:
-                traj_frame = traj_frame[:, max(0, rel_start):min(rel_stop, traj_frame.shape[1]), :]
-        else:
-            window_abs_start = payload_abs_start
-
-        traj_payload = {
-            "traj_features": traj_frame,
-            "traj_start_token": window_abs_start,
-        }
-        traj_mask = x.get("traj_cond_frame_mask", x.get("traj_cond_mask"))
-        if traj_mask is not None:
-            if isinstance(traj_mask, np.ndarray):
-                traj_mask = torch.from_numpy(traj_mask).float()
-            traj_mask = traj_mask.to(device=device)
-            if traj_mask.dim() == 1:
-                traj_mask = traj_mask.unsqueeze(0)
-            if traj_mask.shape[0] != self.batch_size:
-                raise ValueError(
-                    f"traj_cond_frame_mask batch size {traj_mask.shape[0]} does not "
-                    f"match stream batch_size {self.batch_size}"
-                )
-            if payload_local_start < window_start_token:
-                if rel_start >= traj_mask.shape[1]:
-                    traj_mask = traj_mask[:, :0]
-                else:
-                    traj_mask = traj_mask[:, max(0, rel_start):min(rel_stop, traj_mask.shape[1])]
-            traj_payload["traj_cond_mask"] = traj_mask
-
-        traj_emb, traj_token_mask = encode_traj_batch(
-            traj_payload,
-            traj_sl,
-            device,
-            self.local_traj_encoder,
-            self.traj_encoder,
-            return_token_mask=True,
-        )
-        if traj_emb is None:
-            return None, None, None
-        if traj_token_mask is not None:
-            traj_seq_lens = prefix_len_from_tail_invalid(traj_token_mask).to(
-                device=device
-            )
-        else:
-            traj_seq_lens = torch.full(
-                (self.batch_size,),
-                traj_sl,
-                device=device,
-                dtype=torch.long,
-            )
-        return traj_emb, traj_seq_lens, traj_token_mask
-
-    @staticmethod
-    def _extend_stream_text_context_for_attention(
-        text_condition: list,
-        batch_size: int,
-        model_sl: int,
-        attn_sl: int,
-    ) -> list:
-        """Pad frame-aligned stream text context to the attention length.
-
-        The latent rolling window provides ``model_sl`` text slots. Direct 7D
-        trajectory conditioning can extend attention to future trajectory tokens,
-        so frame-aligned text context must be padded to ``attn_sl``. Future
-        slots reuse the last visible text context for each sample.
-        """
-        if attn_sl <= model_sl:
-            return text_condition
-        if len(text_condition) != batch_size * model_sl:
-            if len(text_condition) == batch_size:
-                return text_condition
-            return text_condition
-        out = []
-        for i in range(batch_size):
-            segment = list(text_condition[i * model_sl : (i + 1) * model_sl])
-            if not segment:
-                continue
-            out.extend(segment)
-            out.extend([segment[-1]] * (attn_sl - model_sl))
-        return out
+        self._traj_buf = traj_buffer
 
     @torch.no_grad()
-    def stream_generate_step(self, x, first_chunk=True):
+    def stream_generate_step(self, x=None, first_chunk=True, condition=None):
         """
         Streaming generation step - Diffusion Forcing inference
         Uses triangular noise schedule, progressively generating from left to right
@@ -1641,33 +806,11 @@ class DiffForcingWanModel(nn.Module):
         3. After each denoising step, t increases slightly and continues
         """
 
+        if x is None:
+            x = {}
         device = next(self.parameters()).device
         if first_chunk:
             self.generated = self.generated.to(device)
-        self._traj_buf.update(x, self.commit_index, device)
-
-        # Encode text condition (using cache)
-        if self.use_text_cond and "text" in x:
-            text_list = x["text"]  # List[str]
-            new_text_context = self.encode_text_with_cache(text_list, device)
-            new_text_context = [u.to(self.param_dtype) for u in new_text_context]
-        else:
-            new_text_context = [""] * self.batch_size
-            new_text_context = self.encode_text_with_cache(new_text_context, device)
-            new_text_context = [u.to(self.param_dtype) for u in new_text_context]
-
-        # Get empty text condition encoding (for CFG)
-        text_null_list = [""] * self.batch_size
-        text_null_context = self.encode_text_with_cache(text_null_list, device)
-        text_null_context = [u.to(self.param_dtype) for u in text_null_context]
-
-        for i in range(self.batch_size):
-            if first_chunk:
-                self.text_condition_list[i].extend(
-                    [new_text_context[i]] * self.chunk_size
-                )
-            else:
-                self.text_condition_list[i].extend([new_text_context[i]])
 
         end_step = (
             (self.commit_index + self.chunk_size)
@@ -1691,54 +834,18 @@ class DiffForcingWanModel(nn.Module):
                     self.generated[i, :, :end_index, ...][:, -self.seq_len :]
                 )  # (C, T, 1, 1)
 
-            text_condition = []
-            for i in range(self.batch_size):
-                text_condition.extend(
-                    self.text_condition_list[i][:end_index][-self.seq_len :]
-                )  # (T, D, 4096)
-
             model_sl = min(end_index, self.seq_len)
             window_start_token = max(0, end_index - model_sl)
-            attn_sl = model_sl
-            if x.get("traj_cond_7d_frame") is not None:
-                traj_emb, traj_seq_lens, traj_token_mask = (
-                    self._build_stream_direct_traj_condition(
-                        x,
-                        model_sl,
-                        window_start_token,
-                        device,
-                    )
-                )
-                if traj_emb is not None:
-                    attn_sl = max(model_sl, int(traj_emb.shape[1]))
-            else:
-                traj_emb = self._traj_buf.build_traj_emb(end_index, self.seq_len, device)
-                if traj_emb is not None:
-                    valid_lens = self._traj_buf.get_traj_valid_lens(
-                        end_index, self.seq_len, device
-                    )
-                    traj_seq_lens = (
-                        valid_lens
-                        if valid_lens is not None
-                        else torch.full(
-                            (self.batch_size,),
-                            model_sl,
-                            device=device,
-                            dtype=torch.long,
-                        )
-                    )
-                    traj_token_mask = self._traj_buf.get_traj_token_mask(
-                        end_index, self.seq_len, device
-                    )
-                else:
-                    traj_seq_lens = None
-                    traj_token_mask = None
-            text_condition_attn = self._extend_stream_text_context_for_attention(
-                text_condition,
-                self.batch_size,
-                model_sl,
-                attn_sl,
+            step_condition = self._resolve_stream_condition(
+                x,
+                condition,
+                end_index=end_index,
+                model_sl=model_sl,
+                window_start_token=window_start_token,
+                time_steps=time_steps,
+                device=device,
             )
+            attn_sl = step_condition.resolved_len()
             if attn_sl == model_sl:
                 noise_level_for_attn = noise_level
             else:
@@ -1751,9 +858,10 @@ class DiffForcingWanModel(nn.Module):
             t_scaled = noise_level_for_attn * self.time_embedding_scale
             predicted_result = self._denoise_with_cfg(
                 noisy_input, t_scaled,
-                text_condition_attn, text_null_context,
-                traj_emb, traj_seq_lens, attn_sl, self.batch_size,
-                traj_token_mask=traj_token_mask,
+                step_condition.text_context, step_condition.text_null_context,
+                step_condition.traj_emb, step_condition.traj_seq_lens, attn_sl,
+                self.batch_size,
+                traj_token_mask=step_condition.traj_token_mask,
             )
 
             for i in range(self.batch_size):
@@ -1830,7 +938,8 @@ class DiffForcingWanModel(nn.Module):
                 ],
                 dim=2,
             )
-            self._traj_buf.roll(self.seq_len, device)
+            if self._traj_buf is not None:
+                self._traj_buf.roll(self.seq_len, device)
             self.current_step -= self.seq_len * self.num_denoise_steps / self.chunk_size
             self.commit_index -= self.seq_len
             for i in range(self.batch_size):

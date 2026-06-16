@@ -1,11 +1,11 @@
-"""B-P0-1 mask-aware traj_seq_lens: build_traj_token_mask + _get_traj_seq_lens
-truncation + _prepare_traj_condition wiring.
+"""B-P0-1 mask-aware traj_seq_lens: build_traj_token_mask + get_traj_seq_lens
+truncation + prepare_traj_condition wiring.
 
-The build_traj_token_mask logic is pure (no model). The _get_traj_seq_lens /
-_prepare_traj_condition tests build a tiny DiffForcingWanModel via a precomputed
+The build_traj_token_mask logic is pure (no model). The get_traj_seq_lens /
+prepare_traj_condition tests build a tiny DiffForcingWanModel via a precomputed
 text fixture (no T5 ckpt). The ControlNet-residual value-invariance test (tail
 mask=0 change → residual unchanged; sparse middle-hole non-regression) needs real
-VAE-latent shapes and is run on the runtime box — see _get_traj_seq_lens note.
+VAE-latent shapes and is run on the runtime box — see get_traj_seq_lens note.
 """
 
 from __future__ import annotations
@@ -14,7 +14,8 @@ import pytest
 import torch
 
 from utils.token_frame import num_frames_for_tokens
-from utils.traj_batch import build_traj_token_mask
+from utils.traj_batch import build_traj_token_mask, get_traj_seq_lens
+from utils.training.ldf.conditioning import prepare_traj_condition
 
 _TEXT_DIM = 4096
 
@@ -51,21 +52,24 @@ def test_token_mask_none_when_no_mask_no_horizon():
 
 
 # ---------------------------------------------------------------------------
-# model-level _get_traj_seq_lens (tiny model)
+# get_traj_seq_lens
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
 def model(tmp_path):
     from models.diffusion_forcing_wan import DiffForcingWanModel
+    from utils.training.ldf.model_factory import install_precomputed_text_embeddings
 
     p = tmp_path / "t5.pt"
     torch.save({"embeddings": {"": torch.zeros(2, _TEXT_DIM)}, "text_dim": _TEXT_DIM}, p)
-    return DiffForcingWanModel(
+    model = DiffForcingWanModel(
         input_dim=4, hidden_dim=64, ffn_dim=128, freq_dim=64,
         num_heads=2, num_layers=1, text_len=8, traj_encoder_in_dim=7,
-        use_precomputed_text_emb=True, precomputed_text_emb_path=str(p),
+        build_text_encoder=False,
     )
+    install_precomputed_text_embeddings(model, str(p), expected_text_dim=_TEXT_DIM)
+    return model
 
 
 def _x(seq_len, *, mask=None):
@@ -77,37 +81,38 @@ def _x(seq_len, *, mask=None):
     return x
 
 
-def test_seq_lens_horizon_truncates_pure_suffix(model):
+def test_seq_lens_horizon_truncates_pure_suffix():
     seq_len = 6
-    sl = model._get_traj_seq_lens(_x(seq_len), seq_len, "cpu",
-                                  horizon_tokens=4, horizon_active_end=0)
+    sl = get_traj_seq_lens(
+        _x(seq_len), seq_len, "cpu", horizon_tokens=4, horizon_active_end=0
+    )
     assert sl.tolist() == [4]   # base 6 truncated to the valid prefix 4
 
 
-def test_seq_lens_middle_hole_not_truncated(model):
+def test_seq_lens_middle_hole_not_truncated():
     seq_len = 6
     T_frame = num_frames_for_tokens(seq_len)
     mask = torch.ones(1, T_frame)
     mask[:, 5:9] = 0   # hole at token 2; tokens 3..5 valid
-    sl = model._get_traj_seq_lens(_x(seq_len, mask=mask), seq_len, "cpu")
+    sl = get_traj_seq_lens(_x(seq_len, mask=mask), seq_len, "cpu")
     assert sl.tolist() == [6]   # middle hole must NOT shorten attention
 
 
-def test_seq_lens_all_zero_mask_is_zero(model):
+def test_seq_lens_all_zero_mask_is_zero():
     seq_len = 6
     T_frame = num_frames_for_tokens(seq_len)
     mask = torch.zeros(1, T_frame)
-    sl = model._get_traj_seq_lens(_x(seq_len, mask=mask), seq_len, "cpu")
+    sl = get_traj_seq_lens(_x(seq_len, mask=mask), seq_len, "cpu")
     assert sl.tolist() == [0]
 
 
-def test_seq_lens_no_horizon_no_mask_is_base(model):
+def test_seq_lens_no_horizon_no_mask_is_base():
     seq_len = 6
-    sl = model._get_traj_seq_lens(_x(seq_len), seq_len, "cpu")
+    sl = get_traj_seq_lens(_x(seq_len), seq_len, "cpu")
     assert sl.tolist() == [6]   # full length when nothing masks
 
 
-def test_seq_lens_prefers_explicit_traj_num_tokens_over_feature_length(model):
+def test_seq_lens_prefers_explicit_traj_num_tokens_over_feature_length():
     """Window-local training uses feature_length for latent length only."""
     seq_len = 6
     latent_valid_len = 4
@@ -118,16 +123,16 @@ def test_seq_lens_prefers_explicit_traj_num_tokens_over_feature_length(model):
         "traj_num_tokens": torch.tensor([seq_len]),
     }
 
-    sl = model._get_traj_seq_lens(x, seq_len, "cpu")
+    sl = get_traj_seq_lens(x, seq_len, "cpu")
 
     assert sl.tolist() == [seq_len]
 
 
-def test_prepare_traj_condition_returns_truncated_seq_lens(model):
-    """Wiring: _prepare_traj_condition threads horizon into _get_traj_seq_lens."""
+def test_traj_condition_helper_returns_truncated_seq_lens(model):
+    """Wiring: prepare_traj_condition threads horizon into get_traj_seq_lens."""
     seq_len = 6
-    _, traj_seq_lens, dropped, _tmask = model._prepare_traj_condition(
-        _x(seq_len), seq_len, "cpu", traj_dropped_override=False,
+    _, traj_seq_lens, dropped, _tmask = prepare_traj_condition(
+        model, _x(seq_len), seq_len, "cpu", traj_dropped=False,
         horizon_tokens=4, horizon_active_end=0,
     )
     assert not dropped

@@ -11,6 +11,12 @@ from __future__ import annotations
 
 from omegaconf import OmegaConf
 
+from utils.training.ldf.self_forcing_config import (
+    self_forcing_enabled,
+    self_forcing_k_schedule,
+    self_forcing_stride_tokens,
+)
+
 
 def validate_traj_dim_consistency(cfg) -> int:
     """Check the two traj-dim flags agree and equal 7. Returns the dim (7).
@@ -46,7 +52,7 @@ def validate_7d_requires_self_forcing(cfg) -> None:
       - the body-window world->local canonicalize (apply_body_window_canonicalize,
         called only from the SF path) that matches the streaming-inference
         distribution.
-    So a 7D config with self_forcing_enabled=false would silently train the new
+    So a 7D config with self_forcing.enabled=false would silently train the new
     heading channels unsupervised on uncanonicalized world-frame traj cond. The
     in-SF "traj_encoder_in_dim=7 requires body_aux_loss" guard never runs when SF
     is off, so enforce 7D => self_forcing here (at module construction).
@@ -54,10 +60,9 @@ def validate_7d_requires_self_forcing(cfg) -> None:
     dim = int(OmegaConf.select(cfg, "model.params.traj_encoder_in_dim", default=7))
     if dim != 7:
         return
-    sf = bool(OmegaConf.select(cfg, "model.params.self_forcing_enabled", default=False))
-    if not sf:
+    if not self_forcing_enabled(cfg):
         raise ValueError(
-            "traj_encoder_in_dim=7 requires model.params.self_forcing_enabled=true: "
+            "traj_encoder_in_dim=7 requires self_forcing.enabled=true: "
             "7D heading supervision (body_aux_loss) and the body-window "
             "canonicalize are self-forcing-only, so a non-SF 7D run trains the new "
             "heading channels unsupervised on world-frame traj cond. Enable "
@@ -76,6 +81,11 @@ def validate_stream_training_config(cfg) -> None:
             "stream_training.motion_aux_loss is no longer configurable; "
             "full-prefix motion auxiliary loss is the stream-training default."
         )
+    if "latent_source" in stream_cfg:
+        raise ValueError(
+            "stream_training.latent_source was removed; stream training always "
+            "uses online VAE encode."
+        )
     chunk_size = int(OmegaConf.select(cfg, "model.params.chunk_size", default=5))
     context_tokens = int(OmegaConf.select(cfg, "stream_training.context_tokens", default=0))
     window_sampling_enabled = bool(
@@ -87,9 +97,6 @@ def validate_stream_training_config(cfg) -> None:
     horizon_tokens = int(OmegaConf.select(cfg, "stream_training.horizon_tokens", default=0))
     sample_policy = str(
         OmegaConf.select(cfg, "stream_training.sample_policy", default="variable_history")
-    )
-    latent_source = str(
-        OmegaConf.select(cfg, "stream_training.latent_source", default="precomputed_slice")
     )
     anchor_move = bool(
         OmegaConf.select(cfg, "stream_training.anchor_move_in_rollout", default=False)
@@ -104,12 +111,8 @@ def validate_stream_training_config(cfg) -> None:
         history_max = OmegaConf.select(cfg, f"{ws_prefix}.history_tokens_max", default="auto")
         horizon_min = int(OmegaConf.select(cfg, f"{ws_prefix}.horizon_tokens_min", default=0))
         horizon_max = int(OmegaConf.select(cfg, f"{ws_prefix}.horizon_tokens_max", default=0))
-        stride = int(
-            OmegaConf.select(cfg, "model.params.self_forcing_stride_tokens", default=1)
-        )
-        schedule = OmegaConf.select(
-            cfg, "model.params.self_forcing_k_schedule", default=[[0.0, 1]]
-        )
+        stride = self_forcing_stride_tokens(cfg)
+        schedule = self_forcing_k_schedule(cfg)
         max_k = 1
         for row in schedule:
             max_k = max(max_k, int(row[1]))
@@ -144,11 +147,6 @@ def validate_stream_training_config(cfg) -> None:
                 "stream_training.window_sampling.enabled=true; variable horizon "
                 "is sampled by window_sampling in stream-training v2."
             )
-        if latent_source not in {"precomputed_slice", "online_encode"}:
-            raise ValueError(
-                "stream_training.latent_source must be 'precomputed_slice' or "
-                f"'online_encode' for v2; got {latent_source!r}."
-            )
         if anchor_move:
             raise ValueError(
                 "stream_training.anchor_move_in_rollout=true is not implemented yet. "
@@ -174,11 +172,6 @@ def validate_stream_training_config(cfg) -> None:
         raise ValueError(
             "stream_training.sample_policy must be 'variable_history' or "
             f"'fixed_window'; got {sample_policy!r}."
-        )
-    if latent_source not in {"precomputed_slice", "online_encode"}:
-        raise ValueError(
-            "stream_training.latent_source must be 'precomputed_slice' or "
-            f"'online_encode' for v1; got {latent_source!r}."
         )
     if anchor_move:
         raise ValueError(

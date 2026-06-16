@@ -6,9 +6,9 @@ References:
 
 Why this module: causal VAE token-frame is **not** `N tokens = 4N frames`.
 Token 0 covers 1 frame; token k≥1 covers 4 frames each. Multiple hand-written
-formulas already exist in `utils/traj_batch.py:149-150`, `utils/training/
-control_loss.py:46`, etc. (known bug sources); this module is the canonical
-replacement.
+formulas already exist in `utils/traj_batch.py:149-150`,
+`utils/training/ldf/losses.py`, etc. (known bug sources); this module is the
+canonical replacement.
 
 Layout:
     token 0     → frame [0, 0]      (1 effective frame, VAE pads to 4 copies)
@@ -95,7 +95,7 @@ def num_tokens_for_frame_len(frame_len: int, frames_per_token: int = FRAMES_PER_
     `frame_len <= 0 → 0`; otherwise `frame_idx_to_token_idx(frame_len - 1) + 1`
     (the token covering the last frame, plus one). Use this instead of hand-rolled
     `(L + 2) // 4 + 1`-style formulas. The tensor path in
-    DiffForcingWanModel._get_traj_seq_lens mirrors this elementwise.
+    utils.traj_batch.get_traj_seq_lens mirrors this elementwise.
     """
     if frame_len <= 0:
         return 0
@@ -178,7 +178,7 @@ def frames_to_token_mask(mask_frame, num_tokens: int,
 
 def prefix_len_from_tail_invalid(token_mask):
     """Per-sample valid-token PREFIX length, but ONLY when the invalid region is
-    a pure suffix. Wired into DiffForcingWanModel._get_traj_seq_lens (B-P0-1) to
+    a pure suffix. Wired into get_traj_seq_lens (B-P0-1) to
     truncate ControlNet attention past an out-of-horizon / overflow tail.
 
     `token_mask`: [B, T] (1 = valid). Returns LongTensor [B]:

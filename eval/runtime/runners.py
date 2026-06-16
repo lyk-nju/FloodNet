@@ -25,12 +25,14 @@ from utils.motion_process import (
 )
 from utils.inference.root_plan import build_rootplan_stream_payload_from_buffer
 from utils.inference.timeline import append_timeline_state_at_token_start_frame
+from utils.inference.ldf_conditioning import build_stream_step_condition_provider
 from utils.inference.rollout import (
     StreamTextSegment,
     StreamTextRolloutController,
     build_stream_step_model_input,
     build_stream_suffix_conditioning,
 )
+from utils.inference.stream_state import init_stream_generation
 from utils.inference.trajectory import (
     StreamTrajectoryPlan,
     assign_uniform_timestamps,
@@ -475,7 +477,7 @@ def run_step_case(
     text = sample["text"] if isinstance(sample["text"], str) else sample["text"][0]
     timeline = new_eval_timeline()
     vae.clear_cache()
-    model.init_generated(hl, batch_size=1, num_denoise_steps=nds)
+    init_stream_generation(model, hl, batch_size=1, num_denoise_steps=nds)
     model.generated = model.generated.to(device)
     clear_model_traj_state(model)
     root_5d_history, frame_idx = [], 0
@@ -539,7 +541,17 @@ def run_step_case(
         else:
             raise ValueError(f"unknown traj_condition_path {condition_path!r}")
         step_payload = build_stream_step_model_input(text, traj_input=traj_input)
-        out = model.stream_generate_step(step_payload, first_chunk=first_chunk)
+        condition_provider = build_stream_step_condition_provider(
+            model,
+            step_payload,
+            first_chunk=first_chunk,
+            device=device,
+        )
+        out = model.stream_generate_step(
+            step_payload,
+            first_chunk=first_chunk,
+            condition=condition_provider,
+        )
         decoded = (
             vae.stream_decode(
                 out["generated"][0][None, :].to(device),
@@ -610,7 +622,7 @@ def run_babel_case(
     text_controller = StreamTextRolloutController(segments)
     gt_root = extract_root_trajectory_263(sample["feature"].numpy()[:tfs])
     vae.clear_cache()
-    model.init_generated(hl, batch_size=1, num_denoise_steps=nds)
+    init_stream_generation(model, hl, batch_size=1, num_denoise_steps=nds)
     model.generated = model.generated.to(device)
     clear_model_traj_state(model)
     root_5d_history, frame_idx = [], 0
@@ -721,7 +733,17 @@ def run_babel_case(
         else:
             raise ValueError(f"unknown traj_condition_path {condition_path!r}")
         step_payload = build_stream_step_model_input(text, traj_input=traj_input)
-        out = model.stream_generate_step(step_payload, first_chunk=first_chunk)
+        condition_provider = build_stream_step_condition_provider(
+            model,
+            step_payload,
+            first_chunk=first_chunk,
+            device=device,
+        )
+        out = model.stream_generate_step(
+            step_payload,
+            first_chunk=first_chunk,
+            condition=condition_provider,
+        )
         decoded = (
             vae.stream_decode(
                 out["generated"][0][None, :].to(device),
@@ -832,7 +854,7 @@ def run_real_case(
             plan_pts = rotate_xz_points(plan_pts, plan_pts[0], float(rotate_plan_deg))
     timeline = InferenceGlueTimeline(session_anchor_state)
     vae.clear_cache()
-    model.init_generated(hl, batch_size=1, num_denoise_steps=nds)
+    init_stream_generation(model, hl, batch_size=1, num_denoise_steps=nds)
     model.generated = model.generated.to(device)
     clear_model_traj_state(model)
     root_5d_history, frame_idx = [], 0
@@ -922,7 +944,17 @@ def run_real_case(
         else:
             raise ValueError(f"unknown traj_condition_path {condition_path!r}")
         step_payload = build_stream_step_model_input(text, traj_input=traj_input)
-        out = model.stream_generate_step(step_payload, first_chunk=first_chunk)
+        condition_provider = build_stream_step_condition_provider(
+            model,
+            step_payload,
+            first_chunk=first_chunk,
+            device=device,
+        )
+        out = model.stream_generate_step(
+            step_payload,
+            first_chunk=first_chunk,
+            condition=condition_provider,
+        )
         dec = (
             vae.stream_decode(
                 out["generated"][0][None, :].to(device),
@@ -1023,7 +1055,7 @@ def run_turn_case(
     rot_t = np.arange(len(rot_pts), dtype=np.float32) * wpdt
     gr = extract_root_trajectory_263(sample["feature"].numpy()[:tfs])
     vae.clear_cache()
-    model.init_generated(hl, batch_size=1, num_denoise_steps=nds)
+    init_stream_generation(model, hl, batch_size=1, num_denoise_steps=nds)
     model.generated = model.generated.to(device)
     clear_model_traj_state(model)
     root_5d_history, frame_idx = [], 0
@@ -1142,7 +1174,17 @@ def run_turn_case(
         else:
             raise ValueError(f"unknown traj_condition_path {condition_path!r}")
         step_payload = build_stream_step_model_input(text, traj_input=traj_input)
-        out = model.stream_generate_step(step_payload, first_chunk=first_chunk)
+        condition_provider = build_stream_step_condition_provider(
+            model,
+            step_payload,
+            first_chunk=first_chunk,
+            device=device,
+        )
+        out = model.stream_generate_step(
+            step_payload,
+            first_chunk=first_chunk,
+            condition=condition_provider,
+        )
         dec = (
             vae.stream_decode(
                 out["generated"][0][None, :].to(device),

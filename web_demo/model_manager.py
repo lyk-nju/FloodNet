@@ -20,7 +20,9 @@ from utils.motion_process import StreamJointRecovery263, append_traj_deltas_5d_t
 from utils.inference.root_plan import RootPlan
 from utils.inference.root_plan import build_rootplan_stream_payload_from_buffer
 from utils.inference.timeline import append_timeline_state_at_token_start_frame
+from utils.inference.ldf_conditioning import build_stream_step_condition_provider
 from utils.inference.rollout import build_stream_step_model_input
+from utils.inference.stream_state import init_stream_generation
 from utils.token_frame import num_frames_for_tokens, token_start_frame
 from utils.inference.trajectory import (
     StreamTrajectoryPlan,
@@ -38,6 +40,7 @@ from utils.inference.trajectory import (
     sample_timestamped_trajectory,
     smoothstep01,
 )
+from utils.training.ldf.model_factory import instantiate_ldf_model
 
 
 class FrameBuffer:
@@ -267,9 +270,7 @@ class ModelManager:
             
             # Load diffusion model
             print("Loading diffusion model...")
-            model = instantiate(
-                target=cfg.model.target, cfg=None, hfstyle=False, **cfg.model.params
-            )
+            model = instantiate_ldf_model(cfg.model.target, cfg.model.params)
             checkpoint = torch.load(cfg.test_ckpt, map_location="cpu", weights_only=False)
             try:
                 model.load_state_dict(checkpoint["state_dict"], strict=True)
@@ -368,7 +369,12 @@ class ModelManager:
             self.root_5d_history.clear()
             self._generated_frame_count = 0
             self._absolute_commit_index = 0
-            self.model.init_generated(self.history_length, batch_size=1, num_denoise_steps=self.denoise_steps)
+            init_stream_generation(
+                self.model,
+                self.history_length,
+                batch_size=1,
+                num_denoise_steps=self.denoise_steps,
+            )
             print(f"Model initialized with history length: {self.history_length}, denoise steps: {self.denoise_steps}")
             
             # Start generation thread
@@ -971,7 +977,12 @@ class ModelManager:
         self._reset_glue_timeline()
         
         # Initialize model with denoise steps
-        self.model.init_generated(self.history_length, batch_size=1, num_denoise_steps=self.denoise_steps)
+        init_stream_generation(
+            self.model,
+            self.history_length,
+            batch_size=1,
+            num_denoise_steps=self.denoise_steps,
+        )
         print(f"Model reset - history: {self.history_length}, smoothing: {self.smoothing_alpha}, steps: {self.denoise_steps}")
         return True
     
@@ -1007,11 +1018,19 @@ class ModelManager:
                         x = build_stream_step_model_input(
                             self.current_text, traj_input=traj_input
                         )
+                        condition_provider = build_stream_step_condition_provider(
+                            self.model,
+                            x,
+                            first_chunk=self.first_chunk,
+                            device=next(self.model.parameters()).device,
+                        )
                         
                         # Generate from model (1 token)
                         # Note: denoise_steps is set in init_generated, not here
                         output = self.model.stream_generate_step(
-                            x, first_chunk=self.first_chunk
+                            x,
+                            first_chunk=self.first_chunk,
+                            condition=condition_provider,
                         )
                         generated = output["generated"]
                         self._absolute_commit_index = (

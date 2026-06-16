@@ -1,4 +1,9 @@
-"""Checkpoint compatibility helpers for trajectory-conditioning rewrites."""
+"""Manual checkpoint helpers for old trajectory-conditioning checkpoints.
+
+The 7D LDF training/eval path does not auto-migrate legacy 4D trajectory
+weights. Keep these helpers under tools for one-off inspection or migration
+scripts, outside the runtime training package.
+"""
 
 from __future__ import annotations
 
@@ -53,9 +58,8 @@ def strip_legacy_traj_encoder_weights(state_dict: dict, own_state: dict) -> int:
     return n
 
 
-# Kept for older callers that imported the former expansion helper.
 def expand_traj_input_4d_to_7d(state_dict: dict, target_in_dim: int) -> int:
-    """No-op compatibility shim; use strip_legacy_traj_encoder_weights instead."""
+    """No-op legacy helper; use strip_legacy_traj_encoder_weights manually."""
     del state_dict, target_in_dim
     return 0
 

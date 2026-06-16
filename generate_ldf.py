@@ -6,8 +6,13 @@ from lightning import seed_everything
 from torch_ema import ExponentialMovingAverage
 
 from utils.initialize import check_state_dict, instantiate, load_config
+from utils.inference.ldf_conditioning import (
+    build_stream_step_condition_provider,
+    prepare_generate_condition,
+)
+from utils.inference.stream_state import init_stream_generation
 from utils.motion_process import StreamJointRecovery263
-from utils.training.ldf.ckpt_compat import strip_legacy_traj_encoder_weights
+from utils.training.ldf.model_factory import instantiate_ldf_model
 from utils.visualization.skeleton import get_humanml3d_chains, render_simple_skeleton_video
 from utils.visualization.video import render_single_video
 
@@ -49,22 +54,12 @@ def load_model_from_config():
     vae.eval()
 
     # model
-    model = instantiate(
-        target=cfg.model.target, cfg=None, hfstyle=False, **cfg.model.params
-    )
+    model = instantiate_ldf_model(cfg.model.target, cfg.model.params)
     checkpoint = torch.load(cfg.test_ckpt, map_location="cpu", weights_only=False)
 
-    # Strip legacy traj-encoder weights from a pre-rewrite ckpt (mirrors
-    # train_ldf.on_load_checkpoint). The new 7D traj encoder + traj_in_proj will
-    # then load with strict=False and stay at init values for inference.
-    state_dict = checkpoint["state_dict"]
-    n_traj_exp = strip_legacy_traj_encoder_weights(state_dict, model.state_dict())
-    if n_traj_exp:
-        print(f"[ckpt] stripped {n_traj_exp} legacy traj-encoder weights "
-              "(7D encoder rewrite — new traj encoder uses init weights)")
-    model.load_state_dict(state_dict, strict=(n_traj_exp == 0))
+    model.load_state_dict(checkpoint["state_dict"], strict=True)
 
-    if "ema_state" in checkpoint and n_traj_exp == 0:
+    if "ema_state" in checkpoint:
         # Match the param subset that was tracked during training.
         # ControlNet training freezes the backbone so EMA only covers controlnet + traj_encoder.
         # Using model.parameters() (all params) would cause zip-misalignment in copy_to.
@@ -83,12 +78,6 @@ def load_model_from_config():
         ema.load_state_dict(checkpoint["ema_state"])
         ema.copy_to(ema_params)
         print(f"Loaded model from {cfg.test_ckpt} with EMA ({n_shadow} params)")
-    elif "ema_state" in checkpoint:
-        # n_traj_exp > 0: the EMA shadow_params are the 4D model's; their traj
-        # encoder shadows are [.,4] and cannot copy_to the expanded [.,7] params.
-        # Skip EMA and use the expanded loaded weights directly.
-        print("[ckpt] skipping EMA: shadow_params are from the 4D model and cannot "
-              "map onto the expanded 7D traj encoder; using expanded weights w/o EMA")
     else:
         print(f"Loaded model from {cfg.test_ckpt} w/o EMA")
 
@@ -124,6 +113,10 @@ def generate_feature_stream(
 
     if feature_text_end is not None:
         x["feature_text_end"] = feature_text_end
+
+    device = next(model.parameters()).device
+    x = {key: value.to(device) if torch.is_tensor(value) else value for key, value in x.items()}
+    x["ldf_condition"] = prepare_generate_condition(model, x, device)
 
     # Call model's stream_generate
     # Note: stream_generate is a generator
@@ -200,7 +193,7 @@ if __name__ == "__main__":
         # streaming generate step
         print("Streaming generate step...")
         vae.clear_cache()
-        model.init_generated(30, batch_size=1)
+        init_stream_generation(model, 30, batch_size=1)
         text_end_with_zero = [0] + text_end
         durations = [
             t - b for t, b in zip(text_end_with_zero[1:], text_end_with_zero[:-1])
@@ -224,7 +217,17 @@ if __name__ == "__main__":
                 start_time = time.time()
                 x = {}
                 x["text"] = [text_item]  # text_item is a string
-                output = model.stream_generate_step(x, first_chunk=first_chunk)
+                condition_provider = build_stream_step_condition_provider(
+                    model,
+                    x,
+                    first_chunk=first_chunk,
+                    device=next(model.parameters()).device,
+                )
+                output = model.stream_generate_step(
+                    x,
+                    first_chunk=first_chunk,
+                    condition=condition_provider,
+                )
                 output = output["generated"]
                 # print("output shape: ", output[0].shape)
                 decoded_g = vae.stream_decode(

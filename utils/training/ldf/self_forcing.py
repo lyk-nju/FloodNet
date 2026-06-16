@@ -19,10 +19,20 @@ from utils.training.ldf.history_corruption import (
 )
 from utils.training.ldf.validation_eval_runtime import control_loss_train_mode
 from utils.training.ldf.horizon_sched import sample_random_horizon_tokens
+from utils.training.ldf.self_forcing_config import (
+    self_forcing_k_schedule,
+    self_forcing_stride_tokens,
+)
 from lightning.pytorch.utilities import rank_zero_info
-from .control_loss import compute_body_aux_loss, compute_control_loss_xz
-from .model_batch import prepare_model_input
-from .window_local import build_window_local_model_batch
+from .conditioning import (
+    PreparedCondition,
+    prepare_text_condition,
+    prepare_traj_condition,
+    sample_traj_dropout,
+)
+from .losses import compute_body_aux_loss, compute_control_loss_xz
+from .model_step import run_training_window
+from .sample_creator import SampleCreator
 from utils.training.module_step import compute_step_semantics
 
 if TYPE_CHECKING:
@@ -114,7 +124,7 @@ class SelfForcingTrainer:
             )
             window_sampling_cfg = stream_cfg.get("window_sampling", {}) or {}
             window_sampling_enabled = bool(window_sampling_cfg.get("enabled", False))
-            stride_tokens = int(getattr(model, "self_forcing_stride_tokens", 1))
+            stride_tokens = self_forcing_stride_tokens(self._module.cfg)
             if window_sampling_enabled:
                 semantics = compute_step_semantics(self._module)
                 target_k = self.resolve_k(semantics.progress)
@@ -125,8 +135,8 @@ class SelfForcingTrainer:
             min_history_tokens = int(
                 stream_cfg.get("min_history_tokens", getattr(model, "chunk_size", 1))
             )
-            model_batch = build_window_local_model_batch(
-                batch,
+            model_batch = SampleCreator(
+                stream_enabled=True,
                 context_tokens=context_tokens,
                 horizon_tokens=horizon_tokens,
                 sample_policy=stream_cfg.get("sample_policy", "variable_history"),
@@ -135,16 +145,12 @@ class SelfForcingTrainer:
                 chunk_size=getattr(model, "chunk_size", None),
                 rollout_span=rollout_span,
                 force_start_token_zero=bool(stream_cfg.get("force_start_token_zero", False)),
-                latent_source=stream_cfg.get("latent_source", "precomputed_slice"),
-                vae=getattr(self._module, "vae", None),
-            )
+            ).create(batch, vae=getattr(self._module, "vae", None))
             loss_batch = batch.copy()
             for key in (
                 "_window_global_start_token",
                 "_window_local_latent_start_token",
                 "_window_local_latent_valid_len",
-                "_window_local_latent_source",
-                "_window_local_body_aux_mode",
                 "_window_local_traj",
                 "_window_sampling_active_left_token",
                 "_window_sampling_history_tokens",
@@ -153,14 +159,12 @@ class SelfForcingTrainer:
             ):
                 if key in model_batch:
                     loss_batch[key] = model_batch[key]
-            if model_batch.get("_window_local_body_aux_mode") == "local_decode":
+            if bool(model_batch.get("_window_local_traj", False)):
                 loss_batch["traj_cond_7d"] = model_batch["traj_cond_7d"]
                 loss_batch["traj_length"] = model_batch["traj_length"]
-            # precomputed_slice keeps full-prefix supervision; online_encode uses
-            # the local 7D trajectory recovered from the encoded motion window.
             return self._self_forcing_step(loss_batch, model_batch)
 
-        model_batch = prepare_model_input(batch)
+        model_batch = SampleCreator().create(batch)
         return self._self_forcing_step(batch, model_batch)
 
     # ------------------------------------------------------------------
@@ -296,7 +300,7 @@ class SelfForcingTrainer:
     def resolve_k(self, progress: float) -> int:
         """Resolve the rollout depth K from the schedule table at the given
         phase progress in [0, 1]."""
-        schedule = self._module.model.self_forcing_k_schedule
+        schedule = self_forcing_k_schedule(self._module.cfg)
         k = int(schedule[0][1])
         for threshold, candidate_k in schedule:
             if progress >= threshold:
@@ -346,7 +350,7 @@ class SelfForcingTrainer:
                     f"sample; got {history_tokens.numel()} values for batch "
                     f"size {feature_length.numel()}"
                 )
-            stride_tokens = int(getattr(model, "self_forcing_stride_tokens", 1))
+            stride_tokens = self_forcing_stride_tokens(self._module.cfg)
             rollout_span = max(0, (target_k - 1) * stride_tokens)
             start_end_indices = history_tokens + int(model.chunk_size)
             required_len = start_end_indices + rollout_span
@@ -444,9 +448,18 @@ class SelfForcingTrainer:
         _, seq_len, _ = feature.shape
         device = feature.device
 
-        text_dropped_flags = model._decide_text_dropout(feature.shape[0], device)
-        all_text_context = model._prepare_text_context(model_batch, seq_len, device, text_dropped_flags)
-        traj_dropped = model._decide_traj_dropout(device)
+        text_context, text_dropped_flags = prepare_text_condition(
+            model, model_batch, seq_len, device
+        )
+        traj_dropped = sample_traj_dropout(model, device)
+        condition = PreparedCondition(
+            text_context=text_context,
+            text_dropped_flags=text_dropped_flags,
+            traj_emb=None,
+            traj_seq_lens=None,
+            traj_dropped=traj_dropped,
+            traj_token_mask=None,
+        )
         plan = self.plan_rollout(feature_length, device, progress, model_batch=model_batch)
         self._last_window_local_rollout_metrics = _collect_window_local_rollout_metrics(
             model_batch, plan
@@ -491,7 +504,6 @@ class SelfForcingTrainer:
 
         horizon_tokens = None
         horizon_active_end = 0
-        traj_emb = traj_seq_lens = traj_token_mask = None
         if use_window_sampling_horizon:
             horizon_tokens = model_batch["_window_sampling_horizon_tokens"]
             if not torch.is_tensor(horizon_tokens):
@@ -532,9 +544,17 @@ class SelfForcingTrainer:
                 float(horizon_tokens) if horizon_tokens is not None else -1.0
             )
 
-            traj_emb, traj_seq_lens, _, traj_token_mask = model._prepare_traj_condition(
-                model_batch, seq_len, device, traj_dropped_override=traj_dropped,
-                horizon_tokens=horizon_tokens, horizon_active_end=horizon_active_end,
+            traj_emb, traj_seq_lens, traj_dropped, traj_token_mask = prepare_traj_condition(
+                model,
+                model_batch,
+                seq_len,
+                device,
+                traj_dropped=condition.traj_dropped,
+                horizon_tokens=horizon_tokens,
+                horizon_active_end=horizon_active_end,
+            )
+            condition = condition.with_traj(
+                traj_emb, traj_seq_lens, traj_dropped, traj_token_mask
             )
 
         clean_feature_state = feature.clone()
@@ -564,7 +584,7 @@ class SelfForcingTrainer:
 
         final_step_result = None
         window_start_tokens = model_batch.get("_window_local_latent_start_token")
-        stride_tokens = int(getattr(model, "self_forcing_stride_tokens", 1))
+        stride_tokens = self_forcing_stride_tokens(self._module.cfg)
         for step_idx in range(plan.effective_k):
             current_feature = _apply_fixed_history_corruption_view(
                 clean_feature_state, corruption_mask, corrupted_feature_values
@@ -580,42 +600,38 @@ class SelfForcingTrainer:
                 step_horizon_active_end = _absolute_active_end_token(
                     model_batch, end_indices.to(device), device
                 )
-                traj_emb, traj_seq_lens, _, traj_token_mask = (
-                    model._prepare_traj_condition(
+                traj_emb, traj_seq_lens, traj_dropped, traj_token_mask = (
+                    prepare_traj_condition(
+                        model,
                         model_batch,
                         seq_len,
                         device,
-                        traj_dropped_override=traj_dropped,
+                        traj_dropped=condition.traj_dropped,
                         horizon_tokens=horizon_tokens,
                         horizon_active_end=step_horizon_active_end,
                     )
                 )
+                condition = condition.with_traj(
+                    traj_emb, traj_seq_lens, traj_dropped, traj_token_mask
+                )
             is_final_step = step_idx == plan.effective_k - 1
             if is_final_step:
-                final_step_result = model._forward_single_window(
+                final_step_result = run_training_window(
+                    model,
                     model_batch,
                     current_feature,
                     time_steps,
-                    all_text_context,
-                    traj_emb,
-                    traj_seq_lens,
-                    traj_dropped,
-                    enable_scheduled_sampling=False,
-                    traj_token_mask=traj_token_mask,
+                    condition,
                 )
                 break
 
             with torch.no_grad():
-                rollout_result = model._forward_single_window(
+                rollout_result = run_training_window(
+                    model,
                     model_batch,
                     current_feature,
                     time_steps,
-                    all_text_context,
-                    traj_emb,
-                    traj_seq_lens,
-                    traj_dropped,
-                    enable_scheduled_sampling=False,
-                    traj_token_mask=traj_token_mask,
+                    condition,
                 )
 
             disable_replace = bool(
@@ -779,16 +795,7 @@ def _compute_body_aux_loss(pred_list, batch, module, sample_loss_mask, body_aux_
     """Compute body-aux loss against clip-local 7D trajectory targets."""
     if pred_list is None or "traj_cond_7d" not in batch:
         return None, {}
-    body_aux_mode = str(batch.get("_window_local_body_aux_mode", "full_prefix_splice"))
-    if body_aux_mode == "local_decode":
-        window_start_tokens = None
-    elif "_window_local_latent_start_token" in batch:
-        window_start_tokens = batch["_window_local_latent_start_token"]
-        pred_list = _splice_window_local_pred_to_prefix(
-            pred_list, batch, module.device
-        )
-    else:
-        window_start_tokens = None
+    window_start_tokens = None
     weights = {
         **_DEFAULT_BODY_AUX_WEIGHTS,
         **(body_aux_cfg.get("weights", {}) or {}),
@@ -955,102 +962,6 @@ def _apply_fixed_history_corruption_view(
     return torch.where(corruption_mask, corrupted_feature_values, clean_feature_state)
 
 
-def _splice_window_local_pred_to_prefix(pred_list, batch, device):
-    """Splice local predicted latents ``[S:E]`` back into full prefix ``[0:E]``.
-
-    Motion-space auxiliary loss must decode with causal VAE prefix context. This
-    helper preserves the original pre-window latent prefix and keeps gradients
-    through the predicted local segment.
-    """
-    starts = batch["_window_local_latent_start_token"]
-    if not torch.is_tensor(starts):
-        starts = torch.as_tensor(starts, device=device, dtype=torch.long)
-    else:
-        starts = starts.to(device=device, dtype=torch.long)
-    if starts.ndim == 0:
-        starts = starts.repeat(len(pred_list))
-    else:
-        starts = starts.view(-1)
-    if starts.numel() != len(pred_list):
-        raise ValueError(
-            "_window_local_latent_start_token must provide one value per pred "
-            f"latent; got {starts.numel()} starts for {len(pred_list)} predictions"
-        )
-    token = batch["token"].to(device)
-    if token.ndim != 3:
-        raise ValueError(f"batch['token'] must be [B,T,D], got {tuple(token.shape)}")
-    if token.shape[0] < len(pred_list):
-        raise ValueError(
-            "batch['token'] batch size must cover every prediction; "
-            f"got token batch={token.shape[0]}, predictions={len(pred_list)}"
-        )
-    token_lengths = batch.get("token_length")
-    if token_lengths is None:
-        token_lengths = torch.full(
-            (token.shape[0],), token.shape[1], device=device, dtype=torch.long
-        )
-    elif not torch.is_tensor(token_lengths):
-        token_lengths = torch.as_tensor(token_lengths, device=device, dtype=torch.long)
-    else:
-        token_lengths = token_lengths.to(device=device, dtype=torch.long)
-    token_lengths = token_lengths.view(-1)
-    if token_lengths.numel() == 1 and len(pred_list) > 1:
-        token_lengths = token_lengths.expand(len(pred_list))
-    if token_lengths.numel() < len(pred_list):
-        raise ValueError(
-            "batch['token_length'] must cover every prediction; "
-            f"got {token_lengths.numel()} lengths for {len(pred_list)} predictions"
-        )
-    valid_lengths = batch.get("_window_local_latent_valid_len")
-    if valid_lengths is not None:
-        if not torch.is_tensor(valid_lengths):
-            valid_lengths = torch.as_tensor(
-                valid_lengths, device=device, dtype=torch.long
-            )
-        else:
-            valid_lengths = valid_lengths.to(device=device, dtype=torch.long)
-        valid_lengths = valid_lengths.view(-1)
-        if valid_lengths.numel() == 1 and len(pred_list) > 1:
-            valid_lengths = valid_lengths.expand(len(pred_list))
-        if valid_lengths.numel() != len(pred_list):
-            raise ValueError(
-                "_window_local_latent_valid_len must provide one value per pred "
-                f"latent; got {valid_lengths.numel()} lengths for "
-                f"{len(pred_list)} predictions"
-            )
-    out = []
-    for i, pred_latent in enumerate(pred_list):
-        start = int(starts[i].item())
-        pred_latent = pred_latent.to(device=device, dtype=token.dtype)
-        if start < 0:
-            raise ValueError(f"window-local start token must be >= 0, got {start}")
-        original_len = int(token_lengths[i].item())
-        if start > original_len:
-            raise ValueError(
-                "window-local start token exceeds original token length; "
-                f"sample={i}, start={start}, token_length={original_len}"
-            )
-        pred_len = int(pred_latent.shape[0])
-        if valid_lengths is not None and pred_len > int(valid_lengths[i].item()):
-            raise ValueError(
-                "window-local prediction length exceeds window-local valid length; "
-                f"sample={i}, pred_len={pred_len}, "
-                f"valid_len={int(valid_lengths[i].item())}"
-            )
-        if start + pred_len > original_len:
-            raise ValueError(
-                "window-local prediction extends past original token length; "
-                f"sample={i}, start={start}, pred_len={pred_len}, "
-                f"token_length={original_len}"
-            )
-        if start == 0:
-            out.append(pred_latent)
-            continue
-        prefix = token[i, :start, :].detach()
-        out.append(torch.cat([prefix, pred_latent], dim=0))
-    return out
-
-
 def _compute_control_loss(pred_list, batch, module):
     """Thin wrapper that resolves training-mode config then delegates to
     the pure XZ control-loss function."""
@@ -1079,7 +990,7 @@ def _compute_control_loss(pred_list, batch, module):
 def resolve_sf_runtime(
     absolute_target_step: int,
     resume_ckpt: str | None,
-    model_self_forcing_enabled: bool,
+    sf_enabled: bool,
     configured_num_training_steps: int,
     reset_optimizer_on_resume: bool = True,
 ):
@@ -1095,12 +1006,12 @@ def resolve_sf_runtime(
 
     resume_step_offset = 0
     phase_max_steps = absolute_target_step
-    if resume_ckpt and model_self_forcing_enabled:
+    if resume_ckpt and sf_enabled:
         resume_step_offset = load_resume_step_offset(resume_ckpt)
         phase_max_steps = resolve_runtime_max_steps(
             absolute_target_step,
             resume_step_offset,
-            self_forcing_enabled=model_self_forcing_enabled,
+            self_forcing_enabled=sf_enabled,
         )
         rank_zero_info(
             "[self_forcing runtime] "

@@ -454,3 +454,68 @@ git add -A
 5. 是否是模型面对中间 window local sample 的泛化问题，而不是数据处理问题。
 
 不要再通过 `mask_ratio` 解释 LDF stream train 异常；该机制已经不在代码路径中。
+
+## FlexTraj/RoPE 和 Horizon 语义修复
+
+近期把 FlexTraj 的 future horizon 语义从两个布尔开关改成由输入张量本身决定：
+
+- 删除 `use_future_traj_attention`。
+- 删除 `use_traj_token_mask_in_attention`。
+- `latent_pad_len` 只表示 latent segment 的 tensor padding 长度。
+- `traj_pad_len` 由 `traj_emb.shape[1]` / `traj_num_tokens` 决定，可以大于 latent 长度。
+- `traj_token_mask` 一旦存在，就同时用于 projection zeroing 和 attention hard mask。
+- RoPE position 仍由 token 的 local index 决定，mask 只表示有效性，不压缩 position。
+
+这解决了之前靠开关区分 legacy / future horizon 的问题。旧写法容易让人误以为
+`use_future_traj_attention=false` 就一定看不到 horizon。实际更本质的判断应该是：
+
+```text
+latent segment: [0, latent_pad_len)
+traj segment:   [0, traj_pad_len)
+
+如果 traj_seq_lens_i > latent_seq_lens_i，说明该样本存在真实 future horizon。
+```
+
+### Window-local training 的长度语义
+
+stream window-local batch 也对应改成 latent 和 trajectory 分开 padding：
+
+- `feature.shape[1] == max(latent_lengths)`
+- `feature_length == latent_lengths`
+- `traj_emb.shape[1] == max(traj_num_tokens)`
+- `traj_seq_lens == traj_num_tokens`
+
+也就是说，feature 不再为了 horizon 把 latent tail 补到 `latent_len + horizon`。
+trajectory horizon 由单独的 `traj_emb / traj_seq_lens / traj_token_mask` 表达。
+
+### Cross-attention 语义
+
+frame-aligned text cross-attention 只作用于 latent segment：
+
+```text
+x = [latent_tokens || traj_tokens]
+```
+
+其中 latent tokens 可以 query text，traj tokens 是已知控制条件，不 query text。
+因此 `WanCrossAttention` 不再要求 `x` 长度只能是 `L` 或 `2L`，而是允许
+`L_lat + L_traj`，并只更新前 `L_lat` 个 latent token。
+
+### 485000 checkpoint 验证
+
+使用新版代码对 `step_485000` 跑了一次 HumanML3D stream 测评，结果正常。
+
+评测输出目录：
+
+```text
+eval/output_eval/ldf_compare_step_485000_20260616_172307/stream/HumanML3D/metrics/test/step_485000
+```
+
+这次评测覆盖了以下改动后的实际推理链路：
+
+- latent / traj pad length 分离。
+- trajectory horizon 通过 `traj_num_tokens` 和 `traj_token_mask` 保留。
+- `traj_token_mask` 默认进入 attention hard mask。
+- frame-aligned text 只更新 latent segment。
+
+因此当前判断是：上述 FlexTraj/RoPE 语义修复没有导致 `step_485000` 的 stream
+HumanML3D 评测出现异常退化。

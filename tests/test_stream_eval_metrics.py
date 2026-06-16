@@ -186,22 +186,45 @@ class _FakeStepModel:
         self.payloads = []
         self.commit_index = 0
         self.chunk_size = 1
+        self.batch_size = 1
+        self.seq_len = 2
+        self.use_text_cond = True
+        self.param_dtype = torch.float32
+        self.text_condition_list = [[]]
+        self._traj_buf = None
+        self.local_traj_encoder = torch.nn.Identity()
+        self.traj_encoder = torch.nn.Identity()
 
-    def init_generated(self, history_length, batch_size, num_denoise_steps):
+    def init_generated(
+        self,
+        history_length,
+        batch_size,
+        num_denoise_steps,
+        traj_buffer=None,
+    ):
         self.history_length = history_length
         self.batch_size = batch_size
         self.num_denoise_steps = num_denoise_steps
         self.commit_index = 0
+        self.text_condition_list = [[] for _ in range(batch_size)]
+        self._traj_buf = traj_buffer
 
-    def stream_generate_step(self, step_input, first_chunk=True):
+    def encode_text_with_cache(self, text_list, device):
+        return [torch.zeros(1, 1, device=device) for _ in text_list]
+
+    def stream_generate_step(self, step_input, first_chunk=True, condition=None):
         self.payloads.append(dict(step_input))
         self.commit_index += 1
         return {"generated": [torch.zeros(1, self.input_dim)]}
 
 
 class _FakeRollingStepModel(_FakeStepModel):
-    def stream_generate_step(self, step_input, first_chunk=True):
-        out = super().stream_generate_step(step_input, first_chunk=first_chunk)
+    def stream_generate_step(self, step_input, first_chunk=True, condition=None):
+        out = super().stream_generate_step(
+            step_input,
+            first_chunk=first_chunk,
+            condition=condition,
+        )
         if self.commit_index == 3:
             self.commit_index = 1
         return out

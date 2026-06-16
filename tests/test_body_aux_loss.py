@@ -11,7 +11,7 @@ import math
 
 import torch
 
-from utils.training.ldf.control_loss import (
+from utils.training.ldf.losses import (
     body_aux_loss_terms,
     canonicalize_pose_to_anchor,
     compute_body_aux_loss,

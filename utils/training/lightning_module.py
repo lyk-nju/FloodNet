@@ -9,9 +9,10 @@ from torch_ema import ExponentialMovingAverage
 
 from utils.initialize import (
     check_state_dict,
-    instantiate,
     print_model_size,
 )
+from utils.initialize import instantiate
+from utils.training.ldf.model_factory import instantiate_ldf_model
 from utils.training.module_step import ckpt_step_info
 
 # Set tokenizers parallelism to false to avoid warnings in multiprocessing
@@ -22,9 +23,7 @@ class BasicLightningModule(LightningModule):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.model = instantiate(
-            target=cfg.model.target, cfg=None, hfstyle=False, **cfg.model.params
-        )
+        self.model = instantiate_ldf_model(cfg.model.target, cfg.model.params)
 
         # NOTE: ligntning init stage the device is cpu, so no need to move to device
         # EMA only tracks trainable params — frozen backbone (~123M) needs no shadow copy.

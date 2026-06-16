@@ -23,13 +23,20 @@ def precomputed_text(tmp_path):
 
 def _tiny_model(precomputed_text, **kw):
     from models.diffusion_forcing_wan import DiffForcingWanModel
+    from utils.training.ldf.model_factory import install_precomputed_text_embeddings
 
-    return DiffForcingWanModel(
+    model = DiffForcingWanModel(
         input_dim=4, hidden_dim=64, ffn_dim=128, freq_dim=64,
         num_heads=2, num_layers=1, text_len=8, traj_encoder_in_dim=7,
-        use_precomputed_text_emb=True, precomputed_text_emb_path=precomputed_text,
+        build_text_encoder=False,
         **kw,
     )
+    install_precomputed_text_embeddings(
+        model,
+        precomputed_text,
+        expected_text_dim=_TEXT_DIM,
+    )
+    return model
 
 
 # ---------------------------------------------------------------------------

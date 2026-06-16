@@ -1653,7 +1653,7 @@ class _FakeStreamModel:
         self.generated = torch.zeros(1, 1, 1)
         self._traj_buf = TrajStreamBuffer(batch_size=1, buf_len=96)
 
-    def stream_generate_step(self, step_input, first_chunk=True):
+    def stream_generate_step(self, step_input, first_chunk=True, condition=None):
         self.commit_index += 1
         return {"generated": torch.zeros(1, 1, 263)}
 
@@ -1667,12 +1667,16 @@ class _RecordingActivePlanModel(_FakeStreamModel):
         )
         self.active_plan_sources = []
 
-    def stream_generate_step(self, step_input, first_chunk=True):
+    def stream_generate_step(self, step_input, first_chunk=True, condition=None):
         active_plan = getattr(self._traj_buf, "_active_plan", None)
         self.active_plan_sources.append(
             None if active_plan is None else str(active_plan.source)
         )
-        return super().stream_generate_step(step_input, first_chunk=first_chunk)
+        return super().stream_generate_step(
+            step_input,
+            first_chunk=first_chunk,
+            condition=condition,
+        )
 
 
 class _FakeVae:

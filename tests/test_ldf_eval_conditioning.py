@@ -117,6 +117,30 @@ def test_ldf_eval_stream_conditioner_builds_direct_7d_payload():
     assert payload["traj_cond_frame_mask"].any()
 
 
+def test_ldf_eval_stream_conditioner_extends_gt_tail_for_future_horizon():
+    batch = _make_7d_batch()
+    conditioner = LdfEvalStreamConditioner(
+        batch,
+        history_length=2,
+        traj_horizon_tokens=2,
+        token_dt=0.2,
+        device=torch.device("cpu"),
+    )
+
+    payload = conditioner.build_step_payload(
+        local_commit_index=0,
+        absolute_commit_index=0,
+        chunk_size=1,
+    )
+
+    assert payload is not None
+    traj = payload["traj_cond_7d_frame"][0]
+    mask = payload["traj_cond_frame_mask"][0].bool()
+    assert traj.shape[0] == 9
+    assert bool(mask.all())
+    assert torch.allclose(traj[5:], traj[4:5].expand_as(traj[5:]))
+
+
 class _RecordingForwardModel:
     chunk_size = 1
 

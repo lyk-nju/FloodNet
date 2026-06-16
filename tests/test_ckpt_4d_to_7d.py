@@ -1,9 +1,8 @@
-"""Tests for the 7D traj-encoder rewrite ckpt-compat shim.
+"""Tests for the manual 7D traj-encoder checkpoint helper.
 
 The legacy 4D encoder is dropped entirely — `strip_legacy_traj_encoder_weights`
-removes any incoming key whose shape no longer matches the new 7D model so a
-legacy ckpt loads with `strict=False` and the new traj encoder trains from
-scratch. The kept-stub `expand_traj_input_4d_to_7d` is a no-op that returns 0.
+is kept as a manual tool, not as part of the LDF training/eval load path. The
+kept-stub `expand_traj_input_4d_to_7d` is a no-op that returns 0.
 """
 
 from __future__ import annotations
@@ -11,7 +10,7 @@ from __future__ import annotations
 import torch
 
 from models.tools.traj_encoder import LocalTrajEncoder, TrajEncoder
-from utils.training.ldf.ckpt_compat import (
+from tools.ldf_ckpt_compat import (
     expand_traj_input_4d_to_7d,
     strip_legacy_traj_encoder_weights,
 )

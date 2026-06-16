@@ -15,7 +15,7 @@ only — LocalTrajEncoder rejects in_dim=4 — so a 4D ablation can't be built.)
 
 Bools are emitted lowercase so utils/initialize._convert_value parses them.
 
-CLI: `python -m utils.training.ldf.ablation <name>` prints the space-joined override
+CLI: `python tools/ldf_body_ablation.py <name>` prints the space-joined override
 args for that ablation (consumed by scripts/bench_body_7d_ablation.sh).
 """
 

@@ -38,17 +38,19 @@ from utils.initialize import (
 from utils.training.lightning_module import BasicLightningModule
 from utils.training import ckpt_step_info
 from utils.training.ldf import (
-    prepare_model_input,
+    SampleCreator,
     build_probe_loaders,
     build_val_dataloaders,
     compute_control_loss_xz,
     resolve_sf_runtime,
     SelfForcingTrainer,
+    self_forcing_enabled,
     t2m_metric_enabled,
+    validate_self_forcing_runtime_config,
     validation_repeat_count,
     control_loss_train_mode,
 )
-from utils.training.ldf.ckpt_compat import strip_legacy_traj_encoder_weights
+from utils.training.ldf.model_step import run_model_step
 from utils.training.ldf.config_validate import (
     validate_7d_requires_self_forcing,
     validate_stream_training_config,
@@ -73,13 +75,14 @@ class CustomLightningModule(BasicLightningModule):
         self._validation_eval_dedup = {}
         self._resume_step_offset = 0
         super().__init__(cfg)
-
-        self_forcing_enabled = bool(
-            cfg.model.params.get("self_forcing_enabled", False)
+        validate_self_forcing_runtime_config(
+            cfg, prediction_type=self.model.prediction_type
         )
-        self.automatic_optimization = not self_forcing_enabled
+
+        sf_enabled = self_forcing_enabled(cfg)
+        self.automatic_optimization = not sf_enabled
         self._sf_trainer = (
-            SelfForcingTrainer(self) if self_forcing_enabled else None
+            SelfForcingTrainer(self) if sf_enabled else None
         )
 
         z_stats_dir = (cfg.get("history_corruption", {}) or {}).get("z_stats_dir")
@@ -222,18 +225,10 @@ class CustomLightningModule(BasicLightningModule):
         ##############################
         # state_dict
         ##############################
-        n_traj_exp = strip_legacy_traj_encoder_weights(
-            checkpoint["state_dict"], self.model.state_dict()
-        )
-        if n_traj_exp:
-            rank_zero_info(
-                f"[ckpt] stripped {n_traj_exp} legacy traj-encoder weights "
-                "(7D encoder rewrite — new traj encoder trains from scratch)"
-            )
         ckpt_keys = set(checkpoint["state_dict"].keys())
         controlnet_missing = not any(k.startswith("controlnet.") for k in ckpt_keys)
 
-        strict = not controlnet_missing and n_traj_exp == 0
+        strict = not controlnet_missing
         result = self.model.load_state_dict(checkpoint["state_dict"], strict=strict)
         has_new_cond_params = controlnet_missing and bool(result.missing_keys)
         if not strict and result.missing_keys:
@@ -253,7 +248,7 @@ class CustomLightningModule(BasicLightningModule):
         ##############################
         # EMA
         ##############################
-        if "ema_state" in checkpoint and not has_new_cond_params and n_traj_exp == 0:
+        if "ema_state" in checkpoint and not has_new_cond_params:
             self.ema.load_state_dict(checkpoint["ema_state"])
             rank_zero_info("init ema from ckpt")
         else:
@@ -269,14 +264,12 @@ class CustomLightningModule(BasicLightningModule):
         # check but restores nothing, letting opt/sched follow current config.
         reset_optim_on_resume = bool(self.cfg.get("resume_reset_optimizer", False))
 
-        if has_new_cond_params or reset_optim_on_resume or n_traj_exp > 0:
+        if has_new_cond_params or reset_optim_on_resume:
             checkpoint["optimizer_states"] = []
             checkpoint["lr_schedulers"] = []
             reasons = []
             if has_new_cond_params:
                 reasons.append("new cond params")
-            if n_traj_exp > 0:
-                reasons.append("traj encoder stripped (legacy)")
             if reset_optim_on_resume:
                 reasons.append("resume_reset_optimizer")
             rank_zero_info(
@@ -334,8 +327,8 @@ class CustomLightningModule(BasicLightningModule):
 
     def _step(self, batch, is_training=True, model_batch=None):
         if model_batch is None:
-            model_batch = prepare_model_input(batch)
-        out = self.model(model_batch)
+            model_batch = SampleCreator().create(batch)
+        out = run_model_step(self.model, model_batch)
 
         ##############################
         # control loss (XZ trajectory alignment via VAE decode)
@@ -594,9 +587,7 @@ def main():
     # self-forcing runtime (phase progress + optional scheduler phase horizon)
     ##############################
     trainer_absolute_max_steps = int(cfg.trainer.max_steps)
-    model_self_forcing_enabled = bool(
-        cfg.config.model.params.get("self_forcing_enabled", False)
-    )
+    sf_enabled = self_forcing_enabled(cfg.config)
     lr_params = OmegaConf.to_container(
         cfg.config.lr_scheduler.params, resolve=True
     )
@@ -612,7 +603,7 @@ def main():
         ) = resolve_sf_runtime(
             trainer_absolute_max_steps,
             cfg.resume_ckpt if cfg.train else None,
-            model_self_forcing_enabled,
+            sf_enabled,
             scheduler_training_steps,
             reset_optimizer_on_resume=reset_optim_on_resume,
         )

@@ -4,6 +4,7 @@ import torch
 
 from types import SimpleNamespace
 from models.diffusion_forcing_wan import DiffForcingWanModel
+from utils.ldf_condition import LDFCondition
 
 
 class _NoopTrajBuffer:
@@ -37,6 +38,8 @@ def _make_stream_step_harness(
     model.param_dtype = torch.float32
     model.time_embedding_scale = 1.0
     model.prediction_type = "vel"
+    model.local_traj_encoder = torch.nn.Identity()
+    model.traj_encoder = torch.nn.Identity()
     model.text_condition_list = [[torch.zeros(1, 1) for _ in range(commit_index)]]
     model.recorded = SimpleNamespace(
         seq_lens=[],
@@ -51,7 +54,17 @@ def _make_stream_step_harness(
     def encode_text_with_cache(text_list, device):
         return [torch.zeros(1, 1, device=device) for _ in text_list]
 
-    def build_direct(x, model_sl, window_start_token, device, traj_sl=None):
+    def build_direct(
+        x,
+        model_sl,
+        window_start_token,
+        device,
+        *,
+        batch_size,
+        local_traj_encoder,
+        traj_encoder,
+        traj_sl=None,
+    ):
         payload_start = int(x.get("traj_start_token", window_start_token))
         if payload_start > window_start_token:
             raise ValueError("payload starts after window")
@@ -85,10 +98,39 @@ def _make_stream_step_harness(
         return [torch.zeros_like(noisy_input[0])]
 
     model.encode_text_with_cache = encode_text_with_cache
-    model._build_stream_direct_traj_condition = build_direct
+    model._patched_build_direct = build_direct
     model._denoise_with_cfg = denoise
     model.postprocess = lambda x: x.squeeze(-1).squeeze(-1).permute(0, 2, 1)
     return model
+
+
+def _condition_provider(model, step_input):
+    def provider(*, end_index, model_sl, window_start_token, time_steps, device):
+        traj_emb, traj_seq_lens, traj_token_mask = (
+            model._patched_build_direct(
+                step_input,
+                model_sl,
+                window_start_token,
+                device,
+                batch_size=1,
+                local_traj_encoder=model.local_traj_encoder,
+                traj_encoder=model.traj_encoder,
+            )
+        )
+        attn_sl = max(model_sl, int(traj_emb.shape[1]))
+        text = model.encode_text_with_cache(["walk"], device)[0]
+        text_null = model.encode_text_with_cache([""], device)
+        return LDFCondition(
+            text_context=[text for _ in range(attn_sl)],
+            text_null_context=text_null,
+            traj_emb=traj_emb,
+            traj_seq_lens=traj_seq_lens,
+            traj_token_mask=traj_token_mask,
+            seq_len=model_sl,
+            attn_len=attn_sl,
+        )
+
+    return provider
 
 
 def test_stream_generate_step_uses_future_traj_length_for_denoise_attention():
@@ -102,7 +144,11 @@ def test_stream_generate_step_uses_future_traj_length_for_denoise_attention():
         "traj_num_tokens": 3,
     }
 
-    model.stream_generate_step(step_input, first_chunk=True)
+    model.stream_generate_step(
+        {},
+        first_chunk=True,
+        condition=_condition_provider(model, step_input),
+    )
 
     assert model.recorded.seq_lens == [3]
     assert model.recorded.text_context_lens == [3]
@@ -126,7 +172,11 @@ def test_stream_generate_step_reuses_direct_7d_payload_across_chunk_substeps():
         "traj_num_tokens": 54,
     }
 
-    model.stream_generate_step(step_input, first_chunk=False)
+    model.stream_generate_step(
+        {},
+        first_chunk=False,
+        condition=_condition_provider(model, step_input),
+    )
 
     assert model.recorded.window_starts == [11, 12, 13, 14, 15]
     assert model.recorded.model_sls == [30, 30, 30, 30, 30]

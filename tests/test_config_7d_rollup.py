@@ -36,8 +36,14 @@ def test_all_new_sections_present_and_readable():
     assert cfg.stream_training.window_sampling.horizon_tokens_max == 25
     assert "horizon_sim" not in cfg
     assert "scheduled_sampling_prob" not in cfg.model.params
+    assert "self_forcing_enabled" not in cfg.model.params
     assert "self_forcing_stride_tokens" not in cfg.model.params
     assert "self_forcing_detach_between_steps" not in cfg.model.params
+    assert "self_forcing_k_schedule" not in cfg.model.params
+    assert cfg.self_forcing.enabled is True
+    assert cfg.self_forcing.stride_tokens == 1
+    assert cfg.self_forcing.detach_between_steps is True
+    assert cfg.self_forcing.k_schedule[0] == [0.0, 5]
     assert "anchor_move_in_rollout" not in cfg.stream_training
     assert "latent_source" not in cfg.stream_training
     assert "motion_aux_loss" not in cfg.stream_training
@@ -119,13 +125,15 @@ def test_flip_to_7d_overlay_is_consistent():
 
 def _cfg_sf(model_dim, sf):
     return OmegaConf.create(
-        {"model": {"params": {"traj_encoder_in_dim": model_dim,
-                              "self_forcing_enabled": sf}}}
+        {
+            "model": {"params": {"traj_encoder_in_dim": model_dim}},
+            "self_forcing": {"enabled": sf},
+        }
     )
 
 
 def test_7d_without_self_forcing_raises():
-    with pytest.raises(ValueError, match="self_forcing_enabled"):
+    with pytest.raises(ValueError, match="self_forcing.enabled"):
         validate_7d_requires_self_forcing(_cfg_sf(7, False))
 
 
@@ -143,12 +151,12 @@ def test_non_7d_dim_is_unaffected_by_sf_guard():
 
 def test_empty_config_requires_self_forcing():
     """Defaults are 7D now, so an empty config must require self-forcing."""
-    with pytest.raises(ValueError, match="self_forcing_enabled"):
+    with pytest.raises(ValueError, match="self_forcing.enabled"):
         validate_7d_requires_self_forcing(OmegaConf.create({}))
 
 
 def test_shipped_ldf_passes_sf_guard():
-    """Shipped ldf.yaml is 7D with self_forcing_enabled=true, so the guard passes."""
+    """Shipped ldf.yaml is 7D with self_forcing.enabled=true, so the guard passes."""
     cfg = OmegaConf.load(_LDF)
     validate_7d_requires_self_forcing(cfg)   # no raise
 
@@ -174,12 +182,10 @@ def test_shipped_history_corruption_only_exposes_main_knobs():
 
 def test_stream_training_accepts_window_sampling_auto_history():
     cfg = OmegaConf.create({
-        "model": {
-            "params": {
-                "chunk_size": 5,
-                "self_forcing_k_schedule": [[0.0, 5]],
-                "self_forcing_stride_tokens": 1,
-            }
+        "model": {"params": {"chunk_size": 5}},
+        "self_forcing": {
+            "k_schedule": [[0.0, 5]],
+            "stride_tokens": 1,
         },
         "stream_training": {
             "enabled": True,
@@ -191,7 +197,6 @@ def test_stream_training_accepts_window_sampling_auto_history():
                 "horizon_tokens_min": 5,
                 "horizon_tokens_max": 25,
             },
-            "latent_source": "precomputed_slice",
             "anchor_move_in_rollout": False,
         },
     })
@@ -286,7 +291,7 @@ def test_stream_training_rejects_exposed_motion_aux_loss():
         validate_stream_training_config(cfg)
 
 
-def test_stream_training_accepts_online_encode_latent_source():
+def test_stream_training_rejects_removed_latent_source():
     cfg = OmegaConf.create({
         "model": {"params": {"chunk_size": 5}},
         "stream_training": {
@@ -294,19 +299,6 @@ def test_stream_training_accepts_online_encode_latent_source():
             "context_tokens": 30,
             "min_history_tokens": 8,
             "latent_source": "online_encode",
-        },
-    })
-    validate_stream_training_config(cfg)
-
-
-def test_stream_training_rejects_unknown_latent_source():
-    cfg = OmegaConf.create({
-        "model": {"params": {"chunk_size": 5}},
-        "stream_training": {
-            "enabled": True,
-            "context_tokens": 30,
-            "min_history_tokens": 8,
-            "latent_source": "vae_reencode",
         },
     })
     with pytest.raises(ValueError, match="latent_source"):

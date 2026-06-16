@@ -201,6 +201,35 @@ def rope_apply_concat_latent_traj(x, grid_sizes, freqs, latent_pad_len, traj_pad
     return torch.stack(output).float()
 
 
+def _normalize_traj_token_mask_for_attention(
+    traj_token_mask,
+    *,
+    batch_size: int,
+    traj_pad_len: int,
+    device,
+):
+    mask = traj_token_mask.to(device=device, dtype=torch.bool)
+    if mask.dim() == 3 and mask.shape[-1] == 1:
+        mask = mask[..., 0]
+    if mask.dim() != 2:
+        raise ValueError(f"traj_token_mask must have shape [B,T], got {tuple(mask.shape)}")
+    if mask.shape[0] != batch_size:
+        raise ValueError(
+            f"traj_token_mask batch size {mask.shape[0]} does not match {batch_size}"
+        )
+    if mask.shape[1] < traj_pad_len:
+        mask = torch.cat(
+            [
+                mask,
+                mask.new_zeros(mask.shape[0], traj_pad_len - mask.shape[1]),
+            ],
+            dim=1,
+        )
+    elif mask.shape[1] > traj_pad_len:
+        mask = mask[:, :traj_pad_len]
+    return mask
+
+
 class WanRMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-5):
         super().__init__()
@@ -338,7 +367,7 @@ class WanSelfAttention(nn.Module):
 
 
 class WanCrossAttention(WanSelfAttention):
-    def forward(self, x, context, context_lens):
+    def forward(self, x, context, context_lens, latent_pad_len=None):
         r"""
         Args non-stream mode:
             x(Tensor): Shape [B, L1, C]
@@ -349,7 +378,7 @@ class WanCrossAttention(WanSelfAttention):
             context(Tensor): Shape [BxL1, L2, C]
             context_lens(Tensor): Shape [BxL1]
         Args stream mode (frame-aligned, FlexTraj):
-            x(Tensor): Shape [B, 2*L1, C]  — [latent || traj]
+            x(Tensor): Shape [B, L_lat + L_traj, C]  — [latent || traj]
             context(Tensor): Shape [BxL1, L2, C]
             context_lens(Tensor): Shape [BxL1]
         """
@@ -357,6 +386,7 @@ class WanCrossAttention(WanSelfAttention):
         bq = x.size(0)
         b_ctx = context.size(0)
         n, d = self.num_heads, self.head_dim
+        zero_traj_from = None
         if b_ctx != bq:
             if b_ctx % bq != 0:
                 raise ValueError(
@@ -365,12 +395,15 @@ class WanCrossAttention(WanSelfAttention):
                 )
             Lq = x.size(1)
             L_lat = b_ctx // bq
-            if Lq != L_lat and Lq != 2 * L_lat:
+            if latent_pad_len is not None and int(latent_pad_len) != L_lat:
                 raise ValueError(
-                    "frame-aligned FlexTraj cross-attn requires x length to be "
-                    "either L_lat or 2*L_lat. If trajectory horizon is longer "
-                    "than the latent window, pad the latent attention length "
-                    "and frame-aligned text context to the same length. Got "
+                    "frame-aligned cross-attn context length must match latent_pad_len; "
+                    f"context-derived L_lat {L_lat}, latent_pad_len {int(latent_pad_len)}."
+                )
+            if latent_pad_len is None and Lq < L_lat:
+                raise ValueError(
+                    "frame-aligned cross-attn requires x length to be at least "
+                    "the context-derived latent length. Got "
                     f"x length {Lq}, context-derived L_lat {L_lat}."
                 )
 
@@ -394,17 +427,19 @@ class WanCrossAttention(WanSelfAttention):
                 x = flash_attention(q, k, v, k_lens=context_lens)
                 x = x.flatten(2).view(*out_sizes)
             else:
-                # FlexTraj: x = [lat_0..L_lat ‖ traj_0..L_lat], Lq = 2*L_lat
-                # Each latent token k and its paired traj token k attend to context[b*L_lat+k]
+                # FlexTraj: only latent tokens query frame-aligned text.
+                # Trajectory tokens are known control tokens, so their cross-attn
+                # output stays zero even when L_traj != L_lat.
                 q_lat = q_all[:, :L_lat].reshape(b_ctx, 1, n, d)
-                q_traj = q_all[:, L_lat:].reshape(b_ctx, 1, n, d)
                 out_lat = flash_attention(q_lat, k, v, k_lens=context_lens)
-                out_traj = flash_attention(q_traj, k, v, k_lens=context_lens)
                 out_lat = out_lat.flatten(2).view(bq, L_lat, -1)
-                out_traj = out_traj.flatten(2).view(bq, L_lat, -1)
-                x = torch.cat([out_lat, out_traj], dim=1)  # (bq, 2*L_lat, C)
+                x = x.new_zeros(*out_sizes)
+                x[:, :L_lat, :] = out_lat
+                zero_traj_from = L_lat
 
         x = self.o(x)
+        if zero_traj_from is not None:
+            x[:, zero_traj_from:, :] = 0
         return x
 
 
@@ -498,7 +533,12 @@ class WanAttentionBlock(nn.Module):
         def cross_attn_ffn(x, context, context_lens, e):
             # FlexTraj论文语义：condition/trajectory tokens不应该通过 cross-attn
             # 去查询文本tokens（只允许噪声/主干去查询）。
-            cross_out = self.cross_attn(self.norm3(x), context, context_lens)
+            cross_out = self.cross_attn(
+                self.norm3(x),
+                context,
+                context_lens,
+                latent_pad_len=latent_pad_len,
+            )
             if latent_pad_len is not None:
                 # x = [latent_tokens || traj_tokens], 仅更新latent部分
                 cross_out[:, latent_pad_len:, :] = 0
@@ -577,8 +617,6 @@ class WanModel(ModelMixin, ConfigMixin):
         eps=1e-6,
         causal=False,
         traj_enc_dim=0,
-        use_traj_token_mask_in_attention=False,
-        use_future_traj_attention=False,
     ):
         r"""
         Initialize the diffusion model backbone.
@@ -639,8 +677,6 @@ class WanModel(ModelMixin, ConfigMixin):
         self.eps = eps
         self.causal = causal
         self.traj_enc_dim = traj_enc_dim
-        self.use_traj_token_mask_in_attention = bool(use_traj_token_mask_in_attention)
-        self.use_future_traj_attention = bool(use_future_traj_attention)
         # embeddings
         self.patch_embedding = nn.Conv3d(
             in_dim, dim, kernel_size=patch_size, stride=patch_size
@@ -704,9 +740,7 @@ class WanModel(ModelMixin, ConfigMixin):
         #   mask_emb: learned replacement vector for corrupted history tokens,
         #             in the in_dim (VAE latent) space.
         #   z_mean / z_std: VAE latent per-channel stats, loaded via load_z_stats.
-        # All three are persistent (in state_dict) per Done criteria; old ckpts
-        # that lack them are handled by DiffForcingWanModel.load_state_dict's
-        # backward-compat back-fill.
+        # All three are persistent and must be present in current checkpoints.
         self.mask_emb = nn.Parameter(torch.randn(self.in_dim) * 0.02)
         self.register_buffer("z_mean", torch.zeros(self.in_dim))
         self.register_buffer("z_std", torch.ones(self.in_dim))
@@ -802,33 +836,14 @@ class WanModel(ModelMixin, ConfigMixin):
                     tm = tm[:, :proj_len, :]
                 traj_t = traj_t * tm
             bt, tlen, _ = traj_t.shape
-            traj_pad_len = (
-                max(seq_len, int(tlen))
-                if self.use_future_traj_attention
-                else seq_len
-            )
-            if self.use_traj_token_mask_in_attention and traj_token_mask is not None:
-                traj_token_mask_attn = traj_token_mask.to(
-                    device=x.device, dtype=torch.bool
+            traj_pad_len = max(seq_len, int(tlen))
+            if traj_token_mask is not None:
+                traj_token_mask_attn = _normalize_traj_token_mask_for_attention(
+                    traj_token_mask,
+                    batch_size=bt,
+                    traj_pad_len=traj_pad_len,
+                    device=x.device,
                 )
-                if (
-                    traj_token_mask_attn.dim() == 3
-                    and traj_token_mask_attn.shape[-1] == 1
-                ):
-                    traj_token_mask_attn = traj_token_mask_attn[..., 0]
-                if traj_token_mask_attn.shape[1] < traj_pad_len:
-                    traj_token_mask_attn = torch.cat(
-                        [
-                            traj_token_mask_attn,
-                            traj_token_mask_attn.new_zeros(
-                                traj_token_mask_attn.shape[0],
-                                traj_pad_len - traj_token_mask_attn.shape[1],
-                            ),
-                        ],
-                        dim=1,
-                    )
-                elif traj_token_mask_attn.shape[1] > traj_pad_len:
-                    traj_token_mask_attn = traj_token_mask_attn[:, :traj_pad_len]
             if tlen < traj_pad_len:
                 traj_t = torch.cat(
                     [traj_t, traj_t.new_zeros(bt, traj_pad_len - tlen, traj_t.size(-1))],
@@ -838,11 +853,7 @@ class WanModel(ModelMixin, ConfigMixin):
                 traj_t = traj_t[:, :traj_pad_len, :]
             x = torch.cat([x, traj_t], dim=1)
             if traj_seq_lens is None:
-                traj_seq_lens_attn = (
-                    torch.full_like(seq_lens, int(tlen))
-                    if self.use_future_traj_attention
-                    else seq_lens
-                )
+                traj_seq_lens_attn = torch.full_like(seq_lens, int(tlen))
             else:
                 traj_seq_lens_attn = (
                     traj_seq_lens.to(device=seq_lens.device, dtype=torch.long)
@@ -887,7 +898,7 @@ class WanModel(ModelMixin, ConfigMixin):
             context_lens=context_lens,
             latent_pad_len=latent_pad_len,
             traj_pad_len=(
-                traj_pad_len if self.use_future_traj_attention else None
+                traj_pad_len if traj_pad_len is not None and traj_pad_len != seq_len else None
             ),
         )
 

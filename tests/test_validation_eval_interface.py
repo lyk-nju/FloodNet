@@ -4,7 +4,7 @@ from pathlib import Path
 
 from omegaconf import OmegaConf
 
-from utils.training.ldf.test_probes import build_val_dataloaders
+from utils.training.ldf.validation_eval_runtime import build_val_dataloaders
 
 
 _ROOT = Path(__file__).resolve().parent.parent

@@ -2,7 +2,7 @@
 
 Real HumanML3D/BABEL data isn't on this host, so the dataset __getitem__ path is
 exercised via its building block `extract_root_traj_feats_7d_263` (which the
-flag-gated branch calls). Plus prepare_model_input preference + collate padding.
+flag-gated branch calls). Plus SampleCreator routing preference + collate padding.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from utils.motion_process import (
     recover_root_rot_pos,
     root_to_traj_feats_7d,
 )
-from utils.training.ldf.model_batch import prepare_model_input
+from utils.training.ldf.sample_creator import SampleCreator
 
 
 # ---------------------------------------------------------------------------
@@ -46,11 +46,11 @@ def test_extract_7d_matches_recover_plus_root_to_traj_feats_7d():
 
 
 # ---------------------------------------------------------------------------
-# 3. prepare_model_input prefers traj_cond_7d over the 4D path
+# 3. SampleCreator prefers traj_cond_7d over the 4D path
 # ---------------------------------------------------------------------------
 
 
-def test_prepare_model_input_prefers_traj_cond_7d():
+def test_sample_creator_prefers_traj_cond_7d():
     traj7 = np.random.randn(10, 7).astype(np.float32)
     batch = {
         "token": torch.zeros(4, 8),
@@ -61,13 +61,13 @@ def test_prepare_model_input_prefers_traj_cond_7d():
         "traj_length": 10,
         "traj_cond_mask": np.ones(10, dtype=np.float32),
     }
-    mb = prepare_model_input(batch)
+    mb = SampleCreator().create(batch)
     # 7D routed as the traj feature; raw xyz kept for control-loss GT.
     assert mb["traj_features"] is traj7
     assert mb["traj"].shape[-1] == 3
 
 
-def test_prepare_model_input_falls_back_to_4d_without_7d():
+def test_sample_creator_falls_back_to_4d_without_7d():
     batch = {
         "token": torch.zeros(4, 8),
         "token_length": 4,
@@ -77,7 +77,7 @@ def test_prepare_model_input_falls_back_to_4d_without_7d():
         "traj_cond_mask": np.ones(10, dtype=np.float32),
         "traj_features": np.random.randn(10, 4).astype(np.float32),
     }
-    mb = prepare_model_input(batch)
+    mb = SampleCreator().create(batch)
     # 4D path: traj_features dropped so encode_traj_batch uses traj_cond xyz.
     assert "traj_features" not in mb
     assert mb["traj"].shape[-1] == 3

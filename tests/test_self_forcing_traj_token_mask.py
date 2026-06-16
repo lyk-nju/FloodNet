@@ -1,7 +1,8 @@
 """Regression: SelfForcingTrainer._run_rollout must
 
-  1. unpack `_prepare_traj_condition`'s 4-tuple (B-P0-1: added traj_token_mask),
-  2. thread `traj_token_mask` into every `_forward_single_window` call —
+  1. unpack `prepare_traj_condition`'s 4-tuple (B-P0-1: added traj_token_mask),
+  2. thread `traj_token_mask` through every `PreparedCondition` consumed by
+     `run_training_window` —
      both the no_grad rollout steps (0..K-2) and the supervised final step.
 
 Before the fix the trainer unpacked 3 values and silently dropped the mask, so
@@ -21,6 +22,7 @@ import utils.training.ldf.self_forcing as sf_mod
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+from utils.training.ldf.conditioning import PreparedCondition
 from utils.training.ldf.self_forcing import RolloutPlan, SelfForcingTrainer
 
 
@@ -40,34 +42,31 @@ def _make_trainer():
     # by-identity below.
     sentinel_mask = torch.ones(_BATCH, _SEQ_LEN)
 
-    # `_prepare_traj_condition` is the 4-tuple producer the rewrite added.
+    # `prepare_traj_condition` is the 4-tuple producer the rewrite added.
     traj_emb_sentinel = torch.zeros(_BATCH, _SEQ_LEN, _HIDDEN)
     traj_seq_lens_sentinel = torch.tensor([_SEQ_LEN], dtype=torch.long)
 
     model = MagicMock(name="model")
     model.chunk_size = _CHUNK
-    # K-step schedule: progress=1.0 → K=3 (table: [(0.0, 3)] is enough).
-    model.self_forcing_k_schedule = [(0.0, _K)]
-    model._decide_text_dropout.return_value = torch.zeros(_BATCH, dtype=torch.bool)
-    model._prepare_text_context.return_value = None
-    model._decide_traj_dropout.return_value = False
-    model._prepare_traj_condition.return_value = (
-        traj_emb_sentinel,
-        traj_seq_lens_sentinel,
-        False,                # traj_dropped (already passed via override)
-        sentinel_mask,        # traj_token_mask — the field this test guards
-    )
+    model._test_text_context = None
+    model._test_text_dropped_flags = torch.zeros(_BATCH, dtype=torch.bool)
+    model._test_traj_emb = traj_emb_sentinel
+    model._test_traj_seq_lens = traj_seq_lens_sentinel
+    model._test_traj_token_mask = sentinel_mask
 
-    # `_forward_single_window` returns enough structure for the rollout-step
+    # `run_training_window` returns enough structure for the rollout-step
     # replacement code to no-op (replace_idx < 0 because chunk_size=1 and
     # end_indices start at 1 → replace_idx = 0; pred_seq must be shape-(T,H)).
     fake_x0 = [torch.zeros(_SEQ_LEN, _HIDDEN) for _ in range(_BATCH)]
-    model._forward_single_window.return_value = {
-        "loss": torch.tensor(0.0),
-        "x0_latent_list": fake_x0,
-    }
+    model.training_window_step = MagicMock(
+        return_value={
+            "loss": torch.tensor(0.0),
+            "x0_latent_list": fake_x0,
+        }
+    )
 
     cfg = SimpleNamespace()
+    cfg.self_forcing = SimpleNamespace(k_schedule=[(0.0, _K)], stride_tokens=1)
     cfg.get = lambda key, default=None: {
         "anchor_canonicalize": {"enabled": False},
         "horizon_sim": {"enabled": False},
@@ -97,43 +96,70 @@ def _make_trainer():
     return trainer, model, model_batch, sentinel_mask
 
 
-def test_run_rollout_threads_traj_token_mask_to_every_step():
-    """Every `_forward_single_window` call (K rollout steps) must see the same
-    `traj_token_mask` instance produced by `_prepare_traj_condition`."""
+def _patch_run_training_window(monkeypatch, model):
+    monkeypatch.setattr(sf_mod, "run_training_window", model.training_window_step)
+    model.prepare_text_condition_step = MagicMock(
+        return_value=(model._test_text_context, model._test_text_dropped_flags)
+    )
+    model.sample_traj_dropout_step = MagicMock(return_value=False)
+    model.prepare_traj_condition_step = MagicMock(
+        return_value=(
+            model._test_traj_emb,
+            model._test_traj_seq_lens,
+            False,
+            model._test_traj_token_mask,
+        )
+    )
+    monkeypatch.setattr(
+        sf_mod, "prepare_text_condition", model.prepare_text_condition_step
+    )
+    monkeypatch.setattr(
+        sf_mod, "sample_traj_dropout", model.sample_traj_dropout_step
+    )
+    monkeypatch.setattr(
+        sf_mod, "prepare_traj_condition", model.prepare_traj_condition_step
+    )
+    return model.training_window_step
+
+
+def test_run_rollout_threads_traj_token_mask_to_every_step(monkeypatch):
+    """Every `run_training_window` call (K rollout steps) must see the same
+    `traj_token_mask` instance produced by `prepare_traj_condition`."""
     trainer, model, model_batch, sentinel_mask = _make_trainer()
+    window_step = _patch_run_training_window(monkeypatch, model)
 
     final_result, k = trainer._run_rollout(model_batch, progress=1.0)
 
     assert k == _K
     assert final_result is not None
-    assert model._forward_single_window.call_count == _K
+    assert window_step.call_count == _K
 
-    for i, call in enumerate(model._forward_single_window.call_args_list):
-        kwargs = call.kwargs
-        assert "traj_token_mask" in kwargs, (
-            f"step {i}: traj_token_mask was dropped from _forward_single_window kwargs"
-        )
+    for i, call in enumerate(window_step.call_args_list):
+        condition = call.args[4]
+        assert isinstance(condition, PreparedCondition)
         # Identity check — the trainer must pass the exact mask returned by
-        # `_prepare_traj_condition`, not silently re-derive or None it out.
-        assert kwargs["traj_token_mask"] is sentinel_mask, (
-            f"step {i}: traj_token_mask is not the value from _prepare_traj_condition"
+        # `prepare_traj_condition`, not silently re-derive or None it out.
+        assert condition.traj_token_mask is sentinel_mask, (
+            f"step {i}: traj_token_mask is not the value from prepare_traj_condition"
         )
 
 
-def test_run_rollout_unpacks_four_tuple_from_prepare_traj_condition():
-    """Direct guard: `_run_rollout` must call `_prepare_traj_condition` exactly
+def test_run_rollout_unpacks_four_tuple_from_traj_condition_helper(monkeypatch):
+    """Direct guard: `_run_rollout` must call `prepare_traj_condition` exactly
     once and accept its 4-tuple return without raising. A regression to a
     3-tuple unpack would manifest here as `ValueError: too many values to
     unpack`."""
     trainer, model, model_batch, _ = _make_trainer()
+    _patch_run_training_window(monkeypatch, model)
 
     trainer._run_rollout(model_batch, progress=1.0)
 
-    assert model._prepare_traj_condition.call_count == 1
+    assert model.prepare_traj_condition_step.call_count == 1
 
 
 def test_run_rollout_canonicalizes_7d_traj_by_default(monkeypatch):
     trainer, _, model_batch, _ = _make_trainer()
+    _patch_run_training_window(monkeypatch, trainer._module.model)
     cfg = SimpleNamespace()
     cfg.get = lambda key, default=None: {
         "horizon_sim": {"enabled": False},
@@ -166,6 +192,7 @@ def test_run_rollout_canonicalizes_7d_traj_by_default(monkeypatch):
 
 def test_run_rollout_anchor_canonicalize_ablation_override_disables(monkeypatch):
     trainer, _, model_batch, _ = _make_trainer()
+    _patch_run_training_window(monkeypatch, trainer._module.model)
     cfg = SimpleNamespace()
     cfg.get = lambda key, default=None: {
         "anchor_canonicalize": {"enabled": False},
@@ -192,8 +219,8 @@ def test_run_rollout_anchor_canonicalize_ablation_override_disables(monkeypatch)
 def test_plan_rollout_respects_stream_training_min_history_tokens():
     model = MagicMock(name="model")
     model.chunk_size = 1
-    model.self_forcing_k_schedule = [(0.0, 1)]
     cfg = SimpleNamespace()
+    cfg.self_forcing = SimpleNamespace(k_schedule=[(0.0, 1)], stride_tokens=1)
     cfg.get = lambda key, default=None: {
         "stream_training": {
             "enabled": True,
@@ -216,8 +243,8 @@ def test_plan_rollout_respects_stream_training_min_history_tokens():
 def test_plan_rollout_right_aligns_fixed_window_policy():
     model = MagicMock(name="model")
     model.chunk_size = 1
-    model.self_forcing_k_schedule = [(0.0, 3)]
     cfg = SimpleNamespace()
+    cfg.self_forcing = SimpleNamespace(k_schedule=[(0.0, 3)], stride_tokens=1)
     cfg.get = lambda key, default=None: {
         "stream_training": {
             "enabled": True,
@@ -242,9 +269,8 @@ def test_plan_rollout_right_aligns_fixed_window_policy():
 def test_plan_rollout_uses_window_sampling_history_as_step0_active_right():
     model = MagicMock(name="model")
     model.chunk_size = 5
-    model.self_forcing_k_schedule = [(0.0, 5)]
-    model.self_forcing_stride_tokens = 1
     cfg = SimpleNamespace()
+    cfg.self_forcing = SimpleNamespace(k_schedule=[(0.0, 5)], stride_tokens=1)
     cfg.get = lambda key, default=None: {
         "stream_training": {
             "enabled": True,
@@ -270,8 +296,9 @@ def test_plan_rollout_uses_window_sampling_history_as_step0_active_right():
     assert plan.start_end_indices.tolist() == [5, 12]
 
 
-def test_run_rollout_adds_window_start_to_horizon_active_end():
+def test_run_rollout_adds_window_start_to_horizon_active_end(monkeypatch):
     trainer, model, model_batch, _ = _make_trainer()
+    _patch_run_training_window(monkeypatch, model)
 
     cfg = SimpleNamespace()
     cfg.get = lambda key, default=None: {
@@ -302,13 +329,16 @@ def test_run_rollout_adds_window_start_to_horizon_active_end():
 
     trainer._run_rollout(model_batch, progress=1.0)
 
-    kwargs = model._prepare_traj_condition.call_args.kwargs
+    kwargs = model.prepare_traj_condition_step.call_args.kwargs
     assert kwargs["horizon_tokens"] == 2
     assert kwargs["horizon_active_end"].tolist() == [8]
 
 
-def test_run_rollout_window_sampling_rebuilds_traj_condition_each_step_with_fixed_horizon():
+def test_run_rollout_window_sampling_rebuilds_traj_condition_each_step_with_fixed_horizon(
+    monkeypatch,
+):
     trainer, model, model_batch, _ = _make_trainer()
+    _patch_run_training_window(monkeypatch, model)
 
     cfg = SimpleNamespace()
     cfg.get = lambda key, default=None: {
@@ -340,22 +370,25 @@ def test_run_rollout_window_sampling_rebuilds_traj_condition_each_step_with_fixe
 
     trainer._run_rollout(model_batch, progress=1.0)
 
-    assert model._prepare_traj_condition.call_count == 3
+    assert model.prepare_traj_condition_step.call_count == 3
     horizon_active_ends = [
         call.kwargs["horizon_active_end"].tolist()
-        for call in model._prepare_traj_condition.call_args_list
+        for call in model.prepare_traj_condition_step.call_args_list
     ]
     horizon_tokens = [
         call.kwargs["horizon_tokens"].tolist()
-        for call in model._prepare_traj_condition.call_args_list
+        for call in model.prepare_traj_condition_step.call_args_list
     ]
     assert horizon_active_ends == [[7], [8], [9]]
     assert horizon_tokens == [[4], [4], [4]]
     assert trainer._last_horizon_tokens == 4.0
 
 
-def test_run_rollout_uses_stream_training_horizon_when_horizon_sim_disabled():
+def test_run_rollout_uses_stream_training_horizon_when_horizon_sim_disabled(
+    monkeypatch,
+):
     trainer, model, model_batch, _ = _make_trainer()
+    _patch_run_training_window(monkeypatch, model)
 
     cfg = SimpleNamespace()
     cfg.get = lambda key, default=None: {
@@ -385,14 +418,15 @@ def test_run_rollout_uses_stream_training_horizon_when_horizon_sim_disabled():
 
     trainer._run_rollout(model_batch, progress=1.0)
 
-    kwargs = model._prepare_traj_condition.call_args.kwargs
+    kwargs = model.prepare_traj_condition_step.call_args.kwargs
     assert kwargs["horizon_tokens"] == 2
     assert kwargs["horizon_active_end"].tolist() == [8]
     assert trainer._last_horizon_tokens == 2.0
 
 
-def test_run_rollout_clamps_sampled_horizon_to_stream_training_horizon():
+def test_run_rollout_clamps_sampled_horizon_to_stream_training_horizon(monkeypatch):
     trainer, model, model_batch, _ = _make_trainer()
+    _patch_run_training_window(monkeypatch, model)
 
     cfg = SimpleNamespace()
     cfg.get = lambda key, default=None: {
@@ -427,14 +461,15 @@ def test_run_rollout_clamps_sampled_horizon_to_stream_training_horizon():
 
     trainer._run_rollout(model_batch, progress=1.0)
 
-    kwargs = model._prepare_traj_condition.call_args.kwargs
+    kwargs = model.prepare_traj_condition_step.call_args.kwargs
     assert kwargs["horizon_tokens"] == 2
     assert kwargs["horizon_active_end"].tolist() == [8]
     assert trainer._last_horizon_tokens == 2.0
 
 
-def test_run_rollout_records_window_local_active_history_metrics():
+def test_run_rollout_records_window_local_active_history_metrics(monkeypatch):
     trainer, _, model_batch, _ = _make_trainer()
+    _patch_run_training_window(monkeypatch, trainer._module.model)
     model_batch = {
         **model_batch,
         "_window_local_traj": True,
@@ -463,6 +498,7 @@ def test_run_rollout_replacement_diff_uses_clean_state_under_corruption(monkeypa
     overlay instead of the clean committed latent it replaces.
     """
     trainer, model, model_batch, _ = _make_trainer()
+    window_step = _patch_run_training_window(monkeypatch, model)
     trainer.plan_rollout = MagicMock(
         return_value=RolloutPlan(
             effective_k=2,
@@ -492,7 +528,7 @@ def test_run_rollout_replacement_diff_uses_clean_state_under_corruption(monkeypa
     first_pred = [torch.zeros(_SEQ_LEN, _HIDDEN) for _ in range(_BATCH)]
     first_pred[0][0, :] = 2.0
     final_pred = [torch.zeros(_SEQ_LEN, _HIDDEN) for _ in range(_BATCH)]
-    model._forward_single_window.side_effect = [
+    window_step.side_effect = [
         {"loss": torch.tensor(0.0), "x0_latent_list": first_pred},
         {"loss": torch.tensor(0.0), "x0_latent_list": final_pred},
     ]

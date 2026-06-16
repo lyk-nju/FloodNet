@@ -135,17 +135,16 @@ model:
 
         # Control loss + CFG (mirrors ldf.yaml)
         control_loss_weight: 1.0
-        scheduled_sampling_prob: 0.0
         cfg_scale_traj: 3.0
         cfg_scale_text: 5.0
 
-        # Self-forcing (mirrors ldf.yaml)
-        self_forcing_enabled: true
-        self_forcing_stride_tokens: 1
-        self_forcing_detach_between_steps: true
-        # K=1: diagnostic mode. Raise K for real multi-step SF rollout.
-        self_forcing_k_schedule:
-            - [0.0, 1]
+self_forcing:
+    enabled: true
+    stride_tokens: 1
+    detach_between_steps: true
+    # K=1: diagnostic mode. Raise K for real multi-step SF rollout.
+    k_schedule:
+        - [0.0, 1]
 
 self_forcing_disable_replace: false
 body_aux_loss:

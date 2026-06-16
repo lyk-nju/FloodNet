@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from utils.training.ldf.window_sampling import (
+from utils.training.ldf.sample_creator import (
     resolve_history_tokens_max,
     sample_stream_window_indices,
 )

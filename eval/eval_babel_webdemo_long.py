@@ -46,7 +46,10 @@ from utils.inference.rollout import (
     StreamTextSegment,
     build_stream_step_model_input,
 )
+from utils.inference.ldf_conditioning import build_stream_step_condition_provider
+from utils.inference.stream_state import init_stream_generation
 from utils.inference.trajectory import sample_timestamped_trajectory
+from utils.training.ldf.model_factory import instantiate_ldf_model
 from utils.traj_batch import root_to_traj_feats
 from utils.visualization.video import render_single_video
 
@@ -75,8 +78,7 @@ def _load_vae(cfg, device):
 
 
 def _load_model(cfg, ckpt_path, device):
-    model = instantiate(target=cfg.model.target, cfg=None, hfstyle=False,
-                        **cfg.model.params)
+    model = instantiate_ldf_model(cfg.model.target, cfg.model.params)
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     ckpt_keys = set(checkpoint["state_dict"].keys())
     controlnet_missing = not any(k.startswith("controlnet.") for k in ckpt_keys)
@@ -320,8 +322,12 @@ def _run_stream_session(model, vae, sample: dict, device,
     text_ctrl = StreamTextRolloutController(segments)
 
     vae.clear_cache()
-    model.init_generated(history_length, batch_size=1,
-                         num_denoise_steps=num_denoise_steps)
+    init_stream_generation(
+        model,
+        history_length,
+        batch_size=1,
+        num_denoise_steps=num_denoise_steps,
+    )
     model.generated = model.generated.to(device)
 
     stream_recovery = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
@@ -350,7 +356,17 @@ def _run_stream_session(model, vae, sample: dict, device,
             raise ValueError(f"Unknown mode: {mode}")
 
         step_payload = build_stream_step_model_input(current_text, traj_input=traj_input)
-        output = model.stream_generate_step(step_payload, first_chunk=first_chunk)
+        condition_provider = build_stream_step_condition_provider(
+            model,
+            step_payload,
+            first_chunk=first_chunk,
+            device=device,
+        )
+        output = model.stream_generate_step(
+            step_payload,
+            first_chunk=first_chunk,
+            condition=condition_provider,
+        )
         generated = output["generated"]
         decoded = (vae.stream_decode(generated[0][None, :].to(device),
                                      first_chunk=first_chunk)[0]

@@ -297,7 +297,7 @@ def build_traj_token_mask(x: dict, seq_len: int, device, *,
                           traj_start_token: int | None = None):
     """[B, seq_len] token mask (1=valid) = build_traj_frame_mask + optional horizon
     truncation → frames_to_token_mask. SINGLE source reused by encode_traj_batch
-    (token-embedding zeroing) and _get_traj_seq_lens (attention truncation), so the
+    (token-embedding zeroing) and get_traj_seq_lens (attention truncation), so the
     two never derive the mask differently. Returns None when there is neither a
     traj mask nor a horizon."""
     src = _traj_source(x)
@@ -328,6 +328,74 @@ def build_traj_token_mask(x: dict, seq_len: int, device, *,
         start_token_idx=start_token_idx,
         frames_per_token=frames_per_token,
     )
+
+
+def get_traj_seq_lens(
+    batch: dict,
+    seq_len: int,
+    device,
+    *,
+    horizon_tokens=None,
+    horizon_active_end=0,
+):
+    """Infer valid trajectory token lengths from explicit lengths and masks."""
+    from utils.token_frame import prefix_len_from_tail_invalid
+
+    batch_size = _infer_batch_size(batch)
+    base = _length_tensor(batch.get("traj_num_tokens"), batch_size, seq_len, device)
+    if base is None:
+        base = _length_tensor(
+            batch.get("traj_features_length"), batch_size, seq_len, device
+        )
+    if base is None and batch.get("traj_length") is not None:
+        traj_len = batch["traj_length"].to(device=device, dtype=torch.long)
+        tokens = torch.where(
+            traj_len <= 1,
+            traj_len.clamp(min=0, max=1),
+            (traj_len - 2) // 4 + 2,
+        )
+        base = tokens.clamp(min=0, max=seq_len)
+    if base is None:
+        base = _length_tensor(batch.get("feature_length"), batch_size, seq_len, device)
+    if base is None:
+        return None
+
+    token_mask = build_traj_token_mask(
+        batch,
+        seq_len,
+        device,
+        horizon_tokens=horizon_tokens,
+        horizon_active_end_token=horizon_active_end,
+    )
+    if token_mask is None:
+        return base
+    prefix = prefix_len_from_tail_invalid(token_mask).to(device=device)
+    return torch.minimum(base, prefix)
+
+
+def _infer_batch_size(batch: dict) -> int | None:
+    for key in ("traj_features", "traj_cond_7d_frame", "traj_cond", "traj", "feature"):
+        value = batch.get(key)
+        if torch.is_tensor(value) and value.ndim > 0:
+            return int(value.shape[0])
+    value = batch.get("feature_length")
+    if torch.is_tensor(value) and value.ndim > 0:
+        return int(value.numel())
+    return None
+
+
+def _length_tensor(value, batch_size, seq_len: int, device):
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        out = value.to(device=device, dtype=torch.long)
+    else:
+        out = torch.tensor([int(value)], device=device, dtype=torch.long)
+    if out.ndim == 0:
+        out = out.view(1)
+    if batch_size is not None and out.numel() == 1 and batch_size > 1:
+        out = out.expand(batch_size)
+    return out.clamp(min=0, max=seq_len)
 
 
 def _apply_horizon_mask_tokens_range(

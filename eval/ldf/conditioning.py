@@ -21,7 +21,8 @@ from utils.inference.root_plan import RootPlan
 from utils.inference.root_plan import build_rootplan_stream_payload_from_buffer
 from utils.token_frame import num_tokens_for_frame_len
 from utils.inference.buffer import TrajStreamBuffer
-from utils.training.ldf.model_batch import prepare_model_input
+from utils.inference.ldf_conditioning import prepare_generate_condition
+from utils.training.ldf.sample_creator import SampleCreator
 
 
 def _as_tensor(value, *, device=None, dtype=torch.float32) -> torch.Tensor:
@@ -74,18 +75,25 @@ def _canonicalize_7d_clip_start(traj_7d) -> torch.Tensor:
 def prepare_ldf_eval_model_batch(batch: dict, device, model=None) -> dict:
     """Prepare a model batch for LDF eval with 7D clip-start-local conditioning.
 
-    ``prepare_model_input`` preserves the training field routing, but it does not
+    ``SampleCreator`` preserves the training field routing, but it does not
     canonicalize 7D world-frame trajectory conditions. Offline eval has no
     rolling body window, so the stable eval convention is clip-start-local.
     """
-    model_batch = prepare_model_input(batch)
+    model_batch = SampleCreator().create(batch)
     if _has_7d_traj(model_batch):
         source = model_batch.get("traj_features", model_batch.get("traj_cond_7d"))
         canon = _canonicalize_7d_clip_start(source)
         model_batch["traj_features"] = canon
         if "traj_cond_7d" in model_batch:
             model_batch["traj_cond_7d"] = canon
-    return _to_device(model_batch, device)
+    model_batch = _to_device(model_batch, device)
+    if model is not None:
+        model_batch["ldf_condition"] = prepare_generate_condition(
+            model,
+            model_batch,
+            device,
+        )
+    return model_batch
 
 
 def _first_scalar(value, default: int) -> int:
@@ -107,6 +115,7 @@ def build_gt_rootplan_from_batch(
     token_dt: float,
     frames_per_token: int = 4,
     device=None,
+    tail_hold_tokens: int = 0,
 ) -> RootPlan:
     """Build a single-sample GT RootPlan from frame-level world 7D condition."""
     if "traj_cond_7d" not in sample_batch:
@@ -125,6 +134,12 @@ def build_gt_rootplan_from_batch(
         raise ValueError("traj_cond_7d has no valid frames")
 
     traj = traj[:, :valid_frames, :]
+    tail_hold_frames = max(0, int(tail_hold_tokens)) * int(frames_per_token)
+    if tail_hold_frames > 0:
+        tail = traj[:, -1:, :].expand(-1, tail_hold_frames, -1)
+        traj = torch.cat([traj, tail], dim=1)
+        valid_frames = int(traj.shape[1])
+
     anchor_xz = traj[0, 0, [0, 2]].clone()
     anchor_yaw = torch.atan2(traj[0, 0, 4], traj[0, 0, 3]).clone()
     waypoints_local = canonicalize_7d(
@@ -167,6 +182,7 @@ class LdfEvalStreamConditioner:
             token_dt=token_dt,
             frames_per_token=frames_per_token,
             device=self.device,
+            tail_hold_tokens=self.traj_horizon_tokens,
         )
         token_length = _first_scalar(sample_batch.get("token_length"), self.root_plan.num_tokens_pred)
         buf_len = max(

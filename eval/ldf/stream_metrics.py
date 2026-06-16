@@ -51,6 +51,9 @@ try:
         LdfEvalStreamConditioner,
         prepare_ldf_eval_model_batch,
     )
+    from FloodNet.utils.inference.ldf_conditioning import (
+        build_stream_step_condition_provider,
+    )
     from FloodNet.eval.common.visualization import (
         plot_xz_trajectories,
         plot_yaw_series,
@@ -69,6 +72,8 @@ try:
         build_stream_suffix_conditioning,
         clip_traj_input_to_horizon,
     )
+    from FloodNet.utils.inference.stream_state import init_stream_generation
+    from FloodNet.utils.training.ldf.model_factory import instantiate_ldf_model
 except ImportError:  # pragma: no cover - script entrypoints use top-level imports
     from metrics.stream import (
         compute_stream_boundary_metrics,
@@ -87,6 +92,7 @@ except ImportError:  # pragma: no cover - script entrypoints use top-level impor
         _stable_eval_seed,
     )
     from eval.ldf.conditioning import LdfEvalStreamConditioner, prepare_ldf_eval_model_batch
+    from utils.inference.ldf_conditioning import build_stream_step_condition_provider
     from eval.common.visualization import (
         plot_xz_trajectories,
         plot_yaw_series,
@@ -105,6 +111,8 @@ except ImportError:  # pragma: no cover - script entrypoints use top-level impor
         build_stream_suffix_conditioning,
         clip_traj_input_to_horizon,
     )
+    from utils.inference.stream_state import init_stream_generation
+    from utils.training.ldf.model_factory import instantiate_ldf_model
 
 
 class InMemorySampleDataset(Dataset):
@@ -317,12 +325,7 @@ def load_eval_model_and_vae(cfg, ckpt_path: str, vae_ckpt_path: str, device: tor
         vae_ema.copy_to(vae.parameters())
     vae.to(device).eval()
 
-    model = instantiate(
-        target=cfg.model.target,
-        cfg=None,
-        hfstyle=False,
-        **cfg.model.params,
-    )
+    model = instantiate_ldf_model(cfg.model.target, cfg.model.params)
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     ckpt_keys = set(checkpoint["state_dict"].keys())
     strict = any(key.startswith("controlnet.") for key in ckpt_keys)
@@ -404,8 +407,8 @@ def build_eval_dataloader(
     return dataset, loader
 
 
-def build_stream_input(sample_batch: Dict, device: torch.device) -> Dict:
-    return prepare_ldf_eval_model_batch(sample_batch, device)
+def build_stream_input(sample_batch: Dict, device: torch.device, model=None) -> Dict:
+    return prepare_ldf_eval_model_batch(sample_batch, device, model=model)
 
 
 def _to_python_int(value) -> int:
@@ -417,7 +420,7 @@ def _to_python_int(value) -> int:
 
 
 def run_stream_generate_sample(model, vae, sample_batch: Dict, device: torch.device, num_denoise_steps: Optional[int]):
-    model_batch = build_stream_input(sample_batch, device)
+    model_batch = build_stream_input(sample_batch, device, model=model)
     latent_chunks: List[torch.Tensor] = []
     for output in model.stream_generate(model_batch, num_denoise_steps=num_denoise_steps):
         latent_chunk = output["generated"][0]
@@ -457,7 +460,8 @@ def run_stream_generate_step_sample(
     if num_denoise_steps is None:
         num_denoise_steps = int(getattr(model, "noise_steps"))
 
-    model.init_generated(
+    init_stream_generation(
+        model,
         history_length,
         batch_size=1,
         num_denoise_steps=num_denoise_steps,
@@ -507,7 +511,17 @@ def run_stream_generate_step_sample(
                 current_text,
                 traj_input=traj_input,
             )
-            output = model.stream_generate_step(step_payload, first_chunk=first_chunk)
+            condition_provider = build_stream_step_condition_provider(
+                model,
+                step_payload,
+                first_chunk=first_chunk,
+                device=device,
+            )
+            output = model.stream_generate_step(
+                step_payload,
+                first_chunk=first_chunk,
+                condition=condition_provider,
+            )
             latent_token = output["generated"][0].detach().cpu()
             decoded_chunk = vae.stream_decode(
                 output["generated"][0][None, :], first_chunk=first_chunk
@@ -546,7 +560,7 @@ def run_stream_generate_step_sample(
 
 
 def run_offline_generate_sample(model, vae, sample_batch: Dict, device: torch.device, num_denoise_steps: Optional[int]):
-    model_batch = build_stream_input(sample_batch, device)
+    model_batch = build_stream_input(sample_batch, device, model=model)
     output = model.generate(model_batch, num_denoise_steps=num_denoise_steps)
     latent = output["generated"][0].detach()
     decoded = vae.decode(latent.unsqueeze(0))[0].float().detach().cpu()

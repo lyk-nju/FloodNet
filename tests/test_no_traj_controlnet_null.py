@@ -1,5 +1,3 @@
-import types
-
 import torch
 
 from models.diffusion_forcing_wan import DiffForcingWanModel
@@ -113,9 +111,6 @@ def _make_harness(cfg_scale_text, backbone, controlnet):
     model.cfg_scale_traj = 999.0
     model.model = backbone
     model._controlnet_forward = controlnet
-    model._concat_text_for_cfg = types.MethodType(
-        DiffForcingWanModel._concat_text_for_cfg, model
-    )
     return model
 
 
