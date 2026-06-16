@@ -202,7 +202,7 @@ optimizer:
 
 
 lr_scheduler:
-    target: diffusers.optimization.get_cosine_schedule_with_warmup
+    target: CosineAnnealingLR
     params:
-        num_warmup_steps: 2000
-        num_training_steps: ${trainer.max_steps}
+        T_max: 100000
+        eta_min: 5e-6
