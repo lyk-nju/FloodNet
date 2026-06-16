@@ -1,8 +1,9 @@
 """Unit tests for the 7D-only traj encoder rewrite.
 
 Contract:
-  LocalTrajEncoder: (B, T, 4, 7) → (B, T, 128)        (Conv1d 7→64→128 + masked-mean)
-  TrajEncoder    : (B, T, 128)   → (B, T, out_dim)    (LayerNorm + 2-layer MLP)
+  FrameTrajEncoder: (B, T, 4, 7) → (B, T, 128)        (Conv1d 7→64→128 + masked-mean)
+  TokenTrajEncoder: (B, T, 128)  → (B, T, out_dim)    (LayerNorm + 2-layer MLP)
+  TrajectoryEncoder exposes the combined frame-to-token encoder at model boundary.
 
 The 4D legacy path is gone; the LDF training/eval path now expects 7D
 checkpoints and no longer auto-strips old trajectory encoder weights.
@@ -16,8 +17,9 @@ import torch
 from models.tools.traj_encoder import (
     LOCAL_OUT_DIM,
     TRAJ_OUT_DIM,
-    LocalTrajEncoder,
-    TrajEncoder,
+    FrameTrajEncoder,
+    TokenTrajEncoder,
+    TrajectoryEncoder,
 )
 from models.diffusion_forcing_wan import DiffForcingWanModel
 from utils.inference.stream_conditioning import build_stream_direct_traj_condition
@@ -36,13 +38,41 @@ from utils.traj_batch import (
 )
 
 
-def _encoders(out_dim=16, seed=0):
-    """Build a (LocalTrajEncoder, TrajEncoder) pair matching the 7D contract."""
+def _encoder(out_dim=16, seed=0):
+    """Build a TrajectoryEncoder matching the 7D contract."""
     torch.manual_seed(seed)
-    le = LocalTrajEncoder().eval()                                    # 7 → 128
-    torch.manual_seed(seed + 100)
-    te = TrajEncoder(in_dim=LOCAL_OUT_DIM, out_dim=out_dim).eval()    # 128 → out_dim
-    return le, te
+    return TrajectoryEncoder(out_dim=out_dim).eval()
+
+
+def test_trajectory_encoder_exposes_frame_and_token_stages():
+    enc = TrajectoryEncoder(out_dim=16).eval()
+
+    assert isinstance(enc.frame_encoder, FrameTrajEncoder)
+    assert isinstance(enc.token_encoder, TokenTrajEncoder)
+    with torch.no_grad():
+        out = enc(torch.randn(2, 5, 4, 7), frame_mask=torch.ones(2, 5, 4))
+    assert out.shape == (2, 5, 16)
+
+
+def test_diff_forcing_wan_exposes_single_traj_encoder_boundary():
+    model = DiffForcingWanModel(
+        input_dim=4,
+        hidden_dim=64,
+        ffn_dim=128,
+        freq_dim=64,
+        num_heads=2,
+        num_layers=1,
+        text_len=8,
+        traj_encoder_in_dim=7,
+        build_text_encoder=False,
+    )
+
+    assert isinstance(model.traj_encoder, TrajectoryEncoder)
+    assert not hasattr(model, "local_traj_encoder")
+    keys = list(model.state_dict())
+    assert any(key.startswith("traj_encoder.frame_encoder.") for key in keys)
+    assert any(key.startswith("traj_encoder.token_encoder.") for key in keys)
+    assert not any(key.startswith("local_traj_encoder.") for key in keys)
 
 
 class _KeepFourFrames(torch.nn.Module):
@@ -63,8 +93,7 @@ def _dummy_stream_model():
     model = DiffForcingWanModel.__new__(DiffForcingWanModel)
     torch.nn.Module.__init__(model)
     model.batch_size = 1
-    model.local_traj_encoder = _KeepFirstChannelFourFrames()
-    model.traj_encoder = torch.nn.Identity()
+    model.traj_encoder = _KeepFirstChannelFourFrames()
     return model
 
 
@@ -75,7 +104,6 @@ def _build_direct_traj_condition(model, x, model_sl, window_start_token, device,
         window_start_token,
         device,
         batch_size=model.batch_size,
-        local_traj_encoder=model.local_traj_encoder,
         traj_encoder=model.traj_encoder,
         traj_sl=traj_sl,
     )
@@ -86,40 +114,40 @@ def _build_direct_traj_condition(model, x, model_sl, window_start_token, device,
 # ---------------------------------------------------------------------------
 
 
-def test_local_encoder_7d_forward_shape():
-    enc = LocalTrajEncoder()
+def test_frame_encoder_7d_forward_shape():
+    enc = FrameTrajEncoder()
     out = enc(torch.randn(2, 5, 4, 7))
     assert out.shape == (2, 5, LOCAL_OUT_DIM)
 
 
-def test_traj_encoder_default_forward_shape():
-    enc = TrajEncoder()                                  # 128 → 128
+def test_token_encoder_default_forward_shape():
+    enc = TokenTrajEncoder()                                  # 128 → 128
     out = enc(torch.randn(2, 5, LOCAL_OUT_DIM))
     assert out.shape == (2, 5, TRAJ_OUT_DIM)
 
 
-def test_local_encoder_rejects_non_7d_input():
-    enc = LocalTrajEncoder()
+def test_frame_encoder_rejects_non_7d_input():
+    enc = FrameTrajEncoder()
     with pytest.raises(ValueError):
         enc(torch.randn(2, 5, 4, 4))                     # last dim != 7
 
 
-def test_local_encoder_rejects_non_7_in_dim_param():
+def test_frame_encoder_rejects_non_7_in_dim_param():
     with pytest.raises(ValueError):
-        LocalTrajEncoder(in_dim=4)                       # 7D-only constructor
+        FrameTrajEncoder(in_dim=4)                       # 7D-only constructor
 
 
-def test_traj_encoder_rejects_dim_mismatch():
-    enc = TrajEncoder()                                  # configured for 128
+def test_token_encoder_rejects_dim_mismatch():
+    enc = TokenTrajEncoder()                                  # configured for 128
     with pytest.raises(ValueError):
         enc(torch.randn(2, 5, 7))                        # last dim != 128
 
 
-def test_local_encoder_zeros_invalid_frames_before_conv():
-    """LocalTrajEncoder must zero invalid frames internally — values on
+def test_frame_encoder_zeros_invalid_frames_before_conv():
+    """FrameTrajEncoder must zero invalid frames internally — values on
     masked frames must not bleed into neighbors via the kernel-size-3 conv.
     """
-    enc = LocalTrajEncoder().eval()
+    enc = FrameTrajEncoder().eval()
     base = torch.randn(1, 2, 4, 7)
     mask = torch.ones(1, 2, 4)
     mask[:, :, 1] = 0.0   # frame 1 invalid in every token
@@ -186,7 +214,6 @@ def test_encode_traj_batch_supports_per_sample_start_token():
         seq_len,
         "cpu",
         _KeepFourFrames(),
-        torch.nn.Identity(),
     )
 
     expected = torch.tensor(
@@ -247,7 +274,6 @@ def test_encode_traj_batch_threads_traj_start_token_into_grouping():
         seq_len,
         "cpu",
         _KeepFourFrames(),
-        torch.nn.Identity(),
     )
 
     expected = torch.tensor(
@@ -480,7 +506,7 @@ def test_mask_effectiveness_through_encode_traj_batch():
     """Inputs differing ONLY on masked frames produce identical output."""
     B, seq_len, D = 1, 6, 7
     T_frame = num_frames_for_tokens(seq_len)
-    le, te = _encoders()
+    enc = _encoder()
 
     base = torch.randn(B, T_frame, D)
     mask = torch.ones(B, T_frame)
@@ -492,8 +518,8 @@ def test_mask_effectiveness_through_encode_traj_batch():
     x2 = {"traj_features": x2_feats, "traj_cond_mask": mask.clone()}
 
     with torch.no_grad():
-        o1 = encode_traj_batch(x1, seq_len, "cpu", le, te)
-        o2 = encode_traj_batch(x2, seq_len, "cpu", le, te)
+        o1 = encode_traj_batch(x1, seq_len, "cpu", enc)
+        o2 = encode_traj_batch(x2, seq_len, "cpu", enc)
     assert torch.allclose(o1, o2, atol=1e-5)
 
 
@@ -501,7 +527,7 @@ def test_partial_token_invalid_frames_dont_affect_output():
     """Within a token, changing only masked frames leaves output unchanged."""
     B, seq_len, D = 1, 4, 7
     T_frame = num_frames_for_tokens(seq_len)
-    le, te = _encoders()
+    enc = _encoder()
 
     base = torch.randn(B, T_frame, D)
     mask = torch.ones(B, T_frame)
@@ -511,8 +537,8 @@ def test_partial_token_invalid_frames_dont_affect_output():
     x2_feats[:, 2:5] = 99.0
     x2 = {"traj_features": x2_feats, "traj_cond_mask": mask.clone()}
     with torch.no_grad():
-        o1 = encode_traj_batch(x1, seq_len, "cpu", le, te)
-        o2 = encode_traj_batch(x2, seq_len, "cpu", le, te)
+        o1 = encode_traj_batch(x1, seq_len, "cpu", enc)
+        o2 = encode_traj_batch(x2, seq_len, "cpu", enc)
     assert torch.allclose(o1, o2, atol=1e-5)
 
 
@@ -553,13 +579,13 @@ def test_token0_one_frame_vs_tokenk_four_frames():
 def test_encode_traj_batch_accepts_frame_level_7d():
     B, seq_len, D = 2, 6, 7
     T_frame = num_frames_for_tokens(seq_len)
-    le, te = _encoders(out_dim=16)
+    enc = _encoder(out_dim=16)
     x = {
         "traj_features": torch.randn(B, T_frame, D),
         "traj_cond_mask": torch.ones(B, T_frame),
     }
     with torch.no_grad():
-        out = encode_traj_batch(x, seq_len, "cpu", le, te)
+        out = encode_traj_batch(x, seq_len, "cpu", enc)
     assert out.shape == (B, seq_len, 16)
 
 
@@ -573,39 +599,39 @@ def test_all_zero_mask_returns_none_no_control():
         "traj_features": torch.randn(B, T_frame, D),
         "traj_cond_mask": torch.zeros(B, T_frame),
     }
-    out = encode_traj_batch(x, seq_len, "cpu", nn.Identity(), nn.Identity())
+    out = encode_traj_batch(x, seq_len, "cpu", nn.Identity())
     assert out is None
 
 
 def test_horizon_fully_truncated_returns_none():
-    le, te = _encoders()
+    enc = _encoder()
     seq_len = 6
     T_frame = num_frames_for_tokens(seq_len)
     x = {"traj_features": torch.randn(1, T_frame, 7)}
-    out = encode_traj_batch(x, seq_len, "cpu", le, te, horizon_tokens=0)
+    out = encode_traj_batch(x, seq_len, "cpu", enc, horizon_tokens=0)
     assert out is None
 
 
 def test_partial_mask_still_returns_embedding():
-    le, te = _encoders(out_dim=16)
+    enc = _encoder(out_dim=16)
     B, seq_len, D = 1, 6, 7
     T_frame = num_frames_for_tokens(seq_len)
     mask = torch.zeros(B, T_frame)
     mask[:, :10] = 1.0
     x = {"traj_features": torch.randn(B, T_frame, D), "traj_cond_mask": mask}
-    out = encode_traj_batch(x, seq_len, "cpu", le, te)
+    out = encode_traj_batch(x, seq_len, "cpu", enc)
     assert out is not None and out.shape == (B, seq_len, 16)
 
 
 def test_invalid_token_embeddings_zeroed_post_encoder():
     """Tokens whose covered frames are ALL masked get a zero embedding."""
-    le, te = _encoders(out_dim=16)
+    enc = _encoder(out_dim=16)
     B, seq_len, D = 1, 8, 7
     T_frame = num_frames_for_tokens(seq_len)
     mask = torch.zeros(B, T_frame)
     mask[:, :17] = 1.0
     x = {"traj_features": torch.randn(B, T_frame, D), "traj_cond_mask": mask}
-    out = encode_traj_batch(x, seq_len, "cpu", le, te)
+    out = encode_traj_batch(x, seq_len, "cpu", enc)
     tmask = frames_to_token_mask(mask, seq_len)[0]
     invalid = tmask == 0
     assert invalid.any()
@@ -615,10 +641,10 @@ def test_invalid_token_embeddings_zeroed_post_encoder():
 
 def test_encode_traj_batch_rejects_token_level_input():
     B, seq_len, D = 2, 6, 7
-    le, te = _encoders()
+    enc = _encoder()
     x = {"traj_features": torch.randn(B, seq_len, D)}
     with pytest.raises(ValueError):
-        encode_traj_batch(x, seq_len, "cpu", le, te)
+        encode_traj_batch(x, seq_len, "cpu", enc)
 
 
 def test_encode_traj_batch_returns_token_mask_when_requested():
@@ -627,12 +653,12 @@ def test_encode_traj_batch_returns_token_mask_when_requested():
     traj_in_proj output post-projection."""
     B, seq_len, D = 1, 6, 7
     T_frame = num_frames_for_tokens(seq_len)
-    le, te = _encoders(out_dim=16)
+    enc = _encoder(out_dim=16)
     mask = torch.zeros(B, T_frame)
     mask[:, :10] = 1.0
     x = {"traj_features": torch.randn(B, T_frame, D), "traj_cond_mask": mask}
     out, tmask = encode_traj_batch(
-        x, seq_len, "cpu", le, te, return_token_mask=True,
+        x, seq_len, "cpu", enc, return_token_mask=True,
     )
     assert out.shape == (B, seq_len, 16)
     assert tmask is not None and tmask.shape == (B, seq_len)

@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 from .tools.t5 import T5EncoderModel
-from .tools.traj_encoder import LocalTrajEncoder, TrajEncoder
+from .tools.traj_encoder import TrajectoryEncoder
 from .tools.wan_model import WanModel
 from .tools.wan_controlnet import WanControlNet
 from utils.ldf_condition import LDFCondition
@@ -135,9 +135,10 @@ class DiffForcingWanModel(nn.Module):
         )
         self.controlnet.init_from_backbone(self.model)
 
-        # Local within-token Conv1d encoder, then token-level LayerNorm + MLP.
-        self.local_traj_encoder = LocalTrajEncoder(in_dim=self.traj_in_dim)
-        self.traj_encoder = TrajEncoder(out_dim=self.traj_out_dim)
+        self.traj_encoder = TrajectoryEncoder(
+            in_dim=self.traj_in_dim,
+            out_dim=self.traj_out_dim,
+        )
         self.param_dtype = torch.float32
 
         if self.freeze_backbone:
@@ -146,8 +147,6 @@ class DiffForcingWanModel(nn.Module):
             for p in self.controlnet.parameters():
                 p.requires_grad = True
             for p in self.traj_encoder.parameters():
-                p.requires_grad = True
-            for p in self.local_traj_encoder.parameters():
                 p.requires_grad = True
             # mask_emb lives in the frozen backbone but is trained by history
             # corruption, so keep it trainable.

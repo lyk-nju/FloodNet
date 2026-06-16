@@ -30,7 +30,7 @@ def _make_motion263(batch_size: int, num_frames: int) -> torch.Tensor:
     return motion
 
 
-class _MeanLocalTrajEncoder(torch.nn.Module):
+class _MeanFrameTrajEncoder(torch.nn.Module):
     def forward(
         self,
         feats_4: torch.Tensor,
@@ -631,8 +631,7 @@ def test_window_local_v2_future_horizon_survives_traj_token_mask_when_source_has
         out,
         traj_len,
         "cpu",
-        _MeanLocalTrajEncoder(),
-        torch.nn.Identity(),
+        _MeanFrameTrajEncoder(),
         return_token_mask=True,
     )
 

@@ -56,9 +56,48 @@ from utils.training.ldf.config_validate import (
     validate_ldf_training_config,
     validate_traj_dim_consistency,
 )
+from utils.token_frame import token_range_to_frame_slice
 
 # Set tokenizers parallelism to false to avoid warnings in multiprocessing
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def _build_windowed_metric_ground_truth(batch: dict, model_batch: dict):
+    """Return GT tensors cropped to the same latent window as generation.
+
+    Windowed LDF eval may generate only a prefix/sub-window. Offline metrics must
+    compare that result against the matching GT window rather than the original
+    full clip.
+    """
+    gt_token = model_batch["token"]
+    gt_token_length = model_batch["token_length"]
+    raw_feature = batch["feature"]
+    raw_feature_length = batch["feature_length"]
+    latent_lengths = model_batch.get("feature_length", gt_token_length)
+    starts = model_batch.get("_window_global_start_token")
+    batch_size = int(gt_token.shape[0])
+    device = gt_token.device
+    if starts is None:
+        starts = torch.zeros(batch_size, device=device, dtype=torch.long)
+    else:
+        starts = starts.to(device=device, dtype=torch.long).view(-1)
+        if starts.numel() == 1 and batch_size > 1:
+            starts = starts.expand(batch_size)
+    latent_lengths = latent_lengths.to(device=device, dtype=torch.long).view(-1)
+    raw_feature_length = raw_feature_length.to(device=device, dtype=torch.long).view(-1)
+
+    gt_feature = []
+    gt_feature_length = []
+    for i in range(batch_size):
+        start_token = int(starts[i].item())
+        num_tokens = int(latent_lengths[i].item())
+        frame_slice = token_range_to_frame_slice(start_token, num_tokens)
+        raw_len = int(raw_feature_length[i].item())
+        start_frame = min(int(frame_slice.start), raw_len)
+        stop_frame = min(int(frame_slice.stop), raw_len)
+        gt_feature.append(raw_feature[i, start_frame:stop_frame])
+        gt_feature_length.append(max(0, stop_frame - start_frame))
+    return gt_token, gt_token_length, gt_feature, gt_feature_length
 
 
 class CustomLightningModule(BasicLightningModule):
@@ -314,7 +353,7 @@ class CustomLightningModule(BasicLightningModule):
             backbone_with_ema = 0
             backbone_total = 0
             for name, p in self.model.named_parameters():
-                if not p.requires_grad and "controlnet" not in name and "traj_encoder" not in name and "local_traj_encoder" not in name:
+                if not p.requires_grad and "controlnet" not in name and "traj_encoder" not in name:
                     backbone_total += 1
                     if id(p) in ema_shadow_map:
                         backbone_with_ema += 1
@@ -421,10 +460,12 @@ class CustomLightningModule(BasicLightningModule):
             if cuda_state is not None:
                 torch.cuda.set_rng_state_all(cuda_state)
         generated = output["generated"]
-        ground_truth_token = batch["token"]
-        gt_token_length = batch["token_length"]
-        ground_truth_feature = batch["feature"]
-        gt_feature_length = batch["feature_length"]
+        (
+            ground_truth_token,
+            gt_token_length,
+            ground_truth_feature,
+            gt_feature_length,
+        ) = _build_windowed_metric_ground_truth(batch, model_batch)
 
         for i in range(len(generated)):
             ##############################
@@ -438,7 +479,7 @@ class CustomLightningModule(BasicLightningModule):
             ##############################
             # decode ground truth
             ##############################
-            single_gt_r = ground_truth_token[i][: gt_token_length[i]]
+            single_gt_r = ground_truth_token[i][: int(gt_token_length[i].item())]
             decoded_single_gt_r = self.vae.decode(single_gt_r[None, :].to(self.device))[
                 0
             ]

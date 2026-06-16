@@ -158,8 +158,6 @@ self_forcing:
 ldf_training:
     formulation: windowed
     window_policy: prefix
-    # Prefix self-forcing supervises one active chunk; R must be at least chunk_size.
-    min_history_tokens: 5
 
 body_aux_loss:
     enabled: true

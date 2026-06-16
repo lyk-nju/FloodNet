@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from transformers import AutoConfig, AutoTokenizer, AutoModel
 
 from utils.traj_batch import build_traj_emb, root_to_traj_feats
-from .tools.traj_encoder import TrajEncoder
+from .tools.traj_encoder import TokenTrajEncoder
 from .tools.wan_model import WanModel
 
 
@@ -211,7 +211,7 @@ class DiffForcingWanModel(nn.Module):
             traj_enc_dim=traj_enc_dim,
         )
         if self.use_traj_cond:
-            self.traj_encoder = TrajEncoder(
+            self.traj_encoder = TokenTrajEncoder(
                 in_dim=self.traj_in_dim, hidden_dim=64, out_dim=self.traj_out_dim
             )
         else:
@@ -234,7 +234,7 @@ class DiffForcingWanModel(nn.Module):
                     continue
                 p.requires_grad = False
 
-            # 3) Keep TrajEncoder trainable (trajectory branch)
+            # 3) Keep TokenTrajEncoder trainable (trajectory branch)
             if self.traj_encoder is not None:
                 for p in self.traj_encoder.parameters():
                     p.requires_grad = True

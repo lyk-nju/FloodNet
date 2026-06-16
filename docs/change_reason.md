@@ -313,12 +313,19 @@ CFG、text/traj embedding 资源，而训练策略在 `utils/training/ldf` 管�
 - 删除训练 condition 准备 helper，改由 `utils/training/ldf/conditioning.py` 承接。
 - 保留 `_denoise_with_cfg`、`_controlnet_forward`、text encode cache 和 trajectory encoder
   模块，因为它们属于模型推理/网络调用资源。
-- 保留 `local_traj_encoder + traj_encoder` 的 checkpoint key 结构，避免影响现有
-  `step_485000` 权重加载。
+- trajectory encoder 对外只暴露 `traj_encoder`，内部由
+  `FrameTrajEncoder + TokenTrajEncoder` 组成。
 
-这次没有把 `LocalTrajEncoder` 和 `TrajEncoder` 合并成一个 wrapper。虽然从接口设计上可以
-这么做，但会改变 checkpoint key，例如 `local_traj_encoder.* / traj_encoder.*` 变成新的
-嵌套 key，恢复训练和评测风险较高，因此当前阶段保持原结构。
+当前新主线不再兼容旧 padded-horizon/full-latent checkpoint key。旧的
+`local_traj_encoder.* / traj_encoder.*` 分裂结构已经收敛为：
+
+```text
+traj_encoder.frame_encoder.*
+traj_encoder.token_encoder.*
+```
+
+这样训练、eval、runtime 都只依赖一个 trajectory encoder 边界，避免模型外部继续知道
+frame-stage 和 token-stage 的内部拆分。
 
 ### LDF 训练文件归属
 
@@ -339,7 +346,6 @@ utils/training/ldf/
 
 不属于训练主链路的工具移到 `tools/`：
 
-- `tools/ldf_ckpt_compat.py`
 - `tools/ldf_body_ablation.py`
 
 ## 测试覆盖

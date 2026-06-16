@@ -169,7 +169,6 @@ def prepare_traj_condition(
             batch,
             traj_pad_len,
             device,
-            model.local_traj_encoder,
             model.traj_encoder,
             horizon_tokens=horizon_tokens,
             horizon_active_end_token=horizon_active_end,

@@ -91,7 +91,7 @@ class _RecordingOnlineVAE:
 
 class _RecordingLDFModel:
     def __init__(self):
-        from models.tools.traj_encoder import LocalTrajEncoder, TrajEncoder
+        from models.tools.traj_encoder import TrajectoryEncoder
 
         self.training = True
         self.use_text_cond = False
@@ -101,8 +101,7 @@ class _RecordingLDFModel:
         self.chunk_size = 5
         self.time_embedding_scale = 1.0
         self.prediction_type = "vel"
-        self.local_traj_encoder = LocalTrajEncoder(in_dim=7)
-        self.traj_encoder = TrajEncoder(out_dim=128)
+        self.traj_encoder = TrajectoryEncoder(in_dim=7, out_dim=128)
         self.controlnet_calls = []
         self.backbone_calls = []
         self.model = self._backbone_forward

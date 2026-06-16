@@ -37,6 +37,7 @@ def test_all_new_sections_present_and_readable():
     assert "context_tokens" not in cfg.ldf_training
     assert "horizon_tokens" not in cfg.ldf_training
     assert "window_sampling" not in cfg.ldf_training
+    assert "min_history_tokens" not in cfg.ldf_training
     assert "stream_training" not in cfg
     assert "horizon_sim" not in cfg
     assert "scheduled_sampling_prob" not in cfg.model.params
@@ -214,6 +215,7 @@ def test_ldf_training_prefix_rejects_context_horizon_and_window_sampling():
         ("context_tokens", 30),
         ("horizon_tokens", 25),
         ("window_sampling", {"enabled": False}),
+        ("min_history_tokens", 5),
     ):
         cfg = OmegaConf.create({
             "model": {"params": {"chunk_size": 5}},

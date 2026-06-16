@@ -458,7 +458,6 @@ def encode_traj_batch(
     x: dict,
     seq_len: int,
     device,
-    local_traj_encoder: torch.nn.Module,
     traj_encoder: torch.nn.Module,
     *,
     horizon_tokens: int | torch.Tensor | None = None,
@@ -473,9 +472,9 @@ def encode_traj_batch(
       traj_features (B,T,7) or traj xyz (B,T,3)
         → frame-level mask gate (+ optional T_B_04 horizon truncation)
         → frames_to_tokens
-        → LocalTrajEncoder(masked-mean over 4 frames)
+        → TrajectoryEncoder.frame_encoder(masked-mean over 4 frames)
         → token-level mask gate
-        → TrajEncoder
+        → TrajectoryEncoder.token_encoder
 
     Returns:
       - traj_emb (B, seq_len, traj_out_dim) by default, or None if x has no
@@ -549,7 +548,7 @@ def encode_traj_batch(
         seq_len,
         frames_per_token=frames_per_token,
     )                                                           # (B, seq_len, 4, C)
-    # Build a 4-frame mask (B, seq_len, 4) so LocalTrajEncoder can do masked-mean
+    # Build a 4-frame mask (B, seq_len, 4) so FrameTrajEncoder can do masked-mean
     # pool — otherwise zero-padded frames in a partial token dilute the mean by
     # 1/valid_count.
     if mask_frame is not None:
@@ -562,7 +561,7 @@ def encode_traj_batch(
         frame_mask_4 = mf_grouped.squeeze(-1)                    # (B, seq_len, 4)
     else:
         frame_mask_4 = None
-    feats_tok = local_traj_encoder(feats_4, frame_mask=frame_mask_4)
+    traj_emb = traj_encoder(feats_4, frame_mask=frame_mask_4)
 
     # --- token-level mask gate ---
     # `token_mask` (when present) gates fully-invalid tokens; combine with the
@@ -575,14 +574,12 @@ def encode_traj_batch(
             pad = tm.new_zeros(tm.shape[0], seq_len - tm.shape[1])
             tm = torch.cat([tm, pad], dim=1)
         tm = tm[:, :seq_len]
-        feats_tok = feats_tok * tm.unsqueeze(-1).to(dtype=feats_tok.dtype)
         combined_token_mask = (
             tm if combined_token_mask is None else (combined_token_mask * tm)
         )
 
-    traj_emb = traj_encoder(feats_tok)
     # Re-zero by the COMBINED token mask (frame-derived ∧ x["token_mask"]), not
-    # just token_mask_from_frame: TrajEncoder's LayerNorm+bias maps a zeroed-input
+    # just token_mask_from_frame: TokenTrajEncoder's LayerNorm+bias maps a zeroed-input
     # token to a NON-zero embedding, so a token invalid only via x["token_mask"]
     # (when a separate frame cond_mask marks it valid) would otherwise leak.
     if combined_token_mask is not None:

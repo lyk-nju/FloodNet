@@ -21,7 +21,7 @@ from utils.training.ldf.self_forcing_config import (
 def validate_traj_dim_consistency(cfg) -> int:
     """Check the two traj-dim flags agree and equal 7. Returns the dim (7).
 
-    The 4D legacy encoder was removed (LocalTrajEncoder is 7D-only), so a 4D
+    The 4D legacy encoder was removed (FrameTrajEncoder is 7D-only), so a 4D
     config now crashes at model construction — fail fast here with a clear
     message. Defaults are 7 (matching the model's `traj_in_dim=7` default).
 
@@ -125,6 +125,11 @@ def validate_ldf_training_config(cfg) -> None:
         if "window_sampling" in ldf_cfg:
             raise ValueError(
                 "ldf_training.window_sampling is only used for rolling training; "
+                "prefix active right is sampled from [1, token_length]."
+            )
+        if "min_history_tokens" in ldf_cfg:
+            raise ValueError(
+                "ldf_training.min_history_tokens is not used for prefix training; "
                 "prefix active right is sampled from [1, token_length]."
             )
     else:

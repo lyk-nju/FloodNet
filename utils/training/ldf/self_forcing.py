@@ -360,7 +360,7 @@ class SelfForcingTrainer:
                 dtype=torch.long,
             ).view(-1)
             stride_tokens = self_forcing_stride_tokens(self._module.cfg)
-            min_active_end = int(model.chunk_size)
+            min_active_end = 1
             max_k_per_sample = torch.div(
                 (feature_length_local - min_active_end).clamp(min=-1),
                 int(stride_tokens),
@@ -375,10 +375,9 @@ class SelfForcingTrainer:
                 min_k_supported = min_k_local
             if min_k_supported < 1:
                 raise ValueError(
-                    "prefix self-forcing requires feature_length >= chunk_size for "
+                    "prefix self-forcing requires feature_length >= 1 for "
                     "every sample; "
-                    f"feature_length={feature_length_local.tolist()}, "
-                    f"chunk_size={min_active_end}"
+                    f"feature_length={feature_length_local.tolist()}"
                 )
             effective_k = min(target_k, min_k_supported)
             rollout_span = max(0, (effective_k - 1) * int(stride_tokens))
@@ -389,7 +388,7 @@ class SelfForcingTrainer:
                     "length; "
                     f"feature_length={feature_length_local.tolist()}, "
                     f"start_end_indices={start_end_indices.tolist()}, "
-                    f"chunk_size={min_active_end}, rollout_span={rollout_span}"
+                    f"min_active_end={min_active_end}, rollout_span={rollout_span}"
                 )
             batch_size = int(feature_length_local.shape[0])
             phase_offset = torch.empty(

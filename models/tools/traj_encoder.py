@@ -27,7 +27,7 @@ def _masked_mean(y: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return num / den
 
 
-class LocalTrajEncoder(nn.Module):
+class FrameTrajEncoder(nn.Module):
     """Within-token Conv1d encoder over the 4 frames of a token.
 
     Input: (B, T_token, 4, 7)
@@ -43,7 +43,7 @@ class LocalTrajEncoder(nn.Module):
         super().__init__()
         if in_dim != _IN_DIM:
             raise ValueError(
-                f"LocalTrajEncoder is 7D-only (in_dim must be {_IN_DIM}, got {in_dim})"
+                f"FrameTrajEncoder is 7D-only (in_dim must be {_IN_DIM}, got {in_dim})"
             )
         self.in_dim = in_dim
         self.hidden_dim = hidden_dim
@@ -81,7 +81,7 @@ class LocalTrajEncoder(nn.Module):
         return y.reshape(b, t, self.out_dim)
 
 
-class TrajEncoder(nn.Module):
+class TokenTrajEncoder(nn.Module):
     """Token-level encoder: LayerNorm + 2-layer MLP, all width = `out_dim`.
 
     Input: (B, T_token, 128)
@@ -103,7 +103,44 @@ class TrajEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.size(-1) != self.in_dim:
             raise ValueError(
-                f"TrajEncoder configured for in_dim={self.in_dim}, got last dim "
+                f"TokenTrajEncoder configured for in_dim={self.in_dim}, got last dim "
                 f"{x.size(-1)} (shape {tuple(x.shape)})."
             )
         return self.mlp(self.norm(x))
+
+
+class TrajectoryEncoder(nn.Module):
+    """Full frame-to-token trajectory encoder exposed at the LDF model boundary."""
+
+    def __init__(
+        self,
+        in_dim: int = _IN_DIM,
+        frame_hidden_dim: int = LOCAL_HIDDEN_DIM,
+        frame_out_dim: int = LOCAL_OUT_DIM,
+        token_hidden_dim: int = TRAJ_OUT_DIM,
+        out_dim: int = TRAJ_OUT_DIM,
+    ):
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.frame_in_dim = int(in_dim)
+        self.token_in_dim = int(frame_out_dim)
+        self.out_dim = int(out_dim)
+        self.frame_encoder = FrameTrajEncoder(
+            in_dim=in_dim,
+            hidden_dim=frame_hidden_dim,
+            out_dim=frame_out_dim,
+        )
+        self.token_encoder = TokenTrajEncoder(
+            in_dim=frame_out_dim,
+            hidden_dim=token_hidden_dim,
+            out_dim=out_dim,
+        )
+
+    def encode_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        return self.token_encoder(x)
+
+    def forward(
+        self, x: torch.Tensor, frame_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        tokens = self.frame_encoder(x, frame_mask=frame_mask)
+        return self.encode_tokens(tokens)

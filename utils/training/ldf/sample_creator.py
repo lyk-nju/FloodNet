@@ -969,6 +969,14 @@ class SampleCreator:
         batch_size = int(traj_token_lengths.numel())
         max_traj_tokens = int(traj_token_lengths.max().item())
         max_traj_frames = num_frames_for_tokens(max_traj_tokens, self.frames_per_token)
+        source_lengths = None
+        if "traj_length" in batch:
+            source_lengths = _as_long_1d(
+                batch["traj_length"],
+                batch_size=batch_size,
+                device=device,
+                name="traj_length",
+            )
 
         if "traj_cond_7d" in batch:
             src7 = batch["traj_cond_7d"]
@@ -979,15 +987,24 @@ class SampleCreator:
             )
             traj_features = src7.new_zeros(batch_size, max_traj_frames, src7.shape[-1])
             traj_mask = src7.new_zeros(batch_size, max_traj_frames)
+            traj_lengths: list[int] = []
             for b in range(batch_size):
                 frames = num_frames_for_tokens(
                     int(traj_token_lengths[b].item()),
                     self.frames_per_token,
                 )
-                available = min(frames, int(src7.shape[1]))
+                valid_src_frames = (
+                    int(source_lengths[b].item())
+                    if source_lengths is not None
+                    else int(src7.shape[1])
+                )
+                valid_src_frames = max(0, min(valid_src_frames, int(src7.shape[1])))
+                available = min(frames, valid_src_frames)
+                traj_lengths.append(available)
                 traj_features[b, :available, :] = src7[b, :available, :]
                 if src_mask is not None:
-                    traj_mask[b, :available] = src_mask[b, :available].to(
+                    mask_available = min(available, int(src_mask.shape[1]))
+                    traj_mask[b, :mask_available] = src_mask[b, :mask_available].to(
                         device=device,
                         dtype=traj_mask.dtype,
                     )
@@ -998,16 +1015,16 @@ class SampleCreator:
             if src_traj is not None:
                 traj = src_traj.new_zeros(batch_size, max_traj_frames, src_traj.shape[-1])
                 for b in range(batch_size):
-                    frames = num_frames_for_tokens(
-                        int(traj_token_lengths[b].item()),
-                        self.frames_per_token,
-                    )
-                    available = min(frames, int(src_traj.shape[1]))
+                    available = min(int(traj_lengths[b]), int(src_traj.shape[1]))
                     traj[b, :available, :] = src_traj[b, :available, :]
                 model_batch["traj"] = traj
             model_batch["traj_mask"] = traj_mask
             model_batch["traj_cond_mask"] = traj_mask
-            model_batch["traj_length"] = _frames_for_tokens_tensor(traj_token_lengths)
+            model_batch["traj_length"] = torch.as_tensor(
+                traj_lengths,
+                device=device,
+                dtype=torch.long,
+            )
             model_batch["traj_start_token"] = torch.zeros_like(traj_token_lengths)
             model_batch["traj_num_tokens"] = traj_token_lengths
             model_batch["traj_features_length"] = traj_token_lengths
@@ -1021,15 +1038,24 @@ class SampleCreator:
             )
             traj = src_traj.new_zeros(batch_size, max_traj_frames, src_traj.shape[-1])
             traj_mask = src_traj.new_zeros(batch_size, max_traj_frames)
+            traj_lengths: list[int] = []
             for b in range(batch_size):
                 frames = num_frames_for_tokens(
                     int(traj_token_lengths[b].item()),
                     self.frames_per_token,
                 )
-                available = min(frames, int(src_traj.shape[1]))
+                valid_src_frames = (
+                    int(source_lengths[b].item())
+                    if source_lengths is not None
+                    else int(src_traj.shape[1])
+                )
+                valid_src_frames = max(0, min(valid_src_frames, int(src_traj.shape[1])))
+                available = min(frames, valid_src_frames)
+                traj_lengths.append(available)
                 traj[b, :available, :] = src_traj[b, :available, :]
                 if src_mask is not None:
-                    traj_mask[b, :available] = src_mask[b, :available].to(
+                    mask_available = min(available, int(src_mask.shape[1]))
+                    traj_mask[b, :mask_available] = src_mask[b, :mask_available].to(
                         device=device,
                         dtype=traj_mask.dtype,
                     )
@@ -1037,7 +1063,11 @@ class SampleCreator:
                     traj_mask[b, :available] = 1.0
             model_batch["traj"] = traj
             model_batch["traj_mask"] = traj_mask
-            model_batch["traj_length"] = _frames_for_tokens_tensor(traj_token_lengths)
+            model_batch["traj_length"] = torch.as_tensor(
+                traj_lengths,
+                device=device,
+                dtype=torch.long,
+            )
             model_batch["traj_start_token"] = torch.zeros_like(traj_token_lengths)
             model_batch["traj_num_tokens"] = traj_token_lengths
             model_batch.pop("traj_features", None)

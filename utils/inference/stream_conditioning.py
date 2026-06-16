@@ -19,7 +19,6 @@ def build_stream_direct_traj_condition(
     device,
     *,
     batch_size: int,
-    local_traj_encoder,
     traj_encoder,
     traj_sl: int | None = None,
 ):
@@ -131,7 +130,6 @@ def build_stream_direct_traj_condition(
         traj_payload,
         traj_sl,
         device,
-        local_traj_encoder,
         traj_encoder,
         return_token_mask=True,
     )

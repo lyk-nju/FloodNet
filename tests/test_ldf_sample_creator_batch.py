@@ -165,6 +165,32 @@ def test_sample_creator_prefix_window_allows_short_samples_without_horizon_confi
     assert out["traj_features_length"].tolist() == [4]
 
 
+def test_sample_creator_prefix_traj_length_uses_valid_source_frames():
+    token = torch.zeros(2, 11, 4)
+    traj_frames = num_frames_for_tokens(11)
+    traj7 = torch.ones(2, traj_frames, 7)
+    traj_xyz = torch.ones(2, traj_frames, 3)
+    batch = {
+        "token": token,
+        "token_length": torch.tensor([11, 5]),
+        "traj_cond_7d": traj7,
+        "traj_cond": traj_xyz,
+        "traj_length": torch.tensor([40, 15]),
+        "traj_cond_mask": torch.ones(2, traj_frames),
+    }
+
+    out = SampleCreator(
+        sample_policy="fixed_window",
+        end_tokens=torch.tensor([11, 5]),
+    ).create(batch)
+
+    assert out["traj_num_tokens"].tolist() == [11, 5]
+    assert out["traj_features_length"].tolist() == [11, 5]
+    assert out["traj_length"].tolist() == [40, 15]
+    assert out["traj_cond_mask"][0].sum().item() == 40
+    assert out["traj_cond_mask"][1].sum().item() == 15
+
+
 def test_sample_creator_stream_batch_online_encodes_motion_window():
     token = torch.full((1, 40, 3), -999.0)
     raw = _make_motion263(batch_size=1, num_frames=200)

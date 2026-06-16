@@ -34,7 +34,6 @@ def prepare_generate_condition(
         batch,
         traj_len,
         device,
-        model.local_traj_encoder,
         model.traj_encoder,
         return_token_mask=True,
     )
@@ -151,7 +150,6 @@ def build_stream_step_condition_provider(
                     window_start_token,
                     device,
                     batch_size=batch_size,
-                    local_traj_encoder=model.local_traj_encoder,
                     traj_encoder=model.traj_encoder,
                 )
             )

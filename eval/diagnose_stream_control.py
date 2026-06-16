@@ -862,7 +862,7 @@ def run_stream_step(
 
     When *use_pred_root* is True, replicates web_demo closed-loop behaviour.
     When *use_features_path* is True, uses ``traj_features`` (bypasses
-    xyz→anchor-subtract→LocalTrajEncoder path).
+    xyz→anchor-subtract→FrameTrajEncoder path).
     When *no_traj* is True, skips trajectory conditioning entirely.
     When *collect_latents* is True, returns latent tokens instead of decoded
     motion (for offline-decode comparison).
@@ -1715,7 +1715,6 @@ def main():
             _bs,
             gen_seq_len,
             device,
-            model.local_traj_encoder,
             model.traj_encoder,
         )
         if emb_gen is not None:
@@ -1799,7 +1798,6 @@ def main():
             _bs,
             seq_len + model.chunk_size,
             device,
-            model.local_traj_encoder,
             model.traj_encoder,
         )
         traj_sl = get_traj_seq_lens(_bs, seq_len + model.chunk_size, device)
@@ -2444,7 +2442,6 @@ def main():
             x,
             sl,
             dev,
-            local_traj_encoder=None,
             traj_encoder=None,
             *,
             horizon_tokens=None,
@@ -3391,13 +3388,13 @@ def main():
     # Encoding path labels per mode family.
     _TPATH_GENERATE = (
         "traj_features (frame-level) -> build_traj_emb"
-        " -> frames_to_tokens -> LocalTrajEncoder -> TrajEncoder"
+        " -> frames_to_tokens -> FrameTrajEncoder -> TokenTrajEncoder"
         " (no anchor-subtract)"
     )
     _TPATH_STEP = (
         "traj (xyz) -> TrajStreamBuffer._build_from_xyz"
         " (anchor-subtract) -> token-level -> frames_to_tokens"
-        " -> LocalTrajEncoder -> TrajEncoder"
+        " -> FrameTrajEncoder -> TokenTrajEncoder"
     )
 
     # Diagnostic matrix: (mode_name, horizon, root_source, use_pred_root, traj_encoder_path)

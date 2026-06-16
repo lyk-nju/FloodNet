@@ -72,6 +72,22 @@ def test_prepare_ldf_eval_model_batch_does_not_inject_no_traj_condition():
     assert "traj_mask" not in model_batch
 
 
+def test_prepare_ldf_eval_model_batch_without_model_is_deterministic(monkeypatch):
+    batch = _make_7d_batch()
+    monkeypatch.setattr(
+        torch,
+        "randint",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("prepare_ldf_eval_model_batch should not sample randomly")
+        ),
+    )
+
+    model_batch = prepare_ldf_eval_model_batch(batch, torch.device("cpu"))
+
+    assert model_batch["feature_length"].tolist() == batch["token_length"].tolist()
+    assert model_batch["traj_num_tokens"].tolist() == batch["token_length"].tolist()
+
+
 def test_prepare_ldf_eval_model_batch_prefix_window_uses_full_future_traj(monkeypatch):
     traj_tokens = 5
     traj_frames = num_frames_for_tokens(traj_tokens)

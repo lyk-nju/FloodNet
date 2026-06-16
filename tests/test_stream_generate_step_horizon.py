@@ -38,7 +38,6 @@ def _make_stream_step_harness(
     model.param_dtype = torch.float32
     model.time_embedding_scale = 1.0
     model.prediction_type = "vel"
-    model.local_traj_encoder = torch.nn.Identity()
     model.traj_encoder = torch.nn.Identity()
     model.text_condition_list = [[torch.zeros(1, 1) for _ in range(commit_index)]]
     model.recorded = SimpleNamespace(
@@ -61,7 +60,6 @@ def _make_stream_step_harness(
         device,
         *,
         batch_size,
-        local_traj_encoder,
         traj_encoder,
         traj_sl=None,
     ):
@@ -113,7 +111,6 @@ def _condition_provider(model, step_input):
                 window_start_token,
                 device,
                 batch_size=1,
-                local_traj_encoder=model.local_traj_encoder,
                 traj_encoder=model.traj_encoder,
             )
         )

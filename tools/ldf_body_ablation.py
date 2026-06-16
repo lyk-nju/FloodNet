@@ -11,7 +11,7 @@ isolate each gap-closure subitem:
     no_heading_loss      heading term zeroed in body aux loss (T_B_06 / §2.4)
 
 (The former `no_7d` 4D-legacy baseline was removed: the traj encoder is now 7D
-only — LocalTrajEncoder rejects in_dim=4 — so a 4D ablation can't be built.)
+only — FrameTrajEncoder rejects in_dim=4 — so a 4D ablation can't be built.)
 
 Bools are emitted lowercase so utils/initialize._convert_value parses them.
 

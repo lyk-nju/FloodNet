@@ -1,7 +1,7 @@
 """Streaming trajectory buffer for DiffForcingWanModel.stream_generate_step().
 
 Manages per-step traj features / xyz / token_mask writes and LRU embedding cache.
-Decoupled from the diffusion model: only holds references to the two traj encoders.
+Decoupled from the diffusion model: only holds a reference to the trajectory encoder.
 """
 
 from __future__ import annotations
@@ -37,7 +37,6 @@ class TrajStreamBuffer:
         self,
         batch_size: int | None = None,
         buf_len: int | None = None,
-        local_traj_encoder: torch.nn.Module | None = None,
         traj_encoder: torch.nn.Module | None = None,
         use_emb_cache: bool = True,
         *,
@@ -46,7 +45,6 @@ class TrajStreamBuffer:
     ):
         self.batch_size = batch_size
         self.buf_len = buf_len
-        self.local_traj_encoder = local_traj_encoder
         self.traj_encoder = traj_encoder
         self.use_emb_cache = use_emb_cache
 
@@ -449,39 +447,43 @@ class TrajStreamBuffer:
         if mask is not None:
             feats = feats * mask.unsqueeze(-1).to(dtype=feats.dtype)
 
-        # Streaming buffer stores token-level features. The new 7D encoder
-        # expects per-token output of LocalTrajEncoder (in_dim=128, see
-        # models/tools/traj_encoder.py). If the buffer holds raw 7D frame-level
-        # features, the streaming caller needs to be updated to store them
-        # frame-level so we can run frames_to_tokens + LocalTrajEncoder.
-        traj_in_dim = getattr(self.traj_encoder, "in_dim", None)
+        # Streaming buffer stores token-level features. TrajectoryEncoder expects
+        # post-FrameTrajEncoder token features on this path.
+        traj_in_dim = getattr(
+            self.traj_encoder,
+            "token_in_dim",
+            getattr(self.traj_encoder, "in_dim", None),
+        )
         if traj_in_dim is not None and feats.size(-1) != traj_in_dim:
             raise ValueError(
                 "TrajStreamBuffer._feat_buf last-dim "
-                f"{feats.size(-1)} doesn't match traj_encoder.in_dim={traj_in_dim}. "
+                f"{feats.size(-1)} doesn't match traj_encoder.token_in_dim={traj_in_dim}. "
                 "After the 7D traj-encoder rewrite the streaming buffer must "
-                "either store post-LocalTrajEncoder embeddings (in_dim=128) or "
+                "either store post-FrameTrajEncoder embeddings (in_dim=128) or "
                 "be reworked to stream frame-level features through "
-                "LocalTrajEncoder. Until that landing, route streaming traj "
+                "FrameTrajEncoder. Until that landing, route streaming traj "
                 "through the training-time encode_traj_batch path."
             )
-        emb = self.traj_encoder(feats)
+        if hasattr(self.traj_encoder, "encode_tokens"):
+            emb = self.traj_encoder.encode_tokens(feats)
+        else:
+            emb = self.traj_encoder(feats)
         if self.use_emb_cache:
             self._emb_cache[key] = emb
         return emb
 
     def _build_from_xyz(self, start_t, end_index, ctx_len, device):
         # The legacy xyz path is translate-only 4D path-heading, NOT B-full
-        # canonical / physical-yaw 7D. The 7D LocalTrajEncoder is hard-coded to
+        # canonical / physical-yaw 7D. The 7D FrameTrajEncoder is hard-coded to
         # in_dim=7 and would ValueError downstream with a confusing shape
         # mismatch — fail fast with a clear message so callers migrate to the
         # 7D RootPlan path (get_body_traj_cond).
-        local_in_dim = getattr(self.local_traj_encoder, "in_dim", None)
-        if local_in_dim is not None and local_in_dim != 4:
+        frame_in_dim = getattr(self.traj_encoder, "frame_in_dim", None)
+        if frame_in_dim is not None and frame_in_dim != 4:
             raise RuntimeError(
                 "TrajStreamBuffer._build_from_xyz is the legacy 4D "
-                "translate-only path, but local_traj_encoder.in_dim="
-                f"{local_in_dim} (7D contract). Use get_body_traj_cond "
+                "translate-only path, but traj_encoder.frame_in_dim="
+                f"{frame_in_dim} (7D contract). Use get_body_traj_cond "
                 "(RootPlan 7D, B-full canonical) instead."
             )
         key = ("xyz", start_t, end_index, self._version)
@@ -510,12 +512,10 @@ class TrajStreamBuffer:
         traj_frames = _expand_tokens_to_causal_frames(traj_slice)   # (B, 1+4*(N-1), 3)
         feats_frame = root_to_traj_feats(traj_frames)               # (B, T_frames, 4)
         feats_4 = frames_to_tokens(feats_frame, ctx_len)  # (B, ctx_len, 4, 4)
-        feats_tok = self.local_traj_encoder(feats_4)                 # (B, ctx_len, 4)
+        emb = self.traj_encoder(feats_4)
 
         if mask is not None:
-            feats_tok = feats_tok * mask.unsqueeze(-1).to(dtype=feats_tok.dtype)
-
-        emb = self.traj_encoder(feats_tok)
+            emb = emb * mask.unsqueeze(-1).to(dtype=emb.dtype)
         if self.use_emb_cache:
             self._emb_cache[key] = emb
         return emb

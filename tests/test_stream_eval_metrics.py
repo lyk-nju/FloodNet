@@ -192,7 +192,6 @@ class _FakeStepModel:
         self.param_dtype = torch.float32
         self.text_condition_list = [[]]
         self._traj_buf = None
-        self.local_traj_encoder = torch.nn.Identity()
         self.traj_encoder = torch.nn.Identity()
 
     def init_generated(

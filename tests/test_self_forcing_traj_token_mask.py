@@ -333,6 +333,41 @@ def test_plan_rollout_prefix_aligns_final_active_right_to_latent_end(monkeypatch
     assert (plan.start_end_indices + rollout_span).tolist() == [12]
 
 
+def test_plan_rollout_prefix_supports_partial_active_chunks():
+    model = MagicMock(name="model")
+    model.chunk_size = 5
+    cfg = SimpleNamespace()
+    cfg.self_forcing = SimpleNamespace(k_schedule=[(0.0, 5)], stride_tokens=1)
+    cfg.get = lambda key, default=None: {
+        "ldf_training": {
+            "window_policy": "prefix",
+        },
+    }.get(key, default)
+    module = SimpleNamespace(model=model, cfg=cfg)
+    trainer = SelfForcingTrainer.__new__(SelfForcingTrainer)
+    trainer._module = module
+    model_batch = {
+        "_window_local_sample_policy": "prefix",
+    }
+
+    cases = [
+        (torch.tensor([1], dtype=torch.long), 1, [1]),
+        (torch.tensor([3], dtype=torch.long), 3, [1]),
+        (torch.tensor([10], dtype=torch.long), 5, [6]),
+    ]
+    for feature_length, expected_k, expected_start in cases:
+        plan = trainer.plan_rollout(
+            feature_length,
+            torch.device("cpu"),
+            progress=1.0,
+            model_batch=model_batch,
+        )
+        rollout_span = (plan.effective_k - 1) * cfg.self_forcing.stride_tokens
+        assert plan.effective_k == expected_k
+        assert plan.start_end_indices.tolist() == expected_start
+        assert (plan.start_end_indices + rollout_span).tolist() == feature_length.tolist()
+
+
 def test_run_rollout_adds_window_start_to_horizon_active_end(monkeypatch):
     trainer, model, model_batch, _ = _make_trainer()
     _patch_run_training_window(monkeypatch, model)

@@ -84,7 +84,16 @@ def prepare_ldf_eval_model_batch(batch: dict, device, model=None) -> dict:
             window_policy="prefix",
         ).create(batch)
     else:
-        model_batch = SampleCreator().create(batch)
+        if "token_length" not in batch:
+            raise ValueError(
+                "prepare_ldf_eval_model_batch requires batch['token_length'] "
+                "when model is None"
+            )
+        model_batch = SampleCreator(
+            window_policy="prefix",
+            sample_policy="fixed_window",
+            end_tokens=batch["token_length"],
+        ).create(batch)
     if _has_7d_traj(model_batch):
         source = model_batch.get("traj_features", model_batch.get("traj_cond_7d"))
         canon = _canonicalize_7d_clip_start(source)
