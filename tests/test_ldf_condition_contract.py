@@ -20,6 +20,20 @@ def test_ldf_condition_accepts_prepared_model_inputs():
     condition.validate(batch_size=1)
 
 
+def test_ldf_condition_separates_latent_and_attention_lengths():
+    condition = LDFCondition(text_context=["text"], seq_len=5, attn_len=8)
+
+    assert condition.latent_len() == 5
+    assert condition.attention_len() == 8
+
+
+def test_ldf_condition_requires_seq_len_for_latent_length():
+    condition = LDFCondition(text_context=["text"], attn_len=8)
+
+    with pytest.raises(ValueError, match="seq_len"):
+        condition.latent_len()
+
+
 def test_ldf_condition_rejects_mismatched_traj_batch_size():
     condition = LDFCondition(
         text_context=["text"],

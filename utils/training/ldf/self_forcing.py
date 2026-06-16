@@ -351,6 +351,56 @@ class SelfForcingTrainer:
             (ldf_cfg.get("window_sampling", {}) or {}).get("enabled", False)
         )
         if (
+            not rolling_enabled
+            and model_batch is not None
+            and str(model_batch.get("_window_local_sample_policy", "")) == "prefix"
+        ):
+            feature_length_local = feature_length.to(
+                device=device,
+                dtype=torch.long,
+            ).view(-1)
+            stride_tokens = self_forcing_stride_tokens(self._module.cfg)
+            min_active_end = int(model.chunk_size)
+            max_k_per_sample = torch.div(
+                (feature_length_local - min_active_end).clamp(min=-1),
+                int(stride_tokens),
+                rounding_mode="floor",
+            ) + 1
+            min_k_local = int(max_k_per_sample.min().item())
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                tmp = torch.tensor([min_k_local], device=device, dtype=torch.long)
+                torch.distributed.all_reduce(tmp, op=torch.distributed.ReduceOp.MIN)
+                min_k_supported = int(tmp.item())
+            else:
+                min_k_supported = min_k_local
+            if min_k_supported < 1:
+                raise ValueError(
+                    "prefix self-forcing requires feature_length >= chunk_size for "
+                    "every sample; "
+                    f"feature_length={feature_length_local.tolist()}, "
+                    f"chunk_size={min_active_end}"
+                )
+            effective_k = min(target_k, min_k_supported)
+            rollout_span = max(0, (effective_k - 1) * int(stride_tokens))
+            start_end_indices = feature_length_local - rollout_span
+            if bool((start_end_indices < min_active_end).any()):
+                raise ValueError(
+                    "prefix self-forcing rollout is inconsistent with latent "
+                    "length; "
+                    f"feature_length={feature_length_local.tolist()}, "
+                    f"start_end_indices={start_end_indices.tolist()}, "
+                    f"chunk_size={min_active_end}, rollout_span={rollout_span}"
+                )
+            batch_size = int(feature_length_local.shape[0])
+            phase_offset = torch.empty(
+                batch_size, device=device, dtype=torch.float32
+            ).uniform_(0.0, 1.0 / model.chunk_size)
+            return RolloutPlan(
+                effective_k=effective_k,
+                start_end_indices=start_end_indices,
+                phase_offset=phase_offset,
+            )
+        if (
             rolling_enabled
             and window_sampling_enabled
             and model_batch is not None

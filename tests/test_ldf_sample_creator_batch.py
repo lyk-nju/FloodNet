@@ -115,6 +115,32 @@ def test_sample_creator_prefix_window_does_not_cap_active_right_by_context_token
     assert out["traj_num_tokens"].tolist() == [10]
 
 
+def test_sample_creator_default_prefix_samples_active_right_from_token_length(monkeypatch):
+    token = torch.arange(5 * 4, dtype=torch.float32).view(1, 5, 4)
+    traj_frames = num_frames_for_tokens(5)
+    batch = {
+        "token": token,
+        "token_length": torch.tensor([5]),
+        "traj_cond_7d": torch.zeros(1, traj_frames, 7),
+        "traj_cond": torch.zeros(1, traj_frames, 3),
+        "traj_length": torch.tensor([traj_frames]),
+        "traj_cond_mask": torch.ones(1, traj_frames),
+    }
+    monkeypatch.setattr(
+        torch,
+        "randint",
+        lambda low, high, size, device=None: torch.full(
+            size, int(low), device=device, dtype=torch.long
+        ),
+    )
+
+    out = SampleCreator().create(batch)
+
+    assert out["feature_length"].tolist() == [1]
+    assert out["feature"].shape == (1, 1, 4)
+    assert out["traj_num_tokens"].tolist() == [5]
+
+
 def test_sample_creator_prefix_window_allows_short_samples_without_horizon_config():
     token = torch.arange(4 * 4, dtype=torch.float32).view(1, 4, 4)
     traj_frames = num_frames_for_tokens(4)

@@ -22,7 +22,12 @@ class LDFCondition:
     seq_len: int | None = None
     attn_len: int | None = None
 
-    def resolved_len(self) -> int:
+    def latent_len(self) -> int:
+        if self.seq_len is None:
+            raise ValueError("LDFCondition requires seq_len for latent length.")
+        return int(self.seq_len)
+
+    def attention_len(self) -> int:
         length = self.attn_len if self.attn_len is not None else self.seq_len
         if length is None:
             raise ValueError("LDFCondition requires seq_len or attn_len.")
