@@ -374,6 +374,7 @@ class SampleCreator:
             feature[b, :valid, :] = token[b, start:start + valid, :]
 
         model_batch = batch.copy()
+        model_batch.pop("token_mask", None)
         model_batch["feature"] = feature
         model_batch["feature_length"] = latent_lengths
         model_batch["token"] = feature
@@ -386,7 +387,6 @@ class SampleCreator:
                 valid = int(latent_lengths[b].item())
                 token_mask_out[b, :valid] = token_mask[b, start:start + valid]
             model_batch["latent_token_mask"] = token_mask_out
-            model_batch["token_mask"] = token_mask_out
         if "token_text_end" in batch:
             model_batch["feature_text_end"] = batch["token_text_end"]
         self._copy_prefix_trajectory_fields(batch, model_batch, traj_token_lengths)

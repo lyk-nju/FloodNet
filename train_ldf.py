@@ -24,7 +24,11 @@ from torch.utils.data import DataLoader
 from torch_ema import ExponentialMovingAverage
 
 from metrics.t2m import T2MMetrics
-from eval.ldf.conditioning import prepare_ldf_eval_model_batch
+from eval.ldf.conditioning import (
+    build_windowed_metric_ground_truth as _build_windowed_metric_ground_truth,
+    prepare_ldf_eval_model_batch,
+)
+from eval.ldf.t2m_generation import run_t2m_generation_mode
 from eval.eval_runner import run_validation_generation_eval
 from eval.eval_summary import process_validation_generation_results
 from utils.initialize import (
@@ -56,48 +60,13 @@ from utils.training.ldf.config_validate import (
     validate_ldf_training_config,
     validate_traj_dim_consistency,
 )
-from utils.token_frame import token_range_to_frame_slice
+from utils.training.ldf.t2m_generation_modes import (
+    T2M_GENERATE,
+    resolve_t2m_generation_modes,
+)
 
 # Set tokenizers parallelism to false to avoid warnings in multiprocessing
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-
-def _build_windowed_metric_ground_truth(batch: dict, model_batch: dict):
-    """Return GT tensors cropped to the same latent window as generation.
-
-    Windowed LDF eval may generate only a prefix/sub-window. Offline metrics must
-    compare that result against the matching GT window rather than the original
-    full clip.
-    """
-    gt_token = model_batch["token"]
-    gt_token_length = model_batch["token_length"]
-    raw_feature = batch["feature"]
-    raw_feature_length = batch["feature_length"]
-    latent_lengths = model_batch.get("feature_length", gt_token_length)
-    starts = model_batch.get("_window_global_start_token")
-    batch_size = int(gt_token.shape[0])
-    device = gt_token.device
-    if starts is None:
-        starts = torch.zeros(batch_size, device=device, dtype=torch.long)
-    else:
-        starts = starts.to(device=device, dtype=torch.long).view(-1)
-        if starts.numel() == 1 and batch_size > 1:
-            starts = starts.expand(batch_size)
-    latent_lengths = latent_lengths.to(device=device, dtype=torch.long).view(-1)
-    raw_feature_length = raw_feature_length.to(device=device, dtype=torch.long).view(-1)
-
-    gt_feature = []
-    gt_feature_length = []
-    for i in range(batch_size):
-        start_token = int(starts[i].item())
-        num_tokens = int(latent_lengths[i].item())
-        frame_slice = token_range_to_frame_slice(start_token, num_tokens)
-        raw_len = int(raw_feature_length[i].item())
-        start_frame = min(int(frame_slice.start), raw_len)
-        stop_frame = min(int(frame_slice.stop), raw_len)
-        gt_feature.append(raw_feature[i, start_frame:stop_frame])
-        gt_feature_length.append(max(0, stop_frame - start_frame))
-    return gt_token, gt_token_length, gt_feature, gt_feature_length
 
 
 class CustomLightningModule(BasicLightningModule):
@@ -261,7 +230,15 @@ class CustomLightningModule(BasicLightningModule):
         ##############################
         self.recover_dim = self.cfg.metrics.dim
         self.t2m_enabled = t2m_metric_enabled(self.cfg)
-        self.t2m_metrics = T2MMetrics(self.cfg.metrics.t2m) if self.t2m_enabled else None
+        self.t2m_generation_modes = resolve_t2m_generation_modes(self.cfg)
+        self.t2m_metrics = (
+            torch.nn.ModuleDict({
+                mode: T2MMetrics(self.cfg.metrics.t2m)
+                for mode in self.t2m_generation_modes
+            })
+            if self.t2m_enabled
+            else None
+        )
 
     def on_load_checkpoint(self, checkpoint):
         # NOTE: super() not called — state_dict / EMA / optimizer are restored
@@ -454,12 +431,14 @@ class CustomLightningModule(BasicLightningModule):
         try:
             with self.ema.average_parameters([p for p in self.model.parameters() if p.requires_grad]):
                 model_batch = prepare_ldf_eval_model_batch(batch, self.device, model=self.model)
-                output = self.model.generate(model_batch)
+                outputs = {
+                    mode: run_t2m_generation_mode(self.model, model_batch, mode)
+                    for mode in self.t2m_generation_modes
+                }
         finally:
             torch.random.set_rng_state(cpu_state)
             if cuda_state is not None:
                 torch.cuda.set_rng_state_all(cuda_state)
-        generated = output["generated"]
         (
             ground_truth_token,
             gt_token_length,
@@ -467,54 +446,66 @@ class CustomLightningModule(BasicLightningModule):
             gt_feature_length,
         ) = _build_windowed_metric_ground_truth(batch, model_batch)
 
-        for i in range(len(generated)):
-            ##############################
-            # decode generated motion
-            ##############################
-            single_generated = generated[i]
-            decoded_single_generated = self.vae.decode(
-                single_generated[None, :].to(self.device)
-            )[0]
-            decoded_single_generated = decoded_single_generated.float().to(self.device)
-            ##############################
-            # decode ground truth
-            ##############################
-            single_gt_r = ground_truth_token[i][: int(gt_token_length[i].item())]
-            decoded_single_gt_r = self.vae.decode(single_gt_r[None, :].to(self.device))[
-                0
-            ]
-            decoded_single_gt_r = decoded_single_gt_r.float().to(self.device)
-            ##############################
-            # original ground truth (VAE vs raw feature for fid_target)
-            ##############################
-            single_gt_o = ground_truth_feature[i]
-            decoded_single_gt_o = single_gt_o[: gt_feature_length[i], :].to(self.device)
-            decoded_single_gt_o = decoded_single_gt_o.float().to(self.device)
-            text_tokens_single = batch["text_tokens"][i]
-            if self.cfg.metrics.t2m.fid_target == "vae":
-                self.t2m_metrics.update(
-                    feats_rst=decoded_single_generated[None, ...],
-                    feats_ref=decoded_single_gt_r[None, ...],
-                    lengths_rst=[int(decoded_single_generated.shape[0])],
-                    lengths_ref=[int(decoded_single_gt_r.shape[0])],
-                    text_tokens=[text_tokens_single],
-                )
-            else:
-                self.t2m_metrics.update(
-                    feats_rst=decoded_single_generated[None, ...],
-                    feats_ref=decoded_single_gt_o[None, ...],
-                    lengths_rst=[int(decoded_single_generated.shape[0])],
-                    lengths_ref=[int(decoded_single_gt_o.shape[0])],
-                    text_tokens=[text_tokens_single],
-                )
+        for mode, output in outputs.items():
+            metric = self.t2m_metrics[mode]
+            generated = output["generated"]
+            for i in range(len(generated)):
+                ##############################
+                # decode generated motion
+                ##############################
+                single_generated = generated[i]
+                decoded_single_generated = self.vae.decode(
+                    single_generated[None, :].to(self.device)
+                )[0]
+                decoded_single_generated = decoded_single_generated.float().to(self.device)
+                ##############################
+                # decode ground truth
+                ##############################
+                single_gt_r = ground_truth_token[i][: int(gt_token_length[i].item())]
+                decoded_single_gt_r = self.vae.decode(single_gt_r[None, :].to(self.device))[
+                    0
+                ]
+                decoded_single_gt_r = decoded_single_gt_r.float().to(self.device)
+                ##############################
+                # original ground truth (VAE vs raw feature for fid_target)
+                ##############################
+                single_gt_o = ground_truth_feature[i]
+                decoded_single_gt_o = single_gt_o[: gt_feature_length[i], :].to(self.device)
+                decoded_single_gt_o = decoded_single_gt_o.float().to(self.device)
+                text_tokens_single = batch["text_tokens"][i]
+                if self.cfg.metrics.t2m.fid_target == "vae":
+                    metric.update(
+                        feats_rst=decoded_single_generated[None, ...],
+                        feats_ref=decoded_single_gt_r[None, ...],
+                        lengths_rst=[int(decoded_single_generated.shape[0])],
+                        lengths_ref=[int(decoded_single_gt_r.shape[0])],
+                        text_tokens=[text_tokens_single],
+                    )
+                else:
+                    metric.update(
+                        feats_rst=decoded_single_generated[None, ...],
+                        feats_ref=decoded_single_gt_o[None, ...],
+                        lengths_rst=[int(decoded_single_generated.shape[0])],
+                        lengths_ref=[int(decoded_single_gt_o.shape[0])],
+                        text_tokens=[text_tokens_single],
+                    )
         return
 
     def compute_metrics(self):
         if not self.t2m_enabled or self.t2m_metrics is None:
             return
-        t2m_output = self.t2m_metrics.compute(sanity_flag=self.trainer.sanity_checking)
-        for key, value in t2m_output.items():
-            self.log(f"metrics/t2m_metrics/{key}", value, sync_dist=True)
+        legacy_single_generate = self.t2m_generation_modes == (T2M_GENERATE,)
+        for mode in self.t2m_generation_modes:
+            t2m_output = self.t2m_metrics[mode].compute(
+                sanity_flag=self.trainer.sanity_checking
+            )
+            log_prefix = (
+                "metrics/t2m_metrics"
+                if legacy_single_generate
+                else f"metrics/t2m_metrics/{mode}"
+            )
+            for key, value in t2m_output.items():
+                self.log(f"{log_prefix}/{key}", value, sync_dist=True)
 
     def on_validation_epoch_end(self):
         _force = getattr(self, "_eval_on_resume", False)

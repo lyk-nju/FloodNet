@@ -39,7 +39,7 @@ logger:
 trainer: # lightning trainer
     max_steps: 700000
     accelerator: gpu
-    devices: [1,2]
+    devices: [3]
     log_every_n_steps: 100
     precision: bf16-mixed
 
@@ -51,6 +51,8 @@ validation:
 
     val_repeat: 1
     t2m_metric: true
+    t2m_generation_modes:
+        - generate
     eval_generation_metrics: true
     eval_num_runs: 5
     eval_seg_size: 20

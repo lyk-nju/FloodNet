@@ -51,6 +51,8 @@ validation:
 
     val_repeat: 1
     t2m_metric: true
+    t2m_generation_modes:
+        - generate
     eval_generation_metrics: true
     eval_num_runs: 5
     eval_seg_size: 20

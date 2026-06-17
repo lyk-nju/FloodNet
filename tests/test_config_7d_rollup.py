@@ -54,6 +54,7 @@ def test_all_new_sections_present_and_readable():
     assert "motion_aux_loss" not in cfg.ldf_training
     assert "t2m_metric" not in cfg
     assert cfg.validation.t2m_metric is True
+    assert list(cfg.validation.t2m_generation_modes) == ["generate"]
     assert "val_repeat" not in cfg
     assert cfg.validation.val_repeat == 1
     # T_B_05 is now a hard default in the self-forcing path; only ablations
@@ -169,6 +170,22 @@ def test_shipped_ldf_passes_sf_guard():
 def test_shipped_ldf_training_config_valid():
     cfg = OmegaConf.load(_LDF)
     validate_ldf_training_config(cfg)
+
+
+def test_ldf_training_rejects_unknown_t2m_generation_mode():
+    cfg = OmegaConf.create({
+        "validation": {
+            "t2m_generation_modes": ["generate", "full_latent"],
+        },
+        "model": {"params": {"chunk_size": 5}},
+        "ldf_training": {
+            "formulation": "windowed",
+            "window_policy": "prefix",
+        },
+    })
+
+    with pytest.raises(ValueError, match="t2m_generation_modes"):
+        validate_ldf_training_config(cfg)
 
 
 def test_shipped_ldf_does_not_expose_async_eval_gate():

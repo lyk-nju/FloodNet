@@ -512,7 +512,11 @@ class TrajStreamBuffer:
         traj_frames = _expand_tokens_to_causal_frames(traj_slice)   # (B, 1+4*(N-1), 3)
         feats_frame = root_to_traj_feats(traj_frames)               # (B, T_frames, 4)
         feats_4 = frames_to_tokens(feats_frame, ctx_len)  # (B, ctx_len, 4, 4)
-        emb = self.traj_encoder(feats_4)
+        if hasattr(self.traj_encoder, "frame_in_dim"):
+            emb = self.traj_encoder(feats_4)
+        else:
+            feats = feats_4.mean(dim=2)
+            emb = self.traj_encoder(feats)
 
         if mask is not None:
             emb = emb * mask.unsqueeze(-1).to(dtype=emb.dtype)

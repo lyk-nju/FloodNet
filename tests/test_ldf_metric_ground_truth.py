@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from train_ldf import _build_windowed_metric_ground_truth
+from eval.ldf.conditioning import build_windowed_metric_ground_truth
 from utils.token_frame import num_frames_for_tokens
 
 
@@ -24,7 +24,7 @@ def test_windowed_metric_ground_truth_uses_model_batch_prefix():
     }
 
     gt_token, gt_token_length, gt_feature, gt_feature_length = (
-        _build_windowed_metric_ground_truth(batch, model_batch)
+        build_windowed_metric_ground_truth(batch, model_batch)
     )
 
     assert torch.equal(gt_token, prefix_tokens)
@@ -50,7 +50,7 @@ def test_windowed_metric_ground_truth_clamps_prefix_to_valid_raw_frames():
         "_window_global_start_token": torch.tensor([0]),
     }
 
-    _, _, gt_feature, gt_feature_length = _build_windowed_metric_ground_truth(
+    _, _, gt_feature, gt_feature_length = build_windowed_metric_ground_truth(
         batch,
         model_batch,
     )

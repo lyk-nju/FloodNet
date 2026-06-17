@@ -54,12 +54,35 @@ from metrics.traj import (
     _stable_eval_seed,
     _to_device,
 )
-from eval.ldf.conditioning import prepare_ldf_eval_model_batch
+from eval.ldf.conditioning import (
+    build_windowed_metric_ground_truth,
+    prepare_ldf_eval_model_batch,
+)
+from eval.ldf.t2m_generation import run_t2m_generation_mode
 from utils.initialize import get_function, instantiate, load_config
 from utils.motion_process import extract_root_trajectory_263_torch
+from utils.training.ldf.t2m_generation_modes import (
+    T2M_GENERATE,
+    resolve_t2m_generation_modes,
+)
 from utils.training.ldf.model_factory import instantiate_ldf_model
 from utils.traj_batch import root_to_traj_feats
 from utils.visualization.video import make_composite_compare_videos, render_video
+
+
+def _select_t2m_reference(batch, model_batch, sample_idx: int, *, vae, device, cfg):
+    """Return the metric reference aligned to the generated window."""
+    gt_token, gt_token_length, gt_feature, gt_feature_length = (
+        build_windowed_metric_ground_truth(batch, model_batch)
+    )
+    if cfg.metrics.t2m.fid_target == "vae":
+        token_len = int(gt_token_length[sample_idx].item())
+        token = gt_token[sample_idx][:token_len]
+        decoded = vae.decode(token[None, :].to(device))[0].float().detach().to(device)
+        return decoded, int(decoded.shape[0])
+
+    feature = gt_feature[sample_idx].float().to(device)
+    return feature, int(gt_feature_length[sample_idx])
 
 
 def _default_output_dir() -> Path:
@@ -298,8 +321,10 @@ def _plot_traj_xz(
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _save_t2m_shard(t2m_metrics, args) -> None:
+def _save_t2m_shard(t2m_metrics, args, *, mode: Optional[str] = None) -> None:
     shard_dir = Path(args.t2m_shards_save_dir)
+    if mode is not None:
+        shard_dir = shard_dir / mode
     shard_dir.mkdir(parents=True, exist_ok=True)
     shard_path = shard_dir / f"t2m_shard_{args.val_shard_idx}_of_{args.val_num_shards}.npz"
 
@@ -310,8 +335,9 @@ def _save_t2m_shard(t2m_metrics, args) -> None:
            if txt_list else np.zeros((0, rec.shape[-1]), dtype=np.float32))
 
     np.savez(shard_path, recmotion=rec, gtmotion=gt, text=txt)
-    print(f"[eval] Saved shard {args.val_shard_idx}/{args.val_num_shards} "
-          f"({len(rec)} samples) → {shard_path}")
+    mode_text = f" mode={mode}" if mode is not None else ""
+    print(f"[eval] Saved shard{mode_text} {args.val_shard_idx}/{args.val_num_shards} "
+          f"({len(rec)} samples) -> {shard_path}")
 
 
 def _run_t2m_merge(args, cfg) -> None:
@@ -432,8 +458,12 @@ def main():
         )
 
     # ── Val dataset (T2M FID, only when run_t2m) ──────────────────────────────
+    t2m_generation_modes = resolve_t2m_generation_modes(cfg)
     if run_t2m:
-        t2m_metrics = T2MMetrics(cfg.metrics.t2m).to(device)
+        t2m_metrics_by_mode = {
+            mode: T2MMetrics(cfg.metrics.t2m).to(device)
+            for mode in t2m_generation_modes
+        }
         val_dataset = instantiate(
             cfg.data.get("val_target", cfg.data.target), cfg=cfg.config, split="val"
         )
@@ -451,6 +481,7 @@ def main():
             collate_fn=collate_fn,
         )
         print(f"[eval] val samples (for T2M FID): {len(val_dataset)}")
+        print(f"[eval] T2M generation modes: {', '.join(t2m_generation_modes)}")
 
     if not args.skip_test_pass:
         print(f"[eval] test samples (video + traj): {len(test_dataset)}")
@@ -752,42 +783,69 @@ def main():
 
             with torch.no_grad():
                 model_batch = prepare_ldf_eval_model_batch(batch, device, model=model)
-                output = model.generate(model_batch)
+                outputs_by_mode = {
+                    mode: run_t2m_generation_mode(model, model_batch, mode)
+                    for mode in t2m_generation_modes
+                }
 
-            generated = output["generated"]
+            for mode, output in outputs_by_mode.items():
+                t2m_metrics = t2m_metrics_by_mode[mode]
+                generated = output["generated"]
 
-            for i in range(len(generated)):
-                single_generated  = generated[i].detach()
-                decoded_generated = vae.decode(single_generated[None, :].to(device))[0].float().detach().to(device)
+                for i in range(len(generated)):
+                    single_generated = generated[i].detach()
+                    decoded_generated = vae.decode(single_generated[None, :].to(device))[0].float().detach().to(device)
 
-                gt_token   = batch["token"][i][: batch["token_length"][i]]
-                gt_decoded = vae.decode(gt_token[None, :].to(device))[0].float().detach().to(device)
-                gt_feature = batch["feature"][i][: batch["feature_length"][i]].float().to(device)
-
-                text_tokens_single = batch["text_tokens"][i]
-                if cfg.metrics.t2m.fid_target == "vae":
-                    t2m_metrics.update(
-                        feats_rst=decoded_generated[None, ...],
-                        feats_ref=gt_decoded[None, ...],
-                        lengths_rst=[int(decoded_generated.shape[0])],
-                        lengths_ref=[int(gt_decoded.shape[0])],
-                        text_tokens=[text_tokens_single],
+                    gt_ref, gt_ref_len = _select_t2m_reference(
+                        batch,
+                        model_batch,
+                        i,
+                        vae=vae,
+                        device=device,
+                        cfg=cfg,
                     )
-                else:
-                    t2m_metrics.update(
-                        feats_rst=decoded_generated[None, ...],
-                        feats_ref=gt_feature[None, ...],
-                        lengths_rst=[int(decoded_generated.shape[0])],
-                        lengths_ref=[int(gt_feature.shape[0])],
-                        text_tokens=[text_tokens_single],
-                    )
+
+                    text_tokens_single = batch["text_tokens"][i]
+                    if cfg.metrics.t2m.fid_target == "vae":
+                        t2m_metrics.update(
+                            feats_rst=decoded_generated[None, ...],
+                            feats_ref=gt_ref[None, ...],
+                            lengths_rst=[int(decoded_generated.shape[0])],
+                            lengths_ref=[gt_ref_len],
+                            text_tokens=[text_tokens_single],
+                        )
+                    else:
+                        t2m_metrics.update(
+                            feats_rst=decoded_generated[None, ...],
+                            feats_ref=gt_ref[None, ...],
+                            lengths_rst=[int(decoded_generated.shape[0])],
+                            lengths_ref=[gt_ref_len],
+                            text_tokens=[text_tokens_single],
+                        )
 
         if args.t2m_shards_save_dir:
-            _save_t2m_shard(t2m_metrics, args)
+            multi_mode = len(t2m_generation_modes) > 1
+            for mode, t2m_metrics in t2m_metrics_by_mode.items():
+                _save_t2m_shard(
+                    t2m_metrics,
+                    args,
+                    mode=mode if multi_mode else None,
+                )
         else:
-            t2m_results = t2m_metrics.compute(sanity_flag=False)
-            t2m_results = {k: (v.item() if hasattr(v, "item") else v)
-                           for k, v in t2m_results.items()}
+            legacy_single_generate = t2m_generation_modes == (T2M_GENERATE,)
+            for mode, t2m_metrics in t2m_metrics_by_mode.items():
+                mode_results = t2m_metrics.compute(sanity_flag=False)
+                mode_results = {
+                    k: (v.item() if hasattr(v, "item") else v)
+                    for k, v in mode_results.items()
+                }
+                if legacy_single_generate:
+                    t2m_results.update(mode_results)
+                else:
+                    t2m_results.update({
+                        f"{mode}/{k}": value
+                        for k, value in mode_results.items()
+                    })
 
     # ══════════════════════════════════════════════════════════════════════════
     # Aggregate & save

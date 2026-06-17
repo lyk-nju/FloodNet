@@ -92,6 +92,29 @@ def test_sample_creator_prefix_window_uses_full_future_traj():
     assert torch.equal(out["traj_features"], traj7[:, :traj_frames])
 
 
+def test_sample_creator_prefix_does_not_expose_legacy_token_mask_to_traj_path():
+    token = torch.arange(10 * 4, dtype=torch.float32).view(1, 10, 4)
+    traj_frames = num_frames_for_tokens(10)
+    batch = {
+        "token": token,
+        "token_length": torch.tensor([10]),
+        "token_mask": torch.ones(1, 10),
+        "traj_cond_7d": torch.zeros(1, traj_frames, 7),
+        "traj_cond": torch.zeros(1, traj_frames, 3),
+        "traj_length": torch.tensor([traj_frames]),
+        "traj_cond_mask": torch.ones(1, traj_frames),
+    }
+
+    out = SampleCreator(
+        sample_policy="fixed_window",
+        end_tokens=torch.tensor([5]),
+    ).create(batch)
+
+    assert "token_mask" not in out
+    assert out["latent_token_mask"].shape == (1, 5)
+    assert torch.allclose(out["latent_token_mask"], torch.ones(1, 5))
+
+
 def test_sample_creator_prefix_window_does_not_cap_active_right_by_context_tokens():
     token = torch.arange(10 * 4, dtype=torch.float32).view(1, 10, 4)
     traj_frames = num_frames_for_tokens(10)

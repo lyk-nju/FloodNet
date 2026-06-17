@@ -111,8 +111,8 @@ def test_prepare_ldf_eval_model_batch_prefix_window_uses_full_future_traj(monkey
     monkeypatch.setattr(
         torch,
         "randint",
-        lambda low, high, size, device=None: torch.full(
-            size, int(high) - 1, device=device, dtype=torch.long
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("offline eval should use fixed full-prefix R=T")
         ),
     )
 

@@ -11,6 +11,7 @@ from utils.inference.glue import InferenceGlueState
 from utils.inference.root_plan import RootPlan
 from utils.token_frame import num_frames_for_tokens, token_range_to_frame_slice, token_start_frame
 from utils.inference.buffer import TrajStreamBuffer
+from models.tools.traj_encoder import TokenTrajEncoder
 
 
 def _state(commit_idx, xz=(0.0, 0.0), yaw=0.0):
@@ -40,6 +41,32 @@ def _plan(*, valid_frames=200, anchor_commit_idx=0, anchor_xz=(0.0, 0.0),
 
 def _buf():
     return TrajStreamBuffer(device="cpu", dtype=torch.float32)
+
+
+def test_legacy_xyz_path_with_token_encoder_returns_token_embeddings():
+    encoder = TokenTrajEncoder(in_dim=4, hidden_dim=8, out_dim=8).eval()
+    buf = TrajStreamBuffer(
+        batch_size=1,
+        buf_len=8,
+        traj_encoder=encoder,
+        use_emb_cache=False,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    traj = torch.zeros(1, 5, 3, dtype=torch.float32)
+    traj[0, :, 0] = torch.arange(5, dtype=torch.float32)
+
+    buf.update(
+        {
+            "traj": traj,
+            "token_mask": torch.ones(1, 5, dtype=torch.float32),
+        },
+        commit_index=0,
+        device=torch.device("cpu"),
+    )
+    emb = buf.build_traj_emb(end_index=5, seq_len=5, device=torch.device("cpu"))
+
+    assert emb.shape == (1, 5, 8)
 
 
 # ---------------------------------------------------------------------------

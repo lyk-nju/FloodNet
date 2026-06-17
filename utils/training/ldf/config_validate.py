@@ -16,6 +16,7 @@ from utils.training.ldf.self_forcing_config import (
     self_forcing_k_schedule,
     self_forcing_stride_tokens,
 )
+from utils.training.ldf.t2m_generation_modes import resolve_t2m_generation_modes
 
 
 def validate_traj_dim_consistency(cfg) -> int:
@@ -77,6 +78,7 @@ def validate_ldf_training_config(cfg) -> None:
     ``ldf_training.window_policy`` selects prefix or rolling window sampling,
     while runtime files may still use "stream" in their names.
     """
+    resolve_t2m_generation_modes(cfg)
     if "stream_training" in cfg:
         raise ValueError(
             "stream_training training config was removed; use "
@@ -246,4 +248,5 @@ __all__ = [
     "validate_traj_dim_consistency",
     "validate_7d_requires_self_forcing",
     "validate_ldf_training_config",
+    "resolve_t2m_generation_modes",
 ]
