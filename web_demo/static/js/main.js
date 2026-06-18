@@ -266,6 +266,11 @@ class MotionApp {
         this.cancelTakeoverBtn = document.getElementById('cancelTakeoverBtn');
         this.trajectoryWaypoints = document.getElementById('trajectoryWaypoints');
         this.trajectoryRouteMode = document.getElementById('trajectoryRouteMode');
+        this.trajectoryHorizonTokens = document.getElementById('trajectoryHorizonTokens');
+        this.trajectoryDelayEnabled = document.getElementById('trajectoryDelayEnabled');
+        this.trajectoryDelayTokens = document.getElementById('trajectoryDelayTokens');
+        this.trajectoryBlendEnabled = document.getElementById('trajectoryBlendEnabled');
+        this.trajectoryBlendTokens = document.getElementById('trajectoryBlendTokens');
         this.updateTrajBtn = document.getElementById('updateTrajBtn');
         this.clearTrajBtn = document.getElementById('clearTrajBtn');
 
@@ -283,6 +288,19 @@ class MotionApp {
         this.cancelTakeoverBtn.addEventListener('click', () => this.handleCancelTakeover());
         if (this.updateTrajBtn) this.updateTrajBtn.addEventListener('click', () => this.updateTrajectory());
         if (this.clearTrajBtn) this.clearTrajBtn.addEventListener('click', () => this.clearTrajectory());
+        if (this.trajectoryDelayEnabled) {
+            this.trajectoryDelayEnabled.addEventListener(
+                'change',
+                () => this.syncTrajectoryRuntimeControls()
+            );
+        }
+        if (this.trajectoryBlendEnabled) {
+            this.trajectoryBlendEnabled.addEventListener(
+                'change',
+                () => this.syncTrajectoryRuntimeControls()
+            );
+        }
+        this.syncTrajectoryRuntimeControls();
 
         // Update smoothing value display when slider changes
         this.smoothingAlpha.addEventListener('input', (e) => {
@@ -480,6 +498,51 @@ class MotionApp {
         return this.trajectoryRouteMode ? this.trajectoryRouteMode.value : 'relative_to_actor';
     }
 
+    syncTrajectoryRuntimeControls() {
+        if (this.trajectoryDelayTokens && this.trajectoryDelayEnabled) {
+            this.trajectoryDelayTokens.disabled = !this.trajectoryDelayEnabled.checked;
+        }
+        if (this.trajectoryBlendTokens && this.trajectoryBlendEnabled) {
+            this.trajectoryBlendTokens.disabled = !this.trajectoryBlendEnabled.checked;
+        }
+    }
+
+    parsePositiveIntInput(input, fallback, minValue = 0) {
+        if (!input) return fallback;
+        const value = parseInt(input.value, 10);
+        if (Number.isNaN(value)) return fallback;
+        return Math.max(minValue, value);
+    }
+
+    getTrajectoryRuntimeParams() {
+        return {
+            route_mode: this.getTrajectoryRouteMode(),
+            horizon_tokens: this.parsePositiveIntInput(this.trajectoryHorizonTokens, 20, 1),
+            delay_enabled: this.trajectoryDelayEnabled ? this.trajectoryDelayEnabled.checked : true,
+            delay_tokens: this.parsePositiveIntInput(this.trajectoryDelayTokens, 20, 0),
+            blend_enabled: this.trajectoryBlendEnabled ? this.trajectoryBlendEnabled.checked : true,
+            blend_tokens: this.parsePositiveIntInput(this.trajectoryBlendTokens, 4, 0)
+        };
+    }
+
+    buildTrajectoryRequest(waypoints) {
+        return {
+            session_id: this.sessionId,
+            waypoints: waypoints && waypoints.length > 0 ? waypoints : null,
+            mode: 'replace_future',
+            ...this.getTrajectoryRuntimeParams()
+        };
+    }
+
+    async postJson(url, payload) {
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        return response.json();
+    }
+
     async updateTrajectory() {
         if (this.isProcessing) return;
         const waypoints = this.parseWaypointsFromTextarea();
@@ -489,16 +552,10 @@ class MotionApp {
         }
         this.isProcessing = true;
         try {
-            const response = await fetch('/api/update_trajectory', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    session_id: this.sessionId,
-                    waypoints,
-                    route_mode: this.getTrajectoryRouteMode()
-                })
-            });
-            const data = await response.json();
+            const data = await this.postJson(
+                '/api/update_trajectory',
+                this.buildTrajectoryRequest(waypoints)
+            );
             if (data.status === 'success') {
                 console.log('Trajectory updated:', waypoints.length, 'waypoints');
                 console.log('Trajectory target response length:', data.trajectory ? data.trajectory.length : 0);
@@ -520,16 +577,10 @@ class MotionApp {
         if (this.isProcessing) return;
         this.isProcessing = true;
         try {
-            const response = await fetch('/api/update_trajectory', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    session_id: this.sessionId,
-                    waypoints: null,
-                    route_mode: this.getTrajectoryRouteMode()
-                })
-            });
-            const data = await response.json();
+            const data = await this.postJson(
+                '/api/update_trajectory',
+                this.buildTrajectoryRequest(null)
+            );
             if (data.status === 'success') {
                 this.clearDrawnTrajectoryUI();
                 this.updateTrajectoryTargetLine(data.trajectory);
@@ -907,17 +958,10 @@ class MotionApp {
         this.trajectoryPushInFlight = true;
         this.lastTrajectoryPushTime = now;
         try {
-            const response = await fetch('/api/update_trajectory', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    session_id: this.sessionId,
-                    waypoints: waypoints && waypoints.length > 0 ? waypoints : null,
-                    mode: 'replace_future',
-                    route_mode: this.getTrajectoryRouteMode()
-                })
-            });
-            const data = await response.json();
+            const data = await this.postJson(
+                '/api/update_trajectory',
+                this.buildTrajectoryRequest(waypoints)
+            );
             if (data.status === 'success') {
                 console.log('Trajectory push accepted; target response length:', data.trajectory ? data.trajectory.length : 0);
                 this.updateTrajectoryTargetLine(data.trajectory);

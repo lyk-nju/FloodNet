@@ -6,12 +6,18 @@ import time
 import threading
 import argparse
 import os
+import sys
 import numpy as np
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 from flask import Flask, render_template, jsonify, request
 from flask_cors import CORS
-from omegaconf import OmegaConf
 from model_manager import get_model_manager
+from web_demo.api.schemas import UpdateTrajectoryRequest
+from web_demo.config import load_debug_preset_cfg, load_traj_mask_cfg
 from utils.motion_process import extract_root_trajectory_263
 from utils.inference.geometry import resample_polyline
 
@@ -52,40 +58,6 @@ def init_model():
                 )
                 print("Model manager ready!")
     return model_manager
-
-
-def load_traj_mask_cfg(path: str):
-    """
-    Load web-demo trajectory config from the main model config.
-    Expected format:
-      traj_mask:
-        enabled: bool
-        time_mode: timestamped
-        waypoint_dt: float
-        token_dt: float
-        repeat_policy: str
-    """
-    if not path:
-        return {}
-    if not os.path.exists(path):
-        print(f"Config not found: {path}. Using default trajectory settings.")
-        return {}
-    cfg = OmegaConf.load(path)
-    if "traj_mask" in cfg:
-        return OmegaConf.to_container(cfg.traj_mask, resolve=True)
-    print(f"No traj_mask section in {path}. Using default trajectory settings.")
-    return {}
-
-
-def load_debug_preset_cfg(path: str):
-    """Load optional web-demo debug preset from the model config."""
-    if not path or not os.path.exists(path):
-        return {}
-    cfg = OmegaConf.load(path)
-    section = cfg.get("web_demo_debug", None)
-    if section is None:
-        return {}
-    return OmegaConf.to_container(section, resolve=True)
 
 
 def _load_first_caption(text_path: str) -> str:
@@ -232,7 +204,22 @@ def start_consumption_monitor():
 @app.route('/')
 def index():
     """Main page"""
-    return render_template('index.html')
+    traj_cfg = traj_mask_cfg or {}
+    root_cfg = (traj_cfg.get("root_refiner", {}) or {})
+    route_mode = str(root_cfg.get("route_mode", "relative_to_actor"))
+    return render_template(
+        'index.html',
+        trajectory_defaults={
+            "route_mode": route_mode,
+            "horizon_tokens": int(traj_cfg.get("horizon_tokens", 20)),
+            "delay_enabled": bool(traj_cfg.get("update_delay_enabled", True)),
+            "delay_tokens": int(
+                traj_cfg.get("update_delay_tokens", traj_cfg.get("horizon_tokens", 20))
+            ),
+            "blend_enabled": bool(traj_cfg.get("update_blend_enabled", True)),
+            "blend_tokens": int(traj_cfg.get("update_blend_tokens", 4)),
+        },
+    )
 
 
 @app.route('/api/start', methods=['POST'])
@@ -429,14 +416,9 @@ def update_trajectory():
     """
     try:
         data = request.get_json(silent=True) or {}
-        session_id = data.get('session_id')
-        waypoints = data.get('waypoints')
-        mode = data.get('mode', 'replace_future')
-        source = data.get('source', 'manual')
-        duration_seconds = data.get('duration_seconds')
-        route_mode = data.get('route_mode')
+        req = UpdateTrajectoryRequest.from_payload(data)
         
-        if not session_id:
+        if not req.session_id:
             return jsonify({
                 'status': 'error',
                 'message': 'session_id is required'
@@ -449,31 +431,41 @@ def update_trajectory():
             }), 400
         
         with session_lock:
-            if active_session_id != session_id:
+            if active_session_id != req.session_id:
                 return jsonify({
                     'status': 'error',
                     'message': 'Not the active session'
                 }), 403
         
         target_traj = model_manager.update_trajectory(
-            waypoints,
-            mode=mode,
-            source=source,
-            duration_seconds=duration_seconds,
-            route_mode=route_mode,
+            req.waypoints,
+            mode=req.mode,
+            source=req.source,
+            duration_seconds=req.duration_seconds,
+            route_mode=req.route_mode,
+            horizon_tokens=req.horizon_tokens,
+            delay_enabled=req.delay_enabled,
+            delay_tokens=req.delay_tokens,
+            blend_enabled=req.blend_enabled,
+            blend_tokens=req.blend_tokens,
         )
         target_len = 0 if target_traj is None else len(target_traj)
         print(
-            f"[Session {session_id}] update_trajectory mode={mode} "
-            f"waypoints={0 if not waypoints else len(waypoints)} target_len={target_len}",
+            f"[Session {req.session_id}] update_trajectory mode={req.mode} "
+            f"waypoints={0 if not req.waypoints else len(req.waypoints)} target_len={target_len}",
             flush=True,
         )
         
         return jsonify({
             'status': 'success',
-            'message': 'Trajectory updated' if waypoints else 'Trajectory cleared',
-            'mode': mode,
+            'message': 'Trajectory updated' if req.waypoints else 'Trajectory cleared',
+            'mode': req.mode,
             'route_mode': getattr(model_manager, 'route_reference_mode', None),
+            'horizon_tokens': getattr(model_manager, 'traj_horizon_tokens', None),
+            'delay_enabled': getattr(model_manager, 'traj_update_delay_enabled', None),
+            'delay_tokens': getattr(model_manager, 'traj_update_delay_tokens', None),
+            'blend_enabled': getattr(model_manager, 'traj_update_blend_enabled', None),
+            'blend_tokens': getattr(model_manager, 'traj_update_blend_tokens', None),
             'trajectory': target_traj.tolist() if target_traj is not None else None,
         })
     except Exception as e:

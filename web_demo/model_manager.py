@@ -9,14 +9,11 @@ import time
 from collections import deque
 
 # Add parent directory to path to import project modules
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import numpy as np
-from torch_ema import ExponentialMovingAverage
-from utils.initialize import instantiate, load_config
 from utils.motion_process import StreamJointRecovery263, append_traj_deltas_5d_to_7d
-from utils.inference.condition_manager import ConditionManager
 from utils.inference.root_plan import RootPlan
 from utils.inference.route_condition import (
     RoutePlan,
@@ -25,7 +22,6 @@ from utils.inference.route_condition import (
     reanchor_route_to_xz,
     sample_route_future,
 )
-from utils.inference.stream_generator import StreamGenerator
 from utils.inference.timeline import (
     RootFrameState,
     RootTimeline,
@@ -47,51 +43,23 @@ from utils.inference.geometry import (
     smoothstep01,
     translate_plan_to_current_root,
 )
-from utils.training.ldf.model_factory import instantiate_ldf_model
+from web_demo.runtime.frame_buffer import FrameBuffer
+from web_demo.runtime.contracts import TrajectoryRuntimeControls
+from web_demo.runtime.generation_worker import GenerationWorker
+from web_demo.runtime.model_loader import (
+    build_stream_generator,
+    load_ldf_models,
+    reject_normalized_root_refiner_config,
+    resolve_repo_path,
+)
+from web_demo.runtime.rootplan_controller import RootPlanController
+from web_demo.runtime.state import GenerationState
+from web_demo.runtime.trajectory_controller import TrajectoryController
+from web_demo.runtime.web_runtime import WebRuntime
 
 
-class FrameBuffer:
-    """
-    Thread-safe frame buffer that maintains a queue of generated frames
-    """
-    def __init__(self, target_buffer_size=4):
-        self.buffer = deque(maxlen=100)  # Max 100 frames in buffer
-        self.target_size = target_buffer_size
-        self.lock = threading.Lock()
-        
-    def add_frame(self, joints):
-        """Add a frame to the buffer"""
-        with self.lock:
-            self.buffer.append(joints)
-    
-    def get_frame(self):
-        """Get the next frame from buffer"""
-        with self.lock:
-            if len(self.buffer) > 0:
-                return self.buffer.popleft()
-            return None
-    
-    def size(self):
-        """Get current buffer size"""
-        with self.lock:
-            return len(self.buffer)
-    
-    def clear(self):
-        """Clear the buffer"""
-        with self.lock:
-            self.buffer.clear()
-    
-    def needs_generation(self):
-        """Check if buffer needs more frames"""
-        return self.size() < self.target_size
-
-
-class ModelManager:
-    """
-    Manages model loading and real-time frame generation.
-    Trajectory control is active when the user provides waypoints and the model config enables
-    trajectory conditioning via ControlNet branch (enabled when model.freeze_backbone=True).
-    """
+class ModelManager(WebRuntime):
+    """Compatibility facade for the staged web runtime refactor."""
     def __init__(self, config_path=None, traj_mask_cfg=None):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Using device: {self.device}")
@@ -110,6 +78,7 @@ class ModelManager:
         self.stream_generator = self._load_stream_generator(
             config_path, traj_mask_cfg
         )
+        self.rootplan_controller = RootPlanController(self.stream_generator)
         
         # Frame buffer
         self.frame_buffer = FrameBuffer(target_buffer_size=4)
@@ -122,11 +91,13 @@ class ModelManager:
         # Generation state
         self.current_text = ""
         self.is_generating = False
+        self.generation_worker = GenerationWorker(self._generation_loop)
         self.generation_thread = None
         self.should_stop = False
         self.reset_pending = False  # True while waiting for thread to stop before reset
+        self.generation_state = GenerationState.IDLE
         
-        # ── Trajectory control (Task 001 refactor) ──────────────────────
+        # Trajectory control state. This moves into TrajectoryController in stages.
         self.traj_state_lock = threading.Lock()
         self.active_traj_plan: RoutePlan | None = None
         self.pending_update_event: RouteUpdate | None = None
@@ -143,8 +114,21 @@ class ModelManager:
         self.manual_resample_arclength = bool(traj_mask_cfg.get("manual_resample_arclength", True))
         self.token_dt = float(traj_mask_cfg.get("token_dt", 0.20))
         self.traj_repeat_policy = str(traj_mask_cfg.get("repeat_policy", "translate_from_current_root"))
+        self.traj_update_delay_enabled = bool(traj_mask_cfg.get("update_delay_enabled", True))
         self.traj_update_delay_tokens = int(traj_mask_cfg.get("update_delay_tokens", self.traj_horizon_tokens))
+        self.traj_update_blend_enabled = bool(traj_mask_cfg.get("update_blend_enabled", True))
         self.traj_update_blend_tokens = int(traj_mask_cfg.get("update_blend_tokens", 4))
+        self.trajectory_runtime_controls = TrajectoryRuntimeControls(
+            route_mode=self.route_reference_mode,
+            horizon_tokens=self.traj_horizon_tokens,
+            delay_enabled=self.traj_update_delay_enabled,
+            delay_tokens=self.traj_update_delay_tokens,
+            blend_enabled=self.traj_update_blend_enabled,
+            blend_tokens=self.traj_update_blend_tokens,
+        )
+        self.trajectory_controller = TrajectoryController(
+            self.trajectory_runtime_controls
+        )
         self.default_token_step = float(traj_mask_cfg.get("default_token_step", 0.25))
         self.min_token_step = float(traj_mask_cfg.get("min_token_step", 0.05))
         self.max_token_step = float(traj_mask_cfg.get("max_token_step", 1.50))
@@ -154,7 +138,7 @@ class ModelManager:
         self._absolute_commit_index = 0
         self.traj_repeat_anchor_root = None
         self.traj_repeat_anchor_cycle = None
-        # Backwards-compat helpers for app.py / status endpoints.
+        # Compatibility fields for app.py / status endpoints.
         self.current_traj_waypoints = None
         self.current_traj_times = None
         print(
@@ -165,8 +149,8 @@ class ModelManager:
             f"token_dt={self.token_dt:.3f}s, "
             f"horizon_tokens={self.traj_horizon_tokens}, "
             f"repeat_policy={self.traj_repeat_policy}, "
-            f"update_delay={self.traj_update_delay_tokens}, "
-            f"update_blend={self.traj_update_blend_tokens}"
+            f"update_delay={self.traj_update_delay_enabled}:{self.traj_update_delay_tokens}, "
+            f"update_blend={self.traj_update_blend_enabled}:{self.traj_update_blend_tokens}"
         )
         
         # Model generation state
@@ -240,186 +224,37 @@ class ModelManager:
         return mask
     
     def _load_models(self, config_path):
-        """Load VAE and diffusion models"""
-        torch.set_float32_matmul_precision("high")
-        
-        # Change to parent directory to load config properly
-        original_dir = os.getcwd()
-        parent_dir = os.path.dirname(os.path.dirname(__file__))
-        os.chdir(parent_dir)
-        
-        try:
-            # Load config (same as generate_ldf.py)
-            cfg = load_config(config_path=config_path)
-            
-            # Load VAE
-            print("Loading VAE...")
-            vae = instantiate(
-                target=cfg.test_vae.target,
-                cfg=None,
-                hfstyle=False,
-                **cfg.test_vae.params,
-            )
-            vae_ckpt = torch.load(cfg.test_vae_ckpt, map_location="cpu", weights_only=False)
-            
-            if "ema_state" in vae_ckpt:
-                vae.load_state_dict(vae_ckpt["state_dict"], strict=True)
-                vae_ema = ExponentialMovingAverage(
-                    vae.parameters(), decay=cfg.test_vae.ema_decay
-                )
-                vae_ema.load_state_dict(vae_ckpt["ema_state"])
-                vae_ema.copy_to(vae.parameters())
-                print(f"Loaded VAE with EMA")
-            else:
-                vae.load_state_dict(vae_ckpt["state_dict"], strict=True)
-                print(f"Loaded VAE without EMA")
-            
-            vae.to(self.device)
-            vae.eval()
-            
-            # Load diffusion model
-            print("Loading diffusion model...")
-            model = instantiate_ldf_model(cfg.model.target, cfg.model.params)
-            checkpoint = torch.load(cfg.test_ckpt, map_location="cpu", weights_only=False)
-            try:
-                model.load_state_dict(checkpoint["state_dict"], strict=True)
-            except RuntimeError as exc:
-                print(
-                    "Strict checkpoint load failed; falling back to strict=False for backward compatibility."
-                )
-                print(f"Reason: {exc}")
-                load_result = model.load_state_dict(checkpoint["state_dict"], strict=False)
-                if load_result.missing_keys:
-                    print(f"Missing keys (initialized from current model): {load_result.missing_keys}")
-                if load_result.unexpected_keys:
-                    print(f"Unexpected keys (ignored): {load_result.unexpected_keys}")
-
-            if "ema_state" in checkpoint:
-                n_shadow = len(checkpoint["ema_state"]["shadow_params"])
-                ema_params = [p for p in model.parameters() if p.requires_grad]
-                if len(ema_params) != n_shadow:
-                    ema_params = list(model.parameters())
-                assert len(ema_params) == n_shadow, (
-                    f"EMA shadow_params count ({n_shadow}) does not match "
-                    f"trainable params ({len([p for p in model.parameters() if p.requires_grad])}) "
-                    f"or total params ({len(list(model.parameters()))}). "
-                    "Check freeze settings or EMA checkpoint."
-                )
-                ema = ExponentialMovingAverage(ema_params, decay=cfg.model.ema_decay)
-                ema.load_state_dict(checkpoint["ema_state"])
-                ema.copy_to(ema_params)
-                print(f"Loaded model with EMA ({n_shadow} params)")
-            else:
-                print("Loaded model without EMA")
-            
-            model.to(self.device)
-            model.eval()
-            
-            return vae, model, cfg
-            
-        finally:
-            # Restore original directory
-            os.chdir(original_dir)
+        return load_ldf_models(config_path, self.device)
 
     def _resolve_repo_path(self, path):
-        if not path:
-            return None
-        path = os.path.expanduser(str(path))
-        if os.path.isabs(path):
-            return path
-        parent_dir = os.path.dirname(os.path.dirname(__file__))
-        return os.path.abspath(os.path.join(parent_dir, path))
+        return resolve_repo_path(path)
 
     def _load_stream_generator(self, config_path, traj_mask_cfg):
-        root_cfg = (traj_mask_cfg or {}).get("root_refiner", {}) or {}
-        refiner = None
-        text_encoder = None
-        sparse_point_range = (
-            (root_cfg.get("sparse_path", {}) or {}).get("point_range", (3, 8))
-        )
-
-        if bool(root_cfg.get("enabled", False)):
-            refiner_config = self._resolve_repo_path(
-                root_cfg.get("config_path") or root_cfg.get("config")
-            )
-            ckpt_path = self._resolve_repo_path(
-                root_cfg.get("ckpt")
-                or root_cfg.get("checkpoint")
-                or root_cfg.get("checkpoint_path")
-            )
-            if refiner_config is None:
-                raise ValueError("traj_mask.root_refiner.enabled=true requires config_path")
-            if ckpt_path is None:
-                raise ValueError("traj_mask.root_refiner.enabled=true requires ckpt")
-            print(f"Loading RootRefiner modules: config={refiner_config}, ckpt={ckpt_path}")
-            from train_refiner import _load_cfg, resolve_cfg_interpolations
-            from utils.training.root_refiner.lightning_module import (
-                RootRefinerLightningModule,
-            )
-
-            cfg = resolve_cfg_interpolations(_load_cfg(refiner_config))
-            self._reject_normalized_root_refiner_config(cfg)
-            module = RootRefinerLightningModule(cfg)
-            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-            state_dict = ckpt.get("state_dict", ckpt)
-            try:
-                module.load_state_dict(state_dict, strict=bool(root_cfg.get("strict", True)))
-            except RuntimeError:
-                if bool(root_cfg.get("strict", True)):
-                    raise
-                module.load_state_dict(state_dict, strict=False)
-            refiner = module.refiner
-            text_encoder = module.text_encoder
-            sparse_point_range = (
-                (cfg.get("sampling", {}) or {})
-                .get("path_condition", {})
-                .get("sparse_path", {})
-                .get("point_range", sparse_point_range)
-            )
-            print("Loaded RootRefiner modules")
-        else:
-            print("RootRefiner modules disabled")
-
-        manager = ConditionManager(
-            initial_text="",
-            route_mode=str(root_cfg.get("route_mode", "relative_to_actor")),
-            sparse_point_range=tuple(int(v) for v in sparse_point_range),
-        )
-        return StreamGenerator(
-            ldf_model=self.model,
-            condition_manager=manager,
-            root_refiner=refiner,
-            root_text_encoder=text_encoder,
-            device=self.device,
-            token_dt=float((traj_mask_cfg or {}).get("token_dt", 0.20)),
+        return build_stream_generator(
+            self.model,
+            self.device,
+            traj_mask_cfg=traj_mask_cfg,
             history_length=int(getattr(self, "history_length", 30)),
-            traj_horizon_tokens=int((traj_mask_cfg or {}).get("horizon_tokens", 20)),
         )
 
     @staticmethod
     def _reject_normalized_root_refiner_config(cfg) -> None:
-        data_cfg = (cfg.get("data", {}) or {}) if isinstance(cfg, dict) else {}
-        legacy_keys = {
-            key
-            for key in ("normalize", "stats_dir", "path_feature_stats_dir")
-            if key in data_cfg
-        }
-        if not legacy_keys:
-            return
-        raise ValueError(
-            "web_demo StreamGenerator currently expects physical RootRefiner output; "
-            "normalized RootRefiner checkpoints need wp_mean/wp_std runtime support. "
-            f"Remove legacy data config key(s): {sorted(legacy_keys)}"
-        )
+        return reject_normalized_root_refiner_config(cfg)
     
     def start_generation(self, text, history_length=None):
-        """Start or update generation with new text"""
+        """Start or update generation with new text.
+
+        Clean sessions should call `reset()` first. This method intentionally
+        does not clear route/rootplan state so debug presets can install a
+        route before starting generation.
+        """
         self.current_text = text
         
         if history_length is not None:
             self.history_length = history_length
         
         if not self.is_generating:
+            self.generation_state = GenerationState.LOADING
             # Reset state before starting (only once at the beginning)
             self.frame_buffer.clear()
             self.stream_recovery.reset()
@@ -440,10 +275,9 @@ class ModelManager:
             
             # Start generation thread
             self.should_stop = False
-            self.generation_thread = threading.Thread(target=self._generation_loop)
-            self.generation_thread.daemon = True
-            self.generation_thread.start()
+            self.generation_thread = self._generation_worker().start()
             self.is_generating = True
+            self.generation_state = GenerationState.RUNNING
     
     def update_text(self, text):
         """Update text without resetting state (continuous generation with new text)"""
@@ -482,9 +316,11 @@ class ModelManager:
 
     def update_trajectory(
         self, waypoints, mode="replace_future", *, source="manual",
-        duration_seconds=None, route_mode=None,
+        duration_seconds=None, route_mode=None, horizon_tokens=None,
+        delay_enabled=None, delay_tokens=None, blend_enabled=None,
+        blend_tokens=None,
     ):
-        """Update trajectory control (Task 001: delayed blended replace).
+        """Update trajectory control with optional delayed blended replace.
 
         Does NOT immediately overwrite the active plan.  Instead creates a
         pending ``RouteUpdate`` that takes effect after
@@ -495,6 +331,19 @@ class ModelManager:
         if mode != "replace_future":
             raise ValueError(f"Unsupported trajectory mode: {mode}")
         route_reference_mode = self._set_route_reference_mode(route_mode)
+        (
+            active_horizon_tokens,
+            active_delay_enabled,
+            active_delay_tokens,
+            active_blend_enabled,
+            active_blend_tokens,
+        ) = self._apply_trajectory_runtime_controls(
+            horizon_tokens=horizon_tokens,
+            delay_enabled=delay_enabled,
+            delay_tokens=delay_tokens,
+            blend_enabled=blend_enabled,
+            blend_tokens=blend_tokens,
+        )
 
         # ── Clear ────────────────────────────────────────────────────
         if waypoints is None or len(waypoints) == 0:
@@ -516,7 +365,16 @@ class ModelManager:
         edit_commit = self._get_commit_index()
         with self.traj_state_lock:
             _prev_plan = self.active_traj_plan
-        delay = 0 if _prev_plan is None else self.traj_update_delay_tokens
+        delay = (
+            active_delay_tokens
+            if _prev_plan is not None and active_delay_enabled
+            else 0
+        )
+        blend = (
+            active_blend_tokens
+            if _prev_plan is not None and active_blend_enabled
+            else 0
+        )
         effective_commit = edit_commit + delay
 
         if explicit_times is not None:
@@ -545,7 +403,7 @@ class ModelManager:
             new_plan,
             edit_commit_idx=edit_commit,
             delay_tokens=delay,
-            blend_tokens=self.traj_update_blend_tokens if _prev_plan is not None else 0,
+            blend_tokens=blend,
         )
 
         if _prev_plan is None:
@@ -557,9 +415,21 @@ class ModelManager:
                 self.current_traj_mode = mode
             self._activate_root_plan_from_stream_plan(new_plan)
             self._trajectory_state = "active_7d"
+            preview = sample_route_future(
+                new_plan,
+                current_commit=edit_commit,
+                current_root_xyz=current_root,
+                horizon_tokens=active_horizon_tokens,
+                token_dt=self.token_dt,
+                reanchor_to_current_root=(
+                    route_reference_mode == RouteReferenceMode.RELATIVE_TO_ACTOR.value
+                ),
+            )
+            with self._display_traj_lock:
+                self._display_traj = preview.copy()
             print(
                 f"Trajectory updated: {len(points)} points, source={source}, "
-                f"horizon={self.traj_horizon_tokens}, "
+                f"horizon={active_horizon_tokens}, "
                 f"edit_commit={edit_commit}, effective_commit={effective_commit}, "
                 f"delay={delay}, blend=0"
             )
@@ -567,22 +437,88 @@ class ModelManager:
 
         with self.traj_state_lock:
             self.pending_update_event = update_event
-            # Backwards-compat.
+            # Compatibility fields used by status/debug endpoints.
             self.current_traj_waypoints = points
             self.current_traj_times = times
             self.current_traj_mode = mode
 
         print(
             f"Trajectory updated: {len(points)} points, source={source}, "
-            f"horizon={self.traj_horizon_tokens}, "
+            f"horizon={active_horizon_tokens}, "
             f"edit_commit={edit_commit}, effective_commit={effective_commit}, "
-            f"delay={delay}, blend={self.traj_update_blend_tokens}"
+            f"delay={delay}, blend={blend}"
         )
         return self.get_display_traj()
 
+    def _apply_trajectory_runtime_controls(
+        self,
+        *,
+        horizon_tokens=None,
+        delay_enabled=None,
+        delay_tokens=None,
+        blend_enabled=None,
+        blend_tokens=None,
+    ) -> tuple[int, bool, int, bool, int]:
+        controls = self._trajectory_controller().update_controls(
+            route_mode=self.route_reference_mode,
+            horizon_tokens=horizon_tokens,
+            delay_enabled=delay_enabled,
+            delay_tokens=delay_tokens,
+            blend_enabled=blend_enabled,
+            blend_tokens=blend_tokens,
+        )
+        self.trajectory_runtime_controls = controls
+        self.traj_horizon_tokens = controls.horizon_tokens
+        self.traj_update_delay_enabled = controls.delay_enabled
+        self.traj_update_delay_tokens = controls.delay_tokens
+        self.traj_update_blend_enabled = controls.blend_enabled
+        self.traj_update_blend_tokens = controls.blend_tokens
+        stream_generator = getattr(self, "stream_generator", None)
+        if stream_generator is not None:
+            stream_generator.traj_horizon_tokens = controls.horizon_tokens
+        return (
+            controls.horizon_tokens,
+            controls.delay_enabled,
+            controls.delay_tokens,
+            controls.blend_enabled,
+            controls.blend_tokens,
+        )
+
+    def _trajectory_controller(self) -> TrajectoryController:
+        controller = getattr(self, "trajectory_controller", None)
+        if controller is None:
+            controls = getattr(self, "trajectory_runtime_controls", None)
+            if controls is None:
+                controls = TrajectoryRuntimeControls(
+                    route_mode=getattr(self, "route_reference_mode", "relative_to_actor"),
+                    horizon_tokens=getattr(self, "traj_horizon_tokens", 20),
+                    delay_enabled=getattr(self, "traj_update_delay_enabled", True),
+                    delay_tokens=getattr(self, "traj_update_delay_tokens", 20),
+                    blend_enabled=getattr(self, "traj_update_blend_enabled", True),
+                    blend_tokens=getattr(self, "traj_update_blend_tokens", 4),
+                )
+            controller = TrajectoryController(controls)
+            self.trajectory_controller = controller
+        return controller
+
     def _get_current_root_xyz(self) -> np.ndarray:
         root_xyz = np.zeros(3, dtype=np.float32)
-        root_xyz[[0, 2]] = self.stream_recovery.r_pos_accum[[0, 2]].astype(np.float32)
+        timeline = getattr(self, "_root_timeline", None)
+        if timeline is not None:
+            root_xyz[[0, 2]] = (
+                timeline.head.world_xz.detach().cpu().numpy().astype(np.float32)
+            )
+            recovery_root = getattr(
+                getattr(self, "stream_recovery", None),
+                "r_pos_accum",
+                None,
+            )
+            if recovery_root is not None and len(recovery_root) > 1:
+                root_xyz[1] = float(np.asarray(recovery_root, dtype=np.float32)[1])
+            return root_xyz
+
+        recovery_root = getattr(self.stream_recovery, "r_pos_accum", root_xyz)
+        root_xyz[[0, 2]] = np.asarray(recovery_root, dtype=np.float32)[[0, 2]]
         return root_xyz
 
     def _set_route_reference_mode(self, route_mode=None) -> str:
@@ -592,6 +528,20 @@ class ModelManager:
         self.route_reference_mode = mode
         self.stream_generator.condition_manager.set_route_mode(mode)
         return mode
+
+    def _rootplan_controller(self) -> RootPlanController:
+        controller = getattr(self, "rootplan_controller", None)
+        if controller is None:
+            controller = RootPlanController(self.stream_generator)
+            self.rootplan_controller = controller
+        return controller
+
+    def _generation_worker(self) -> GenerationWorker:
+        worker = getattr(self, "generation_worker", None)
+        if worker is None:
+            worker = GenerationWorker(self._generation_loop)
+            self.generation_worker = worker
+        return worker
 
     def _clear_runtime_route_state(self) -> None:
         with self.traj_state_lock:
@@ -605,7 +555,7 @@ class ModelManager:
         with self._display_traj_lock:
             self._display_traj = None
         if getattr(self, "stream_generator", None) is not None:
-            self.stream_generator.active_root_plan = None
+            self._rootplan_controller().clear()
             self.stream_generator.condition_manager.route.clear()
 
     def _prepare_manual_route_points(
@@ -895,7 +845,7 @@ class ModelManager:
             return False
         anchor_state = timeline.at_commit(anchor_commit)
         root_plan = self._build_root_plan_from_stream_plan(plan, anchor_state)
-        self.stream_generator.active_root_plan = root_plan
+        self._rootplan_controller().set_active(root_plan)
         self._model_traj_plan_version = int(plan.version)
         self.stream_generator.timeline = timeline
         return True
@@ -914,14 +864,12 @@ class ModelManager:
             return None
         anchor_state = timeline.at_commit(anchor_commit)
         root_plan = self._build_root_plan_from_stream_plan(plan, anchor_state)
-        previous = self.stream_generator.active_root_plan
         previous_version = getattr(self, "_model_traj_plan_version", None)
         try:
-            self.stream_generator.active_root_plan = root_plan
-            self._model_traj_plan_version = model_traj_plan_version
-            payload = self._build_rootplan_stream_traj_input()
+            with self._rootplan_controller().temporarily_active(root_plan):
+                self._model_traj_plan_version = model_traj_plan_version
+                payload = self._build_rootplan_stream_traj_input()
         finally:
-            self.stream_generator.active_root_plan = previous
             self._model_traj_plan_version = previous_version
         return payload
 
@@ -1069,7 +1017,7 @@ class ModelManager:
             with self.traj_state_lock:
                 self.active_traj_plan = event.new_route
                 self.pending_update_event = None
-            self.stream_generator.active_root_plan = None
+            self._rootplan_controller().clear()
             self._model_traj_plan_version = None
             self._activate_root_plan_from_stream_plan(event.new_route)
             rootplan_payload = self._build_rootplan_stream_traj_input()
@@ -1092,12 +1040,12 @@ class ModelManager:
     def pause_generation(self):
         """Pause generation (keeps all state)"""
         self.should_stop = True
-        if self.generation_thread:
-            self.generation_thread.join(timeout=5.0)
-            if self.generation_thread.is_alive():
-                print("Warning: generation thread did not stop within timeout; model state may be unsafe")
-                return False
+        if self.generation_thread and not self._generation_worker().stop(timeout=5.0):
+            print("Warning: generation thread did not stop within timeout; model state may be unsafe")
+            self.generation_state = GenerationState.ERROR
+            return False
         self.is_generating = False
+        self.generation_state = GenerationState.PAUSED
         print("Generation paused (state preserved)")
         return True
     
@@ -1109,10 +1057,9 @@ class ModelManager:
         
         # Restart generation thread with existing state
         self.should_stop = False
-        self.generation_thread = threading.Thread(target=self._generation_loop)
-        self.generation_thread.daemon = True
-        self.generation_thread.start()
+        self.generation_thread = self._generation_worker().start()
         self.is_generating = True
+        self.generation_state = GenerationState.RUNNING
         print("Generation resumed")
     
     def reset(self, history_length=None, smoothing_alpha=None, denoise_steps=None):
@@ -1126,9 +1073,11 @@ class ModelManager:
                 - Recommended: 0.3-0.7 for visible smoothing
             denoise_steps: Number of denoising steps (1-50, default 10)
         """
+        self.generation_state = GenerationState.RESETTING
         # Stop if running, then poll until thread truly exits (max 10s total)
         if self.is_generating:
             if not self.pause_generation():
+                self.generation_state = GenerationState.ERROR
                 return False
         if self.generation_thread is not None and self.generation_thread.is_alive():
             self.reset_pending = True
@@ -1140,6 +1089,7 @@ class ModelManager:
             if self.generation_thread.is_alive():
                 print("Reset failed: generation thread still running after 15s timeout")
                 self.reset_pending = False
+                self.generation_state = GenerationState.ERROR
                 return False
         self.reset_pending = False
 
@@ -1182,6 +1132,7 @@ class ModelManager:
             batch_size=1,
             num_denoise_steps=self.denoise_steps,
         )
+        self.generation_state = GenerationState.IDLE
         print(f"Model reset - history: {self.history_length}, smoothing: {self.smoothing_alpha}, steps: {self.denoise_steps}")
         return True
     
@@ -1294,7 +1245,7 @@ class ModelManager:
         return joints, traj
     
     def get_buffer_status(self):
-        """Get buffer status (Task 001: exposes trajectory state + update metadata)."""
+        """Get buffer status plus trajectory state and update metadata."""
         with self.traj_state_lock:
             ev = self.pending_update_event
             plan = self.active_traj_plan
@@ -1302,16 +1253,27 @@ class ModelManager:
             "buffer_size": self.frame_buffer.size(),
             "target_size": self.frame_buffer.target_size,
             "is_generating": self.is_generating,
+            "generation_state": self.generation_state.value,
             "current_text": self.current_text,
             "trajectory_state": self._trajectory_state,
             "trajectory_active": self.active_traj_plan is not None,
-            "trajectory_route_mode": self.route_reference_mode,
             "trajectory_time_mode": self.traj_time_mode,
-            "trajectory_horizon_tokens": self.traj_horizon_tokens,
             "model_traj_plan_version": self._model_traj_plan_version,
             "smoothing_alpha": self.smoothing_alpha,
             "denoise_steps": self.denoise_steps,
         }
+        controls = getattr(self, "trajectory_runtime_controls", None)
+        if controls is not None:
+            status.update(controls.to_status_dict())
+        else:
+            status.update({
+                "trajectory_route_mode": self.route_reference_mode,
+                "trajectory_horizon_tokens": self.traj_horizon_tokens,
+                "trajectory_delay_enabled": self.traj_update_delay_enabled,
+                "trajectory_delay_tokens": self.traj_update_delay_tokens,
+                "trajectory_blend_enabled": self.traj_update_blend_enabled,
+                "trajectory_blend_tokens": self.traj_update_blend_tokens,
+            })
         if plan is not None:
             status["active_plan_version"] = plan.version
             status["active_plan_source"] = plan.source

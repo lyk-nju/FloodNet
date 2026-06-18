@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import numpy as np
 import torch
 from torch import nn
@@ -13,6 +14,32 @@ from utils.inference.stream_generator import StreamGenerator
 from utils.inference.timeline import RootFrameState, RootTimeline
 from utils.token_frame import token_range_to_frame_slice, token_start_frame
 from web_demo.model_manager import ModelManager
+
+
+def test_web_demo_layered_runtime_import_contract():
+    from web_demo.model_manager import ModelManager, get_model_manager
+    from web_demo.runtime.state import GenerationState
+
+    assert ModelManager is not None
+    assert get_model_manager is not None
+    assert GenerationState.IDLE.value == "idle"
+    for module_name in (
+        "web_demo.config",
+        "web_demo.bootstrap",
+        "web_demo.api.routes",
+        "web_demo.api.schemas",
+        "web_demo.api.responses",
+        "web_demo.services.session_service",
+        "web_demo.runtime.contracts",
+        "web_demo.runtime.model_bundle",
+        "web_demo.runtime.model_loader",
+        "web_demo.runtime.frame_buffer",
+        "web_demo.runtime.web_runtime",
+        "web_demo.runtime.trajectory_controller",
+        "web_demo.runtime.rootplan_controller",
+        "web_demo.runtime.generation_worker",
+    ):
+        assert importlib.import_module(module_name) is not None
 
 
 class _DummyModel(nn.Module):
@@ -209,6 +236,47 @@ def test_update_trajectory_second_edit_uses_route_update_contract():
     assert mgr.stream_generator.condition_manager.route.mode.value == "relative_to_actor"
 
 
+def test_update_trajectory_accepts_per_update_horizon_delay_blend_controls():
+    mgr = _trajectory_manager()
+    first = np.array([[0.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+    second = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float32)
+
+    preview = mgr.update_trajectory(
+        first,
+        source="manual",
+        route_mode="relative_to_actor",
+        horizon_tokens=5,
+        delay_enabled=True,
+        delay_tokens=8,
+        blend_enabled=True,
+        blend_tokens=2,
+    )
+
+    assert preview is not None
+    assert len(preview) == 5
+    assert mgr.traj_horizon_tokens == 5
+
+    mgr.update_trajectory(
+        second,
+        source="manual",
+        route_mode="relative_to_actor",
+        horizon_tokens=7,
+        delay_enabled=False,
+        delay_tokens=8,
+        blend_enabled=True,
+        blend_tokens=6,
+    )
+
+    assert mgr.traj_horizon_tokens == 7
+    assert mgr.traj_update_delay_enabled is False
+    assert mgr.traj_update_delay_tokens == 8
+    assert mgr.traj_update_blend_enabled is True
+    assert mgr.traj_update_blend_tokens == 6
+    assert mgr.pending_update_event is not None
+    assert mgr.pending_update_event.delay_tokens == 0
+    assert mgr.pending_update_event.blend_tokens == 6
+
+
 def test_update_trajectory_sets_absolute_route_mode_without_reanchoring():
     mgr = _trajectory_manager()
     route = np.array([[10.0, 0.0], [10.0, 2.0]], dtype=np.float32)
@@ -222,6 +290,30 @@ def test_update_trajectory_sets_absolute_route_mode_without_reanchoring():
         route,
         atol=1e-6,
     )
+
+
+def test_get_current_root_xyz_prefers_timeline_head_world_xz():
+    mgr = _trajectory_manager()
+    mgr._root_timeline = RootTimeline(_state(7, xz=(3.5, -2.0)))
+    mgr.stream_recovery.r_pos_accum = np.array([99.0, 1.25, 88.0], dtype=np.float32)
+
+    root = mgr._get_current_root_xyz()
+
+    np.testing.assert_allclose(root, np.array([3.5, 1.25, -2.0], dtype=np.float32))
+
+
+def test_first_update_trajectory_returns_display_preview_immediately():
+    mgr = _trajectory_manager()
+    mgr._root_timeline = RootTimeline(_state(0, xz=(2.0, 3.0)))
+    mgr.stream_generator.timeline = mgr._root_timeline
+    route = np.array([[0.0, 0.0], [0.0, 2.0]], dtype=np.float32)
+
+    preview = mgr.update_trajectory(route, source="manual", route_mode="relative_to_actor")
+
+    assert preview is not None
+    assert preview.shape[1] == 3
+    np.testing.assert_allclose(preview[0, [0, 2]], np.array([2.0, 3.0]), atol=1e-6)
+    np.testing.assert_allclose(mgr.get_display_traj(), preview)
 
 
 def test_reset_clears_model_manager_and_stream_generator_route_state():

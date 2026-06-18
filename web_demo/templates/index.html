@@ -85,9 +85,38 @@
             <div class="input-group trajectory-group">
                 <label for="trajectoryWaypoints">Trajectory (root path) — optional:</label>
                 <select id="trajectoryRouteMode" class="trajectory-mode-select">
-                    <option value="relative_to_actor" selected>Relative to actor</option>
-                    <option value="absolute">Absolute world</option>
+                    <option value="relative_to_actor"
+                        {% if trajectory_defaults.route_mode != "absolute" %}selected{% endif %}>Relative to actor</option>
+                    <option value="absolute"
+                        {% if trajectory_defaults.route_mode == "absolute" %}selected{% endif %}>Absolute world</option>
                 </select>
+                <div class="trajectory-runtime-controls">
+                    <div class="trajectory-param">
+                        <label for="trajectoryHorizonTokens">Horizon tokens</label>
+                        <input type="number" id="trajectoryHorizonTokens" min="1" max="200"
+                            value="{{ trajectory_defaults.horizon_tokens | default(20) }}">
+                    </div>
+                    <label class="trajectory-toggle">
+                        <input type="checkbox" id="trajectoryDelayEnabled"
+                            {% if trajectory_defaults.delay_enabled | default(true) %}checked{% endif %}>
+                        <span>Delay</span>
+                    </label>
+                    <div class="trajectory-param">
+                        <label for="trajectoryDelayTokens">Delay tokens</label>
+                        <input type="number" id="trajectoryDelayTokens" min="0" max="200"
+                            value="{{ trajectory_defaults.delay_tokens | default(20) }}">
+                    </div>
+                    <label class="trajectory-toggle">
+                        <input type="checkbox" id="trajectoryBlendEnabled"
+                            {% if trajectory_defaults.blend_enabled | default(true) %}checked{% endif %}>
+                        <span>Blend</span>
+                    </label>
+                    <div class="trajectory-param">
+                        <label for="trajectoryBlendTokens">Blend tokens</label>
+                        <input type="number" id="trajectoryBlendTokens" min="0" max="200"
+                            value="{{ trajectory_defaults.blend_tokens | default(4) }}">
+                    </div>
+                </div>
                 <textarea id="trajectoryWaypoints" rows="3"
                     placeholder="One waypoint per line: x z  or  x y z&#10;Example:&#10;0 0&#10;1 0&#10;1 1&#10;0 1"></textarea>
                 <div class="trajectory-buttons">
