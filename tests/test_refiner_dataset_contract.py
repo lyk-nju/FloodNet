@@ -4,7 +4,6 @@ import torch
 
 from tests.helpers.humanml3d_fixture import make_root_refiner_from_samples
 from utils.training.root_refiner import collate_fn
-from utils.token_frame import num_frames_for_tokens
 
 
 def _make_clip(T: int = 80) -> dict:
@@ -20,15 +19,15 @@ def test_root_refiner_sample_contract_has_new_keys_and_shapes():
         full_plan_ratio=1.0,
         n_hist=8,
         n_path=16,
-        min_tokens=2,
-        max_tokens=8,
+        min_frames=5,
+        max_frames=29,
         normalize=False,
         seed=0,
     )
     sample = ds.get_sample(
         0,
         force_mode="full",
-        force_num_tokens=4,
+        force_num_frames=17,
         force_no_path_aug=True,
         force_path_mode="dense_path",
     )
@@ -45,9 +44,10 @@ def test_root_refiner_sample_contract_has_new_keys_and_shapes():
         "waypoints",
         "waypoints_mask",
         "path_supervision_mask",
-        "num_tokens",
+        "num_frames",
     }
     assert required.issubset(sample)
+    assert "num_tokens" not in sample
     assert sample["path"].shape == (ds.n_path, 2)
     assert sample["path_valid_mask"].shape == (ds.n_path,)
     assert sample["path_control_mask"].shape == (ds.n_path,)
@@ -57,7 +57,8 @@ def test_root_refiner_sample_contract_has_new_keys_and_shapes():
     assert sample["waypoints_mask"].shape == (ds.max_frames,)
     assert sample["path_supervision_mask"].shape == (ds.max_frames,)
     assert sample["path_mode"] in {"dense_path", "sparse_path", "goal_point"}
-    assert int(sample["waypoints_mask"].sum()) == num_frames_for_tokens(4)
+    assert int(sample["num_frames"].item()) == 17
+    assert int(sample["waypoints_mask"].sum()) == 17
 
 
 def test_collate_fn_stacks_new_tensor_keys_and_keeps_modes_as_list():
@@ -66,13 +67,13 @@ def test_collate_fn_stacks_new_tensor_keys_and_keeps_modes_as_list():
         full_plan_ratio=1.0,
         n_hist=8,
         n_path=16,
-        min_tokens=2,
-        max_tokens=8,
+        min_frames=5,
+        max_frames=29,
         normalize=False,
         seed=0,
     )
     samples = [
-        ds.get_sample(i, force_mode="full", force_num_tokens=3, force_no_path_aug=True)
+        ds.get_sample(i, force_mode="full", force_num_frames=9, force_no_path_aug=True)
         for i in range(2)
     ]
     batch = collate_fn(samples)
@@ -83,3 +84,5 @@ def test_collate_fn_stacks_new_tensor_keys_and_keeps_modes_as_list():
     assert batch["path_features"].shape == (2, 5)
     assert batch["history_motion"].shape == (2, ds.n_hist, 5)
     assert batch["waypoints"].shape == (2, ds.max_frames, 5)
+    assert torch.equal(batch["num_frames"], torch.tensor([9, 9]))
+    assert "num_tokens" not in batch

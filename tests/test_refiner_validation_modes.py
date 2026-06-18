@@ -17,9 +17,8 @@ def _cfg() -> dict:
                 "n_layers": 2,
                 "n_heads": 4,
                 "ff_dim": 64,
-                "max_tokens": 8,
-                "min_tokens": 2,
-                "frames_per_token": 4,
+                "max_frames": 29,
+                "min_frames": 5,
                 "n_path": 16,
                 "n_hist": 8,
                 "text_emb_dim": 16,
@@ -44,9 +43,8 @@ def _cfg() -> dict:
         },
         "loss": {"heading_form": "cosine"},
         "loss_weights": {
-            "num_token": 1.0,
-            "num_token_soft": 0.1,
             "pace": 0.5,
+            "frame_pace": 1.0,
             "xyz": 5.0,
             "heading": 1.0,
             "fwd_delta": 0.5,
@@ -63,6 +61,9 @@ def _batch(module: RefinerLightningModule, B: int = 2) -> dict:
     m = module.refiner
     waypoints = torch.zeros(B, m.max_frames, 5)
     waypoints[..., 3] = 1.0
+    frame_counts = torch.tensor([9, 17], dtype=torch.long)
+    if B != frame_counts.numel():
+        frame_counts = frame_counts[:1].expand(B).clone()
     return {
         "text": ["walk"] * B,
         "path_mode": ["dense_path"] * B,
@@ -77,7 +78,7 @@ def _batch(module: RefinerLightningModule, B: int = 2) -> dict:
         "waypoints_mask": torch.ones(B, m.max_frames, dtype=torch.bool),
         "path_supervision_mask": torch.ones(B, m.max_frames, dtype=torch.bool),
         "offset_start_frames": torch.zeros(B, dtype=torch.long),
-        "num_tokens": torch.tensor([3, 5]),
+        "num_frames": frame_counts,
     }
 
 
@@ -88,23 +89,20 @@ def test_forward_duration_modes_choose_gt_or_predicted_horizon():
     gt_out = module(batch, duration_mode="groundtruth_duration")
     pred_out = module(batch, duration_mode="pred_duration")
 
-    assert torch.equal(gt_out["used_num_tokens"], batch["num_tokens"])
-    assert torch.equal(pred_out["used_num_tokens"], pred_out["pred_num_tokens"])
+    assert torch.equal(gt_out["used_frames"], batch["num_frames"])
+    assert torch.equal(pred_out["used_frames"], pred_out["pred_frames"])
 
 
 def test_common_prefix_mask_uses_predicted_duration_horizon():
     module = RefinerLightningModule(_cfg())
     batch = _batch(module, B=2)
     out = {
-        "used_num_tokens": torch.tensor([2, 4]),
+        "used_frames": torch.tensor([5, 13]),
     }
 
     mask = module._common_prefix_mask(batch, out)
 
-    expected_counts = torch.tensor([
-        module.refiner.frames_per_token * 2 - (module.refiner.frames_per_token - 1),
-        module.refiner.frames_per_token * 4 - (module.refiner.frames_per_token - 1),
-    ])
+    expected_counts = torch.tensor([5, 13])
     assert torch.equal(mask.sum(dim=1).cpu(), expected_counts)
 
 
@@ -138,10 +136,10 @@ def test_validation_step_filters_wandb_metrics_with_log_keys():
     cfg["validation"]["log_keys"] = [
         "loss",
         "pace",
-        "num_token_pace",
-        "num_token_pace_mae",
-        "num_token_pace_acc_pm1",
-        "num_token_pace_acc_pm2",
+        "frame_pace",
+        "frame_pace_mae",
+        "frame_pace_acc_pm1",
+        "frame_pace_acc_pm4",
         "xyz_ADE_m",
         "xyz_FDE_m",
         "heading",
@@ -159,14 +157,11 @@ def test_validation_step_filters_wandb_metrics_with_log_keys():
     module.validation_step(batch, 0, dataloader_idx=0)
 
     assert "val_full_dense_max/groundtruth_duration/loss" in logged
-    assert "val_full_dense_max/groundtruth_duration/num_token_pace_mae" in logged
-    assert "val_full_dense_max/groundtruth_duration/num_token_pace_acc_pm1" in logged
-    assert "val_full_dense_max/groundtruth_duration/num_token_pace_acc_pm2" in logged
+    assert "val_full_dense_max/groundtruth_duration/frame_pace_mae" in logged
+    assert "val_full_dense_max/groundtruth_duration/frame_pace_acc_pm1" in logged
+    assert "val_full_dense_max/groundtruth_duration/frame_pace_acc_pm4" in logged
     assert "val_full_dense_max/groundtruth_duration/fwd_delta" in logged
     assert "val_full_dense_max/groundtruth_duration/yaw_delta" in logged
-    assert "val_full_dense_max/groundtruth_duration/num_token_soft_cls" not in logged
-    assert "val_full_dense_max/groundtruth_duration/num_token_cls_argmax_mae" not in logged
-    assert "val_full_dense_max/groundtruth_duration/num_token_cls_soft_mae" not in logged
     suffixes = {key.rsplit("/", 1)[-1] for key in logged}
     assert suffixes <= set(cfg["validation"]["log_keys"])
 
@@ -175,7 +170,7 @@ def test_training_step_logs_physical_xyz_metrics():
     module = RefinerLightningModule(_cfg())
     batch = _batch(module, B=1)
     T = module.refiner.max_frames
-    batch["num_tokens"] = torch.tensor([3])
+    batch["num_frames"] = torch.tensor([9])
     batch["waypoints"] = torch.zeros(1, T, 5)
     batch["waypoints"][..., 3] = 1.0
     batch["waypoints_physical"] = torch.zeros(1, T, 7)
@@ -184,13 +179,11 @@ def test_training_step_logs_physical_xyz_metrics():
     pred[..., 0] = 1.0
     out = {
         "waypoints": pred,
-        "num_token_logits": torch.zeros(1, module.max_tokens - module.min_tokens + 1),
         "pred_log_pace": torch.zeros(1),
-        "pred_num_tokens_float": torch.tensor([3.0]),
-        "pred_num_tokens_cls": torch.tensor([3]),
-        "pred_num_tokens_pace": torch.tensor([3]),
-        "pred_num_tokens": torch.tensor([3]),
-        "used_num_tokens": torch.tensor([3]),
+        "pred_frames_float": torch.tensor([9.0]),
+        "pred_frames_pace": torch.tensor([9]),
+        "pred_frames": torch.tensor([9]),
+        "used_frames": torch.tensor([9]),
     }
     module.forward = types.MethodType(lambda self, batch: out, module)
     logged = {}
@@ -210,15 +203,13 @@ def test_training_step_excludes_configured_wandb_metrics():
     cfg["logger"] = {
         "wandb": {
             "train_exclude_log_keys": [
-                "num_token_soft_cls",
-                "num_token_cls_argmax_mae",
-                "num_token_cls_soft_mae",
+                "frame_pace_mae",
             ]
         }
     }
     module = RefinerLightningModule(cfg)
     batch = _batch(module, B=1)
-    batch["num_tokens"] = torch.tensor([3])
+    batch["num_frames"] = torch.tensor([9])
     logged = {}
     module.log = types.MethodType(
         lambda self, key, value, **kwargs: logged.__setitem__(key, value),
@@ -228,11 +219,8 @@ def test_training_step_excludes_configured_wandb_metrics():
     module.training_step(batch, 0)
 
     assert "train/loss" in logged
-    assert "train/num_token_cls" in logged
-    assert "train/num_token_pace_mae" in logged
-    assert "train/num_token_soft_cls" not in logged
-    assert "train/num_token_cls_argmax_mae" not in logged
-    assert "train/num_token_cls_soft_mae" not in logged
+    assert "train/frame_pace" in logged
+    assert "train/frame_pace_mae" not in logged
 
 
 def test_physical_xyz_metrics_report_meter_ade_fde_and_common_prefix():

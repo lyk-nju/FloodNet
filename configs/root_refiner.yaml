@@ -44,22 +44,18 @@ model:
     d_model: 256
     n_layers: 6
     n_layers_cond: 3
-    n_layers_token: 3
+    n_layers_root: 3
     n_heads: 8
     ff_dim: 1024
     dropout: 0.1
-    max_tokens: 49              # = 4 * 49 - 3 = 193 effective frames at prefix
-    min_tokens: 4               # = num_frames_for_tokens(4) = 13 frames
-    frames_per_token: 4         # causal VAE token width
+    max_frames: 193
+    min_frames: 13
     n_path: 64                  # arclength-resampled user path length
     n_hist: 20                  # history window length
     text_emb_dim: 512
     path_features_dim: 5
-    decoder_type: path_cond     # path_cond | simple
-    decoder_width: 256          # PathCondFrameDecoder hidden width
-    decoder_path_cond_dim: 6    # [path_x, path_z, tan_x, tan_z, horizon_prog, grid_prog]
-    decoder_token_res_depth: 2
-    decoder_frame_res_depth: 4
+    decoder_width: 256
+    decoder_depth: 4
     decoder_dilation_growth_rate: 2
     decoder_dropout: 0.0
 
@@ -80,13 +76,10 @@ lr_scheduler:
 
 loss:
   heading_form: cosine                # cosine | smooth_l1
-  ordinal_sigma: 1.0                  # duration soft-label bandwidth
 
 loss_weights:
   pace: 0.5
-  num_token_pace: 0.1
-  num_token_cls: 0.2
-  num_token_soft_cls: 0.02
+  frame_pace: 0.1
   xyz: 5.0
   heading: 1.0
   fwd_delta: 0.5                      # per-frame forward delta (NOT m/s)

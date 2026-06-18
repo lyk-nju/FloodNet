@@ -48,7 +48,7 @@ def _save_5d_stats(tmp_path) -> None:
 
 def _sample(ds):
     return ds.get_sample(
-        0, force_mode="full", force_num_tokens=5,
+        0, force_mode="full", force_num_frames=17,
         force_no_path_aug=True, force_path_mode="dense_path", force_text_idx=0,
     )
 
@@ -57,7 +57,7 @@ def test_path_features_are_physical_regardless_of_normalize(tmp_path):
     _save_5d_stats(tmp_path)
     common = dict(
         full_plan_ratio=1.0, n_hist=8, n_path=16,
-        min_tokens=2, max_tokens=8, seed=0,
+        min_frames=5, max_frames=29, seed=0,
     )
     ds_raw = make_root_refiner_from_samples([_make_clip()], normalize=False, **common)
     ds_norm = make_root_refiner_from_samples(
@@ -79,7 +79,7 @@ def test_path_geometry_tokens_are_zscored_when_normalize(tmp_path):
     _save_5d_stats(tmp_path)
     common = dict(
         full_plan_ratio=1.0, n_hist=8, n_path=16,
-        min_tokens=2, max_tokens=8, seed=0,
+        min_frames=5, max_frames=29, seed=0,
     )
     ds_raw = make_root_refiner_from_samples([_make_clip()], normalize=False, **common)
     ds_norm = make_root_refiner_from_samples(
@@ -98,7 +98,7 @@ def test_path_features_match_waypoints_when_normalize_off(tmp_path):
     """Sanity: physical path_length ~ arclength of the physical future xz."""
     ds = make_root_refiner_from_samples(
         [_make_clip()], full_plan_ratio=1.0, n_hist=8, n_path=16,
-        min_tokens=2, max_tokens=8, seed=0, normalize=False,
+        min_frames=5, max_frames=29, seed=0, normalize=False,
     )
     s = _sample(ds)
     wp = s["waypoints"][s["waypoints_mask"]][:, [0, 2]]

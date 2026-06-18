@@ -23,9 +23,8 @@ def _minimal_cfg() -> dict:
         "model": {
             "target": "models.root_refiner.RootRefiner",
             "params": {
-                "min_tokens": 4,
-                "max_tokens": 49,
-                "frames_per_token": 4,
+                "min_frames": 13,
+                "max_frames": 193,
             },
         },
         "optimizer": {
@@ -68,8 +67,8 @@ def _minimal_cfg() -> dict:
             },
         },
         "loss_weights": {
-            "num_token": 1.0,
-            "num_token_soft": 0.1,
+            "pace": 1.0,
+            "frame_pace": 0.1,
             "xyz": 5.0,
             "heading": 1.0,
             "fwd_delta": 0.5,
@@ -101,19 +100,19 @@ def test_rejects_history_condition_config():
         validate_refiner_config(cfg)
 
 
-def test_rejects_invalid_token_range():
+def test_rejects_invalid_frame_range():
     cfg = _minimal_cfg()
-    cfg["model"]["params"]["min_tokens"] = 50
+    cfg["model"]["params"]["min_frames"] = 194
 
-    with pytest.raises(ValueError, match="min_tokens"):
+    with pytest.raises(ValueError, match="frame range"):
         validate_refiner_config(cfg)
 
 
-def test_rejects_invalid_frames_per_token():
+def test_rejects_legacy_token_model_keys():
     cfg = _minimal_cfg()
-    cfg["model"]["params"]["frames_per_token"] = 0
+    cfg["model"]["params"]["frames_per_token"] = 4
 
-    with pytest.raises(ValueError, match="frames_per_token"):
+    with pytest.raises(ValueError, match="legacy token"):
         validate_refiner_config(cfg)
 
 
@@ -151,7 +150,7 @@ def test_rejects_legacy_training_block():
 
 def test_rejects_model_without_target_params():
     cfg = _minimal_cfg()
-    cfg["model"] = {"min_tokens": 4, "max_tokens": 49}
+    cfg["model"] = {"min_frames": 13, "max_frames": 193}
 
     with pytest.raises(ValueError, match="model.target"):
         validate_refiner_config(cfg)

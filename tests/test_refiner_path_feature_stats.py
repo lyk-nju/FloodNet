@@ -48,7 +48,7 @@ def test_compute_stats_clamps_small_std():
 
 def test_sampling_config_hash_ignores_runtime_fields():
     cfg_a = {
-        "model": {"n_path": 64, "min_tokens": 4, "max_tokens": 49, "frames_per_token": 4},
+        "model": {"n_path": 64, "min_frames": 13, "max_frames": 193},
         "sampling": {"horizon_policy": "random"},
         "data": {"dataset": "humanml3d", "train_split_file": "train.txt"},
         "trainer": {"devices": [0]},
@@ -124,9 +124,8 @@ def test_compute_path_stats_cli_smoke(tmp_path):
             "params": {
                 "n_hist": 8,
                 "n_path": 16,
-                "min_tokens": 2,
-                "max_tokens": 8,
-                "frames_per_token": 4,
+                "min_frames": 5,
+                "max_frames": 29,
             },
         },
         "sampling": {
@@ -192,7 +191,7 @@ def test_dataset_stats_dir_without_hash_raises(tmp_path):
     _write_pf_stats(tmp_path, "H")
     with pytest.raises(ValueError, match="sampling_config_hash"):
         make_root_refiner_from_samples(
-            [_tiny_clip()], n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
+            [_tiny_clip()], n_hist=8, n_path=16, max_frames=29, min_frames=5,
             full_plan_ratio=1.0, seed=0,
             path_feature_stats_dir=str(tmp_path),
         )
@@ -204,7 +203,7 @@ def test_dataset_stats_dir_wrong_hash_raises(tmp_path):
     _write_pf_stats(tmp_path, "GOOD")
     with pytest.raises(ValueError, match="hash mismatch"):
         make_root_refiner_from_samples(
-            [_tiny_clip()], n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
+            [_tiny_clip()], n_hist=8, n_path=16, max_frames=29, min_frames=5,
             full_plan_ratio=1.0, seed=0,
             path_feature_stats_dir=str(tmp_path), sampling_config_hash="BAD",
         )
@@ -214,7 +213,7 @@ def test_dataset_stats_dir_correct_hash_loads(tmp_path):
     from tests.helpers.humanml3d_fixture import make_root_refiner_from_samples
     _write_pf_stats(tmp_path, "GOOD")
     ds = make_root_refiner_from_samples(
-        [_tiny_clip()], n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
+        [_tiny_clip()], n_hist=8, n_path=16, max_frames=29, min_frames=5,
         full_plan_ratio=1.0, seed=0,
         path_feature_stats_dir=str(tmp_path), sampling_config_hash="GOOD",
     )

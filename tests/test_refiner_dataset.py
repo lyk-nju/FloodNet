@@ -14,7 +14,6 @@ import torch
 
 from tests.helpers.humanml3d_fixture import make_root_refiner_from_samples
 from utils.motion_process import recover_root_rot_pos, root_to_traj_feats_7d
-from utils.token_frame import num_frames_for_tokens
 
 ATOL = 1e-4
 PI = math.pi
@@ -88,10 +87,8 @@ def test_T01_full_plan_anchor_is_frame_zero_and_history_mask_only_last_slot():
     assert int(s["history_mask"].sum().item()) == 1
 
 
-def test_T02_full_plan_anchor_duplicate_in_current_motion_and_target():
-    """current_motion[-1] ≈ (0, y_anchor, 0, 1, 0) AND target_waypoints[0] ≈
-    (0, y_anchor, 0, 1, 0, *, *). y values match.
-    """
+def test_T02_full_plan_anchor_in_current_motion_and_future_target_starts_after_anchor():
+    """current_motion[-1] is the anchor; target_waypoints[0] is the first future frame."""
     clip = _make_clip(T=50)
     ds = make_root_refiner_from_samples([clip], full_plan_ratio=1.0, seed=0)
     s = ds.get_sample(0, force_mode="full", force_no_path_aug=True)
@@ -110,16 +107,16 @@ def test_T02_full_plan_anchor_duplicate_in_current_motion_and_target():
 
     assert abs(tw_first[0].item()) < ATOL
     assert abs(tw_first[1].item() - expected_y) < ATOL
-    assert abs(tw_first[2].item()) < ATOL
+    assert abs(tw_first[2].item() - 0.1) < ATOL
     assert abs(tw_first[3].item() - 1.0) < ATOL
     assert abs(tw_first[4].item()) < ATOL
 
-    # y consistent across the two
+    # y is unchanged by the one-frame future step.
     assert abs(cm_last[1].item() - tw_first[1].item()) < ATOL
 
 
-def test_T03_sliding_window_history_mask_all_true_and_anchor_duplicate():
-    """Sliding: history_mask all True, anchor duplicated at history[-1] and target[0]."""
+def test_T03_sliding_window_history_mask_all_true_and_future_target_starts_after_anchor():
+    """Sliding: history_mask all True, history[-1] is anchor, target[0] is future."""
     T = 60
     clip = _make_clip(T=T)
     ds = make_root_refiner_from_samples([clip], full_plan_ratio=0.0, seed=0)
@@ -132,7 +129,7 @@ def test_T03_sliding_window_history_mask_all_true_and_anchor_duplicate():
     tw_first = s["target_waypoints"][0]
     assert abs(cm_last[0].item()) < ATOL and abs(cm_last[2].item()) < ATOL
     assert abs(cm_last[3].item() - 1.0) < ATOL and abs(cm_last[4].item()) < ATOL
-    assert abs(tw_first[0].item()) < ATOL and abs(tw_first[2].item()) < ATOL
+    assert abs(tw_first[0].item()) < ATOL and abs(tw_first[2].item() - 0.1) < ATOL
     assert abs(tw_first[3].item() - 1.0) < ATOL and abs(tw_first[4].item()) < ATOL
 
 
@@ -147,62 +144,70 @@ def test_T04_root_y_preserved_across_canonicalize():
     # Compute expected world y for the target frames.
     quat, xyz = recover_root_rot_pos(clip["motion_263"].unsqueeze(0))
     target_frame_count = int(s["target_mask"].sum().item())
-    expected_y = xyz[0, :target_frame_count, 1]
+    expected_y = xyz[0, 1 : 1 + target_frame_count, 1]
     actual_y = s["target_waypoints"][:target_frame_count, 1]
     assert torch.allclose(actual_y, expected_y, atol=ATOL)
 
 
 # ---------------------------------------------------------------------------
-# T05-T06: num_tokens / target_frame_count strict alignment
+# T05-T06: num_frames / target_frame_count strict alignment
 # ---------------------------------------------------------------------------
 
 
-def test_T05_target_frame_count_equals_num_frames_for_tokens():
-    """num_tokens=1 → target_frame_count=1; =2 → 5; =3 → 9 (and target_mask matches)."""
+def test_T05_target_frame_count_equals_forced_num_frames():
+    """force_num_frames sets target_frame_count directly, including non-token lengths."""
     clip = _make_clip(T=100)
-    ds = make_root_refiner_from_samples([clip], full_plan_ratio=1.0, max_tokens=49, min_tokens=1, seed=0)
-    cases = {1: 1, 2: 5, 3: 9, 5: 17}
-    for nt, expected_frames in cases.items():
-        s = ds.get_sample(0, force_mode="full", force_num_tokens=nt,
+    ds = make_root_refiner_from_samples(
+        [clip],
+        full_plan_ratio=1.0,
+        max_frames=49,
+        min_frames=1,
+        seed=0,
+    )
+    for expected_frames in (1, 2, 3, 17):
+        s = ds.get_sample(0, force_mode="full", force_num_frames=expected_frames,
                            force_no_path_aug=True)
-        assert s["num_tokens"].item() == nt
+        assert "num_tokens" not in s
+        assert s["num_frames"].item() == expected_frames
         assert int(s["target_mask"].sum().item()) == expected_frames, (
-            f"num_tokens={nt}: target_mask.sum()={int(s['target_mask'].sum())}, "
+            f"num_frames={expected_frames}: target_mask.sum()={int(s['target_mask'].sum())}, "
             f"expected {expected_frames}"
         )
 
 
-def test_num_token_policy_max_disables_random_token_sampling():
-    """Diagnostic training can disable random num_tokens by taking the maximum
-    valid horizon for the selected anchor."""
+def test_horizon_policy_max_disables_random_frame_sampling():
+    """Diagnostic training can disable random horizons by taking the maximum valid frames."""
     clip = _make_clip(T=80)
     ds = make_root_refiner_from_samples(
         [clip],
         full_plan_ratio=1.0,
-        max_tokens=49,
-        min_tokens=4,
+        max_frames=193,
+        min_frames=13,
         seed=0,
-        num_token_policy="max",
+        horizon_policy="max",
     )
     s0 = ds.get_sample(0, force_mode="full", force_no_path_aug=True)
     s1 = ds.get_sample(0, force_mode="full", force_no_path_aug=True)
 
-    assert s0["num_tokens"].item() == 20
-    assert s1["num_tokens"].item() == 20
-    assert int(s0["target_mask"].sum().item()) == num_frames_for_tokens(20)
+    assert s0["num_frames"].item() == 79
+    assert s1["num_frames"].item() == 79
+    assert int(s0["target_mask"].sum().item()) == 79
 
 
-def test_T06_target_mask_sum_equals_num_frames_for_tokens_strict():
-    """Strict equality (round 8 P0-1 lock-in): target_mask.sum() must equal
-    num_frames_for_tokens(num_tokens), NOT just <=.
-    """
-    # Use min_tokens=1 so we can test num_tokens=2 without clamping.
+def test_T06_target_mask_sum_equals_num_frames_strict():
+    """target_mask.sum() must equal the requested frame count, not a token-derived length."""
     clip = _make_clip(T=200)
-    ds = make_root_refiner_from_samples([clip], full_plan_ratio=1.0, min_tokens=1, seed=0)
-    for nt in (2, 5, 10, 20, 30):
-        s = ds.get_sample(0, force_mode="full", force_num_tokens=nt,
+    ds = make_root_refiner_from_samples(
+        [clip],
+        full_plan_ratio=1.0,
+        min_frames=1,
+        max_frames=193,
+        seed=0,
+    )
+    for frames in (2, 5, 10, 20, 30):
+        s = ds.get_sample(0, force_mode="full", force_num_frames=frames,
                            force_no_path_aug=True)
-        assert int(s["target_mask"].sum().item()) == num_frames_for_tokens(nt)
+        assert int(s["target_mask"].sum().item()) == frames
 
 
 # ---------------------------------------------------------------------------
@@ -211,16 +216,16 @@ def test_T06_target_mask_sum_equals_num_frames_for_tokens_strict():
 
 
 def test_T07_short_clip_filtered_from_valid_indices():
-    """Clip too short to support min_tokens never appears in valid_indices."""
-    min_tokens = 4
-    too_short = num_frames_for_tokens(min_tokens) - 1   # =12 frames
-    long_enough = num_frames_for_tokens(min_tokens)    # =13 frames
+    """Clip too short to support min_frames future frames never appears in valid_indices."""
+    min_frames = 13
+    too_short = min_frames
+    long_enough = min_frames + 1
 
     short_clip = _make_clip(T=too_short)
     long_clip = _make_clip(T=long_enough + 10)
     ds = make_root_refiner_from_samples(
         [short_clip, long_clip],
-        min_tokens=min_tokens,
+        min_frames=min_frames,
         full_plan_ratio=1.0,
         seed=0,
     )
@@ -230,19 +235,19 @@ def test_T07_short_clip_filtered_from_valid_indices():
 
 
 def test_sliding_eligibility_split():
-    """Sliding requires T >= (n_hist - 1) + num_frames_for_tokens(min_tokens).
+    """Sliding requires T >= n_hist + min_frames.
     Short-but-full-eligible clip forced to full mode even when sliding drawn.
     """
-    min_tokens = 4
+    min_frames = 13
     n_hist = 20
-    full_only_T = num_frames_for_tokens(min_tokens) + 2   # >= min_full but < sliding
-    full_and_sliding_T = (n_hist - 1) + num_frames_for_tokens(min_tokens) + 5
+    full_only_T = min_frames + 3
+    full_and_sliding_T = n_hist + min_frames + 5
 
     full_only_clip = _make_clip(T=full_only_T)
     long_clip = _make_clip(T=full_and_sliding_T)
     ds = make_root_refiner_from_samples(
         [full_only_clip, long_clip],
-        n_hist=n_hist, min_tokens=min_tokens,
+        n_hist=n_hist, min_frames=min_frames,
         full_plan_ratio=0.0,   # always draw sliding
         seed=0,
     )
@@ -285,9 +290,9 @@ def test_T13_cos_sin_invariant_under_selective_zscore(tmp_path):
     ds_raw = make_root_refiner_from_samples([clip], full_plan_ratio=1.0, seed=0, normalize=False)
     ds_norm = make_root_refiner_from_samples([clip], full_plan_ratio=1.0, seed=0,
                               normalize=True, stats_dir=tmp_path)
-    s_raw = ds_raw.get_sample(0, force_mode="full", force_num_tokens=10,
+    s_raw = ds_raw.get_sample(0, force_mode="full", force_num_frames=37,
                                 force_no_path_aug=True)
-    s_norm = ds_norm.get_sample(0, force_mode="full", force_num_tokens=10,
+    s_norm = ds_norm.get_sample(0, force_mode="full", force_num_frames=37,
                                   force_no_path_aug=True)
     # cos/sin at channels [3], [4] must be bit-equal between raw and norm.
     assert torch.equal(s_raw["current_motion"][..., 3], s_norm["current_motion"][..., 3])
@@ -350,7 +355,7 @@ def test_T15_fwd_delta_yaw_delta_invariant_under_canonicalize_via_pipeline():
     """
     clip = _make_clip(T=80, local_vel_xz=(0.0, 0.1), rot_vel_t0=PI / 8)
     ds = make_root_refiner_from_samples([clip], full_plan_ratio=1.0, seed=0)
-    s = ds.get_sample(0, force_mode="full", force_num_tokens=10,
+    s = ds.get_sample(0, force_mode="full", force_num_frames=37,
                        force_no_path_aug=True)
     target_count = int(s["target_mask"].sum().item())
 
@@ -359,8 +364,8 @@ def test_T15_fwd_delta_yaw_delta_invariant_under_canonicalize_via_pipeline():
     quat, xyz = recover_root_rot_pos(motion_263)
     world_7d = root_to_traj_feats_7d(quat, xyz)[0]   # [T, 7]
 
-    expected_fwd = world_7d[: target_count, 5]
-    expected_yaw_d = world_7d[: target_count, 6]
+    expected_fwd = world_7d[1 : 1 + target_count, 5]
+    expected_yaw_d = world_7d[1 : 1 + target_count, 6]
     actual_fwd = s["target_waypoints"][: target_count, 5]
     actual_yaw_d = s["target_waypoints"][: target_count, 6]
 
@@ -376,14 +381,15 @@ def test_T15_fwd_delta_yaw_delta_invariant_under_canonicalize_via_pipeline():
 def test_returned_dict_has_required_keys_and_shapes():
     clip = _make_clip(T=80)
     ds = make_root_refiner_from_samples([clip], full_plan_ratio=1.0, seed=0)
-    s = ds.get_sample(0, force_mode="full", force_num_tokens=10,
+    s = ds.get_sample(0, force_mode="full", force_num_frames=37,
                        force_no_path_aug=True)
     expected_keys = {
         "text", "current_motion",
-        "history_mask", "target_waypoints", "target_mask", "num_tokens", "mode",
+        "history_mask", "target_waypoints", "target_mask", "num_frames", "mode",
         "anchor_frame", "anchor_xz_world", "anchor_yaw_world",
     }
     assert expected_keys.issubset(s.keys())
+    assert "num_tokens" not in s
     new_keys = {
         "path",
         "path_valid_mask",
@@ -400,8 +406,8 @@ def test_returned_dict_has_required_keys_and_shapes():
     assert new_keys.issubset(s.keys())
     assert s["current_motion"].shape == (20, 5)
     assert s["history_mask"].shape == (20,)
-    assert s["target_waypoints"].shape == (num_frames_for_tokens(49), 7)
-    assert s["target_mask"].shape == (num_frames_for_tokens(49),)
+    assert s["target_waypoints"].shape == (ds.max_frames, 7)
+    assert s["target_mask"].shape == (ds.max_frames,)
     assert s["history_mask"].dtype == torch.bool
     assert s["target_mask"].dtype == torch.bool
     assert torch.allclose(s["path_features"], s["path_features_raw"])
@@ -412,10 +418,10 @@ def test_uniform_shape_between_full_and_sliding_modes():
     T = 80
     clip = _make_clip(T=T)
     ds = make_root_refiner_from_samples([clip], full_plan_ratio=1.0, seed=0)
-    s_full = ds.get_sample(0, force_mode="full", force_num_tokens=10,
+    s_full = ds.get_sample(0, force_mode="full", force_num_frames=37,
                             force_no_path_aug=True)
     s_slide = ds.get_sample(0, force_mode="sliding", force_anchor_frame=30,
-                              force_num_tokens=10, force_no_path_aug=True)
+                              force_num_frames=37, force_no_path_aug=True)
     for key in ("current_motion", "history_mask",
                  "target_waypoints", "target_mask"):
         assert s_full[key].shape == s_slide[key].shape, (
@@ -425,7 +431,7 @@ def test_uniform_shape_between_full_and_sliding_modes():
 
 
 def test_len_excludes_short_clips():
-    short = _make_clip(T=10)   # < num_frames_for_tokens(4) = 13
+    short = _make_clip(T=13)   # < min_frames + anchor frame
     long_a = _make_clip(T=50)
     long_b = _make_clip(T=70)
     ds = make_root_refiner_from_samples([short, long_a, long_b], full_plan_ratio=1.0, seed=0)
@@ -434,15 +440,15 @@ def test_len_excludes_short_clips():
 
 def test_reset_rng_makes_get_sample_sequence_reproducible():
     """reset_rng() restores the base-seed RNG so a repeat pass draws the identical
-    mode/anchor/num_tokens sequence (benchmark reproducibility)."""
+    mode/anchor/num_frames sequence (benchmark reproducibility)."""
     clips = [_make_clip(T=50) for _ in range(5)]
-    ds = make_root_refiner_from_samples(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
+    ds = make_root_refiner_from_samples(clips, n_hist=8, n_path=16, max_frames=29, min_frames=5,
                          full_plan_ratio=0.5, seed=0)
-    first = [int(ds.get_sample(i)["num_tokens"].item()) for i in range(len(ds))]
+    first = [int(ds.get_sample(i)["num_frames"].item()) for i in range(len(ds))]
     # Without reset, a second pass diverges (RNG advanced).
-    second_no_reset = [int(ds.get_sample(i)["num_tokens"].item()) for i in range(len(ds))]
+    second_no_reset = [int(ds.get_sample(i)["num_frames"].item()) for i in range(len(ds))]
     ds.reset_rng()
-    third_after_reset = [int(ds.get_sample(i)["num_tokens"].item()) for i in range(len(ds))]
+    third_after_reset = [int(ds.get_sample(i)["num_frames"].item()) for i in range(len(ds))]
     assert third_after_reset == first, "reset_rng did not reproduce the first pass"
     # (second_no_reset is allowed to differ; assert reset actually changed something
     #  only when the un-reset pass diverged, which it does for full_plan_ratio<1.)
@@ -483,7 +489,7 @@ def test_force_text_idx_pins_specific_caption():
 
 def test_randomize_caption_false_pins_first_and_consumes_no_rng():
     """randomize_caption=False (val / benchmark) must always return texts[0] AND
-    consume no caption RNG, so the mode/num_tokens draw order is identical to a
+    consume no caption RNG, so the mode/num_frames draw order is identical to a
     single-caption clip — keeping val/loss comparable across epochs."""
     texts = ["walk forward", "stroll ahead", "march onward", "step forward"]
     ds_fixed = make_root_refiner_from_samples([_make_multicap_clip(T=60, texts=texts)],
@@ -491,16 +497,16 @@ def test_randomize_caption_false_pins_first_and_consumes_no_rng():
     # Always the first caption, never a random one.
     assert {ds_fixed.get_sample(0)["text"] for _ in range(20)} == {"walk forward"}
 
-    # No caption RNG consumed: the num_tokens sequence matches a clip that has
+    # No caption RNG consumed: the num_frames sequence matches a clip that has
     # only `text` (the legacy, no-`texts` path) under the same seed.
     multicap_seq = [int(make_root_refiner_from_samples([_make_multicap_clip(T=60, texts=texts)],
                                        full_plan_ratio=0.5, seed=0,
                                        randomize_caption=False)
-                        .get_sample(0, force_no_path_aug=True)["num_tokens"])
+                        .get_sample(0, force_no_path_aug=True)["num_frames"])
                     for _ in range(5)]
     legacy_seq = [int(make_root_refiner_from_samples([_make_clip(T=60, text="walk forward")],
                                      full_plan_ratio=0.5, seed=0)
-                      .get_sample(0, force_no_path_aug=True)["num_tokens"])
+                      .get_sample(0, force_no_path_aug=True)["num_frames"])
                   for _ in range(5)]
     assert multicap_seq == legacy_seq
 
@@ -508,7 +514,7 @@ def test_randomize_caption_false_pins_first_and_consumes_no_rng():
 def test_clip_without_texts_falls_back_to_single_text():
     """Legacy clips (only `text`, no `texts`) keep working: the single caption is
     returned, and the fallback path does NOT call self._rng.choice — so two fresh
-    identical legacy datasets draw an identical mode/num_tokens sequence (the
+    identical legacy datasets draw an identical mode/num_frames sequence (the
     existing T01/T02/reset_rng tests separately lock in that the legacy draw order
     is unperturbed by the multi-caption change)."""
     def fresh():
@@ -518,8 +524,8 @@ def test_clip_without_texts_falls_back_to_single_text():
     ds_a = fresh()
     assert ds_a.get_sample(0)["text"] == "walk forward"   # single-caption fallback
 
-    seq_a = [int(fresh().get_sample(0, force_no_path_aug=True)["num_tokens"])
+    seq_a = [int(fresh().get_sample(0, force_no_path_aug=True)["num_frames"])
              for _ in range(5)]
-    seq_b = [int(fresh().get_sample(0, force_no_path_aug=True)["num_tokens"])
+    seq_b = [int(fresh().get_sample(0, force_no_path_aug=True)["num_frames"])
              for _ in range(5)]
     assert seq_a == seq_b   # deterministic; fallback consumes no caption RNG

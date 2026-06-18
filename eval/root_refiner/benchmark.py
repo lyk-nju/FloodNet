@@ -3,7 +3,7 @@
 Evaluates RootRefiner predictions against RefinerDataset targets WITHOUT the
 body model. Computes the metric suite from docs/TODO.md §T_A_10:
 
-    num_token_top1_accuracy / num_token_top3_accuracy / num_token_MAE
+    frame_MAE / frame_acc_pm1 / frame_acc_pm4
     xyz_ADE / xyz_FDE
     heading_error_deg (median)
     fwd_speed_MAE      (per-frame fwd_delta channel; "speed" is the metric label)
@@ -14,10 +14,9 @@ body model. Computes the metric suite from docs/TODO.md §T_A_10:
 
 Outputs a JSON summary + per-sample CSV.
 
-⚠ Done-criteria thresholds (num_token top-1 > 0.5, heading_error_deg < 30°
-median) require a TRAINED checkpoint (T_A_09). With random weights the pipeline
-runs end-to-end but the numbers are meaningless — the smoke test only checks
-that metrics are finite and the report is written.
+With random weights the pipeline runs end-to-end but the numbers are
+meaningless — the smoke test only checks that metrics are finite and the report
+is written.
 
 References:
 - docs/TODO.md §T_A_10 lines 1441-1478.
@@ -158,7 +157,7 @@ def _get_eval_sample(
     force_path_mode: str | None,
     force_no_path_aug: bool,
     force_mode: str | None = None,
-    force_num_tokens: int | None = None,
+    force_num_frames: int | None = None,
     force_anchor_frame: int | None = None,
 ) -> dict:
     if not hasattr(dataset, "get_sample"):
@@ -174,8 +173,8 @@ def _get_eval_sample(
         kwargs["force_path_mode"] = force_path_mode
     if force_mode is not None:
         kwargs["force_mode"] = force_mode
-    if force_num_tokens is not None:
-        kwargs["force_num_tokens"] = int(force_num_tokens)
+    if force_num_frames is not None:
+        kwargs["force_num_frames"] = int(force_num_frames)
     if force_anchor_frame is not None:
         kwargs["force_anchor_frame"] = int(force_anchor_frame)
     try:
@@ -255,22 +254,22 @@ def build_eval_task_specs(dataset, max_samples: int = -1) -> list[dict]:
             force_no_path_aug=True,
         )
         mode = str(sample.get("mode", "sample"))
-        num_tokens = _to_int(sample.get("num_tokens"), default=0)
+        num_frames = _to_int(sample.get("num_frames"), default=0)
         anchor_frame = _to_int(sample.get("anchor_frame"), default=0)
         specs.append(
             {
                 "idx": idx,
                 **_clip_metadata_for_eval_index(dataset, idx),
                 "mode": mode,
-                "num_tokens": num_tokens,
+                "num_frames": num_frames,
                 "anchor_frame": anchor_frame,
-                "task_key": f"{idx}:{mode}:{num_tokens}:{anchor_frame}",
+                "task_key": f"{idx}:{mode}:{num_frames}:{anchor_frame}",
             }
         )
     return specs
 
 
-def _max_tokens_for_full_route(dataset, idx: int, anchor_frame: int = 0) -> int:
+def _max_frames_for_full_route(dataset, idx: int, anchor_frame: int = 0) -> int:
     record = _dataset_record_for_eval_index(dataset, idx)
     if record is None:
         sample = _get_eval_sample(
@@ -281,16 +280,15 @@ def _max_tokens_for_full_route(dataset, idx: int, anchor_frame: int = 0) -> int:
             force_mode="full",
             force_anchor_frame=anchor_frame,
         )
-        return _to_int(sample.get("num_tokens"), default=0)
+        return _to_int(sample.get("num_frames"), default=0)
     if "feature_length" in record:
         T = int(record["feature_length"])
     else:
         motion = record.get("feature", record.get("motion_263"))
         T = int(motion.shape[0])
-    remaining = max(0, T - int(anchor_frame))
-    frames_per_token = int(getattr(dataset, "frames_per_token", 4))
-    max_tokens = int(getattr(dataset, "max_tokens", 49))
-    return min(max_tokens, (remaining + frames_per_token - 1) // frames_per_token)
+    remaining = max(0, T - int(anchor_frame) - 1)
+    max_frames = int(getattr(dataset, "max_frames", remaining))
+    return min(max_frames, remaining)
 
 
 def build_full_route_task_specs(
@@ -314,14 +312,14 @@ def build_full_route_task_specs(
         raw_id = str(meta.get("raw_id", meta.get("name", idx)))
         if wanted is not None and raw_id not in wanted:
             continue
-        num_tokens = _max_tokens_for_full_route(dataset, idx, anchor_frame=0)
+        num_frames = _max_frames_for_full_route(dataset, idx, anchor_frame=0)
         spec = {
             "idx": idx,
             **meta,
             "mode": "full",
-            "num_tokens": num_tokens,
+            "num_frames": num_frames,
             "anchor_frame": 0,
-            "task_key": f"{raw_id}:full:{num_tokens}:0",
+            "task_key": f"{raw_id}:full:{num_frames}:0",
         }
         specs.append(spec)
         if wanted is None and max_n is not None and len(specs) >= max_n:
@@ -391,19 +389,19 @@ def summarize_per_sample(
         "n_unique_tasks": n_unique,
         "duration_mode": resolved_duration_mode,
         "oracle_duration": use_groundtruth_duration,
-        "num_token_top1_accuracy": (
-            sum(int(s.get("num_token_top1_hit", 0)) for s in per_sample) / n
-            if n else float("nan")
-        ),
-        "num_token_top3_accuracy": (
-            sum(int(s.get("num_token_top3_hit", 0)) for s in per_sample) / n
-            if n else float("nan")
-        ),
-        "num_token_MAE": (
+        "frame_MAE": (
             sum(
-                abs(int(s["pred_num_tokens"]) - int(s["gt_num_tokens"]))
+                abs(int(s["pred_frames"]) - int(s["gt_frames"]))
                 for s in per_sample
             ) / n
+            if n else float("nan")
+        ),
+        "frame_acc_pm1": (
+            sum(int(abs(int(s["pred_frames"]) - int(s["gt_frames"])) <= 1) for s in per_sample) / n
+            if n else float("nan")
+        ),
+        "frame_acc_pm4": (
+            sum(int(abs(int(s["pred_frames"]) - int(s["gt_frames"])) <= 4) for s in per_sample) / n
             if n else float("nan")
         ),
         "xyz_ADE": _nanmean_from_samples(per_sample, "xyz_ADE"),
@@ -449,9 +447,8 @@ def resolve_suite_duration_mode(
 _CKPT_CONFIG_CONTRACT_KEYS = (
     ("model", "params", "n_hist"),
     ("model", "params", "n_path"),
-    ("model", "params", "max_tokens"),
-    ("model", "params", "min_tokens"),
-    ("model", "params", "frames_per_token"),
+    ("model", "params", "max_frames"),
+    ("model", "params", "min_frames"),
 )
 
 
@@ -536,11 +533,8 @@ def _sample_anchor_world(sample: dict) -> tuple[list[float], float]:
     return anchor_xz, anchor_yaw
 
 
-def _pred_duration_mask(model, used_tokens: int, mask_len: int) -> torch.Tensor:
-    valid_eff = int(model.frames_per_token) * int(used_tokens) - (
-        int(model.frames_per_token) - 1
-    )
-    return torch.arange(mask_len, dtype=torch.long) < max(0, int(valid_eff))
+def _pred_duration_mask(used_frames: int, mask_len: int) -> torch.Tensor:
+    return torch.arange(mask_len, dtype=torch.long) < max(0, int(used_frames))
 
 
 def _rootplan_artifact_payload(
@@ -548,8 +542,7 @@ def _rootplan_artifact_payload(
     *,
     duration_mode: str,
     valid_mask,
-    pred_num_tokens: int,
-    frames_per_token: int,
+    pred_frames: int,
     source: str,
     anchor_world_xz: list[float],
     anchor_world_yaw: float,
@@ -560,8 +553,7 @@ def _rootplan_artifact_payload(
         "duration_mode": normalize_duration_mode(duration_mode),
         "source": str(source),
         "coordinate_frame": "anchor_local",
-        "frames_per_token": int(frames_per_token),
-        "pred_num_tokens": int(pred_num_tokens),
+        "pred_frames": int(pred_frames),
         "valid_frames": int(root.shape[0]),
         "anchor_commit_idx": 0,
         "anchor_world_xz": [float(anchor_world_xz[0]), float(anchor_world_xz[1])],
@@ -579,7 +571,6 @@ def _write_root_refiner_sample_artifacts(
     pred_by_duration: dict[str, dict],
     gt_root_7d: torch.Tensor,
     gt_mask: torch.Tensor,
-    frames_per_token: int,
     wp_mean=None,
     wp_std=None,
     wp_norm_idx=None,
@@ -615,8 +606,6 @@ def _write_root_refiner_sample_artifacts(
 
     path_mode = str(sample.get("path_mode", "dense_path"))
     offset_frame = _to_int(sample.get("offset_start_frames"), default=0)
-    frames_per_token_i = int(frames_per_token)
-    offset_token = offset_frame // max(1, frames_per_token_i)
     anchor_frame = _to_int(sample.get("anchor_frame"), default=0)
     gt_slice_start = anchor_frame
     gt_slice_end = gt_slice_start + int(_as_cpu_tensor(gt_mask).bool().sum().item())
@@ -626,7 +615,7 @@ def _write_root_refiner_sample_artifacts(
         route_mode=_path_mode_to_artifact_route_mode(path_mode),
         duration_mode=str(metrics.get("duration_mode", DURATION_PRED)),
         offset_frame=offset_frame,
-        offset_token=offset_token,
+        offset_token=None,
         anchor_world_xz=anchor_world_xz,
         anchor_world_yaw=anchor_world_yaw,
         gt_slice_start=gt_slice_start,
@@ -640,7 +629,7 @@ def _write_root_refiner_sample_artifacts(
             "path_mode": path_mode,
             "mode": sample.get("mode"),
             "text": sample.get("text"),
-            "gt_num_tokens": int(metrics.get("gt_num_tokens", 0)),
+            "gt_frames": int(metrics.get("gt_frames", 0)),
         },
     )
     write_eval_json(out / shared_names["metadata"], metadata)
@@ -656,7 +645,7 @@ def _write_root_refiner_sample_artifacts(
         names = ROOT_REFINER_ARTIFACT_NAMES[duration]
         root = _as_cpu_tensor(pred_payload["root_7d"]).float()
         mask = _as_cpu_tensor(pred_payload["mask"]).bool()
-        pred_num_tokens = int(pred_payload["pred_num_tokens"])
+        pred_frames = int(pred_payload["pred_frames"])
         valid_root = _valid_rows(root, mask)
         np.save(out / names["pred_root_7d"], valid_root.astype(np.float32))
         write_eval_json(
@@ -665,8 +654,7 @@ def _write_root_refiner_sample_artifacts(
                 root,
                 duration_mode=duration,
                 valid_mask=mask,
-                pred_num_tokens=pred_num_tokens,
-                frames_per_token=frames_per_token_i,
+                pred_frames=pred_frames,
                 source="root_refiner_benchmark",
                 anchor_world_xz=anchor_world_xz,
                 anchor_world_yaw=anchor_world_yaw,
@@ -711,14 +699,14 @@ def run_benchmark(
     `.encode(list[str], device=...) -> [B, text_emb_dim]`.
 
     `duration_mode`: `pred_duration` uses model-predicted duration;
-    `groundtruth_duration` feeds GT num_tokens so trajectory metrics
+    `groundtruth_duration` feeds GT num_frames so trajectory metrics
     (xyz_ADE/FDE, heading, ...) measure the WAYPOINT DECODER ALONE under the
-    correct horizon, isolating it from num_token-head prediction error.
+    correct horizon, isolating it from frame-duration prediction error.
     `oracle_duration` is a deprecated alias for `groundtruth_duration`.
     Default = real inference (model picks its expected-round duration, so
     trajectory metrics use the common GT/predicted prefix).
-    top-k duration metrics still use classification logits; num_token_MAE uses
-    the actual predicted duration that drives inference.
+    Frame-duration metrics use the actual predicted duration that drives
+    inference.
 
     Returns dict with `summary` (aggregate metrics) and `per_sample` (list).
     """
@@ -728,7 +716,6 @@ def run_benchmark(
     )
     use_groundtruth_duration = duration_mode_resolved == DURATION_GROUNDTRUTH
     model = model.to(device).eval()
-    min_tokens = model.min_tokens
 
     # Reproducibility: when no frozen task list is provided, get_sample advances
     # the dataset RNG every call, so reset it to the base seed for comparable
@@ -757,7 +744,7 @@ def run_benchmark(
             force_path_mode=force_path_mode,
             force_no_path_aug=force_no_path_aug,
             force_mode=spec.get("mode"),
-            force_num_tokens=spec.get("num_tokens"),
+            force_num_frames=spec.get("num_frames"),
             force_anchor_frame=spec.get("anchor_frame"),
         )
         text_emb = text_encoder.encode([sample["text"]], device=device)
@@ -767,8 +754,8 @@ def run_benchmark(
         wp_norm_idx = getattr(dataset, "_wp_norm_idx", None)
 
         def _forward_duration(mode_name: str) -> tuple[dict, torch.Tensor, torch.Tensor]:
-            teacher_num_tokens = (
-                sample["num_tokens"].reshape(1).to(device)
+            teacher_num_frames = (
+                sample["num_frames"].reshape(1).to(device)
                 if mode_name == DURATION_GROUNDTRUTH
                 else None
             )
@@ -786,11 +773,17 @@ def run_benchmark(
                 sample_mode=[sample.get("mode", "full")],
                 history_motion=sample["history_motion"].unsqueeze(0).to(device),
                 history_mask=sample["history_mask"].unsqueeze(0).to(device),
-                offset_start_frames=sample.get(
-                    "offset_start_frames",
+                anchor_frame=sample.get(
+                    "anchor_frame",
                     torch.tensor(0, dtype=torch.long),
-                ).reshape(1).to(device),
-                num_tokens=teacher_num_tokens,
+                ).reshape(1).to(device)
+                if torch.is_tensor(sample.get("anchor_frame"))
+                else torch.tensor(
+                    [int(sample.get("anchor_frame", 0))],
+                    dtype=torch.long,
+                    device=device,
+                ),
+                num_frames=teacher_num_frames,
             )
             # Model emits NORMALIZED 5D. Assemble physical 7D at the boundary
             # (unnormalize xyz → unit heading → append fwd_delta / yaw_delta) so
@@ -798,16 +791,15 @@ def run_benchmark(
             pred_root = build_physical_7d_from_normalized_5d(
                 output["waypoints"][0].cpu(), wp_mean, wp_std, wp_norm_idx,
             )
-            used_tokens = int(output["used_num_tokens"][0].detach().cpu().item())
+            used_frames = int(output["used_frames"][0].detach().cpu().item())
             valid_mask = (
                 _as_cpu_tensor(sample.get("target_mask", sample.get("waypoints_mask"))).bool()
                 if mode_name == DURATION_GROUNDTRUTH
-                else _pred_duration_mask(model, used_tokens, pred_root.shape[0])
+                else _pred_duration_mask(used_frames, pred_root.shape[0])
             )
             return output, pred_root, valid_mask
 
         out, pred_wp, duration_mask = _forward_duration(duration_mode_resolved)
-        logits = out["num_token_logits"][0]                  # [K]
         # GT `target_waypoints` is PHYSICAL-then-z-scored, so unnormalize its xyz
         # the same way and re-derive its deltas.
         gt_source = sample.get("target_waypoints", sample.get("waypoints"))
@@ -820,14 +812,8 @@ def run_benchmark(
         if not use_groundtruth_duration:
             mask = gt_mask & duration_mask.bool()
 
-        # num_token metrics.
-        gt_class = int(sample["num_tokens"].item()) - min_tokens
-        gt_class = max(0, min(gt_class, logits.shape[-1] - 1))
-        pred_class = int(logits.argmax().item())
-        pred_num_tokens = int(out["pred_num_tokens"][0].detach().cpu().item())
-        top3 = torch.topk(logits, k=min(3, logits.shape[-1])).indices.tolist()
-        top1_hit = int(pred_class == gt_class)
-        top3_hit = int(gt_class in top3)
+        gt_frames = int(sample["num_frames"].detach().cpu().item())
+        pred_frames = int(out["pred_frames"][0].detach().cpu().item())
 
         m = compute_sample_metrics(pred_wp, gt_wp, mask)
         m["idx"] = idx
@@ -839,18 +825,16 @@ def run_benchmark(
             value = sample.get(meta_key, spec.get(meta_key))
             if value is not None:
                 m[meta_key] = value
-        m["num_token_top1_hit"] = top1_hit
-        m["num_token_top3_hit"] = top3_hit
-        m["pred_num_tokens"] = pred_num_tokens
-        m["argmax_num_tokens"] = pred_class + min_tokens
-        m["gt_num_tokens"] = gt_class + min_tokens
+        m["pred_frames"] = pred_frames
+        m["gt_frames"] = gt_frames
+        m["frame_abs_error"] = abs(pred_frames - gt_frames)
         m["duration_mode"] = duration_mode_resolved
         per_sample.append(m)
 
         if artifact_dir is not None and (
             int(artifact_max_samples) <= 0 or artifact_count < int(artifact_max_samples)
         ):
-            used_num_tokens = int(out["used_num_tokens"][0].detach().cpu().item())
+            used_frames = int(out["used_frames"][0].detach().cpu().item())
             pred_by_duration = {
                 duration_mode_resolved: {
                     "root_7d": pred_wp,
@@ -859,20 +843,20 @@ def run_benchmark(
                         if duration_mode_resolved == DURATION_PRED
                         else gt_mask
                     ),
-                    "pred_num_tokens": used_num_tokens,
+                    "pred_frames": used_frames,
                 }
             }
             for extra_duration in (DURATION_PRED, DURATION_GROUNDTRUTH):
                 if extra_duration in pred_by_duration:
                     continue
                 extra_out, extra_wp, extra_mask = _forward_duration(extra_duration)
-                extra_pred_num_tokens = int(
-                    extra_out["used_num_tokens"][0].detach().cpu().item()
+                extra_pred_frames = int(
+                    extra_out["used_frames"][0].detach().cpu().item()
                 )
                 pred_by_duration[extra_duration] = {
                     "root_7d": extra_wp,
                     "mask": extra_mask,
-                    "pred_num_tokens": extra_pred_num_tokens,
+                    "pred_frames": extra_pred_frames,
                 }
             sample_id = f"sample_{artifact_count:06d}"
             _write_root_refiner_sample_artifacts(
@@ -883,7 +867,6 @@ def run_benchmark(
                 pred_by_duration=pred_by_duration,
                 gt_root_7d=gt_wp,
                 gt_mask=gt_mask,
-                frames_per_token=int(model.frames_per_token),
                 wp_mean=wp_mean,
                 wp_std=wp_std,
                 wp_norm_idx=wp_norm_idx,
@@ -1160,7 +1143,7 @@ def main(argv=None):
         default=False,
         help=(
             "Deprecated alias for --duration_mode groundtruth_duration: "
-            "teacher-force GT num_tokens for trajectory metrics."
+            "teacher-force GT num_frames for trajectory metrics."
         ),
     )
     parser.add_argument(
@@ -1199,7 +1182,7 @@ def main(argv=None):
         default=False,
         help=(
             "Evaluate full-clip routes: force mode=full, anchor_frame=0, "
-            "and num_tokens=max valid tokens for each selected clip."
+            "and num_frames=max valid frames for each selected clip."
         ),
     )
     parser.add_argument(

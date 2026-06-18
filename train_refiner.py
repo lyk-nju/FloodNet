@@ -24,7 +24,6 @@ _REPO_ROOT = Path(__file__).resolve().parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from utils.training.root_refiner import collate_fn  # noqa: E402
 from utils.initialize import (  # noqa: E402
     get_function,
     get_shared_run_time,
@@ -34,12 +33,6 @@ from utils.initialize import (  # noqa: E402
 from utils.training.root_refiner.config_validate import validate_refiner_config  # noqa: E402
 from utils.training.root_refiner.lightning_module import (  # noqa: E402
     RefinerLightningModule,
-    RootRefinerLightningModule,
-)
-from utils.training.root_refiner.losses import (  # noqa: E402
-    masked_mean,
-    second_order_diff_l2,
-    smooth_l1_masked,
 )
 
 log = logging.getLogger(__name__)
@@ -424,7 +417,7 @@ def apply_default_fixed_validation_dataset(train_ds, val_suites):
             force_anchor_frame = None
             if (
                 suite.get("mode_policy") == "sliding"
-                and getattr(dataset, "num_token_policy", None) == "max"
+                and getattr(dataset, "horizon_policy", None) == "max"
                 and hasattr(dataset, "n_hist")
             ):
                 force_anchor_frame = int(dataset.n_hist) - 1

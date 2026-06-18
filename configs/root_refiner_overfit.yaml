@@ -9,9 +9,8 @@ model:
   n_heads: 8
   ff_dim: 1024
   dropout: 0.0
-  max_tokens: 49
-  min_tokens: 4
-  frames_per_token: 4
+  max_frames: 193
+  min_frames: 13
   n_path: 64
   n_hist: 20
   text_emb_dim: 4096
@@ -36,7 +35,7 @@ loss:
   heading_form: cosine
 
 loss_weights:
-  num_token: 1.0
+  frame_pace: 1.0
   xyz: 5.0
   heading: 1.0
   fwd_delta: 0.5

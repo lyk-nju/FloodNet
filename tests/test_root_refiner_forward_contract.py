@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import pytest
 
-from models.root_refiner import PathCondFrameDecoder, RootRefiner
+from models.root_refiner import RootDurationHead, RootRefiner
 
 
 def _model() -> RootRefiner:
@@ -11,17 +11,16 @@ def _model() -> RootRefiner:
         d_model=64,
         n_layers=2,
         n_layers_cond=1,
-        n_layers_token=1,
+        n_layers_root=1,
         n_heads=4,
         ff_dim=128,
         dropout=0.0,
-        max_tokens=8,
-        min_tokens=2,
+        max_frames=24,
+        min_frames=2,
         n_path=16,
         n_hist=8,
         text_emb_dim=32,
         path_features_dim=5,
-        decoder_type="simple",
     )
 
 
@@ -40,29 +39,69 @@ def _inputs(model: RootRefiner, batch_size: int = 3) -> dict:
     }
 
 
-def test_root_refiner_accepts_new_forward_contract_and_returns_used_tokens():
+def test_root_refiner_accepts_frame_forward_contract_and_returns_future_waypoints():
     model = _model()
     inputs = _inputs(model)
-    num_tokens = torch.tensor([2, 4, 8])
+    num_frames = torch.tensor([2, 12, 24])
 
-    out = model(**inputs, num_tokens=num_tokens)
+    out = model(**inputs, num_frames=num_frames)
 
-    assert out["num_token_logits"].shape == (3, model.max_tokens - model.min_tokens + 1)
-    assert out["expected_num_tokens_cls"].shape == (3,)
-    assert out["pred_num_tokens_cls"].shape == (3,)
     assert out["pred_log_pace"].shape == (3,)
-    assert out["pred_num_tokens_float"].shape == (3,)
-    assert out["pred_num_tokens_pace"].shape == (3,)
+    assert out["pred_frames_float"].shape == (3,)
     effective_length = (
         inputs["path_features_raw"][:, 0].clamp_min(0.0)
         + inputs["path_features_raw"][:, 3].clamp_min(0.0)
     )
-    expected_float = 1.0 + out["pred_log_pace"].clamp(-8.0, 8.0).exp() * effective_length
-    assert torch.allclose(out["pred_num_tokens_float"], expected_float)
-    assert torch.equal(out["used_num_tokens"], num_tokens)
-    assert torch.equal(out["pred_num_tokens"], out["pred_num_tokens_pace"])
-    assert out["pred_num_tokens"].shape == (3,)
+    expected_float = out["pred_log_pace"].clamp(-8.0, 8.0).exp() * effective_length
+    assert torch.allclose(out["pred_frames_float"], expected_float)
+    assert torch.equal(out["used_frames"], num_frames)
+    assert torch.equal(out["pred_frames"], out["pred_frames_pace"])
+    assert out["pred_frames"].shape == (3,)
+    assert out["future_waypoints"].shape == (3, model.max_frames, 5)
     assert out["waypoints"].shape == (3, model.max_frames, 5)
+    assert torch.equal(out["frame_mask"], torch.arange(model.max_frames)[None] < num_frames[:, None])
+    assert "used_num_tokens" not in out
+
+
+def test_root_duration_head_is_explicit_module_and_outputs_frame_duration():
+    g = torch.Generator().manual_seed(1)
+    head = RootDurationHead(
+        d_model=64,
+        path_features_dim=5,
+        min_frames=2,
+        max_frames=24,
+        dropout=0.0,
+        pace_text_dim=16,
+    )
+    inputs = {
+        "cls_summary": torch.randn(3, 64, generator=g),
+        "path_summary": torch.randn(3, 64, generator=g),
+        "history_summary": torch.randn(3, 64, generator=g),
+        "text_summary": torch.randn(3, 64, generator=g),
+        "path_features": torch.randn(3, 5, generator=g),
+        "path_features_raw": torch.rand(3, 5, generator=g) + 1.0,
+    }
+
+    out = head(**inputs)
+
+    assert out["pred_log_pace"].shape == (3,)
+    assert out["pred_frames_float"].shape == (3,)
+    effective_length = (
+        inputs["path_features_raw"][:, 0].clamp_min(0.0)
+        + inputs["path_features_raw"][:, 3].clamp_min(0.0)
+    )
+    expected_float = out["pred_log_pace"].clamp(-8.0, 8.0).exp() * effective_length
+    assert torch.allclose(out["pred_frames_float"], expected_float)
+    assert torch.equal(out["pred_frames"], out["pred_frames_pace"])
+    assert out["pred_frames"].min() >= 2
+    assert out["pred_frames"].max() <= 24
+
+
+def test_root_refiner_uses_explicit_duration_head():
+    model = _model()
+
+    assert isinstance(model.duration_head, RootDurationHead)
+    assert not hasattr(model, "pace_head")
 
 
 def test_root_refiner_rejects_legacy_forward_aliases():
@@ -87,21 +126,10 @@ def test_root_refiner_inference_uses_predicted_duration():
 
     out = model(**inputs)
 
-    assert torch.equal(out["used_num_tokens"], out["pred_num_tokens_pace"])
-    assert torch.equal(out["pred_num_tokens"], out["pred_num_tokens_pace"])
-    assert out["used_num_tokens"].min() >= model.min_tokens
-    assert out["used_num_tokens"].max() <= model.max_tokens
-
-
-def test_root_refiner_can_disable_pace_duration_for_legacy_checkpoints():
-    model = _model()
-    model.use_pace_duration = False
-    inputs = _inputs(model)
-
-    out = model(**inputs)
-
-    assert torch.equal(out["pred_num_tokens"], out["pred_num_tokens_cls"])
-    assert torch.equal(out["used_num_tokens"], out["pred_num_tokens_cls"])
+    assert torch.equal(out["used_frames"], out["pred_frames_pace"])
+    assert torch.equal(out["pred_frames"], out["pred_frames_pace"])
+    assert out["used_frames"].min() >= model.min_frames
+    assert out["used_frames"].max() <= model.max_frames
 
 
 def test_path_control_mask_changes_condition_encoding():
@@ -114,54 +142,22 @@ def test_path_control_mask_changes_condition_encoding():
     out_with_controls = model(**inputs)
 
     assert not torch.allclose(
-        out_without_controls["num_token_logits"],
-        out_with_controls["num_token_logits"],
+        out_without_controls["pred_log_pace"],
+        out_with_controls["pred_log_pace"],
     )
 
 
-def test_root_refiner_rejects_unknown_path_mode():
-    model = _model()
+def test_path_mode_metadata_does_not_change_model_output():
+    model = _model().eval()
     inputs = _inputs(model)
+    inputs["path_mode"] = ["dense_path"] * inputs["text_emb"].shape[0]
+    dense_out = model(**inputs)
+
     inputs["path_mode"] = ["dense_path", "unknown_mode", "goal_point"]
+    mixed_out = model(**inputs)
 
-    with pytest.raises(ValueError, match="unknown path_mode"):
-        model(**inputs)
-
-
-def test_path_cond_frame_decoder_accepts_new_path_condition_names():
-    decoder = PathCondFrameDecoder(d_model=16, max_tokens=4, n_path=8, width=24)
-    token_hidden = torch.randn(2, 4, 16)
-    path = torch.randn(2, 8, 2)
-    path_valid_mask = torch.ones(2, 8, dtype=torch.bool)
-    used_num_tokens = torch.tensor([2, 4])
-
-    out = decoder(
-        token_hidden,
-        path=path,
-        path_valid_mask=path_valid_mask,
-        used_num_tokens=used_num_tokens,
-    )
-
-    assert out.shape == (2, decoder.max_frames, 5)
-
-
-def test_path_cond_frame_decoder_offsets_path_hint_prefix():
-    decoder = PathCondFrameDecoder(d_model=16, max_tokens=4, n_path=8, width=24)
-    path = torch.zeros(1, 8, 2)
-    path[0, :, 0] = torch.linspace(10.0, 17.0, 8)
-    path_valid_mask = torch.ones(1, 8, dtype=torch.bool)
-    used_num_tokens = torch.tensor([4])
-    offset = torch.tensor([5])
-
-    cond = decoder._build_path_cond(
-        path,
-        path_valid_mask,
-        used_num_tokens,
-        offset_start_frames=offset,
-    )
-
-    assert torch.allclose(cond[0, :5], torch.zeros_like(cond[0, :5]))
-    assert torch.allclose(cond[0, 5, :2], path[0, 0], atol=1e-5)
+    assert torch.allclose(dense_out["pred_log_pace"], mixed_out["pred_log_pace"])
+    assert torch.allclose(dense_out["future_waypoints"], mixed_out["future_waypoints"])
 
 
 def test_pace_head_gets_clean_raw_path_features_skip():
@@ -175,13 +171,14 @@ def test_pace_head_gets_clean_raw_path_features_skip():
     out["pred_log_pace"].sum().backward()
 
     grads = [
-        p.grad for p in model.pace_feature_proj.parameters() if p.grad is not None
+        p.grad for p in model.duration_head.raw_feature_proj.parameters()
+        if p.grad is not None
     ]
-    assert grads, "pace_feature_proj received no gradient — raw feature path not wired"
+    assert grads, "duration_head.raw_feature_proj received no gradient"
     assert any(g.abs().sum() > 0 for g in grads)
 
 
-def test_sample_mode_changes_pace_head_not_condition_classifier():
+def test_sample_mode_metadata_does_not_change_model_output():
     model = _model().eval()
     inputs = _inputs(model)
     inputs["sample_mode"] = ["full"] * inputs["text_emb"].shape[0]
@@ -189,5 +186,5 @@ def test_sample_mode_changes_pace_head_not_condition_classifier():
     inputs["sample_mode"] = ["sliding"] * inputs["text_emb"].shape[0]
     sliding_out = model(**inputs)
 
-    assert not torch.allclose(full_out["pred_log_pace"], sliding_out["pred_log_pace"])
-    assert torch.allclose(full_out["num_token_logits"], sliding_out["num_token_logits"])
+    assert torch.allclose(full_out["pred_log_pace"], sliding_out["pred_log_pace"])
+    assert torch.allclose(full_out["future_waypoints"], sliding_out["future_waypoints"])

@@ -17,7 +17,7 @@ from utils.local_frame import canonicalize_5d
 from utils.motion_process import build_physical_7d_from_normalized_5d
 from utils.training.root_refiner.path_condition import build_path_condition
 from utils.inference.root_plan import RootPlan
-from utils.token_frame import num_frames_for_tokens
+from utils.token_frame import num_frames_for_tokens, num_tokens_for_frame_len
 
 
 def _state_dict_has_pace_duration(state_dict) -> bool:
@@ -279,10 +279,11 @@ class RootRefinerRuntime:
         )
         text_emb = self.text_encoder.encode([str(text)], device=self.device)
 
-        forced_num_tokens_t = None
+        forced_num_frames_t = None
         if forced_num_tokens is not None:
-            forced_num_tokens_t = torch.as_tensor(
-                [int(forced_num_tokens)],
+            forced_valid_frames = num_frames_for_tokens(int(forced_num_tokens), 4)
+            forced_num_frames_t = torch.as_tensor(
+                [max(1, forced_valid_frames - 1)],
                 dtype=torch.long,
                 device=self.device,
             )
@@ -298,22 +299,23 @@ class RootRefinerRuntime:
             sample_mode=[sample_mode],
             history_motion=history_motion,
             history_mask=history_mask,
-            offset_start_frames=torch.zeros(1, dtype=torch.long, device=self.device),
-            num_tokens=forced_num_tokens_t,
+            anchor_frame=torch.zeros(1, dtype=torch.long, device=self.device),
+            num_frames=forced_num_frames_t,
         )
 
-        used_tokens = int(out["used_num_tokens"][0].detach().cpu().item())
-        frames_per_token = int(self.refiner.frames_per_token)
-        valid_frames = min(
-            num_frames_for_tokens(used_tokens, frames_per_token),
-            int(out["waypoints"].shape[1]),
-        )
+        used_future_frames = int(out["used_frames"][0].detach().cpu().item())
+        valid_frames = min(used_future_frames + 1, int(out["waypoints"].shape[1]) + 1)
+        frames_per_token = 4
+        used_tokens = num_tokens_for_frame_len(valid_frames, frames_per_token)
         wp7 = build_physical_7d_from_normalized_5d(
             out["waypoints"][0],
             self.wp_mean,
             self.wp_std,
             self.wp_norm_idx,
         )
+        anchor7 = wp7.new_zeros(1, 7)
+        anchor7[:, 3] = 1.0
+        wp7 = torch.cat([anchor7, wp7], dim=0)
         return RootPlan(
             num_tokens_pred=used_tokens,
             valid_frames=valid_frames,

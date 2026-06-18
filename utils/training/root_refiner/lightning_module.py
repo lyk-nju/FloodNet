@@ -23,7 +23,6 @@ from utils.training.root_refiner.losses import (
     dense_path_control_loss,
     goal_point_control_loss,
     masked_mean,
-    ordinal_duration_loss,
     second_order_diff_l2,
     smooth_l1_masked,
     sparse_path_control_loss,
@@ -47,13 +46,12 @@ class RootRefinerLightningModule(pl.LightningModule):
             self.refiner = RootRefiner(**model_cfg)
         else:
             self.refiner = instantiate(target=target, cfg=None, hfstyle=False, **model_cfg)
-        self.min_tokens = model_cfg["min_tokens"]
-        self.max_tokens = model_cfg["max_tokens"]
+        self.min_frames = model_cfg["min_frames"]
+        self.max_frames = model_cfg["max_frames"]
         text_emb_dim = model_cfg.get("text_emb_dim", 512)
         self.text_encoder = resolve_text_encoder(cfg, text_encoder, text_emb_dim)
         self.loss_weights = dict(cfg.get("loss_weights", {}))
         self.heading_form = cfg.get("loss", {}).get("heading_form", "cosine")
-        self.ordinal_sigma = float(cfg.get("loss", {}).get("ordinal_sigma", 1.0))
         self.validation_suite_names = self._validation_suite_names(cfg)
         self._register_waypoint_stats(cfg)
         self.save_hyperparameters(ignore=["text_encoder"])
@@ -75,7 +73,7 @@ class RootRefinerLightningModule(pl.LightningModule):
                 f"got {duration_mode!r}."
             )
         text_emb = self.text_encoder.encode(batch["text"], device=self.device)
-        num_tokens = batch.get("num_tokens") if duration_mode == "groundtruth_duration" else None
+        num_frames = batch.get("num_frames") if duration_mode == "groundtruth_duration" else None
         return self.refiner(
             text_emb=text_emb,
             path=batch["path"],
@@ -87,8 +85,8 @@ class RootRefinerLightningModule(pl.LightningModule):
             sample_mode=batch.get("mode"),
             history_motion=batch["history_motion"],
             history_mask=batch["history_mask"],
-            offset_start_frames=batch.get("offset_start_frames"),
-            num_tokens=num_tokens,
+            anchor_frame=batch.get("anchor_frame"),
+            num_frames=num_frames,
         )
 
     def _compute_loss(
@@ -102,14 +100,6 @@ class RootRefinerLightningModule(pl.LightningModule):
         if target_mask is None:
             target_mask = batch["waypoints_mask"]
 
-        target_class = batch["num_tokens"] - self.min_tokens
-        dur = ordinal_duration_loss(
-            out["num_token_logits"], batch["num_tokens"],
-            min_tokens=self.min_tokens, sigma=self.ordinal_sigma,
-        )
-        L_num = dur["ordinal_ce"]
-        L_num_soft = dur["expected"]
-        expected_class = dur["expected_num_tokens"] - float(self.min_tokens)
         raw_features = batch.get("path_features_raw", batch["path_features"]).to(
             device=out["waypoints"].device,
             dtype=out["waypoints"].dtype,
@@ -119,13 +109,12 @@ class RootRefinerLightningModule(pl.LightningModule):
             + raw_features[:, 3].clamp_min(0.0)
         )
         pace_valid = effective_length >= 0.05
-        target_tokens = batch["num_tokens"].to(
+        target_frames = batch["num_frames"].to(
             device=out["waypoints"].device,
             dtype=out["waypoints"].dtype,
         )
         target_log_pace = torch.log(
-            (target_tokens - 1.0).clamp_min(1.0)
-            / effective_length.clamp_min(0.05)
+            target_frames.clamp_min(1.0) / effective_length.clamp_min(0.05)
         )
         pace_terms = F.smooth_l1_loss(
             out["pred_log_pace"],
@@ -133,12 +122,12 @@ class RootRefinerLightningModule(pl.LightningModule):
             reduction="none",
         )
         L_pace = masked_mean(pace_terms, pace_valid)
-        num_token_pace_terms = F.smooth_l1_loss(
-            out["pred_num_tokens_float"],
-            target_tokens,
+        frame_pace_terms = F.smooth_l1_loss(
+            out["pred_frames_float"],
+            target_frames,
             reduction="none",
         )
-        L_num_token_pace = masked_mean(num_token_pace_terms, pace_valid)
+        L_frame_pace = masked_mean(frame_pace_terms, pace_valid)
 
         L_xyz = smooth_l1_masked(out["waypoints"][..., 0:3], target_wp[..., 0:3], target_mask)
 
@@ -175,9 +164,7 @@ class RootRefinerLightningModule(pl.LightningModule):
             L_path_control = self._compute_path_control_loss(out, batch, target_mask)
         loss = (
             w.get("pace", 0.0) * L_pace
-            + w.get("num_token_pace", w.get("num_token_float", 0.0)) * L_num_token_pace
-            + w.get("num_token_cls", w.get("num_token", 1.0)) * L_num
-            + w.get("num_token_soft_cls", w.get("num_token_soft", 0.1)) * L_num_soft
+            + w.get("frame_pace", 1.0) * L_frame_pace
             + w.get("xyz", 5.0) * L_xyz
             + w.get("heading", 1.0) * L_head
             + w.get("fwd_delta", 0.5) * L_fwd_delta
@@ -187,45 +174,29 @@ class RootRefinerLightningModule(pl.LightningModule):
         )
 
         with torch.no_grad():
-            pred_class = out["num_token_logits"].argmax(dim=-1)
-            pred_token_class_cls = (
-                out["pred_num_tokens_cls"].to(target_class.device) - self.min_tokens
-            )
-            target_tokens_for_metric = batch["num_tokens"].to(
-                device=target_class.device,
-                dtype=out["pred_num_tokens_float"].dtype,
-            )
-            cls_err = (pred_token_class_cls - target_class).abs().float()
-            argmax_err = (pred_class - target_class).abs().float()
-            soft_err = (expected_class - target_class.to(expected_class.dtype)).abs()
             float_err = (
-                out["pred_num_tokens_float"].to(target_class.device)
-                - target_tokens_for_metric
+                out["pred_frames_float"].to(target_frames.device)
+                - target_frames
             ).abs()
             float_err_mean = masked_mean(float_err, pace_valid.to(float_err.device))
             physical_metrics = self._compute_physical_xyz_metrics(out, batch, target_mask)
         return {
             "loss": loss,
             "pace": L_pace,
-            "num_token_pace": L_num_token_pace,
-            "num_token_cls": L_num,
-            "num_token_soft_cls": L_num_soft,
+            "frame_pace": L_frame_pace,
             "xyz": L_xyz,
             "heading": L_head,
             "fwd_delta": L_fwd_delta,
             "yaw_delta": L_yaw_delta,
             "path_control": L_path_control,
             "smoothness": L_smooth,
-            "num_token_cls_mae": cls_err.mean(),
-            "num_token_cls_argmax_mae": argmax_err.mean(),
-            "num_token_cls_soft_mae": soft_err.mean(),
-            "num_token_pace_mae": float_err_mean,
-            "num_token_pace_acc_pm1": masked_mean(
+            "frame_pace_mae": float_err_mean,
+            "frame_pace_acc_pm1": masked_mean(
                 (float_err <= 1.0).to(float_err.dtype),
                 pace_valid.to(float_err.device),
             ),
-            "num_token_pace_acc_pm2": masked_mean(
-                (float_err <= 2.0).to(float_err.dtype),
+            "frame_pace_acc_pm4": masked_mean(
+                (float_err <= 4.0).to(float_err.dtype),
                 pace_valid.to(float_err.device),
             ),
             **physical_metrics,
@@ -301,12 +272,9 @@ class RootRefinerLightningModule(pl.LightningModule):
         return torch.stack(losses).mean()
 
     METRIC_KEYS = (
-        "num_token_cls_mae",
-        "num_token_cls_argmax_mae",
-        "num_token_cls_soft_mae",
-        "num_token_pace_mae",
-        "num_token_pace_acc_pm1",
-        "num_token_pace_acc_pm2",
+        "frame_pace_mae",
+        "frame_pace_acc_pm1",
+        "frame_pace_acc_pm4",
         "xyz_ADE_m",
         "xyz_FDE_m",
     )
@@ -365,13 +333,9 @@ class RootRefinerLightningModule(pl.LightningModule):
 
     def _common_prefix_mask(self, batch: dict, out: dict) -> torch.Tensor:
         target_mask = batch["waypoints_mask"]
-        used_num_tokens = out["used_num_tokens"].to(target_mask.device, dtype=torch.long)
-        valid_eff = (
-            self.refiner.frames_per_token * used_num_tokens
-            - (self.refiner.frames_per_token - 1)
-        )
+        used_frames = out["used_frames"].to(target_mask.device, dtype=torch.long)
         frame_idx = torch.arange(target_mask.shape[1], device=target_mask.device)
-        return target_mask.bool() & (frame_idx.unsqueeze(0) < valid_eff.unsqueeze(1))
+        return target_mask.bool() & (frame_idx.unsqueeze(0) < used_frames.unsqueeze(1))
 
     def _compute_physical_xyz_metrics(
         self,
@@ -441,7 +405,7 @@ class RootRefinerLightningModule(pl.LightningModule):
         validation_cfg = self.cfg.get("validation") or {}
         log_keys_cfg = validation_cfg.get("log_keys")
         log_keys = set(str(key) for key in log_keys_cfg) if log_keys_cfg else None
-        batch_size = int(batch["num_tokens"].shape[0])
+        batch_size = int(batch["num_frames"].shape[0])
         first_loss = None
         for mode in modes:
             out = self(batch, duration_mode=mode)

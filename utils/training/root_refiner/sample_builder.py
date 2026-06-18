@@ -23,7 +23,6 @@ from utils.local_frame import (
 from utils.motion_process import recover_root_rot_pos, root_to_traj_feats_7d
 from utils.training.root_refiner.path_condition import build_path_condition
 from utils.training.root_refiner.sample_creator import RefinerSample
-from utils.token_frame import num_frames_for_tokens
 
 
 def _pad_or_truncate(x: torch.Tensor, target_len: int) -> torch.Tensor:
@@ -45,9 +44,8 @@ class RefinerSampleBuilder:
         *,
         n_hist: int = 20,
         n_path: int = 64,
-        max_tokens: int = 49,
-        min_tokens: int = 4,
-        frames_per_token: int = 4,
+        max_frames: int = 193,
+        min_frames: int = 13,
         normalize: bool = False,
         stats_dir: str | os.PathLike | None = None,
         sparse_path_point_range: tuple[int, int] = (3, 8),
@@ -57,9 +55,8 @@ class RefinerSampleBuilder:
     ):
         self.n_hist = int(n_hist)
         self.n_path = int(n_path)
-        self.max_tokens = int(max_tokens)
-        self.min_tokens = int(min_tokens)
-        self.frames_per_token = int(frames_per_token)
+        self.max_frames_value = int(max_frames)
+        self.min_frames = int(min_frames)
         self.normalize = bool(normalize)
         self.sparse_path_point_range = tuple(int(v) for v in sparse_path_point_range)
         self._seed = seed
@@ -93,7 +90,7 @@ class RefinerSampleBuilder:
 
     @property
     def max_frames(self) -> int:
-        return num_frames_for_tokens(self.max_tokens, self.frames_per_token)
+        return self.max_frames_value
 
     def reset_rng(self) -> None:
         """Reset sparse path sampling to the builder seed."""
@@ -118,11 +115,6 @@ class RefinerSampleBuilder:
             .detach()
             .cpu()
             .tolist()
-        )
-        num_tokens = torch.tensor(
-            int(plan.num_tokens[index].item()),
-            device=motion_263.device,
-            dtype=torch.long,
         )
         target_frame_count = int(plan.target_frame_counts[index].item())
         anchor_xz = root_xyz[anchor_frame, [0, 2]]
@@ -164,7 +156,11 @@ class RefinerSampleBuilder:
             "target_waypoints": target_waypoints,
             "target_waypoints_physical": target_waypoints_physical,
             "target_mask": target_mask,
-            "num_tokens": num_tokens,
+            "num_frames": torch.tensor(
+                target_frame_count,
+                device=motion_263.device,
+                dtype=torch.long,
+            ),
             "mode": plan.modes[index],
             "anchor_frame": anchor_frame,
             "anchor_xz_world": anchor_xz.detach().clone(),
@@ -256,7 +252,9 @@ class RefinerSampleBuilder:
         anchor_xz: torch.Tensor,
         anchor_yaw: torch.Tensor,
     ):
-        target_world = motion_7d_world[anchor_frame : anchor_frame + target_frame_count]
+        target_world = motion_7d_world[
+            anchor_frame + 1 : anchor_frame + 1 + target_frame_count
+        ]
         target_local = canonicalize_7d(target_world, anchor_xz, anchor_yaw)
         target_waypoints = _pad_or_truncate(target_local, self.max_frames)
         target_waypoints_physical = target_waypoints.clone()

@@ -1,8 +1,8 @@
 """Unit tests for eval/root_refiner_benchmark.py (T_A_10).
 
-Smoke / metric-correctness tests. Done-criteria accuracy thresholds
-(num_token top-1 > 0.5, heading < 30°) require a trained ckpt (T_A_09) and are
-NOT asserted here — random weights make those numbers meaningless. We only
+Smoke / metric-correctness tests. Done-criteria quality thresholds require a
+trained ckpt (T_A_09) and are NOT asserted here — random weights make those
+numbers meaningless. We only
 verify the pipeline runs end-to-end with finite metrics + JSON/CSV output, and
 that the metric math is correct on hand-built predictions.
 """
@@ -145,9 +145,8 @@ def _tiny_lightning_cfg():
                 "n_layers": 2,
                 "n_heads": 4,
                 "ff_dim": 64,
-                "max_tokens": 8,
-                "min_tokens": 2,
-                "frames_per_token": 4,
+                "max_frames": 29,
+                "min_frames": 5,
                 "n_path": 16,
                 "n_hist": 8,
                 "text_emb_dim": 16,
@@ -170,9 +169,7 @@ def _tiny_lightning_cfg():
         "loss": {"heading_form": "cosine"},
         "loss_weights": {
             "pace": 0.5,
-            "num_token_pace": 0.1,
-            "num_token_cls": 0.2,
-            "num_token_soft_cls": 0.02,
+            "frame_pace": 0.1,
             "xyz": 5.0,
             "heading": 1.0,
             "fwd_delta": 0.5,
@@ -184,30 +181,19 @@ def _tiny_lightning_cfg():
     }
 
 
-def test_load_model_from_ckpt_accepts_legacy_without_pace_duration(tmp_path):
+def test_load_model_from_ckpt_accepts_current_duration_head(tmp_path):
     from train_refiner import RefinerLightningModule
 
     cfg = _tiny_lightning_cfg()
     module = RefinerLightningModule(cfg)
-    state_dict = {
-        key: value
-        for key, value in module.state_dict().items()
-        if not key.startswith(
-            (
-                "refiner.sample_mode_emb.",
-                "refiner.pace_text_proj.",
-                "refiner.pace_feature_proj.",
-                "refiner.pace_head.",
-            )
-        )
-    }
-    ckpt_path = tmp_path / "legacy_no_pace.ckpt"
+    state_dict = module.state_dict()
+    ckpt_path = tmp_path / "current_duration.ckpt"
     torch.save({"hyper_parameters": {"cfg": cfg}, "state_dict": state_dict}, ckpt_path)
 
     refiner, text_encoder, loaded_cfg = _load_model_from_ckpt(str(ckpt_path), "cpu")
 
     assert loaded_cfg == cfg
-    assert getattr(refiner, "use_pace_duration") is False
+    assert hasattr(refiner, "duration_head")
     assert text_encoder is not None
 
 
@@ -228,10 +214,10 @@ def _save_refiner_stats(tmp_path):
 
 def test_run_benchmark_smoke_finite_metrics_and_report(tmp_path):
     clips = [_make_clip(50) for _ in range(6)]
-    ds = make_root_refiner_from_samples(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
+    ds = make_root_refiner_from_samples(clips, n_hist=8, n_path=16, max_frames=29, min_frames=5,
                          full_plan_ratio=1.0, seed=0)
     model = RootRefiner(d_model=32, n_layers=2, n_heads=4, ff_dim=64,
-                         max_tokens=8, min_tokens=2, n_hist=8, n_path=16,
+                         max_frames=29, min_frames=5, n_hist=8, n_path=16,
                          text_emb_dim=16, dropout=0.0, path_features_dim=5)
     text_encoder = FrozenStubTextEncoder(emb_dim=16)
 
@@ -240,18 +226,18 @@ def test_run_benchmark_smoke_finite_metrics_and_report(tmp_path):
 
     # All expected metric keys present.
     expected_keys = {
-        "n_samples", "num_token_top1_accuracy", "num_token_top3_accuracy",
-        "num_token_MAE", "xyz_ADE", "xyz_FDE", "heading_error_deg",
+        "n_samples", "frame_MAE", "frame_acc_pm1", "frame_acc_pm4",
+        "xyz_ADE", "xyz_FDE", "heading_error_deg",
         "fwd_speed_MAE", "lateral_speed_MAE", "yaw_rate_MAE", "smoothness_acc_mean",
     }
     assert expected_keys.issubset(summary.keys())
     assert summary["n_samples"] == 6
 
-    # Accuracy in [0, 1]; errors finite & non-negative (random weights, but
+    # Duration accuracies in [0, 1]; errors finite & non-negative (random weights, but
     # must not be NaN/Inf since inputs are well-formed).
-    assert 0.0 <= summary["num_token_top1_accuracy"] <= 1.0
-    assert 0.0 <= summary["num_token_top3_accuracy"] <= 1.0
-    for k in ("xyz_ADE", "xyz_FDE", "heading_error_deg", "fwd_speed_MAE",
+    assert 0.0 <= summary["frame_acc_pm1"] <= 1.0
+    assert 0.0 <= summary["frame_acc_pm4"] <= 1.0
+    for k in ("frame_MAE", "xyz_ADE", "xyz_FDE", "heading_error_deg", "fwd_speed_MAE",
                "yaw_rate_MAE", "smoothness_acc_mean"):
         assert math.isfinite(summary[k]), f"{k} not finite: {summary[k]}"
         assert summary[k] >= 0.0
@@ -271,8 +257,8 @@ def test_run_benchmark_writes_root_refiner_sample_artifacts(tmp_path):
         clips,
         n_hist=8,
         n_path=16,
-        max_tokens=8,
-        min_tokens=2,
+        max_frames=29,
+        min_frames=5,
         full_plan_ratio=1.0,
         seed=0,
     )
@@ -281,8 +267,8 @@ def test_run_benchmark_writes_root_refiner_sample_artifacts(tmp_path):
         n_layers=2,
         n_heads=4,
         ff_dim=64,
-        max_tokens=8,
-        min_tokens=2,
+        max_frames=29,
+        min_frames=5,
         n_hist=8,
         n_path=16,
         text_emb_dim=16,
@@ -339,8 +325,8 @@ def test_root_refiner_artifact_metadata_includes_raw_id_and_split(tmp_path):
         clips,
         n_hist=8,
         n_path=16,
-        max_tokens=8,
-        min_tokens=2,
+        max_frames=29,
+        min_frames=5,
         full_plan_ratio=1.0,
         seed=0,
     )
@@ -349,8 +335,8 @@ def test_root_refiner_artifact_metadata_includes_raw_id_and_split(tmp_path):
         n_layers=2,
         n_heads=4,
         ff_dim=64,
-        max_tokens=8,
-        min_tokens=2,
+        max_frames=29,
+        min_frames=5,
         n_hist=8,
         n_path=16,
         text_emb_dim=16,
@@ -371,9 +357,9 @@ def test_root_refiner_artifact_metadata_includes_raw_id_and_split(tmp_path):
                 "split_index": 25,
                 "split_file": "test.txt",
                 "mode": "full",
-                "num_tokens": 8,
+                "num_frames": 29,
                 "anchor_frame": 0,
-                "task_key": "000021:full:8:0",
+                "task_key": "000021:full:29:0",
             }
         ],
         artifact_dir=tmp_path / "samples",
@@ -393,7 +379,7 @@ def test_root_refiner_artifact_metadata_includes_raw_id_and_split(tmp_path):
     assert metadata["split_index"] == 0
     assert metadata["split_file"] == "val.txt"
     assert metadata["dataset"] == "HumanML3D"
-    assert metadata["task_key"] == "000021:full:8:0"
+    assert metadata["task_key"] == "000021:full:29:0"
 
 
 def test_root_refiner_artifacts_use_physical_path_and_real_anchor(tmp_path):
@@ -402,8 +388,8 @@ def test_root_refiner_artifacts_use_physical_path_and_real_anchor(tmp_path):
     common = dict(
         n_hist=8,
         n_path=16,
-        max_tokens=8,
-        min_tokens=2,
+        max_frames=29,
+        min_frames=5,
         full_plan_ratio=1.0,
         seed=0,
     )
@@ -413,7 +399,7 @@ def test_root_refiner_artifacts_use_physical_path_and_real_anchor(tmp_path):
         {
             "idx": 0,
             "mode": "full",
-            "num_tokens": 5,
+            "num_frames": 17,
             "anchor_frame": 5,
             "task_key": "sample-anchor-5",
         }
@@ -421,7 +407,7 @@ def test_root_refiner_artifacts_use_physical_path_and_real_anchor(tmp_path):
     raw_sample = ds_raw.get_sample(
         0,
         force_mode="full",
-        force_num_tokens=5,
+        force_num_frames=17,
         force_anchor_frame=5,
         force_path_mode="dense_path",
         force_no_path_aug=True,
@@ -429,7 +415,7 @@ def test_root_refiner_artifacts_use_physical_path_and_real_anchor(tmp_path):
     norm_sample = ds_norm.get_sample(
         0,
         force_mode="full",
-        force_num_tokens=5,
+        force_num_frames=17,
         force_anchor_frame=5,
         force_path_mode="dense_path",
         force_no_path_aug=True,
@@ -439,8 +425,8 @@ def test_root_refiner_artifacts_use_physical_path_and_real_anchor(tmp_path):
         n_layers=2,
         n_heads=4,
         ff_dim=64,
-        max_tokens=8,
-        min_tokens=2,
+        max_frames=29,
+        min_frames=5,
         n_hist=8,
         n_path=16,
         text_emb_dim=16,
@@ -518,22 +504,21 @@ def test_root_refiner_pred_duration_artifact_is_not_clipped_to_gt_mask(tmp_path)
         tmp_path,
         sample=sample,
         sample_id="sample",
-        metrics={"duration_mode": DURATION_PRED, "gt_num_tokens": 2},
+        metrics={"duration_mode": DURATION_PRED, "gt_frames": 5},
         pred_by_duration={
             DURATION_PRED: {
                 "root_7d": pred_root,
                 "mask": pred_mask,
-                "pred_num_tokens": 3,
+                "pred_frames": 9,
             },
             DURATION_GROUNDTRUTH: {
                 "root_7d": gt_root,
                 "mask": gt_mask,
-                "pred_num_tokens": 2,
+                "pred_frames": 5,
             },
         },
         gt_root_7d=gt_root,
         gt_mask=gt_mask,
-        frames_per_token=4,
     )
 
     pred_artifact = np.load(
@@ -552,18 +537,18 @@ def test_root_refiner_pred_duration_artifact_is_not_clipped_to_gt_mask(tmp_path)
 
 
 def test_run_benchmark_oracle_duration_mode():
-    """oracle_duration=True feeds GT num_tokens (teacher-force) so trajectory
-    metrics isolate the waypoint decoder; num_token metrics (argmax) are unchanged."""
+    """oracle_duration=True feeds GT num_frames so trajectory metrics isolate
+    the waypoint decoder."""
     clips = [_make_clip(50) for _ in range(6)]
     model = RootRefiner(d_model=32, n_layers=2, n_heads=4, ff_dim=64,
-                         max_tokens=8, min_tokens=2, n_hist=8, n_path=16,
+                         max_frames=29, min_frames=5, n_hist=8, n_path=16,
                          text_emb_dim=16, dropout=0.0, path_features_dim=5)
     text_encoder = FrozenStubTextEncoder(emb_dim=16)
 
     # A SINGLE shared dataset: run_benchmark calls dataset.reset_rng() at the start
     # so both passes see the identical sample sequence (this also exercises
     # reset_rng — otherwise the RNG would advance and the two runs would diverge).
-    ds = make_root_refiner_from_samples(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
+    ds = make_root_refiner_from_samples(clips, n_hist=8, n_path=16, max_frames=29, min_frames=5,
                          full_plan_ratio=1.0, seed=0)
     normal = run_benchmark(model, ds, text_encoder, device="cpu")["summary"]
     oracle = run_benchmark(model, ds, text_encoder, device="cpu",
@@ -573,19 +558,18 @@ def test_run_benchmark_oracle_duration_mode():
     assert oracle["oracle_duration"] is True
     assert normal["duration_mode"] == "pred_duration"
     assert oracle["duration_mode"] == "groundtruth_duration"
-    # num_token head metrics are argmax-based → independent of the oracle horizon.
-    assert normal["num_token_top1_accuracy"] == oracle["num_token_top1_accuracy"]
-    assert normal["num_token_MAE"] == oracle["num_token_MAE"]
+    assert math.isfinite(normal["frame_MAE"]) and normal["frame_MAE"] >= 0.0
+    assert math.isfinite(oracle["frame_MAE"]) and oracle["frame_MAE"] >= 0.0
     # trajectory metrics finite under the oracle (GT) horizon.
     assert math.isfinite(oracle["xyz_ADE"]) and oracle["xyz_ADE"] >= 0.0
 
 
 def test_run_benchmark_max_samples_limit(tmp_path):
     clips = [_make_clip(50) for _ in range(10)]
-    ds = make_root_refiner_from_samples(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
+    ds = make_root_refiner_from_samples(clips, n_hist=8, n_path=16, max_frames=29, min_frames=5,
                          full_plan_ratio=1.0, seed=0)
     model = RootRefiner(d_model=32, n_layers=2, n_heads=4, ff_dim=64,
-                         max_tokens=8, min_tokens=2, n_hist=8, n_path=16,
+                         max_frames=29, min_frames=5, n_hist=8, n_path=16,
                          text_emb_dim=16, dropout=0.0, path_features_dim=5)
     text_encoder = FrozenStubTextEncoder(emb_dim=16)
     result = run_benchmark(model, ds, text_encoder, device="cpu", max_samples=4)
@@ -637,9 +621,8 @@ def test_build_refiner_dataset_from_config_uses_sampling_config(tmp_path):
             "params": {
                 "n_hist": 8,
                 "n_path": 16,
-                "max_tokens": 8,
-                "min_tokens": 2,
-                "frames_per_token": 4,
+                "max_frames": 29,
+                "min_frames": 5,
             }
         },
         "sampling": {
@@ -666,7 +649,7 @@ def test_build_refiner_dataset_from_config_uses_sampling_config(tmp_path):
     ds = build_refiner_dataset_from_config(cfg, split_file="val.txt", seed=123)
 
     assert ds.full_plan_ratio == 0.25
-    assert ds.num_token_policy == "max"
+    assert ds.horizon_policy == "max"
     assert ds.path_condition_policy == "mixed"
     assert ds.path_condition_ratios == {
         "dense_path": 0.2,
@@ -686,9 +669,8 @@ def test_validate_ckpt_eval_config_compatible_accepts_matching_contract():
             "params": {
                 "n_hist": 8,
                 "n_path": 16,
-                "max_tokens": 8,
-                "min_tokens": 2,
-                "frames_per_token": 4,
+                "max_frames": 29,
+                "min_frames": 5,
             }
         }
     }
@@ -702,9 +684,8 @@ def test_validate_ckpt_eval_config_compatible_rejects_contract_mismatch():
             "params": {
                 "n_hist": 8,
                 "n_path": 16,
-                "max_tokens": 8,
-                "min_tokens": 2,
-                "frames_per_token": 4,
+                "max_frames": 29,
+                "min_frames": 5,
             }
         }
     }
@@ -713,9 +694,8 @@ def test_validate_ckpt_eval_config_compatible_rejects_contract_mismatch():
             "params": {
                 "n_hist": 12,
                 "n_path": 16,
-                "max_tokens": 8,
-                "min_tokens": 2,
-                "frames_per_token": 4,
+                "max_frames": 29,
+                "min_frames": 5,
             }
         }
     }
@@ -730,8 +710,8 @@ def test_build_eval_task_specs_freezes_underlying_tasks_before_path_modes():
         clips,
         n_hist=8,
         n_path=16,
-        max_tokens=8,
-        min_tokens=2,
+        max_frames=29,
+        min_frames=5,
         full_plan_ratio=0.5,
         seed=0,
     )
@@ -741,7 +721,7 @@ def test_build_eval_task_specs_freezes_underlying_tasks_before_path_modes():
     assert len(specs) == 3
     assert [spec["idx"] for spec in specs] == [0, 1, 2]
     assert all("mode" in spec for spec in specs)
-    assert all("num_tokens" in spec for spec in specs)
+    assert all("num_frames" in spec for spec in specs)
     assert all("anchor_frame" in spec for spec in specs)
     assert all("task_key" in spec for spec in specs)
 
@@ -755,8 +735,8 @@ def test_build_full_route_task_specs_selects_raw_id_and_max_horizon():
         clips,
         n_hist=8,
         n_path=16,
-        max_tokens=49,
-        min_tokens=2,
+        max_frames=193,
+        min_frames=5,
         full_plan_ratio=0.0,
         seed=0,
     )
@@ -771,9 +751,9 @@ def test_build_full_route_task_specs_selects_raw_id_and_max_horizon():
                 "split_file": "val.txt",
                 "dataset": "HumanML3D",
             "mode": "full",
-            "num_tokens": 45,
+            "num_frames": 178,
             "anchor_frame": 0,
-            "task_key": "000021:full:45:0",
+            "task_key": "000021:full:178:0",
         }
     ]
 
@@ -786,10 +766,10 @@ def test_cli_full_route_without_suite_forces_dense_path():
 
 def test_run_suite_benchmark_standard_emits_schema_and_path_mode_buckets(tmp_path):
     clips = [_make_clip(50) for _ in range(6)]
-    ds = make_root_refiner_from_samples(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
+    ds = make_root_refiner_from_samples(clips, n_hist=8, n_path=16, max_frames=29, min_frames=5,
                          full_plan_ratio=1.0, seed=0)
     model = RootRefiner(d_model=32, n_layers=2, n_heads=4, ff_dim=64,
-                         max_tokens=8, min_tokens=2, n_hist=8, n_path=16,
+                         max_frames=29, min_frames=5, n_hist=8, n_path=16,
                          text_emb_dim=16, dropout=0.0, path_features_dim=5)
     text_encoder = FrozenStubTextEncoder(emb_dim=16)
 
@@ -834,10 +814,10 @@ def test_run_suite_benchmark_standard_emits_schema_and_path_mode_buckets(tmp_pat
 
 def test_run_suite_benchmark_oracle_suite_marks_duration_mode():
     clips = [_make_clip(50) for _ in range(6)]
-    ds = make_root_refiner_from_samples(clips, n_hist=8, n_path=16, max_tokens=8, min_tokens=2,
+    ds = make_root_refiner_from_samples(clips, n_hist=8, n_path=16, max_frames=29, min_frames=5,
                          full_plan_ratio=1.0, seed=0)
     model = RootRefiner(d_model=32, n_layers=2, n_heads=4, ff_dim=64,
-                         max_tokens=8, min_tokens=2, n_hist=8, n_path=16,
+                         max_frames=29, min_frames=5, n_hist=8, n_path=16,
                          text_emb_dim=16, dropout=0.0, path_features_dim=5)
     text_encoder = FrozenStubTextEncoder(emb_dim=16)
 

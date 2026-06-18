@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-import pytest
 import torch
 
 from utils.training.root_refiner.losses import (
     dense_path_control_loss,
     goal_point_control_loss,
     masked_mean,
-    ordinal_duration_loss,
     second_order_diff_l2,
-    soft_ordinal_targets,
     sparse_path_control_loss,
     smooth_l1_masked,
 )
@@ -62,52 +59,6 @@ def test_second_order_diff_l2_nonzero_on_curved():
     mask = torch.ones(batch, frames, dtype=torch.bool)
 
     assert abs(second_order_diff_l2(curve, mask).item() - 4.0) < 1e-5
-
-
-def test_soft_ordinal_targets_peak_at_target_and_decay_with_distance():
-    target = torch.tensor([3])
-    soft = soft_ordinal_targets(target, num_classes=7, sigma=1.0)
-
-    assert soft.shape == (1, 7)
-    assert torch.allclose(soft.sum(dim=-1), torch.ones(1))
-    assert soft[0].argmax().item() == 3
-    assert soft[0, 2] > soft[0, 0]
-
-
-def test_ordinal_duration_loss_zero_expected_when_distribution_matches_target():
-    logits = torch.full((1, 5), -20.0)
-    logits[0, 2] = 20.0
-    target_num_tokens = torch.tensor([4])
-
-    losses = ordinal_duration_loss(
-        logits,
-        target_num_tokens,
-        min_tokens=2,
-        sigma=1.0,
-    )
-
-    assert losses["expected"].item() < 1e-5
-    assert torch.allclose(losses["expected_num_tokens"], torch.tensor([4.0]), atol=1e-4)
-
-
-def test_ordinal_duration_loss_raises_on_out_of_range_target():
-    """Out-of-range num_tokens must fail loudly (R2.6 keeps the loud-failure
-    invariant the old hard F.cross_entropy gave) — not silently leak Gaussian
-    mass onto wrong in-range classes."""
-    logits = torch.zeros(1, 5)
-    # min_tokens=2, K=5 → valid num_tokens ∈ [2, 6]. 7 is out of range.
-    for bad in (torch.tensor([7]), torch.tensor([1])):
-        with pytest.raises(ValueError, match="out of range"):
-            ordinal_duration_loss(logits, bad, min_tokens=2, sigma=1.0)
-
-
-def test_ordinal_duration_loss_rejects_nonpositive_sigma():
-    """sigma<=0 would divide by zero in the Gaussian → NaN loss; reject it."""
-    logits = torch.zeros(1, 5)
-    target = torch.tensor([4])
-    for bad_sigma in (0.0, -1.0):
-        with pytest.raises(ValueError, match="sigma"):
-            ordinal_duration_loss(logits, target, min_tokens=2, sigma=bad_sigma)
 
 
 def test_dense_path_control_loss_aligns_offset_window_start_to_path_start():

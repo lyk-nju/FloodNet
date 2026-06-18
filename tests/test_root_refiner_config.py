@@ -94,9 +94,8 @@ def test_model_block_required_keys_and_values():
         "n_heads": 8,
         "ff_dim": 1024,
         "dropout": 0.1,
-        "max_tokens": 49,
-        "min_tokens": 4,
-        "frames_per_token": 4,
+        "max_frames": 193,
+        "min_frames": 13,
         "n_path": 64,
         "n_hist": 20,
         "text_emb_dim": 512,
@@ -136,9 +135,7 @@ def test_loss_and_loss_weights():
     weights = cfg["loss_weights"]
     expected_w = {
         "pace": 0.5,
-        "num_token_pace": 0.1,
-        "num_token_cls": 0.2,
-        "num_token_soft_cls": 0.02,
+        "frame_pace": 0.1,
         "xyz": 5.0,
         "heading": 1.0,
         "fwd_delta": 0.5,

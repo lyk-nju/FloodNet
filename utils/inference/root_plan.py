@@ -29,14 +29,13 @@ from torch import Tensor
 class RootPlan:
     """Refiner output in **plan-anchor-local frame** (B-full convention).
 
-    A single plan can span multiple body windows; runtime stores only the
-    `valid_frames = num_frames_for_tokens(num_tokens_pred)` prefix of
-    waypoints (padding beyond that is irrelevant since `slice_plan_with_mask`
-    treats it as overflow + mask=0).
+    A single plan can span multiple body windows. `valid_frames` is the real
+    plan length in frame units; `num_tokens_pred` is only the LDF/VAE backend
+    allocation derived from that frame length.
     """
 
-    num_tokens_pred: int                   # token-level duration (includes anchor token)
-    valid_frames: int                      # = num_frames_for_tokens(num_tokens_pred) = 4N-3 (N>=1)
+    num_tokens_pred: int                   # LDF token allocation derived from valid_frames
+    valid_frames: int                      # real plan length in frames, including anchor
     waypoints_local_7d: Tensor             # [valid_frames, 7] plan-anchor-local
 
     frame_dt: float                        # = 1 / fps

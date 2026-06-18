@@ -21,15 +21,18 @@ class _FakeRefiner(nn.Module):
         self.n_path = 4
         self.frames_per_token = 4
         self.max_tokens = 5
-        self.max_frames = num_frames_for_tokens(self.max_tokens, self.frames_per_token)
+        self.max_frames = num_frames_for_tokens(self.max_tokens, self.frames_per_token) - 1
         self.calls = []
 
     def forward(self, **kwargs):
         self.calls.append(kwargs)
-        used_num_tokens = (
-            kwargs["num_tokens"].to(device=kwargs["path"].device, dtype=torch.long)
-            if kwargs.get("num_tokens") is not None
-            else torch.tensor([3], device=kwargs["path"].device)
+        used_frames = (
+            kwargs["num_frames"].to(device=kwargs["path"].device, dtype=torch.long)
+            if kwargs.get("num_frames") is not None
+            else torch.tensor(
+                [num_frames_for_tokens(3, self.frames_per_token) - 1],
+                device=kwargs["path"].device,
+            )
         )
         waypoints = torch.zeros(1, self.max_frames, 5, device=kwargs["path"].device)
         waypoints[0, :, 2] = torch.arange(
@@ -37,7 +40,7 @@ class _FakeRefiner(nn.Module):
         )
         waypoints[0, :, 3] = 1.0
         return {
-            "used_num_tokens": used_num_tokens,
+            "used_frames": used_frames,
             "waypoints": waypoints,
         }
 
@@ -215,4 +218,4 @@ def test_root_refiner_runtime_can_force_gt_num_tokens():
     assert root_plan.source == "root_refiner_gtnum"
     assert root_plan.num_tokens_pred == 5
     assert root_plan.valid_frames == num_frames_for_tokens(5, 4)
-    assert torch.equal(refiner.calls[0]["num_tokens"], torch.tensor([5]))
+    assert torch.equal(refiner.calls[0]["num_frames"], torch.tensor([16]))

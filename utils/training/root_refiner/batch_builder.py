@@ -7,7 +7,6 @@ import torch
 from pathlib import Path
 from typing import Any
 from torch.utils.data import Dataset
-from utils.token_frame import num_frames_for_tokens
 from utils.training.root_refiner.sample_builder import RefinerSampleBuilder
 from utils.training.root_refiner.sample_creator import RefinerSampleCreator
 
@@ -20,12 +19,10 @@ class RootRefinerBatchBuilder:
         *,
         n_hist: int = 20,
         n_path: int = 64,
-        max_tokens: int = 49,
-        min_tokens: int = 4,
-        frames_per_token: int = 4,
+        max_frames: int = 193,
+        min_frames: int = 13,
         full_plan_ratio: float = 0.5,
-        num_token_policy: str = "random",
-        horizon_policy: str | None = None,
+        horizon_policy: str = "random",
         path_condition_policy: str = "dense_path",
         path_condition_ratios: dict[str, float] | None = None,
         offset_start_enabled: bool = False,
@@ -45,13 +42,10 @@ class RootRefinerBatchBuilder:
     ):
         self.n_hist = int(n_hist)
         self.n_path = int(n_path)
-        self.max_tokens = int(max_tokens)
-        self.min_tokens = int(min_tokens)
-        self.frames_per_token = int(frames_per_token)
+        self.max_frames_value = int(max_frames)
+        self.min_frames = int(min_frames)
         self.full_plan_ratio = float(full_plan_ratio)
-        self.num_token_policy = str(
-            num_token_policy if horizon_policy is None else horizon_policy
-        )
+        self.horizon_policy = str(horizon_policy)
         self.path_condition_policy = str(path_condition_policy)
         self.path_condition_ratios = path_condition_ratios
         self.offset_start_enabled = bool(offset_start_enabled)
@@ -66,11 +60,10 @@ class RootRefinerBatchBuilder:
 
         self.sample_creator = RefinerSampleCreator(
             n_hist=self.n_hist,
-            max_tokens=self.max_tokens,
-            min_tokens=self.min_tokens,
-            frames_per_token=self.frames_per_token,
+            max_frames=self.max_frames_value,
+            min_frames=self.min_frames,
             full_plan_ratio=self.full_plan_ratio,
-            num_token_policy=self.num_token_policy,
+            horizon_policy=self.horizon_policy,
             path_condition_policy=self.path_condition_policy,
             path_condition_ratios=self.path_condition_ratios,
             offset_start_enabled=self.offset_start_enabled,
@@ -82,9 +75,8 @@ class RootRefinerBatchBuilder:
         self.sample_builder = RefinerSampleBuilder(
             n_hist=self.n_hist,
             n_path=self.n_path,
-            max_tokens=self.max_tokens,
-            min_tokens=self.min_tokens,
-            frames_per_token=self.frames_per_token,
+            max_frames=self.max_frames_value,
+            min_frames=self.min_frames,
             normalize=self.normalize,
             stats_dir=stats_dir if self.normalize else None,
             sparse_path_point_range=self.sparse_path_point_range,
@@ -96,7 +88,7 @@ class RootRefinerBatchBuilder:
 
     @property
     def max_frames(self) -> int:
-        return num_frames_for_tokens(self.max_tokens, self.frames_per_token)
+        return self.max_frames_value
 
     def reset_rng(self) -> None:
         self._rng = random_module.Random(self._seed)
@@ -117,7 +109,7 @@ class RootRefinerBatchBuilder:
         *,
         index: int = 0,
         force_mode: str | None = None,
-        force_num_tokens: int | None = None,
+        force_num_frames: int | None = None,
         force_anchor_frame: int | None = None,
         force_path_mode: str | None = None,
         force_no_path_aug: bool = False,
@@ -128,7 +120,7 @@ class RootRefinerBatchBuilder:
         plan = self.sample_creator.create(
             torch.tensor([int(motion.shape[0])], dtype=torch.long),
             force_mode=force_mode,
-            force_num_tokens=force_num_tokens,
+            force_num_frames=force_num_frames,
             force_anchor_frame=force_anchor_frame,
             force_path_mode=force_path_mode,
             force_no_path_aug=force_no_path_aug,
@@ -198,11 +190,10 @@ class RootRefinerDataset(Dataset):
         self.batch_builder = RootRefinerBatchBuilder(**builder_kwargs)
         self.n_hist = self.batch_builder.n_hist
         self.n_path = self.batch_builder.n_path
-        self.max_tokens = self.batch_builder.max_tokens
-        self.min_tokens = self.batch_builder.min_tokens
-        self.frames_per_token = self.batch_builder.frames_per_token
+        self.max_frames_value = self.batch_builder.max_frames
+        self.min_frames = self.batch_builder.min_frames
         self.full_plan_ratio = self.batch_builder.full_plan_ratio
-        self.num_token_policy = self.batch_builder.num_token_policy
+        self.horizon_policy = self.batch_builder.horizon_policy
         self.path_condition_policy = self.batch_builder.path_condition_policy
         self.path_condition_ratios = self.batch_builder.path_condition_ratios
         self.offset_start_enabled = self.batch_builder.offset_start_enabled
@@ -216,8 +207,8 @@ class RootRefinerDataset(Dataset):
         self._sample_lengths = [
             self._effective_motion_length(i) for i in range(len(raw_dataset))
         ]
-        min_full = num_frames_for_tokens(self.min_tokens, self.frames_per_token)
-        min_sliding = (self.n_hist - 1) + min_full
+        min_full = self.min_frames + 1
+        min_sliding = self.n_hist + self.min_frames
         self.full_eligible_indices = [
             i for i, length in enumerate(self._sample_lengths) if length >= min_full
         ]
@@ -241,7 +232,7 @@ class RootRefinerDataset(Dataset):
         idx_in_valid: int,
         *,
         force_mode: str | None = None,
-        force_num_tokens: int | None = None,
+        force_num_frames: int | None = None,
         force_anchor_frame: int | None = None,
         force_path_mode: str | None = None,
         force_no_path_aug: bool = False,
@@ -250,7 +241,7 @@ class RootRefinerDataset(Dataset):
         return self._process(
             self.valid_indices[int(idx_in_valid)],
             force_mode=force_mode,
-            force_num_tokens=force_num_tokens,
+            force_num_frames=force_num_frames,
             force_anchor_frame=force_anchor_frame,
             force_path_mode=force_path_mode,
             force_no_path_aug=force_no_path_aug,
@@ -268,7 +259,7 @@ class RootRefinerDataset(Dataset):
         raw_idx: int,
         *,
         force_mode: str | None = None,
-        force_num_tokens: int | None = None,
+        force_num_frames: int | None = None,
         force_anchor_frame: int | None = None,
         force_path_mode: str | None = None,
         force_no_path_aug: bool = False,
@@ -285,7 +276,7 @@ class RootRefinerDataset(Dataset):
             raw_sample,
             index=int(raw_idx),
             force_mode=force_mode,
-            force_num_tokens=force_num_tokens,
+            force_num_frames=force_num_frames,
             force_anchor_frame=force_anchor_frame,
             force_path_mode=force_path_mode,
             force_no_path_aug=force_no_path_aug,
@@ -345,7 +336,7 @@ def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "waypoints_mask",
         "path_supervision_mask",
         "offset_start_frames",
-        "num_tokens",
+        "num_frames",
     ):
         out[key] = torch.stack([sample[key] for sample in batch])
     if "waypoints_physical" in batch[0]:

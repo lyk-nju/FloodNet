@@ -36,9 +36,8 @@ def _sampling_relevant_config(cfg: dict[str, Any]) -> dict[str, Any]:
     return {
         "model": {
             "n_path": model.get("n_path"),
-            "min_tokens": model.get("min_tokens"),
-            "max_tokens": model.get("max_tokens"),
-            "frames_per_token": model.get("frames_per_token"),
+            "min_frames": model.get("min_frames"),
+            "max_frames": model.get("max_frames"),
         },
         "sampling": cfg.get("sampling", {}) or {},
         "data": {

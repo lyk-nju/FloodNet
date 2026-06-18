@@ -13,7 +13,6 @@ import torch
 
 from dataclasses import dataclass
 from typing import Iterable
-from utils.token_frame import num_frames_for_tokens
 
 
 _PATH_MODES = ("dense_path", "sparse_path", "goal_point")
@@ -29,7 +28,6 @@ class RefinerSample:
     valid_history_frames: torch.Tensor
     history_frame_indices: torch.Tensor
     history_mask: torch.Tensor
-    num_tokens: torch.Tensor
     target_frame_counts: torch.Tensor
     path_modes: list[str]
     offset_start_frames: torch.Tensor
@@ -42,12 +40,10 @@ class RefinerSampleCreator:
         self,
         *,
         n_hist: int = 20,
-        max_tokens: int = 49,
-        min_tokens: int = 4,
-        frames_per_token: int = 4,
+        max_frames: int = 193,
+        min_frames: int = 13,
         full_plan_ratio: float = 0.5,
-        num_token_policy: str = "random",
-        horizon_policy: str | None = None,
+        horizon_policy: str = "random",
         path_condition_policy: str = "dense_path",
         path_condition_ratios: dict[str, float] | None = None,
         offset_start_enabled: bool = False,
@@ -60,13 +56,10 @@ class RefinerSampleCreator:
         seed: int | None = None,
     ):
         self.n_hist = int(n_hist)
-        self.max_tokens = int(max_tokens)
-        self.min_tokens = int(min_tokens)
-        self.frames_per_token = int(frames_per_token)
+        self.max_frames = int(max_frames)
+        self.min_frames = int(min_frames)
         self.full_plan_ratio = float(full_plan_ratio)
-        self.num_token_policy = str(
-            num_token_policy if horizon_policy is None else horizon_policy
-        )
+        self.horizon_policy = str(horizon_policy)
         self.path_condition_policy = str(path_condition_policy)
         self.path_condition_ratios = dict(
             path_condition_ratios or _DEFAULT_PATH_RATIOS
@@ -93,7 +86,7 @@ class RefinerSampleCreator:
         motion_lengths,
         *,
         force_mode: str | Iterable[str] | None = None,
-        force_num_tokens=None,
+        force_num_frames=None,
         force_anchor_frame=None,
         force_path_mode: str | Iterable[str] | None = None,
         force_no_path_aug: bool = False,
@@ -112,12 +105,12 @@ class RefinerSampleCreator:
             raise ValueError("motion_lengths must contain at least one sample")
         if self.n_hist <= 0:
             raise ValueError(f"n_hist must be > 0, got {self.n_hist}")
-        if self.min_tokens <= 0:
-            raise ValueError(f"min_tokens must be > 0, got {self.min_tokens}")
-        if self.max_tokens < self.min_tokens:
+        if self.min_frames <= 0:
+            raise ValueError(f"min_frames must be > 0, got {self.min_frames}")
+        if self.max_frames < self.min_frames:
             raise ValueError(
-                f"max_tokens must be >= min_tokens; got "
-                f"max_tokens={self.max_tokens}, min_tokens={self.min_tokens}"
+                f"max_frames must be >= min_frames; got "
+                f"max_frames={self.max_frames}, min_frames={self.min_frames}"
             )
 
         ##############################
@@ -129,12 +122,12 @@ class RefinerSampleCreator:
         force_path_modes = _to_str_batch(
             force_path_mode, batch_size=batch_size, name="force_path_mode",
         )
-        forced_tokens = (
-            None if force_num_tokens is None else _to_long_batch(
-                force_num_tokens,
+        forced_frames = (
+            None if force_num_frames is None else _to_long_batch(
+                force_num_frames,
                 batch_size=batch_size,
                 device=device,
-                name="force_num_tokens",
+                name="force_num_frames",
             )
         )
         forced_anchors = (
@@ -159,14 +152,14 @@ class RefinerSampleCreator:
         history_mask = torch.zeros(
             batch_size, self.n_hist, device=device, dtype=torch.bool,
         )
-        num_tokens = torch.zeros(batch_size, device=device, dtype=torch.long)
+        target_frame_counts = torch.zeros(batch_size, device=device, dtype=torch.long)
 
-        min_full = num_frames_for_tokens(self.min_tokens, self.frames_per_token)
-        min_sliding = (self.n_hist - 1) + min_full
-        if bool((lengths < min_full).any()):
+        min_full_length = self.min_frames + 1
+        min_sliding = self.n_hist + self.min_frames
+        if bool((lengths < min_full_length).any()):
             raise ValueError(
-                "motion length is too short for min_tokens; "
-                f"motion_lengths={lengths.tolist()}, min_required_frames={min_full}"
+                "motion length is too short for min_frames; "
+                f"motion_lengths={lengths.tolist()}, min_required_frames={min_full_length}"
             )
 
         ##############################
@@ -182,27 +175,23 @@ class RefinerSampleCreator:
             anchor = self._sample_anchor(
                 T,
                 mode=mode,
-                min_full=min_full,
+                min_future_frames=self.min_frames,
                 forced_anchor=(
                     None
                     if forced_anchors is None
                     else int(forced_anchors[b].item())
                 ),
             )
-            max_valid_tokens = min(
-                self.max_tokens,
-                self._max_tokens_in_frames(T - anchor),
-            )
-            tokens = self._sample_num_tokens(
-                max_valid_tokens,
-                forced_tokens=(
+            max_valid_frames = min(self.max_frames, T - anchor - 1)
+            target_frames = self._sample_num_frames(
+                max_valid_frames,
+                forced_frames=(
                     None
-                    if forced_tokens is None
-                    else int(forced_tokens[b].item())
+                    if forced_frames is None
+                    else int(forced_frames[b].item())
                 ),
             )
-            target_frames = num_frames_for_tokens(tokens, self.frames_per_token)
-            if anchor + target_frames > T:
+            if anchor + 1 + target_frames > T:
                 raise ValueError(
                     "sampled target window exceeds motion length; "
                     f"sample={b}, anchor_frame={anchor}, "
@@ -210,7 +199,7 @@ class RefinerSampleCreator:
                 )
 
             anchor_frames[b] = anchor
-            num_tokens[b] = tokens
+            target_frame_counts[b] = target_frames
             modes.append(mode)
             if mode == "full":
                 valid_history_frames[b] = 1
@@ -237,9 +226,6 @@ class RefinerSampleCreator:
         ##############################
         # path augmentation
         ##############################
-        target_frame_counts = _frames_from_tokens(
-            num_tokens, frames_per_token=self.frames_per_token,
-        )
         offset_start_frames = self._sample_offset_start_frames(
             target_frame_counts,
             path_modes,
@@ -251,7 +237,6 @@ class RefinerSampleCreator:
             valid_history_frames=valid_history_frames,
             history_frame_indices=history_frame_indices,
             history_mask=history_mask,
-            num_tokens=num_tokens,
             target_frame_counts=target_frame_counts,
             path_modes=path_modes,
             offset_start_frames=offset_start_frames,
@@ -281,14 +266,14 @@ class RefinerSampleCreator:
         motion_length: int,
         *,
         mode: str,
-        min_full: int,
+        min_future_frames: int,
         forced_anchor: int | None,
     ) -> int:
         if mode == "full":
             anchor = 0 if forced_anchor is None else int(forced_anchor)
         else:
             lo = self.n_hist - 1
-            hi = motion_length - min_full
+            hi = motion_length - int(min_future_frames) - 1
             if hi < lo:
                 raise ValueError(
                     "sliding anchor range invalid; "
@@ -308,34 +293,34 @@ class RefinerSampleCreator:
             )
         return anchor
 
-    def _sample_num_tokens(
+    def _sample_num_frames(
         self,
-        max_valid_tokens: int,
+        max_valid_frames: int,
         *,
-        forced_tokens: int | None,
+        forced_frames: int | None,
     ) -> int:
-        if max_valid_tokens < self.min_tokens:
+        if max_valid_frames < self.min_frames:
             raise ValueError(
-                "not enough frames for min_tokens after anchor; "
-                f"max_valid_tokens={max_valid_tokens}, min_tokens={self.min_tokens}"
+                "not enough future frames for min_frames after anchor; "
+                f"max_valid_frames={max_valid_frames}, min_frames={self.min_frames}"
             )
-        if forced_tokens is not None:
-            tokens = int(forced_tokens)
-            if tokens < self.min_tokens or tokens > max_valid_tokens:
+        if forced_frames is not None:
+            frames = int(forced_frames)
+            if frames < self.min_frames or frames > max_valid_frames:
                 raise ValueError(
-                    "force_num_tokens must be within the valid horizon range; "
-                    f"got {tokens}, valid=[{self.min_tokens}, {max_valid_tokens}]"
+                    "force_num_frames must be within the valid horizon range; "
+                    f"got {frames}, valid=[{self.min_frames}, {max_valid_frames}]"
                 )
-        elif self.num_token_policy == "max":
-            tokens = max_valid_tokens
-        elif self.num_token_policy == "random":
-            tokens = self._rng.randint(self.min_tokens, max_valid_tokens)
+        elif self.horizon_policy == "max":
+            frames = max_valid_frames
+        elif self.horizon_policy == "random":
+            frames = self._rng.randint(self.min_frames, max_valid_frames)
         else:
             raise ValueError(
-                "num_token_policy must be 'random' or 'max', "
-                f"got {self.num_token_policy!r}"
+                "horizon_policy must be 'random' or 'max', "
+                f"got {self.horizon_policy!r}"
             )
-        return tokens
+        return frames
 
     def _sample_path_mode(self) -> str:
         policy = self.path_condition_policy
@@ -391,14 +376,6 @@ class RefinerSampleCreator:
             )
         return offsets
 
-    def _max_tokens_in_frames(self, remaining_frames: int) -> int:
-        if remaining_frames <= 0:
-            return 0
-        return (
-            remaining_frames + self.frames_per_token - 1
-        ) // self.frames_per_token
-
-
 def _to_long_batch(value, *, batch_size: int, device, name: str) -> torch.Tensor:
     if torch.is_tensor(value):
         out = value.to(device=device, dtype=torch.long).view(-1)
@@ -429,18 +406,5 @@ def _to_str_batch(
     if len(out) != batch_size:
         raise ValueError(f"{name} must be scalar or length {batch_size}; got {out!r}")
     return out
-
-
-def _frames_from_tokens(
-    tokens: torch.Tensor,
-    *,
-    frames_per_token: int,
-) -> torch.Tensor:
-    values = [
-        num_frames_for_tokens(int(v.item()), frames_per_token)
-        for v in tokens.view(-1)
-    ]
-    return torch.as_tensor(values, device=tokens.device, dtype=torch.long).view_as(tokens)
-
 
 __all__ = ["RefinerSample", "RefinerSampleCreator"]

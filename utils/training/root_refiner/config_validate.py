@@ -62,18 +62,28 @@ def validate_refiner_config(cfg: Mapping) -> None:
             "sampling.path_condition.sparse_path instead."
         )
 
-    min_tokens = int(model.get("min_tokens", 1))
-    max_tokens = int(model.get("max_tokens", min_tokens))
-    if min_tokens < 1 or max_tokens < min_tokens:
+    min_frames = int(model.get("min_frames", 1))
+    max_frames = int(model.get("max_frames", min_frames))
+    if min_frames < 1 or max_frames < min_frames:
         raise ValueError(
-            "RootRefiner token range invalid: "
-            f"min_tokens={min_tokens}, max_tokens={max_tokens}."
+            "RootRefiner frame range invalid: "
+            f"min_frames={min_frames}, max_frames={max_frames}."
         )
-
-    frames_per_token = int(model.get("frames_per_token", 4))
-    if frames_per_token <= 0:
+    legacy_model_keys = {
+        "min_tokens",
+        "max_tokens",
+        "frames_per_token",
+        "n_layers_token",
+        "decoder_type",
+        "decoder_path_cond_dim",
+        "decoder_token_res_depth",
+        "decoder_frame_res_depth",
+    }
+    legacy_present = sorted(set(model) & legacy_model_keys)
+    if legacy_present:
         raise ValueError(
-            f"model.frames_per_token must be positive, got {frames_per_token}."
+            "RootRefiner model.params contains legacy token/decoder key(s) "
+            f"{legacy_present}; use frame-space RootRefiner v2 keys instead."
         )
 
     policy = str(sampling.get("horizon_policy", "random"))

@@ -193,9 +193,8 @@ def build_stats_dataset(
             "params": {
                 "n_hist": 20,
                 "n_path": 64,
-                "max_tokens": 49,
-                "min_tokens": 4,
-                "frames_per_token": 4,
+                "max_frames": 193,
+                "min_frames": 13,
             },
         },
         "sampling": {
