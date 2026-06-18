@@ -1215,7 +1215,7 @@ class ModelManager(WebRuntime):
         print(f"Model reset - history: {self.history_length}, smoothing: {self.smoothing_alpha}, steps: {self.denoise_steps}")
         return True
     
-    def _generation_loop(self):
+    def _generation_loop(self, stop_event=None):
         """Background loop: each iteration produces one latent token (→ 4 motion frames).
 
         When trajectory control is active, each step passes a future token-horizon in
@@ -1229,7 +1229,9 @@ class ModelManager(WebRuntime):
         total_gen_time = 0
         
         with torch.no_grad():
-            while not self.should_stop:
+            while not self.should_stop and not (
+                stop_event is not None and stop_event.is_set()
+            ):
                 # Check if buffer needs more frames
                 if self.frame_buffer.needs_generation():
                     try:

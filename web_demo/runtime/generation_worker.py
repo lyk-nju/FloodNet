@@ -11,20 +11,28 @@ class GenerationWorker:
     def __init__(self, target):
         self.target = target
         self.thread: threading.Thread | None = None
+        self.stop_event = threading.Event()
+        self._lock = threading.Lock()
 
     def start(self):
-        if self.is_running:
+        with self._lock:
+            if self.is_running:
+                return self.thread
+            self.stop_event.clear()
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
             return self.thread
-        self.thread = threading.Thread(target=self.target)
-        self.thread.daemon = True
-        self.thread.start()
-        return self.thread
+
+    def _run(self):
+        self.target(self.stop_event)
 
     def stop(self, timeout: float = 5.0) -> bool:
-        if self.thread is None:
+        self.stop_event.set()
+        thread = self.thread
+        if thread is None:
             return True
-        self.thread.join(timeout=timeout)
-        return not self.thread.is_alive()
+        thread.join(timeout=timeout)
+        return not thread.is_alive()
 
     @property
     def is_running(self) -> bool:
