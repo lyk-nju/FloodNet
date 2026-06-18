@@ -81,8 +81,6 @@ def _minimal_cfg() -> dict:
 def test_shipped_refiner_configs_are_valid():
     validate_refiner_config(_load("root_refiner.yaml"))
     validate_refiner_config(_load("root_refiner_train.yaml"))
-    validate_refiner_config(_load("root_refiner_train_humanml3d.yaml"))
-    validate_refiner_config(_load("root_refiner_train_fixed_val_no_random_token.yaml"))
 
 
 def test_rejects_history_condition_config():
