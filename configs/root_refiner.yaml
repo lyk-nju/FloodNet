@@ -1,13 +1,3 @@
-# RootRefiner debug/smoke config.
-#
-# This config is intentionally cheap: debug_stub=true.
-# Use configs/root_refiner_train.yaml for semantic T5 embeddings.
-#
-# Hard constraints (do NOT silently drift):
-#   - canonicalization.mode = b_full + anchor = first_effective_frame
-#   - canonicalization.full_plan_valid_history_frames = 1
-#   - loss_weights uses `fwd_delta` / `yaw_delta` (per-frame deltas, NOT m/s).
-
 exp_name: root_refiner_debug
 seed: 1234                    # torch + dataset-aug RNG seed (pl.seed_everything)
 debug: true                   # true → wandb OFF (smoke); set false for real wandb

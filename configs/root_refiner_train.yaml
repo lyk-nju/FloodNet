@@ -3,7 +3,7 @@ seed: 1234
 debug: false
 train: true
 deterministic: false
-save_dir: ./outputs
+save_dir: /data1/yuankai/text2Motion/FloodDiffusion/outputs
 resume_ckpt:
 
 logger:
@@ -16,7 +16,7 @@ logger:
 trainer:
   max_steps: 200000
   accelerator: auto
-  devices: [2, 3]
+  devices: [0, 2]
   log_every_n_steps: 50
   precision: bf16-mixed
   gradient_clip_val: 1.0
@@ -116,7 +116,7 @@ loss:
 
 loss_weights:
   pace: 1.0
-  frame_pace: 0.1
+  frame_pace: 0.03
 
   xyz: 5.0
   heading: 1.0
@@ -149,7 +149,7 @@ data:
   text_path: texts
 
 sampling:
-  full_plan_ratio: 0.3
+  full_plan_ratio: 0.7
   horizon_policy: random
 
   path_condition:
