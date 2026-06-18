@@ -26,6 +26,18 @@ def test_web_demo_layered_runtime_import_contract():
     assert ModelManager is not None
     assert get_model_manager is not None
     assert GenerationState.IDLE.value == "idle"
+    route_rules = {str(rule) for rule in web_demo.app.app.url_map.iter_rules()}
+    assert {
+        "/",
+        "/api/start",
+        "/api/update_text",
+        "/api/update_trajectory",
+        "/api/pause",
+        "/api/resume",
+        "/api/reset",
+        "/api/get_frame",
+        "/api/status",
+    }.issubset(route_rules)
     for module_name in (
         "web_demo.config",
         "web_demo.bootstrap",
