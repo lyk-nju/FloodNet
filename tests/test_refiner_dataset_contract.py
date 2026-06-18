@@ -21,7 +21,6 @@ def test_root_refiner_sample_contract_has_new_keys_and_shapes():
         n_path=16,
         min_frames=5,
         max_frames=29,
-        normalize=False,
         seed=0,
     )
     sample = ds.get_sample(
@@ -69,7 +68,6 @@ def test_collate_fn_stacks_new_tensor_keys_and_keeps_modes_as_list():
         n_path=16,
         min_frames=5,
         max_frames=29,
-        normalize=False,
         seed=0,
     )
     samples = [

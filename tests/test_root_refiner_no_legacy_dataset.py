@@ -15,7 +15,6 @@ def test_root_refiner_code_has_no_legacy_dataset_imports():
     )
     checked_roots = [
         _ROOT / "train_refiner.py",
-        _ROOT / "scripts" / "compute_5d_stats.py",
         _ROOT / "eval" / "root_refiner" / "benchmark.py",
         _ROOT / "utils" / "training" / "root_refiner",
     ]
@@ -34,15 +33,37 @@ def test_legacy_refiner_dataset_file_removed():
     assert not (_ROOT / "datasets" / ("humanml3d" "_refiner.py")).exists()
 
 
+def test_legacy_refiner_stats_tools_removed():
+    assert not (_ROOT / "scripts" / "compute_5d_stats.py").exists()
+    assert not (_ROOT / "scripts" / "compute_path_stats.py").exists()
+    assert not (_ROOT / "utils" / "training" / "root_refiner" / "path_feature_stats.py").exists()
+
+
 def test_train_refiner_rejects_legacy_dataset_target(tmp_path):
     from tests.helpers.humanml3d_fixture import write_humanml3d_fixture
     from train_refiner import build_datasets
-    from tests.test_train_refiner import _tiny_cfg
 
     write_humanml3d_fixture(tmp_path, [{"name": "s1"}])
-    cfg = _tiny_cfg()
-    cfg["data"].update(
-        {
+    cfg = {
+        "model": {
+            "target": "models.root_refiner.RootRefiner",
+            "params": {
+                "n_hist": 8,
+                "n_path": 16,
+                "min_frames": 5,
+                "max_frames": 29,
+            },
+        },
+        "sampling": {
+            "full_plan_ratio": 1.0,
+            "horizon_policy": "random",
+            "path_condition": {
+                "policy": "dense_path",
+                "offset_start": {"enabled": False},
+                "sparse_path": {"point_range": [3, 8]},
+            },
+        },
+        "data": {
             "target": "datasets." "humanml3d" "_refiner.HumanML3D" "RefinerDataset",
             "collate_fn": "datasets." "humanml3d" "_refiner.collate_fn",
             "raw_data_dir": str(tmp_path),
@@ -50,9 +71,8 @@ def test_train_refiner_rejects_legacy_dataset_target(tmp_path):
             "train_split_file": "train.txt",
             "feature_path": "new_joint_vecs",
             "text_path": "texts",
-            "normalize": False,
-        }
-    )
+        },
+    }
 
     with pytest.raises(ValueError, match="datasets.humanml3d.HumanML3DDataset"):
         build_datasets(cfg)

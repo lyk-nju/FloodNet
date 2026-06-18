@@ -197,21 +197,6 @@ def test_load_model_from_ckpt_accepts_current_duration_head(tmp_path):
     assert text_encoder is not None
 
 
-def _save_refiner_stats(tmp_path):
-    cm_mean = np.zeros(5, dtype=np.float32)
-    cm_std = np.ones(5, dtype=np.float32)
-    cm_idx = np.array([0, 1, 2], dtype=np.int64)
-    wp_mean = np.array([1.25, 0.0, -2.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
-    wp_std = np.array([2.0, 1.0, 4.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32)
-    wp_idx = np.array([0, 1, 2], dtype=np.int64)
-    np.save(tmp_path / "current_motion_mean.npy", cm_mean)
-    np.save(tmp_path / "current_motion_std.npy", cm_std)
-    np.save(tmp_path / "current_motion_norm_indices.npy", cm_idx)
-    np.save(tmp_path / "waypoint_mean.npy", wp_mean)
-    np.save(tmp_path / "waypoint_std.npy", wp_std)
-    np.save(tmp_path / "waypoint_norm_indices.npy", wp_idx)
-
-
 def test_run_benchmark_smoke_finite_metrics_and_report(tmp_path):
     clips = [_make_clip(50) for _ in range(6)]
     ds = make_root_refiner_from_samples(clips, n_hist=8, n_path=16, max_frames=29, min_frames=5,
@@ -383,7 +368,6 @@ def test_root_refiner_artifact_metadata_includes_raw_id_and_split(tmp_path):
 
 
 def test_root_refiner_artifacts_use_physical_path_and_real_anchor(tmp_path):
-    _save_refiner_stats(tmp_path)
     clips = [_make_clip(80)]
     common = dict(
         n_hist=8,
@@ -393,8 +377,7 @@ def test_root_refiner_artifacts_use_physical_path_and_real_anchor(tmp_path):
         full_plan_ratio=1.0,
         seed=0,
     )
-    ds_raw = make_root_refiner_from_samples(clips, normalize=False, **common)
-    ds_norm = make_root_refiner_from_samples(clips, normalize=True, stats_dir=tmp_path, **common)
+    ds = make_root_refiner_from_samples(clips, **common)
     task_specs = [
         {
             "idx": 0,
@@ -404,15 +387,7 @@ def test_root_refiner_artifacts_use_physical_path_and_real_anchor(tmp_path):
             "task_key": "sample-anchor-5",
         }
     ]
-    raw_sample = ds_raw.get_sample(
-        0,
-        force_mode="full",
-        force_num_frames=17,
-        force_anchor_frame=5,
-        force_path_mode="dense_path",
-        force_no_path_aug=True,
-    )
-    norm_sample = ds_norm.get_sample(
+    raw_sample = ds.get_sample(
         0,
         force_mode="full",
         force_num_frames=17,
@@ -437,7 +412,7 @@ def test_root_refiner_artifacts_use_physical_path_and_real_anchor(tmp_path):
 
     run_benchmark(
         model,
-        ds_norm,
+        ds,
         text_encoder,
         device="cpu",
         force_path_mode="dense_path",
@@ -452,11 +427,7 @@ def test_root_refiner_artifacts_use_physical_path_and_real_anchor(tmp_path):
     expected_physical_route = raw_sample["path"][
         raw_sample["path_valid_mask"].bool()
     ].numpy()
-    normalized_route = norm_sample["path"][
-        norm_sample["path_valid_mask"].bool()
-    ].numpy()
     np.testing.assert_allclose(route_input, expected_physical_route, atol=1e-5)
-    assert not np.allclose(route_input, normalized_route, atol=1e-3)
 
     metadata = json.loads(
         (sample_dir / ROOT_REFINER_ARTIFACT_NAMES["shared"]["metadata"]).read_text()
@@ -615,7 +586,6 @@ def test_build_refiner_dataset_from_config_uses_sampling_config(tmp_path):
             "val_split_file": "val.txt",
             "feature_path": "new_joint_vecs",
             "text_path": "texts",
-            "normalize": False,
         },
         "model": {
             "params": {

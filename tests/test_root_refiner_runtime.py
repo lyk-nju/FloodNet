@@ -92,17 +92,51 @@ def test_root_refiner_runtime_builds_anchor_local_7d_root_plan():
     assert root_plan.num_tokens_pred == 3
     assert root_plan.valid_frames == num_frames_for_tokens(3, 4)
     assert root_plan.waypoints_local_7d.shape == (root_plan.valid_frames, 7)
-    assert torch.allclose(root_plan.waypoints_local_7d[0, :5], torch.tensor([0.0, 0.0, 0.0, 1.0, 0.0]))
+    assert torch.allclose(root_plan.waypoints_local_7d[0, :5], torch.tensor([0.0, 1.0, 0.0, 1.0, 0.0]))
     assert len(refiner.calls) == 1
     call = refiner.calls[0]
-    assert call["path_mode"] == ["dense_path"]
-    assert call["sample_mode"] == ["full"]
+    assert "path_mode" not in call
+    assert "sample_mode" not in call
     assert "path_features_raw" in call
     assert torch.allclose(call["path_features"], call["path_features_raw"])
     assert torch.allclose(call["path"][0, 0], torch.tensor([0.0, 0.0]))
     assert torch.allclose(call["path"][0, -1], torch.tensor([0.0, 2.0]))
-    assert torch.allclose(call["history_motion"][0, -1], torch.tensor([0.0, 0.0, 0.0, 1.0, 0.0]))
+    assert torch.allclose(call["history_motion"][0, -1], torch.tensor([0.0, 1.0, 0.0, 1.0, 0.0]))
     assert call["history_mask"].tolist() == [[False, False, False, True]]
+
+
+def test_root_refiner_runtime_uses_explicit_anchor_y_without_history():
+    refiner = _FakeRefiner()
+    runtime = RootRefinerRuntime(
+        refiner,
+        _FakeTextEncoder(),
+        device="cpu",
+        path_mode="dense_path",
+    )
+    plan = StreamTrajectoryPlan(
+        times=torch.tensor([0.0, 1.0]).numpy(),
+        points_xyz=torch.tensor([[10.0, 0.0, 0.0], [10.0, 0.0, 2.0]]).numpy(),
+        start_commit_index=7,
+        version=1,
+        source="manual",
+    )
+    anchor = InferenceGlueState(
+        commit_idx=7,
+        world_xz=torch.tensor([10.0, 0.0]),
+        world_yaw=torch.tensor(0.0),
+    )
+
+    root_plan = runtime.build_root_plan(
+        text="walk forward",
+        plan=plan,
+        anchor_state=anchor,
+        token_dt=0.20,
+        anchor_world_y=0.875,
+    )
+
+    call = refiner.calls[0]
+    assert torch.allclose(call["history_motion"][0, -1], torch.tensor([0.0, 0.875, 0.0, 1.0, 0.0]))
+    assert torch.allclose(root_plan.waypoints_local_7d[0, :5], torch.tensor([0.0, 0.875, 0.0, 1.0, 0.0]))
 
 
 def test_root_refiner_runtime_uses_world_history_when_available():
@@ -142,48 +176,26 @@ def test_root_refiner_runtime_uses_world_history_when_available():
     )
 
     call = refiner.calls[0]
-    assert call["sample_mode"] == ["sliding"]
+    assert "sample_mode" not in call
     assert call["history_mask"].tolist() == [[False, False, True, True]]
     assert torch.allclose(call["history_motion"][0, -2], torch.tensor([0.0, 0.0, 0.0, 1.0, 0.0]))
     assert torch.allclose(call["history_motion"][0, -1], torch.tensor([0.0, 0.0, 1.0, 1.0, 0.0]))
 
 
-def test_root_refiner_runtime_anchor_only_history_uses_stats_root_height():
+def test_root_refiner_runtime_rejects_legacy_stats_kwargs():
     refiner = _FakeRefiner()
-    runtime = RootRefinerRuntime(
-        refiner,
-        _FakeTextEncoder(),
-        device="cpu",
-        cm_mean=torch.tensor([0.0, 0.9, 0.0, 0.0, 0.0]),
-        cm_std=torch.tensor([1.0, 0.1, 1.0, 1.0, 1.0]),
-        cm_norm_idx=torch.tensor([0, 1, 2]),
-        path_mode="dense_path",
-    )
-    plan = StreamTrajectoryPlan(
-        times=torch.tensor([0.0, 1.0]).numpy(),
-        points_xyz=torch.tensor([[10.0, 0.0, 0.0], [10.0, 0.0, 2.0]]).numpy(),
-        start_commit_index=7,
-        version=1,
-        source="manual",
-    )
-    anchor = InferenceGlueState(
-        commit_idx=7,
-        world_xz=torch.tensor([10.0, 0.0]),
-        world_yaw=torch.tensor(0.0),
-    )
-
-    runtime.build_root_plan(
-        text="walk forward",
-        plan=plan,
-        anchor_state=anchor,
-        token_dt=0.20,
-    )
-
-    call = refiner.calls[0]
-    assert torch.allclose(
-        call["history_motion"][0, -1],
-        torch.tensor([0.0, 0.0, 0.0, 1.0, 0.0]),
-    )
+    try:
+        RootRefinerRuntime(
+            refiner,
+            _FakeTextEncoder(),
+            device="cpu",
+            cm_mean=torch.tensor([0.0, 0.9, 0.0, 0.0, 0.0]),
+            path_mode="dense_path",
+        )
+    except TypeError as exc:
+        assert "cm_mean" in str(exc)
+    else:
+        raise AssertionError("legacy cm_mean kwarg should be rejected")
 
 
 def test_root_refiner_runtime_can_force_gt_num_tokens():

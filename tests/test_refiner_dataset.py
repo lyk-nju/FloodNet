@@ -1,14 +1,9 @@
-"""Unit tests for the RootRefiner HumanML3D adapter path (T_A_04).
-
-Covers T01-T15 per docs/TODO.md §T_A_04 Unit tests (T14 stats-side is deferred
-to T_A_06 compute_5d_stats).
-"""
+"""Unit tests for the RootRefiner HumanML3D adapter path (T_A_04)."""
 
 from __future__ import annotations
 
 import math
 
-import numpy as np
 import pytest
 import torch
 
@@ -24,21 +19,15 @@ PI = math.pi
 # ---------------------------------------------------------------------------
 
 
-def test_P0_2_normalize_false_ignores_stats_dir():
-    """P0-2: with normalize=False the dataset must NOT touch stats_dir, even a
-    nonexistent one — the benchmark now passes stats_dir=None when normalize is
-    off (mirrors train_refiner), so constructing here must not raise."""
-    ds = make_root_refiner_from_samples(
-        [_make_clip(T=50)], full_plan_ratio=1.0, seed=0,
-        normalize=False, stats_dir="/does/not/exist/refiner_stats",
-    )
-    _ = ds[0]   # __getitem__ works without loading any stats
-
-
-def test_P0_2_normalize_true_requires_stats_dir():
-    import pytest
-    with pytest.raises(ValueError):
-        make_root_refiner_from_samples([_make_clip(T=50)], normalize=True, stats_dir=None)
+def test_legacy_normalize_kwargs_are_rejected():
+    """RootRefiner training data is always physical frame-space now."""
+    with pytest.raises(TypeError, match="normalize"):
+        make_root_refiner_from_samples([_make_clip(T=50)], normalize=False)
+    with pytest.raises(TypeError, match="stats_dir"):
+        make_root_refiner_from_samples(
+            [_make_clip(T=50)],
+            stats_dir="/does/not/exist/refiner_stats",
+        )
 
 
 def _make_clip(T: int, *, text: str = "walk forward",
@@ -75,12 +64,12 @@ def _expected_anchor_world(motion_263: torch.Tensor, anchor_frame: int):
 # ---------------------------------------------------------------------------
 
 
-def test_T01_full_plan_anchor_is_frame_zero_and_history_mask_only_last_slot():
-    """full mode: anchor_frame=0, valid_history_frames=1, history_mask only [-1]=True."""
+def test_T01_full_plan_anchor_is_random_and_history_mask_only_last_slot():
+    """full mode: random anchor, valid_history_frames=1, history_mask only [-1]=True."""
     ds = make_root_refiner_from_samples([_make_clip(T=50)], full_plan_ratio=1.0, seed=0)
     s = ds.get_sample(0, force_mode="full", force_no_path_aug=True)
     assert s["mode"] == "full"
-    assert s["anchor_frame"] == 0
+    assert 0 < s["anchor_frame"] <= 50 - ds.min_frames - 1
     # history_mask: only last position True, rest False.
     assert s["history_mask"].dtype == torch.bool
     assert s["history_mask"][-1].item() is True
@@ -91,7 +80,12 @@ def test_T02_full_plan_anchor_in_current_motion_and_future_target_starts_after_a
     """current_motion[-1] is the anchor; target_waypoints[0] is the first future frame."""
     clip = _make_clip(T=50)
     ds = make_root_refiner_from_samples([clip], full_plan_ratio=1.0, seed=0)
-    s = ds.get_sample(0, force_mode="full", force_no_path_aug=True)
+    s = ds.get_sample(
+        0,
+        force_mode="full",
+        force_anchor_frame=0,
+        force_no_path_aug=True,
+    )
     cm_last = s["current_motion"][-1]   # (x, y, z, cos, sin)
     tw_first = s["target_waypoints"][0]   # (x, y, z, cos, sin, fwd, yaw_delta)
 
@@ -144,7 +138,8 @@ def test_T04_root_y_preserved_across_canonicalize():
     # Compute expected world y for the target frames.
     quat, xyz = recover_root_rot_pos(clip["motion_263"].unsqueeze(0))
     target_frame_count = int(s["target_mask"].sum().item())
-    expected_y = xyz[0, 1 : 1 + target_frame_count, 1]
+    anchor = int(s["anchor_frame"])
+    expected_y = xyz[0, anchor + 1 : anchor + 1 + target_frame_count, 1]
     actual_y = s["target_waypoints"][:target_frame_count, 1]
     assert torch.allclose(actual_y, expected_y, atol=ATOL)
 
@@ -165,7 +160,8 @@ def test_T05_target_frame_count_equals_forced_num_frames():
         seed=0,
     )
     for expected_frames in (1, 2, 3, 17):
-        s = ds.get_sample(0, force_mode="full", force_num_frames=expected_frames,
+        s = ds.get_sample(0, force_mode="full", force_anchor_frame=0,
+                           force_num_frames=expected_frames,
                            force_no_path_aug=True)
         assert "num_tokens" not in s
         assert s["num_frames"].item() == expected_frames
@@ -189,9 +185,11 @@ def test_horizon_policy_max_disables_random_frame_sampling():
     s0 = ds.get_sample(0, force_mode="full", force_no_path_aug=True)
     s1 = ds.get_sample(0, force_mode="full", force_no_path_aug=True)
 
-    assert s0["num_frames"].item() == 79
-    assert s1["num_frames"].item() == 79
-    assert int(s0["target_mask"].sum().item()) == 79
+    expected0 = min(ds.max_frames, 80 - int(s0["anchor_frame"]) - 1)
+    expected1 = min(ds.max_frames, 80 - int(s1["anchor_frame"]) - 1)
+    assert s0["num_frames"].item() == expected0
+    assert s1["num_frames"].item() == expected1
+    assert int(s0["target_mask"].sum().item()) == expected0
 
 
 def test_T06_target_mask_sum_equals_num_frames_strict():
@@ -205,8 +203,8 @@ def test_T06_target_mask_sum_equals_num_frames_strict():
         seed=0,
     )
     for frames in (2, 5, 10, 20, 30):
-        s = ds.get_sample(0, force_mode="full", force_num_frames=frames,
-                           force_no_path_aug=True)
+        s = ds.get_sample(0, force_mode="full", force_anchor_frame=0,
+                           force_num_frames=frames, force_no_path_aug=True)
         assert int(s["target_mask"].sum().item()) == frames
 
 
@@ -267,80 +265,15 @@ def test_sliding_eligibility_split():
 # ---------------------------------------------------------------------------
 
 
-def test_T13_cos_sin_invariant_under_selective_zscore(tmp_path):
-    """When normalize=True with norm_indices excluding [3, 4], the cos/sin
-    channels in current_motion and target_waypoints must equal their
-    unnormalized values bit-for-bit.
-    """
-    # Build dummy stats files.
-    cm_mean = np.array([1.0, 2.0, 3.0, 0.5, 0.5], dtype=np.float32)
-    cm_std = np.array([0.1, 0.2, 0.3, 1.0, 1.0], dtype=np.float32)
-    cm_idx = np.array([0, 1, 2], dtype=np.int64)
-    wp_mean = np.array([1.0, 2.0, 3.0, 0.5, 0.5, 0.1, 0.1], dtype=np.float32)
-    wp_std = np.array([0.1, 0.2, 0.3, 1.0, 1.0, 0.05, 0.05], dtype=np.float32)
-    wp_idx = np.array([0, 1, 2, 5, 6], dtype=np.int64)
-    np.save(tmp_path / "current_motion_mean.npy", cm_mean)
-    np.save(tmp_path / "current_motion_std.npy", cm_std)
-    np.save(tmp_path / "current_motion_norm_indices.npy", cm_idx)
-    np.save(tmp_path / "waypoint_mean.npy", wp_mean)
-    np.save(tmp_path / "waypoint_std.npy", wp_std)
-    np.save(tmp_path / "waypoint_norm_indices.npy", wp_idx)
-
+def test_T13_waypoints_are_already_physical_frame_space():
+    """There is no RootRefiner z-score space; training targets are physical."""
     clip = _make_clip(T=80)
-    ds_raw = make_root_refiner_from_samples([clip], full_plan_ratio=1.0, seed=0, normalize=False)
-    ds_norm = make_root_refiner_from_samples([clip], full_plan_ratio=1.0, seed=0,
-                              normalize=True, stats_dir=tmp_path)
-    s_raw = ds_raw.get_sample(0, force_mode="full", force_num_frames=37,
-                                force_no_path_aug=True)
-    s_norm = ds_norm.get_sample(0, force_mode="full", force_num_frames=37,
-                                  force_no_path_aug=True)
-    # cos/sin at channels [3], [4] must be bit-equal between raw and norm.
-    assert torch.equal(s_raw["current_motion"][..., 3], s_norm["current_motion"][..., 3])
-    assert torch.equal(s_raw["current_motion"][..., 4], s_norm["current_motion"][..., 4])
-    assert torch.equal(s_raw["target_waypoints"][..., 3], s_norm["target_waypoints"][..., 3])
-    assert torch.equal(s_raw["target_waypoints"][..., 4], s_norm["target_waypoints"][..., 4])
-    # xyz channels of current_motion DIFFER after normalize.
-    assert not torch.equal(s_raw["current_motion"][..., 0], s_norm["current_motion"][..., 0])
+    ds = make_root_refiner_from_samples([clip], full_plan_ratio=1.0, seed=0)
+    s = ds.get_sample(0, force_mode="full", force_anchor_frame=0,
+                       force_num_frames=37, force_no_path_aug=True)
 
-
-def test_waypoint_norm_indices_with_heading_channel_raises(tmp_path):
-    """A stats file that lists heading channel 3 or 4 in waypoint_norm_indices
-    must fail loudly at load (z-scoring cos/sin would break the unit-norm GT the
-    cosine heading loss assumes)."""
-    cm_mean = np.zeros(5, dtype=np.float32)
-    cm_std = np.ones(5, dtype=np.float32)
-    cm_idx = np.array([0, 1, 2], dtype=np.int64)
-    wp_mean = np.zeros(7, dtype=np.float32)
-    wp_std = np.ones(7, dtype=np.float32)
-    wp_idx = np.array([0, 1, 2, 3, 5, 6], dtype=np.int64)   # ⚠ includes heading ch 3
-    np.save(tmp_path / "current_motion_mean.npy", cm_mean)
-    np.save(tmp_path / "current_motion_std.npy", cm_std)
-    np.save(tmp_path / "current_motion_norm_indices.npy", cm_idx)
-    np.save(tmp_path / "waypoint_mean.npy", wp_mean)
-    np.save(tmp_path / "waypoint_std.npy", wp_std)
-    np.save(tmp_path / "waypoint_norm_indices.npy", wp_idx)
-    with pytest.raises(ValueError, match="heading channels 3/4"):
-        make_root_refiner_from_samples([_make_clip(T=50)], normalize=True, stats_dir=tmp_path)
-
-
-def test_current_motion_norm_indices_with_heading_channel_raises(tmp_path):
-    """Symmetric to the waypoint check: a stats file that lists heading channel
-    3 or 4 in current_motion_norm_indices must also fail loudly at load (cos/sin
-    yaw are unit-vector invariant; rule 7)."""
-    cm_mean = np.zeros(5, dtype=np.float32)
-    cm_std = np.ones(5, dtype=np.float32)
-    cm_idx = np.array([0, 1, 2, 4], dtype=np.int64)   # ⚠ includes heading ch 4
-    wp_mean = np.zeros(7, dtype=np.float32)
-    wp_std = np.ones(7, dtype=np.float32)
-    wp_idx = np.array([0, 1, 2, 5, 6], dtype=np.int64)
-    np.save(tmp_path / "current_motion_mean.npy", cm_mean)
-    np.save(tmp_path / "current_motion_std.npy", cm_std)
-    np.save(tmp_path / "current_motion_norm_indices.npy", cm_idx)
-    np.save(tmp_path / "waypoint_mean.npy", wp_mean)
-    np.save(tmp_path / "waypoint_std.npy", wp_std)
-    np.save(tmp_path / "waypoint_norm_indices.npy", wp_idx)
-    with pytest.raises(ValueError, match="heading channels 3/4"):
-        make_root_refiner_from_samples([_make_clip(T=50)], normalize=True, stats_dir=tmp_path)
+    assert torch.equal(s["target_waypoints"], s["target_waypoints_physical"])
+    assert torch.equal(s["waypoints"], s["waypoints_physical"][..., :5])
 
 
 # ---------------------------------------------------------------------------
@@ -355,8 +288,8 @@ def test_T15_fwd_delta_yaw_delta_invariant_under_canonicalize_via_pipeline():
     """
     clip = _make_clip(T=80, local_vel_xz=(0.0, 0.1), rot_vel_t0=PI / 8)
     ds = make_root_refiner_from_samples([clip], full_plan_ratio=1.0, seed=0)
-    s = ds.get_sample(0, force_mode="full", force_num_frames=37,
-                       force_no_path_aug=True)
+    s = ds.get_sample(0, force_mode="full", force_anchor_frame=0,
+                       force_num_frames=37, force_no_path_aug=True)
     target_count = int(s["target_mask"].sum().item())
 
     # Recompute world 7D from the clip directly.
@@ -381,8 +314,8 @@ def test_T15_fwd_delta_yaw_delta_invariant_under_canonicalize_via_pipeline():
 def test_returned_dict_has_required_keys_and_shapes():
     clip = _make_clip(T=80)
     ds = make_root_refiner_from_samples([clip], full_plan_ratio=1.0, seed=0)
-    s = ds.get_sample(0, force_mode="full", force_num_frames=37,
-                       force_no_path_aug=True)
+    s = ds.get_sample(0, force_mode="full", force_anchor_frame=0,
+                       force_num_frames=37, force_no_path_aug=True)
     expected_keys = {
         "text", "current_motion",
         "history_mask", "target_waypoints", "target_mask", "num_frames", "mode",
@@ -418,8 +351,8 @@ def test_uniform_shape_between_full_and_sliding_modes():
     T = 80
     clip = _make_clip(T=T)
     ds = make_root_refiner_from_samples([clip], full_plan_ratio=1.0, seed=0)
-    s_full = ds.get_sample(0, force_mode="full", force_num_frames=37,
-                            force_no_path_aug=True)
+    s_full = ds.get_sample(0, force_mode="full", force_anchor_frame=0,
+                            force_num_frames=37, force_no_path_aug=True)
     s_slide = ds.get_sample(0, force_mode="sliding", force_anchor_frame=30,
                               force_num_frames=37, force_no_path_aug=True)
     for key in ("current_motion", "history_mask",

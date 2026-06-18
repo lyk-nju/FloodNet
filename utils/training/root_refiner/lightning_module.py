@@ -9,15 +9,13 @@ from __future__ import annotations
 
 import logging
 import lightning.pytorch as pl
-import numpy as np
 import torch
 import torch.nn.functional as F
 
-from pathlib import Path
 from torch import nn
 from models.root_refiner import RootRefiner
 from utils.initialize import instantiate
-from utils.motion_process import build_physical_7d_from_normalized_5d
+from utils.motion_process import build_physical_7d_from_5d
 from utils.training.root_refiner.config_validate import validate_refiner_config
 from utils.training.root_refiner.losses import (
     dense_path_control_loss,
@@ -53,7 +51,6 @@ class RootRefinerLightningModule(pl.LightningModule):
         self.loss_weights = dict(cfg.get("loss_weights", {}))
         self.heading_form = cfg.get("loss", {}).get("heading_form", "cosine")
         self.validation_suite_names = self._validation_suite_names(cfg)
-        self._register_waypoint_stats(cfg)
         self.save_hyperparameters(ignore=["text_encoder"])
 
     @staticmethod
@@ -79,10 +76,8 @@ class RootRefinerLightningModule(pl.LightningModule):
             path=batch["path"],
             path_valid_mask=batch["path_valid_mask"],
             path_control_mask=batch.get("path_control_mask"),
-            path_mode=batch.get("path_mode"),
             path_features=batch["path_features"],
             path_features_raw=batch.get("path_features_raw", batch["path_features"]),
-            sample_mode=batch.get("mode"),
             history_motion=batch["history_motion"],
             history_mask=batch["history_mask"],
             anchor_frame=batch.get("anchor_frame"),
@@ -279,57 +274,8 @@ class RootRefinerLightningModule(pl.LightningModule):
         "xyz_FDE_m",
     )
 
-    def _register_waypoint_stats(self, cfg: dict) -> None:
-        data_cfg = cfg.get("data", {}) or {}
-        normalize = bool(data_cfg.get("normalize", False))
-        stats_dir = data_cfg.get("stats_dir")
-        if not normalize:
-            self.register_buffer("_wp_mean", None, persistent=False)
-            self.register_buffer("_wp_std", None, persistent=False)
-            self.register_buffer("_wp_norm_idx", None, persistent=False)
-            return
-        if not stats_dir:
-            raise FileNotFoundError(
-                "data.normalize=true requires data.stats_dir for physical waypoint losses"
-            )
-        stats_path = Path(stats_dir)
-        if not stats_path.is_dir():
-            raise FileNotFoundError(
-                f"data.normalize=true requires an existing stats_dir, got {stats_path}"
-            )
-        required = (
-            "waypoint_mean.npy",
-            "waypoint_std.npy",
-            "waypoint_norm_indices.npy",
-        )
-        missing = [name for name in required if not (stats_path / name).is_file()]
-        if missing:
-            raise FileNotFoundError(
-                f"stats_dir {stats_path} is missing required waypoint stats: {missing}"
-            )
-        self.register_buffer(
-            "_wp_mean",
-            torch.as_tensor(np.load(stats_path / "waypoint_mean.npy"), dtype=torch.float32),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_wp_std",
-            torch.as_tensor(np.load(stats_path / "waypoint_std.npy"), dtype=torch.float32).clamp(min=1e-6),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_wp_norm_idx",
-            torch.as_tensor(np.load(stats_path / "waypoint_norm_indices.npy"), dtype=torch.long),
-            persistent=False,
-        )
-
     def _to_physical_7d(self, waypoints5: torch.Tensor) -> torch.Tensor:
-        return build_physical_7d_from_normalized_5d(
-            waypoints5,
-            self._wp_mean,
-            self._wp_std,
-            self._wp_norm_idx,
-        )
+        return build_physical_7d_from_5d(waypoints5)
 
     def _common_prefix_mask(self, batch: dict, out: dict) -> torch.Tensor:
         target_mask = batch["waypoints_mask"]

@@ -56,6 +56,14 @@ def validate_refiner_config(cfg: Mapping) -> None:
         raise ValueError(
             "data.num_token_policy is legacy; use sampling.horizon_policy instead."
         )
+    legacy_data_keys = {"normalize", "stats_dir", "path_feature_stats_dir"}
+    legacy_data_present = sorted(set(data) & legacy_data_keys)
+    if legacy_data_present:
+        raise ValueError(
+            "RootRefiner data config contains legacy normalize/stat key(s) "
+            f"{legacy_data_present}; RootRefiner training now uses physical "
+            "frame-space tensors directly."
+        )
     if isinstance(cfg, Mapping) and "path_aug" in cfg:
         raise ValueError(
             "path_aug is legacy; use sampling.path_condition.offset_start and "

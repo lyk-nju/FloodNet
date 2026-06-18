@@ -32,7 +32,7 @@ def test_yaml_parses():
 def test_debug_config_uses_stub():
     cfg = _load(CFG_PATH)
     assert cfg["text_encoder"]["debug_stub"] is True
-    assert cfg["data"]["normalize"] is False
+    assert "normalize" not in cfg["data"]
 
 
 def test_train_config_is_real_precomputed_t5():
@@ -43,8 +43,8 @@ def test_train_config_is_real_precomputed_t5():
     assert "precomputed_text_emb_path" in te
     assert te.get("pooling") in ("mean", "first")
     assert cfg["model"]["params"]["text_emb_dim"] == 4096   # = T5 cache text_dim (P0-1)
-    assert cfg["data"]["normalize"] is True        # real training z-scores (P2-1)
-    assert cfg["data"].get("path_feature_stats_dir") is None
+    assert "normalize" not in cfg["data"]
+    assert "path_feature_stats_dir" not in cfg["data"]
 
 
 def test_train_config_has_no_fixed_validation_knob():
@@ -180,7 +180,9 @@ def test_default_refiner_configs_use_humanml3d_adapter_path():
         assert data["target"] == "datasets.humanml3d.HumanML3DDataset"
         assert data["collate_fn"] == "utils.training.root_refiner.collate_fn"
         assert "raw_data_dir" in data
-        assert "stats_dir" in data
+        assert "normalize" not in data
+        assert "stats_dir" not in data
+        assert "path_feature_stats_dir" not in data
 
 
 # ---------------------------------------------------------------------------

@@ -148,11 +148,6 @@ data:
   feature_path: new_joint_vecs
   text_path: texts
 
-  normalize: true
-  stats_dir: deps/refiner_stats
-
-  path_feature_stats_dir: null
-
 sampling:
   full_plan_ratio: 0.3
   horizon_policy: random

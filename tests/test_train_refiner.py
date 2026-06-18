@@ -6,9 +6,9 @@ import torch
 import pytest
 
 from tests.helpers.humanml3d_fixture import make_root_refiner_from_samples
-from train_refiner import (
-    RefinerLightningModule,
-    collate_fn,
+from train_refiner import RefinerLightningModule
+from utils.training.root_refiner import collate_fn
+from utils.training.root_refiner.losses import (
     masked_mean,
     second_order_diff_l2,
     smooth_l1_masked,
@@ -120,15 +120,15 @@ def test_build_datasets_returns_train_and_val(tmp_path):
 
     _make_fake_humanml3d(tmp_path, ["t1", "t2", "t3"], ["v1", "v2"])
     cfg = _tiny_cfg()
-    cfg["data"] = {
+    cfg["data"].update({
         "raw_data_dir": str(tmp_path),
         "dataset": "humanml3d",
         "train_split_file": "train.txt",
         "val_split_file": "val.txt",
         "feature_path": "new_joint_vecs",
         "text_path": "texts",
-        # no stats_dir → normalize=False
-    }
+        # RootRefiner training tensors are physical frame-space.
+    })
     train_ds, val_suites = build_datasets(cfg)
     assert len(train_ds) == 3
     assert len(val_suites) == 3
@@ -137,6 +137,26 @@ def test_build_datasets_returns_train_and_val(tmp_path):
         "sliding_dense_random",
         "sliding_dense_max",
     ]
+
+
+def test_build_datasets_validates_legacy_normalize_keys_before_building():
+    from train_refiner import build_datasets
+
+    cfg = _tiny_cfg()
+    cfg["data"]["normalize"] = True
+
+    with pytest.raises(ValueError, match="legacy normalize"):
+        build_datasets(cfg)
+
+
+def test_build_root_refiner_dataset_validates_legacy_normalize_keys_before_building():
+    from utils.training.root_refiner import build_root_refiner_dataset
+
+    cfg = _tiny_cfg()
+    cfg["data"]["normalize"] = True
+
+    with pytest.raises(ValueError, match="legacy normalize"):
+        build_root_refiner_dataset(cfg)
 
 
 def test_build_datasets_wraps_humanml3d_for_root_refiner(tmp_path):
@@ -169,14 +189,14 @@ def test_build_datasets_wraps_humanml3d_for_root_refiner(tmp_path):
     sample = train_ds.get_sample(
         0,
         force_mode="full",
-        force_num_tokens=4,
+        force_num_frames=13,
         force_path_mode="dense_path",
         force_no_path_aug=True,
         force_text_idx=0,
     )
     assert sample["mode"] == "full"
     assert sample["path_mode"] == "dense_path"
-    assert sample["num_tokens"].item() == 4
+    assert sample["num_frames"].item() == 13
 
 
 def test_build_datasets_train_split_force_text_idx_uses_all_captions(tmp_path):
@@ -211,7 +231,7 @@ def test_build_datasets_train_split_force_text_idx_uses_all_captions(tmp_path):
     sample = train_ds.get_sample(
         0,
         force_mode="full",
-        force_num_tokens=4,
+        force_num_frames=13,
         force_path_mode="dense_path",
         force_no_path_aug=True,
         force_text_idx=1,
@@ -236,14 +256,14 @@ def test_build_datasets_builds_fixed_validation_suites(tmp_path):
     np.save(ds_root / "new_joint_vecs" / "short.npy", short)
     np.save(ds_root / "new_joint_vecs" / "long.npy", long)
     cfg = _tiny_cfg()
-    cfg["data"] = {
+    cfg["data"].update({
         "raw_data_dir": str(tmp_path),
         "dataset": "humanml3d",
         "train_split_file": "train.txt",
         "val_split_file": "val.txt",
         "feature_path": "new_joint_vecs",
         "text_path": "texts",
-    }
+    })
     cfg["sampling"] = {
         "full_plan_ratio": 0.0,
         "horizon_policy": "random",
@@ -261,7 +281,7 @@ def test_build_datasets_builds_fixed_validation_suites(tmp_path):
     train_ds, val_suites = build_datasets(cfg, seed=0)
     assert train_ds.path_condition_policy == "goal_point"
     assert train_ds.full_plan_ratio == 0.0
-    assert train_ds.num_token_policy == "random"
+    assert train_ds.horizon_policy == "random"
     assert [suite["name"] for suite in val_suites] == [
         "full_dense_max",
         "sliding_dense_random",
@@ -272,26 +292,30 @@ def test_build_datasets_builds_fixed_validation_suites(tmp_path):
     full = by_name["full_dense_max"]
     assert full.path_condition_policy == "dense_path"
     assert full.full_plan_ratio == 1.0
-    assert full.num_token_policy == "max"
+    assert full.horizon_policy == "max"
     assert full.offset_start_enabled is False
 
     full_sample = full[1]
     assert full_sample["mode"] == "full"
     assert full_sample["path_mode"] == "dense_path"
     assert full_sample["offset_start_frames"].item() == 0
-    assert full_sample["num_tokens"].item() == full.max_tokens
-    assert full_sample["waypoints_mask"].sum().item() == full.max_frames
-    assert full_sample["path_supervision_mask"].sum().item() == full.max_frames
+    expected_full_frames = min(
+        full.max_frames,
+        80 - int(full_sample["anchor_frame"]) - 1,
+    )
+    assert full_sample["num_frames"].item() == expected_full_frames
+    assert full_sample["waypoints_mask"].sum().item() == expected_full_frames
+    assert full_sample["path_supervision_mask"].sum().item() == expected_full_frames
 
     sliding_random = by_name["sliding_dense_random"]
     sliding_max = by_name["sliding_dense_max"]
     assert sliding_random.path_condition_policy == "dense_path"
     assert sliding_random.full_plan_ratio == 0.0
-    assert sliding_random.num_token_policy == "random"
+    assert sliding_random.horizon_policy == "random"
     assert sliding_random.offset_start_enabled is False
     assert sliding_max.path_condition_policy == "dense_path"
     assert sliding_max.full_plan_ratio == 0.0
-    assert sliding_max.num_token_policy == "max"
+    assert sliding_max.horizon_policy == "max"
     assert sliding_max.offset_start_enabled is False
     assert len(sliding_random.valid_indices) == 1
     assert len(sliding_max.valid_indices) == 1
@@ -309,7 +333,7 @@ def test_build_datasets_builds_fixed_validation_suites(tmp_path):
     max_sample = fixed_by_name["sliding_dense_max"][0]
     assert max_sample["mode"] == "sliding"
     assert max_sample["path_mode"] == "dense_path"
-    assert max_sample["num_tokens"].item() == sliding_max.max_tokens
+    assert max_sample["num_frames"].item() == sliding_max.max_frames
 
 
 def test_module_raises_when_no_encoder_and_no_debug_stub():
@@ -331,12 +355,11 @@ def test_module_uses_explicit_encoder_over_stub():
     assert module.text_encoder is enc
 
 
-def test_module_requires_waypoint_stats_when_normalizing(tmp_path):
+def test_module_rejects_legacy_normalize_config_key():
     cfg = _tiny_cfg()
     cfg["data"]["normalize"] = True
-    cfg["data"]["stats_dir"] = str(tmp_path / "missing_stats")
 
-    with pytest.raises(FileNotFoundError, match="stats_dir"):
+    with pytest.raises(ValueError, match="normalize"):
         RefinerLightningModule(cfg)
 
 
@@ -345,14 +368,15 @@ def test_build_datasets_val_none_when_no_val_split(tmp_path):
 
     _make_fake_humanml3d(tmp_path, ["t1", "t2"], ["v1"])
     cfg = _tiny_cfg()
-    cfg["data"] = {
+    cfg["data"].update({
         "raw_data_dir": str(tmp_path),
         "dataset": "humanml3d",
         "train_split_file": "train.txt",
         # val_split_file omitted
         "feature_path": "new_joint_vecs",
         "text_path": "texts",
-    }
+    })
+    cfg["data"].pop("val_split_file", None)
     train_ds, val_suites = build_datasets(cfg)
     assert len(train_ds) == 2
     assert val_suites == []
@@ -370,7 +394,7 @@ def _tiny_cfg():
             "ema_decay": None,
             "params": {
                 "d_model": 32, "n_layers": 2, "n_heads": 4, "ff_dim": 64,
-                "max_tokens": 8, "min_tokens": 2, "frames_per_token": 4,
+                "max_frames": 29, "min_frames": 5,
                 "n_path": 16, "n_hist": 8, "text_emb_dim": 16,
                 "path_features_dim": 5, "dropout": 0.0,
             },
@@ -390,9 +414,7 @@ def _tiny_cfg():
         "loss": {"heading_form": "cosine"},
         "loss_weights": {
             "pace": 0.5,
-            "num_token_pace": 0.1,
-            "num_token_cls": 0.2,
-            "num_token_soft_cls": 0.02,
+            "frame_pace": 0.1,
             "xyz": 5.0, "heading": 1.0,
             "fwd_delta": 0.5, "yaw_delta": 0.5, "path_control": 0.0,
             "smoothness": 0.0,
@@ -420,7 +442,7 @@ def _make_batch(module, B=2):
         "history_mask": torch.ones(B, m.n_hist, dtype=torch.bool),
         "waypoints": waypoints[..., :5],
         "waypoints_mask": torch.ones(B, m.max_frames, dtype=torch.bool),
-        "num_tokens": torch.arange(B, dtype=torch.long) % 2 * 2 + 3,
+        "num_frames": torch.arange(B, dtype=torch.long) % 2 * 4 + 9,
     }
 
 
@@ -450,8 +472,7 @@ def test_loss_dict_keys_match_config_weights_and_no_speed():
     batch = _make_batch(module)
     out = module(batch)
     losses = module._compute_loss(out, batch)
-    # Loss-term keys + the logged-only num_token diagnostic metrics.
-    expected = {"loss", "pace", "num_token_pace", "num_token_cls", "num_token_soft_cls", "xyz", "heading",
+    expected = {"loss", "pace", "frame_pace", "xyz", "heading",
                 "fwd_delta", "yaw_delta", "path_control", "smoothness"}
     expected |= set(RefinerLightningModule.METRIC_KEYS)
     assert set(losses.keys()) == expected
@@ -461,87 +482,24 @@ def test_loss_dict_keys_match_config_weights_and_no_speed():
         assert torch.isfinite(v).all(), f"{k} not finite"
 
 
-def test_num_token_metrics_follow_actual_pred_num_tokens_not_argmax():
-    module = RefinerLightningModule(_tiny_cfg())
-    batch = _make_batch(module, B=2)
-    out = {
-        "num_token_logits": torch.tensor(
-            [
-                [3.0, 2.9, 2.9, 2.9, 2.9, 2.9, 2.9],
-                [3.0, 2.9, 2.9, 2.9, 2.9, 2.9, 2.9],
-            ],
-        ),
-        "expected_num_tokens": torch.tensor([5.0, 5.0]),
-        "expected_num_tokens_cls": torch.tensor([5.0, 5.0]),
-        "pred_num_tokens_cls": torch.tensor([2, 2]),
-        "pred_log_pace": torch.zeros(2),
-        "pred_num_tokens_float": torch.tensor([5.0, 5.0]),
-        "pred_num_tokens_pace": torch.tensor([5, 5]),
-        "pred_num_tokens": torch.tensor([5, 5]),
-        "used_num_tokens": batch["num_tokens"],
-        "waypoints": batch["waypoints"].clone(),
-    }
-    batch["num_tokens"] = torch.tensor([5, 5])
-
-    losses = module._compute_loss(out, batch)
-
-    assert losses["num_token_pace_mae"].item() == 0.0
-    assert losses["num_token_cls_argmax_mae"].item() > 0.0
-    assert "num_token_pred_round_mae" not in losses
-    assert "num_token_pace_round_mae" not in losses
-
-
-def test_num_token_logs_exclude_batch_mean_diagnostics():
-    module = RefinerLightningModule(_tiny_cfg())
-    batch = _make_batch(module, B=2)
-    batch["num_tokens"] = torch.tensor([4, 8])
-    out = {
-        "num_token_logits": torch.zeros(2, module.max_tokens - module.min_tokens + 1),
-        "expected_num_tokens": torch.tensor([3.0, 7.0]),
-        "expected_num_tokens_cls": torch.tensor([3.0, 7.0]),
-        "pred_num_tokens_cls": torch.tensor([3, 7]),
-        "pred_log_pace": torch.zeros(2),
-        "pred_num_tokens_float": torch.tensor([4.25, 7.75]),
-        "pred_num_tokens_pace": torch.tensor([4, 8]),
-        "pred_num_tokens": torch.tensor([4, 8]),
-        "used_num_tokens": batch["num_tokens"],
-        "waypoints": batch["waypoints"].clone(),
-    }
-
-    losses = module._compute_loss(out, batch)
-
-    assert "num_token_gt_mean" not in losses
-    assert "num_token_pace_mean" not in losses
-    assert "num_token_cls_mean" not in losses
-    assert "num_token_pred_round_mean" not in losses
-    assert "num_token_pace_round_mean" not in losses
-
-
 def test_pace_loss_uses_path_length_plus_start_distance():
     module = RefinerLightningModule(_tiny_cfg())
     batch = _make_batch(module, B=1)
-    batch["num_tokens"] = torch.tensor([6])
+    batch["num_frames"] = torch.tensor([6])
     batch["path_features_raw"] = torch.tensor([[2.0, 0.0, 0.0, 3.0, 2.0]])
-    target_log_pace = torch.log(torch.tensor([(6.0 - 1.0) / (2.0 + 3.0)]))
+    target_log_pace = torch.log(torch.tensor([6.0 / (2.0 + 3.0)]))
     out = {
-        "num_token_logits": torch.zeros(1, module.max_tokens - module.min_tokens + 1),
-        "expected_num_tokens_cls": torch.tensor([4.0]),
-        "pred_num_tokens_cls": torch.tensor([4]),
         "pred_log_pace": target_log_pace.clone(),
-        "pred_num_tokens_float": torch.tensor([6.0]),
-        "pred_num_tokens_pace": torch.tensor([6]),
-        "pred_num_tokens": torch.tensor([6]),
-        "used_num_tokens": batch["num_tokens"],
+        "pred_frames_float": torch.tensor([6.0]),
+        "pred_frames": torch.tensor([6]),
+        "used_frames": batch["num_frames"],
         "waypoints": batch["waypoints"].clone(),
     }
 
     losses = module._compute_loss(out, batch)
 
     assert losses["pace"].item() == pytest.approx(0.0, abs=1e-6)
-    assert losses["num_token_pace_mae"].item() == 0.0
-    assert "num_token_pred_round_mae" not in losses
-    assert "num_token_pace_round_mae" not in losses
-    assert losses["num_token_cls_mae"].item() == 2.0
+    assert losses["frame_pace_mae"].item() == 0.0
 
 
 def test_pace_loss_masks_very_short_effective_length():
@@ -549,49 +507,41 @@ def test_pace_loss_masks_very_short_effective_length():
     batch = _make_batch(module, B=1)
     batch["path_features_raw"] = torch.tensor([[0.01, 0.0, 0.0, 0.01, 0.01]])
     out = {
-        "num_token_logits": torch.zeros(1, module.max_tokens - module.min_tokens + 1),
-        "expected_num_tokens_cls": torch.tensor([4.0]),
-        "pred_num_tokens_cls": torch.tensor([4]),
         "pred_log_pace": torch.tensor([100.0]),
-        "pred_num_tokens_float": torch.tensor([8.0]),
-        "pred_num_tokens_pace": torch.tensor([8]),
-        "pred_num_tokens": torch.tensor([8]),
-        "used_num_tokens": batch["num_tokens"],
+        "pred_frames_float": torch.tensor([8.0]),
+        "pred_frames": torch.tensor([8]),
+        "used_frames": batch["num_frames"],
         "waypoints": batch["waypoints"].clone(),
     }
 
     losses = module._compute_loss(out, batch)
 
     assert losses["pace"].item() == 0.0
-    assert losses["num_token_pace"].item() == 0.0
-    assert losses["num_token_pace_mae"].item() == 0.0
+    assert losses["frame_pace"].item() == 0.0
+    assert losses["frame_pace_mae"].item() == 0.0
 
 
-def test_num_token_pace_loss_aligns_pace_with_token_space():
+def test_frame_pace_loss_aligns_pace_with_frame_space():
     module = RefinerLightningModule(_tiny_cfg())
     batch = _make_batch(module, B=1)
-    batch["num_tokens"] = torch.tensor([8])
+    batch["num_frames"] = torch.tensor([8])
     batch["path_features_raw"] = torch.tensor([[10.0, 0.0, 0.0, 0.0, 10.0]])
     out = module(batch)
-    out["pred_num_tokens_float"] = torch.tensor([6.0])
-    out["pred_num_tokens_pace"] = torch.tensor([6])
-    out["pred_num_tokens"] = torch.tensor([6])
+    out["pred_frames_float"] = torch.tensor([6.0])
+    out["pred_frames"] = torch.tensor([6])
 
     losses = module._compute_loss(out, batch)
 
-    assert "num_token_pace" in losses
-    assert "num_token_pace_mae" in losses
-    assert losses["num_token_pace"].item() == pytest.approx(1.5, abs=1e-6)
-    assert losses["num_token_pace_mae"].item() == pytest.approx(2.0, abs=1e-6)
-    assert losses["num_token_pace_acc_pm1"].item() == pytest.approx(0.0, abs=1e-6)
-    assert losses["num_token_pace_acc_pm2"].item() == pytest.approx(1.0, abs=1e-6)
+    assert "frame_pace" in losses
+    assert "frame_pace_mae" in losses
+    assert losses["frame_pace"].item() == pytest.approx(1.5, abs=1e-6)
+    assert losses["frame_pace_mae"].item() == pytest.approx(2.0, abs=1e-6)
+    assert losses["frame_pace_acc_pm1"].item() == pytest.approx(0.0, abs=1e-6)
+    assert losses["frame_pace_acc_pm4"].item() == pytest.approx(1.0, abs=1e-6)
 
 
-def test_delta_helper_unnormalizes_waypoints_before_deriving_physical_7d():
+def test_delta_helper_uses_physical_waypoints_directly():
     module = RefinerLightningModule(_tiny_cfg())
-    module._wp_mean = torch.tensor([10.0, 0.0, -5.0, 0.0, 0.0, 0.0, 0.0])
-    module._wp_std = torch.tensor([2.0, 1.0, 4.0, 1.0, 1.0, 1.0, 1.0])
-    module._wp_norm_idx = torch.tensor([0, 1, 2])
     wp5 = torch.zeros(1, 2, 5)
     wp5[..., 3] = 1.0
     wp5[0, 1, 0] = 1.0
@@ -599,42 +549,7 @@ def test_delta_helper_unnormalizes_waypoints_before_deriving_physical_7d():
 
     physical = module._to_physical_7d(wp5)
 
-    assert torch.allclose(physical[0, 1, :3], torch.tensor([12.0, 0.0, -1.0]))
-
-
-def test_num_token_soft_cls_term_present_and_differentiable():
-    """The soft-argmax expected-token aux term is a weighted loss term, finite,
-    and its gradient reaches num_token_head (so it actually shapes the logits)."""
-    module = RefinerLightningModule(_tiny_cfg())
-    batch = _make_batch(module)
-    losses = module._compute_loss(module(batch), batch)
-    assert "num_token_soft_cls" in losses and "num_token_cls_soft_mae" in losses
-    assert "num_token_soft_mae" not in losses
-    assert torch.isfinite(losses["num_token_soft_cls"]).all()
-    assert "num_token_soft_cls" not in RefinerLightningModule.METRIC_KEYS  # weighted loss term
-    assert "num_token_soft_mae" not in RefinerLightningModule.METRIC_KEYS  # ambiguous old alias
-    assert "num_token_cls_soft_mae" in RefinerLightningModule.METRIC_KEYS  # logged-only cls metric
-    losses["num_token_soft_cls"].backward()
-    assert any(
-        p.grad is not None
-        for p in module.refiner.num_token_head.parameters()
-    )
-
-
-def test_soft_argmax_expected_value_is_distance_aware():
-    """Soft-argmax expected class = sum_k p_k * k tracks the logit peak (so the
-    Huber aux penalizes by token distance, not 0/1 like CE)."""
-    K = 7
-    logits = torch.full((1, K), -10.0)
-    logits[0, 3] = 10.0
-    probs = logits.softmax(dim=-1)
-    expected = (probs * torch.arange(K, dtype=probs.dtype)).sum(-1)
-    assert abs(expected.item() - 3.0) < 1e-2
-    # SmoothL1 to a far target is larger than to a near target (distance-aware).
-    import torch.nn.functional as F
-    near = F.smooth_l1_loss(expected, torch.tensor([3.0]))
-    far = F.smooth_l1_loss(expected, torch.tensor([0.0]))
-    assert far > near
+    assert torch.allclose(physical[0, 1, :3], torch.tensor([1.0, 0.0, 1.0]))
 
 
 def test_loss_weights_keys_align_with_compute_loss_keys():
@@ -773,7 +688,7 @@ def test_collate_fn_stacks_tensors_and_keeps_text_list():
     assert isinstance(batch["text"], list) and len(batch["text"]) == 3
     assert batch["path"].shape[0] == 3
     assert batch["waypoints"].shape[0] == 3
-    assert batch["num_tokens"].shape == (3,)
+    assert batch["num_frames"].shape == (3,)
 
 
 # ---------------------------------------------------------------------------
@@ -790,8 +705,8 @@ def test_lightning_smoke_fit_runs_a_few_steps(tmp_path):
         clips,
         n_hist=8,
         n_path=16,
-        max_tokens=8,
-        min_tokens=2,
+        max_frames=29,
+        min_frames=5,
         full_plan_ratio=1.0,
         seed=0,
     )
@@ -822,8 +737,8 @@ def test_lightning_resume_from_checkpoint(tmp_path):
         clips,
         n_hist=8,
         n_path=16,
-        max_tokens=8,
-        min_tokens=2,
+        max_frames=29,
+        min_frames=5,
         full_plan_ratio=1.0,
         seed=0,
     )

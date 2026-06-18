@@ -270,7 +270,18 @@ class RefinerSampleCreator:
         forced_anchor: int | None,
     ) -> int:
         if mode == "full":
-            anchor = 0 if forced_anchor is None else int(forced_anchor)
+            lo = 0
+            hi = motion_length - int(min_future_frames) - 1
+            if hi < lo:
+                raise ValueError(
+                    "full anchor range invalid; "
+                    f"lo={lo}, hi={hi}, motion_length={motion_length}"
+                )
+            anchor = (
+                int(forced_anchor)
+                if forced_anchor is not None
+                else self._rng.randint(lo, hi)
+            )
         else:
             lo = self.n_hist - 1
             hi = motion_length - int(min_future_frames) - 1

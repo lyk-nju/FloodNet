@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import torch
 import pytest
 
@@ -35,7 +36,6 @@ def _inputs(model: RootRefiner, batch_size: int = 3) -> dict:
         "path_features_raw": torch.rand(batch_size, 5, generator=g) + 1.0,
         "history_motion": torch.randn(batch_size, model.n_hist, 5, generator=g),
         "history_mask": torch.ones(batch_size, model.n_hist, dtype=torch.bool),
-        "sample_mode": ["full", "sliding", "full"][:batch_size],
     }
 
 
@@ -147,17 +147,11 @@ def test_path_control_mask_changes_condition_encoding():
     )
 
 
-def test_path_mode_metadata_does_not_change_model_output():
-    model = _model().eval()
-    inputs = _inputs(model)
-    inputs["path_mode"] = ["dense_path"] * inputs["text_emb"].shape[0]
-    dense_out = model(**inputs)
+def test_root_refiner_forward_contract_excludes_metadata_modes():
+    signature = inspect.signature(RootRefiner.forward)
 
-    inputs["path_mode"] = ["dense_path", "unknown_mode", "goal_point"]
-    mixed_out = model(**inputs)
-
-    assert torch.allclose(dense_out["pred_log_pace"], mixed_out["pred_log_pace"])
-    assert torch.allclose(dense_out["future_waypoints"], mixed_out["future_waypoints"])
+    assert "path_mode" not in signature.parameters
+    assert "sample_mode" not in signature.parameters
 
 
 def test_pace_head_gets_clean_raw_path_features_skip():
@@ -177,14 +171,3 @@ def test_pace_head_gets_clean_raw_path_features_skip():
     assert grads, "duration_head.raw_feature_proj received no gradient"
     assert any(g.abs().sum() > 0 for g in grads)
 
-
-def test_sample_mode_metadata_does_not_change_model_output():
-    model = _model().eval()
-    inputs = _inputs(model)
-    inputs["sample_mode"] = ["full"] * inputs["text_emb"].shape[0]
-    full_out = model(**inputs)
-    inputs["sample_mode"] = ["sliding"] * inputs["text_emb"].shape[0]
-    sliding_out = model(**inputs)
-
-    assert torch.allclose(full_out["pred_log_pace"], sliding_out["pred_log_pace"])
-    assert torch.allclose(full_out["future_waypoints"], sliding_out["future_waypoints"])

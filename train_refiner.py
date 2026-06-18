@@ -328,6 +328,7 @@ def _build_one_dataset(
 
 def build_datasets(cfg: dict, seed: int | None = None):
     """Build train and optional validation datasets from cfg.data."""
+    validate_refiner_config(cfg)
     data_cfg = cfg.get("data", {})
     train_split = data_cfg.get("train_split_file", "train.txt")
     val_split = data_cfg.get("val_split_file")
@@ -457,21 +458,12 @@ def main(argv=None):
     parser.add_argument("--raw_data_dir", type=str, default=None,
                          help="Override data.raw_data_dir (e.g. on a host where the "
                               "config's training-box path doesn't exist).")
-    parser.add_argument("--stats_dir", type=str, default=None,
-                         help="Override data.stats_dir.")
-    parser.add_argument("--normalize", type=str, default=None,
-                         choices=["true", "false"],
-                         help="Override data.normalize (true/false).")
     args = parser.parse_args(argv)
 
     cfg = _load_cfg(args.config)
     cfg.setdefault("data", {})
     if args.raw_data_dir is not None:
         cfg["data"]["raw_data_dir"] = args.raw_data_dir
-    if args.stats_dir is not None:
-        cfg["data"]["stats_dir"] = args.stats_dir
-    if args.normalize is not None:
-        cfg["data"]["normalize"] = (args.normalize == "true")
     cfg = resolve_cfg_interpolations(cfg)
     validate_refiner_config(cfg)
     normalize_validation_suites_in_cfg(cfg)

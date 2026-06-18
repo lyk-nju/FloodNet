@@ -140,6 +140,15 @@ def test_rejects_legacy_num_token_policy_key():
         validate_refiner_config(cfg)
 
 
+@pytest.mark.parametrize("key", ["normalize", "stats_dir", "path_feature_stats_dir"])
+def test_rejects_legacy_normalize_data_keys(key):
+    cfg = _minimal_cfg()
+    cfg["data"][key] = True if key == "normalize" else "deps/refiner_stats"
+
+    with pytest.raises(ValueError, match=key):
+        validate_refiner_config(cfg)
+
+
 def test_rejects_legacy_training_block():
     cfg = _minimal_cfg()
     cfg["training"] = {"batch_size": 64, "lr": 1.0e-4, "total_steps": 1000}

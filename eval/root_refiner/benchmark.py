@@ -507,20 +507,6 @@ def _path_mode_to_artifact_route_mode(path_mode: str | None) -> str:
     return mapping.get(path_mode, "user_polyline")
 
 
-def _denormalize_path_xz(path_xz, wp_mean, wp_std, wp_norm_idx) -> torch.Tensor:
-    out = _as_cpu_tensor(path_xz).float().clone()
-    if wp_mean is None or wp_std is None or wp_norm_idx is None:
-        return out
-    mean = _as_cpu_tensor(wp_mean).float()
-    std = _as_cpu_tensor(wp_std).float().clamp(min=1e-6)
-    idx_set = set(_as_cpu_tensor(wp_norm_idx).long().tolist())
-    if 0 in idx_set and out.shape[-1] >= 1:
-        out[..., 0] = out[..., 0] * std[0] + mean[0]
-    if 2 in idx_set and out.shape[-1] >= 2:
-        out[..., 1] = out[..., 1] * std[2] + mean[2]
-    return out
-
-
 def _sample_anchor_world(sample: dict) -> tuple[list[float], float]:
     xz = sample.get("anchor_xz_world", None)
     yaw = sample.get("anchor_yaw_world", None)
@@ -571,19 +557,11 @@ def _write_root_refiner_sample_artifacts(
     pred_by_duration: dict[str, dict],
     gt_root_7d: torch.Tensor,
     gt_mask: torch.Tensor,
-    wp_mean=None,
-    wp_std=None,
-    wp_norm_idx=None,
 ) -> None:
     out = ensure_dir(sample_dir)
     shared_names = ROOT_REFINER_ARTIFACT_NAMES["shared"]
 
-    path_physical = _denormalize_path_xz(
-        sample.get("path", torch.zeros(0, 2)),
-        wp_mean,
-        wp_std,
-        wp_norm_idx,
-    )
+    path_physical = _as_cpu_tensor(sample.get("path", torch.zeros(0, 2))).float()
     path_valid_mask = _as_cpu_tensor(
         sample.get(
             "path_valid_mask",
@@ -748,10 +726,7 @@ def run_benchmark(
             force_anchor_frame=spec.get("anchor_frame"),
         )
         text_emb = text_encoder.encode([sample["text"]], device=device)
-        from utils.motion_process import build_physical_7d_from_normalized_5d
-        wp_mean = getattr(dataset, "_wp_mean", None)
-        wp_std = getattr(dataset, "_wp_std", None)
-        wp_norm_idx = getattr(dataset, "_wp_norm_idx", None)
+        from utils.motion_process import build_physical_7d_from_5d
 
         def _forward_duration(mode_name: str) -> tuple[dict, torch.Tensor, torch.Tensor]:
             teacher_num_frames = (
@@ -764,13 +739,11 @@ def run_benchmark(
                 path=sample["path"].unsqueeze(0).to(device),
                 path_valid_mask=sample["path_valid_mask"].unsqueeze(0).to(device),
                 path_control_mask=sample["path_control_mask"].unsqueeze(0).to(device),
-                path_mode=[sample.get("path_mode", "dense_path")],
                 path_features=sample["path_features"].unsqueeze(0).to(device),
                 path_features_raw=sample.get(
                     "path_features_raw",
                     sample["path_features"],
                 ).unsqueeze(0).to(device),
-                sample_mode=[sample.get("mode", "full")],
                 history_motion=sample["history_motion"].unsqueeze(0).to(device),
                 history_mask=sample["history_mask"].unsqueeze(0).to(device),
                 anchor_frame=sample.get(
@@ -785,11 +758,11 @@ def run_benchmark(
                 ),
                 num_frames=teacher_num_frames,
             )
-            # Model emits NORMALIZED 5D. Assemble physical 7D at the boundary
-            # (unnormalize xyz → unit heading → append fwd_delta / yaw_delta) so
-            # metrics are computed in physical space.
-            pred_root = build_physical_7d_from_normalized_5d(
-                output["waypoints"][0].cpu(), wp_mean, wp_std, wp_norm_idx,
+            # Assemble physical 7D at the boundary
+            # (unit heading → append fwd_delta / yaw_delta) so metrics are
+            # computed in physical space.
+            pred_root = build_physical_7d_from_5d(
+                output["waypoints"][0].cpu(),
             )
             used_frames = int(output["used_frames"][0].detach().cpu().item())
             valid_mask = (
@@ -800,13 +773,9 @@ def run_benchmark(
             return output, pred_root, valid_mask
 
         out, pred_wp, duration_mask = _forward_duration(duration_mode_resolved)
-        # GT `target_waypoints` is PHYSICAL-then-z-scored, so unnormalize its xyz
-        # the same way and re-derive its deltas.
         gt_source = sample.get("target_waypoints", sample.get("waypoints"))
         gt5_norm = gt_source[..., :5]
-        gt_wp = build_physical_7d_from_normalized_5d(
-            gt5_norm, wp_mean, wp_std, wp_norm_idx,
-        )                                                    # [max_frames, 7] physical
+        gt_wp = build_physical_7d_from_5d(gt5_norm)
         gt_mask = _as_cpu_tensor(sample.get("target_mask", sample.get("waypoints_mask"))).bool()
         mask = duration_mask
         if not use_groundtruth_duration:
@@ -867,9 +836,6 @@ def run_benchmark(
                 pred_by_duration=pred_by_duration,
                 gt_root_7d=gt_wp,
                 gt_mask=gt_mask,
-                wp_mean=wp_mean,
-                wp_std=wp_std,
-                wp_norm_idx=wp_norm_idx,
             )
             artifact_count += 1
 

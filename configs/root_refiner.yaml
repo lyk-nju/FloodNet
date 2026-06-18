@@ -1,8 +1,7 @@
 # RootRefiner debug/smoke config.
 #
-# This config is intentionally cheap: debug_stub=true and normalize=false.
-# Use configs/root_refiner_train.yaml for semantic T5 embeddings and z-score
-# normalization.
+# This config is intentionally cheap: debug_stub=true.
+# Use configs/root_refiner_train.yaml for semantic T5 embeddings.
 #
 # Hard constraints (do NOT silently drift):
 #   - canonicalization.mode = b_full + anchor = first_effective_frame
@@ -105,10 +104,6 @@ data:
   val_split_file: val.txt               # babel: val_processed.txt
   feature_path: new_joint_vecs          # babel: motions
   text_path: texts
-  # normalize gates z-score. Keep false until compute_5d_stats has populated
-  # stats_dir; set true for real training. If true, stats_dir must exist.
-  normalize: false
-  stats_dir: deps/refiner_stats
 
 sampling:
   full_plan_ratio: 0.5        # full-plan vs sliding split

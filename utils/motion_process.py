@@ -41,33 +41,16 @@ def recover_root_rot_pos(data):
 
 
 def extract_root_trajectory_263(feature_263: np.ndarray) -> np.ndarray:
-    """
-    从 263 维 motion 中提取根节点 3D 轨迹。
-
-    Args:
-        feature_263: (T, 263) numpy array, 263D motion features (crop 后)
-
-    Returns:
-        r_pos: (T, 3) numpy array, 根节点每帧的 3D 位置 (x, y, z)
-    """
+    """Recover root xyz trajectory from a raw 263D motion array."""
     feature_vec = torch.from_numpy(feature_263).float().unsqueeze(0)
     _, r_pos = recover_root_rot_pos(feature_vec)
     return r_pos.squeeze(0).cpu().numpy()
 
 
 def extract_root_xz_phi_features_263(feature_263: np.ndarray) -> np.ndarray:
-    """
-    从 263 维 motion 中提取 root 条件特征 [x, z, cos(yaw), sin(yaw)]。
-
-    Args:
-        feature_263: (T, 263) numpy array, 263D motion features (crop 后)
-
-    Returns:
-        features: (T, 4) numpy array, [x, z, cos(yaw), sin(yaw)]
-    """
-    feature_vec = torch.from_numpy(feature_263).float().unsqueeze(0)  # (1, T, 263)
+    """Recover legacy 4D root condition [x, z, quat_w, quat_y]."""
+    feature_vec = torch.from_numpy(feature_263).float().unsqueeze(0)
     r_rot_quat, r_pos = recover_root_rot_pos(feature_vec)
-    # yaw is around Y axis in this representation: quat = [cos(theta), 0, sin(theta), 0]
     cos_yaw = r_rot_quat[..., 0]
     sin_yaw = r_rot_quat[..., 2]
     xz = r_pos[..., [0, 2]]
@@ -76,68 +59,34 @@ def extract_root_xz_phi_features_263(feature_263: np.ndarray) -> np.ndarray:
 
 
 def extract_root_traj_feats_7d_263(feature_263: np.ndarray) -> np.ndarray:
-    """从 263 维 motion 提取 7D world-frame 轨迹特征 (T_B_09).
-
-    [x, y, z, cos(physical_yaw), sin(physical_yaw), fwd_delta, yaw_delta].
-    朝向用 root 物理 yaw (身体朝向), 与 4D path-heading 不同 (倒走时相反).
-
-    Args:
-        feature_263: (T, 263) numpy array, 263D motion features (crop 后, 未归一化)
-    Returns:
-        (T, 7) numpy array, world-frame 7D traj features (canonicalize 前).
-    """
-    feature_vec = torch.from_numpy(feature_263).float().unsqueeze(0)   # (1, T, 263)
-    r_rot_quat, r_pos = recover_root_rot_pos(feature_vec)              # (1,T,4),(1,T,3)
-    feats_7d = root_to_traj_feats_7d(r_rot_quat, r_pos)               # (1, T, 7)
-    return feats_7d.squeeze(0).cpu().numpy()
+    """Recover world-frame 7D root trajectory features from 263D motion."""
+    feature_vec = torch.from_numpy(feature_263).float().unsqueeze(0)
+    root_quat, root_xyz = recover_root_rot_pos(feature_vec)
+    traj_7d = root_to_traj_feats_7d(root_quat, root_xyz)
+    return traj_7d.squeeze(0).cpu().numpy()
 
 
 def extract_root_trajectory_263_torch(feature_263: torch.Tensor) -> torch.Tensor:
-    """
-    从 263 维 motion 中提取根节点 3D 轨迹（PyTorch 版本，用于 control loss）。
-
-    Args:
-        feature_263: (B, T, 263) tensor
-
-    Returns:
-        r_pos: (B, T, 3)，根节点每帧的 3D 位置 (x, y, z)
-    """
+    """Torch variant of extract_root_trajectory_263 for batched tensors."""
     _, r_pos = recover_root_rot_pos(feature_263)
     return r_pos
 
 
-def root_to_traj_feats_7d(root_quat: torch.Tensor, root_xyz: torch.Tensor) -> torch.Tensor:
-    """263D recovery → new 7D world-frame trajectory features.
+def root_to_traj_feats_7d(
+    root_quat: torch.Tensor,
+    root_xyz: torch.Tensor,
+) -> torch.Tensor:
+    """Convert recovered root rotation/position to 7D trajectory features.
 
     Args:
-        root_quat: [..., T, 4] from `recover_root_rot_pos` ([cos(a), 0, sin(a), 0]
-                   with a = HumanML3D r_rot_ang half-angle).
-        root_xyz:  [..., T, 3] from `recover_root_rot_pos`.
+        root_quat: [..., T, 4] from recover_root_rot_pos.
+        root_xyz: [..., T, 3] from recover_root_rot_pos.
 
     Returns:
-        [..., T, 7] = [x, y, z, cos(physical_yaw), sin(physical_yaw),
-                       fwd_delta, yaw_delta]
+        [..., T, 7] as [x, y, z, cos(yaw), sin(yaw), fwd_delta, yaw_delta].
 
-    Unit convention (v1, consistent with HumanML3D 263D root velocity):
-        fwd_delta = per-frame forward displacement (NOT divided by dt).
-        yaw_delta = per-frame yaw change (NOT divided by dt).
-        Convert to fwd_speed (m/s) / yaw_rate (rad/s) at the caller side by
-        dividing by `frame_dt = 1 / fps`.
-
-    First-frame padding (HARD CONSTRAINT, round 8 P0-2 lock-in):
-        fwd_delta[..., 0]  == 0
-        yaw_delta[..., 0]  == 0
-    The previous prototype used `fwd_delta[0] = fwd_delta[1]` (repeat-next)
-    while keeping `yaw_delta[0] = 0`, which made the two channels inconsistent
-    and misled debugging at the anchor frame. v1 zeros both, matching the
-    physical intuition that frame 0 has no preceding frame.
-
-    Uses `utils.local_frame` for all physical-yaw geometry; this module
-    intentionally does NOT reimplement quaternion → physical yaw to avoid
-    drift from the canonical implementation.
-
-    Note: do NOT confuse with legacy `utils.traj_batch.root_to_traj_feats`
-    (which returns path-direction unit vectors, NOT physical yaw cos/sin).
+    fwd_delta and yaw_delta are per-frame deltas, not rates. Frame 0 has no
+    previous frame, so both delta channels are zero there.
     """
     from utils.local_frame import root_quat_to_physical_yaw
 
@@ -145,77 +94,28 @@ def root_to_traj_feats_7d(root_quat: torch.Tensor, root_xyz: torch.Tensor) -> to
     cos_h = torch.cos(physical_yaw)
     sin_h = torch.sin(physical_yaw)
     traj_5d = torch.cat([root_xyz, cos_h[..., None], sin_h[..., None]], dim=-1)
-    # Single source for the delta derivation (shared with the RootRefiner, which
-    # predicts the 5D and derives the same deltas). Pass the exact physical_yaw so
-    # this stays bit-identical to the quaternion-derived 7D (no atan2 round-trip).
     return append_traj_deltas_5d_to_7d(traj_5d, physical_yaw=physical_yaw)
 
 
-def unnormalize_waypoints_5d(
-    wp5: torch.Tensor,
-    wp_mean: torch.Tensor | None,
-    wp_std: torch.Tensor | None,
-    wp_norm_idx: torch.Tensor | None = None,
+def build_physical_7d_from_5d(wp5: torch.Tensor) -> torch.Tensor:
+    """Append physical delta channels to [x, y, z, cos(yaw), sin(yaw)]."""
+    return append_traj_deltas_5d_to_7d(wp5)
+
+
+def append_traj_deltas_5d_to_7d(
+    traj_5d: torch.Tensor,
+    *,
+    physical_yaw: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Inverse z-score for the xyz channels (0, 1, 2) of a 5D waypoint tensor.
+    """Append fwd_delta and yaw_delta to 5D root trajectory features.
 
-    cos / sin (channels 3, 4) are unit-vector invariant and intentionally NOT
-    z-scored by the RootRefiner sample builder, so they
-    pass through unchanged. If `wp_mean` or `wp_std` is None (normalize=False),
-    returns `wp5` unchanged.
+    Input and output shapes are [..., T, 5] and [..., T, 7]. The appended
+    channels are derived as:
 
-    `wp_norm_idx` is the dataset's per-channel z-score index list (subset of
-    [0, 1, 2, 5, 6]); only indices < 5 are honored here (the 5D output cannot
-    speak for the 7D delta channels).
-    """
-    if wp_mean is None or wp_std is None:
-        return wp5
-    out = wp5.clone()
-    mean = wp_mean.to(device=wp5.device, dtype=wp5.dtype)
-    std = wp_std.to(device=wp5.device, dtype=wp5.dtype)
-    if wp_norm_idx is not None:
-        idxs = [int(i) for i in wp_norm_idx.tolist() if int(i) < 5]
-    else:
-        idxs = [0, 1, 2]
-    for c in idxs:
-        out[..., c] = wp5[..., c] * std[c] + mean[c]
-    return out
+        fwd_delta[t] = dot(xz[t] - xz[t-1], [sin(yaw[t]), cos(yaw[t])])
+        yaw_delta[t] = wrap_angle(yaw[t] - yaw[t-1])
 
-
-def build_physical_7d_from_normalized_5d(
-    wp5: torch.Tensor,
-    wp_mean: torch.Tensor | None,
-    wp_std: torch.Tensor | None,
-    wp_norm_idx: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Boundary assembly: normalized 5D `[x, y, z, cos, sin]` → physical 7D.
-
-    Order is load-bearing: unnormalize xyz FIRST, then derive fwd_delta /
-    yaw_delta in the physical space (deltas are only meaningful there). cos /
-    sin are re-L2-normalized before derivation so a slight model drift does
-    not bias the fwd_dir.
-    """
-    wp5_phys = unnormalize_waypoints_5d(wp5, wp_mean, wp_std, wp_norm_idx)
-    head = F.normalize(wp5_phys[..., 3:5], dim=-1, eps=1e-6)
-    wp5_phys = torch.cat([wp5_phys[..., :3], head], dim=-1)
-    return append_traj_deltas_5d_to_7d(wp5_phys)
-
-
-def append_traj_deltas_5d_to_7d(traj_5d: torch.Tensor,
-                                *, physical_yaw: torch.Tensor | None = None) -> torch.Tensor:
-    """[..., T, 5] = [x, y, z, cos(yaw), sin(yaw)] → [..., T, 7] by appending the
-    fwd_delta / yaw_delta channels *derived* from the xz + heading channels, so
-    the 7D is internally consistent by construction:
-
-        fwd_delta[t] = ⟨xz[t] - xz[t-1], heading_dir_xz(yaw[t])⟩,
-                       heading_dir_xz(yaw) = [sin(yaw), cos(yaw)] = [sin_h, cos_h]
-        yaw_delta[t] = wrap_angle(yaw[t] - yaw[t-1]),  yaw = atan2(sin_h, cos_h)
-        fwd_delta[0] = yaw_delta[0] = 0   (no preceding frame)
-
-    Differentiable (gradients flow into the 5D), so the RootRefiner can predict a
-    minimal 5D and emit a consistent 7D for the LDF traj-cond contract. Matches
-    `root_to_traj_feats_7d` exactly; pass `physical_yaw` (the unwrapped/canonical
-    angle) on the GT path to skip the atan2 and stay bit-identical.
+    Frame 0 has no previous frame, so both appended deltas are zero.
     """
     from utils.local_frame import wrap_angle
 
@@ -223,34 +123,28 @@ def append_traj_deltas_5d_to_7d(traj_5d: torch.Tensor,
     cos_h = traj_5d[..., 3]
     sin_h = traj_5d[..., 4]
     if physical_yaw is None:
-        # Gradient-safe atan2. atan2(y, x) back-props ∝ 1/(x²+y²), so as the
-        # heading vector collapses toward zero norm the gradient explodes (→1e9
-        # for a 1e-9 heading), which can diverge training into eventual Inf/NaN
-        # (every parameter then reads NaN). The caller normalizes cos/sin with
-        # F.normalize(eps=1e-6), but that divides by max(‖v‖, eps): a pre-norm
-        # magnitude < eps stays sub-unit (or exactly zero), so the unit-vector
-        # guarantee we rely on here does not hold. Hard-normalize to a unit
-        # direction (atan2 grad denom = 1 → bounded) and fall back to yaw=0
-        # ([cos,sin]=[1,0]) below the floor so a fully-collapsed heading gets a
-        # bounded gradient instead of 1/‖v‖². For a valid unit heading this is
-        # bit-identical to atan2(sin, cos) (dividing a unit vector by its ~1.0
-        # norm is a no-op).
-        # Clamp the SQUARED norm before the sqrt: sqrt(0) back-props inf, and
-        # clamping the sqrt *result* instead would zero that path (0·inf = NaN).
-        # Flooring the radicand keeps the sqrt input > 0 so its gradient stays
-        # finite, and the floored norm (≥1e-6) makes the division safe too.
-        sq = cos_h * cos_h + sin_h * sin_h
-        norm = torch.sqrt(sq.clamp_min(1e-12))
-        ok = sq > 1e-12
-        cos_u = torch.where(ok, cos_h / norm, torch.ones_like(cos_h))
-        sin_u = torch.where(ok, sin_h / norm, torch.zeros_like(sin_h))
+        # Keep atan2 gradients finite for collapsed heading vectors. The output
+        # still preserves the input cos/sin channels unchanged.
+        heading_sq = cos_h * cos_h + sin_h * sin_h
+        heading_norm = torch.sqrt(heading_sq.clamp_min(1e-12))
+        valid_heading = heading_sq > 1e-12
+        cos_u = torch.where(
+            valid_heading,
+            cos_h / heading_norm,
+            torch.ones_like(cos_h),
+        )
+        sin_u = torch.where(
+            valid_heading,
+            sin_h / heading_norm,
+            torch.zeros_like(sin_h),
+        )
         physical_yaw = torch.atan2(sin_u, cos_u)
 
     xz = traj_5d[..., [0, 2]]
     delta_xz = torch.zeros_like(xz)
     delta_xz[..., 1:, :] = xz[..., 1:, :] - xz[..., :-1, :]
-    fwd_dir = torch.stack([sin_h, cos_h], dim=-1)                     # heading_dir_xz(yaw)
-    fwd_delta = (delta_xz * fwd_dir).sum(-1, keepdim=True)            # [..., T, 1]
+    fwd_dir = torch.stack([sin_h, cos_h], dim=-1)
+    fwd_delta = (delta_xz * fwd_dir).sum(-1, keepdim=True)
 
     yaw_delta = torch.zeros_like(physical_yaw)
     yaw_delta[..., 1:] = wrap_angle(physical_yaw[..., 1:] - physical_yaw[..., :-1])
@@ -261,16 +155,11 @@ def append_traj_deltas_5d_to_7d(traj_5d: torch.Tensor,
     )
 
 
-def extract_root_trajectory_length(feature_263: np.ndarray | torch.Tensor, xy_only: bool = True) -> float:
-    """Compute the path length of the recovered root trajectory.
-
-    Args:
-        feature_263: (T, 263) numpy array or (B, T, 263) / (T, 263) tensor.
-        xy_only: If True, measure length on the ground plane xz only.
-
-    Returns:
-        Total path length along the trajectory.
-    """
+def extract_root_trajectory_length(
+    feature_263: np.ndarray | torch.Tensor,
+    xy_only: bool = True,
+) -> float:
+    """Compute recovered root trajectory length."""
     if isinstance(feature_263, np.ndarray):
         feat = torch.from_numpy(feature_263).float()
     else:

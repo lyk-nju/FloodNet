@@ -7,6 +7,7 @@ from omegaconf import OmegaConf
 
 from datasets.humanml3d import HumanML3DDataset
 from utils.training.root_refiner.batch_builder import RootRefinerDataset
+from utils.training.root_refiner.config_validate import validate_refiner_config
 
 
 DATASET_DEFAULTS: dict[str, dict[str, str]] = {
@@ -84,8 +85,8 @@ def build_root_refiner_dataset(
     seed: int | None = None,
     randomize_caption: bool = True,
     validation_suite: Mapping | None = None,
-    normalize: bool | None = None,
 ) -> RootRefinerDataset:
+    validate_refiner_config(cfg)
     data_cfg = _section(cfg, "data")
     target = data_cfg.get("target", "datasets.humanml3d.HumanML3DDataset")
     if target != "datasets.humanml3d.HumanML3DDataset":
@@ -100,14 +101,6 @@ def build_root_refiner_dataset(
     path_condition_cfg = _section(sampling_cfg, "path_condition")
     offset_cfg = _section(path_condition_cfg, "offset_start")
     sparse_cfg = _section(path_condition_cfg, "sparse_path")
-
-    normalize = bool(data_cfg.get("normalize", False) if normalize is None else normalize)
-    stats_dir = data_cfg.get("stats_dir")
-    if normalize and (not stats_dir or not Path(stats_dir).is_dir()):
-        raise FileNotFoundError(
-            f"data.normalize is true but stats_dir={stats_dir!r} does not exist. "
-            "Run scripts/compute_5d_stats.py first, or set data.normalize: false."
-        )
 
     full_plan_ratio = sampling_cfg.get("full_plan_ratio", 0.5)
     horizon_policy = sampling_cfg.get("horizon_policy", "random")
@@ -131,15 +124,6 @@ def build_root_refiner_dataset(
         offset_start_prob = float(
             validation_suite.get("offset_start_prob", default_offset_prob)
         )
-
-    path_feature_stats_dir = data_cfg.get("path_feature_stats_dir") if normalize else None
-    sampling_config_hash = None
-    if path_feature_stats_dir is not None:
-        from utils.training.root_refiner.path_feature_stats import (
-            compute_sampling_config_hash,
-        )
-
-        sampling_config_hash = compute_sampling_config_hash(cfg)
 
     dataset_name = str(data_cfg.get("dataset", "humanml3d"))
     raw_cfg = build_humanml3d_dataset_cfg(
@@ -178,10 +162,6 @@ def build_root_refiner_dataset(
             offset_cfg.get("apply_to", ("dense_path", "sparse_path"))
         ),
         sparse_path_point_range=tuple(sparse_cfg.get("point_range", (3, 8))),
-        normalize=normalize,
-        stats_dir=stats_dir if normalize else None,
-        path_feature_stats_dir=path_feature_stats_dir,
-        sampling_config_hash=sampling_config_hash,
         seed=seed,
         randomize_caption=randomize_caption,
     )

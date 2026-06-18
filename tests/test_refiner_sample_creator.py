@@ -15,7 +15,7 @@ def test_refiner_package_exports_sample_creator():
     assert ExportedCreator is RefinerSampleCreator
 
 
-def test_full_sample_uses_anchor_zero_single_history_and_max_horizon():
+def test_full_sample_randomizes_anchor_single_history_and_max_horizon():
     creator = RefinerSampleCreator(
         n_hist=8,
         max_frames=29,
@@ -26,17 +26,18 @@ def test_full_sample_uses_anchor_zero_single_history_and_max_horizon():
         seed=0,
     )
 
-    sample = creator.create(torch.tensor([40]))
+    sample = creator.create(torch.tensor([80]))
 
     assert sample.modes == ["full"]
-    assert sample.anchor_frames.tolist() == [0]
+    anchor = int(sample.anchor_frames[0].item())
+    assert 0 < anchor <= 74
     assert sample.valid_history_frames.tolist() == [1]
     assert sample.history_mask.tolist() == [
         [False, False, False, False, False, False, False, True],
     ]
-    assert sample.history_frame_indices.tolist() == [[0, 0, 0, 0, 0, 0, 0, 0]]
+    assert sample.history_frame_indices.tolist() == [[0, 0, 0, 0, 0, 0, 0, anchor]]
     assert not hasattr(sample, "num_tokens")
-    assert sample.target_frame_counts.tolist() == [29]
+    assert sample.target_frame_counts.tolist() == [min(29, 80 - anchor - 1)]
     assert sample.path_modes == ["dense_path"]
     assert sample.offset_start_frames.tolist() == [0]
 
@@ -84,7 +85,7 @@ def test_sliding_draw_falls_back_to_full_when_clip_is_not_sliding_eligible():
     sample = creator.create(torch.tensor([full_only_length]))
 
     assert sample.modes == ["full"]
-    assert sample.anchor_frames.tolist() == [0]
+    assert 0 <= int(sample.anchor_frames[0].item()) <= full_only_length - min_frames - 1
     assert sample.valid_history_frames.tolist() == [1]
 
 

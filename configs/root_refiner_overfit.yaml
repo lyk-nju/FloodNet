@@ -57,8 +57,6 @@ data:
   val_split_file: val.txt
   feature_path: new_joint_vecs
   text_path: texts
-  normalize: true
-  stats_dir: deps/refiner_stats
 
 path_aug:
   trim_prob: 0.0

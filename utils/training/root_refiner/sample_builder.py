@@ -3,17 +3,14 @@
 RefinerSampleBuilder turns a raw HumanML3D-style motion sample and a
 RefinerSample plan into the batch contract consumed by RootRefiner training.
 Sampling decisions live in sample_creator.py; this module owns root recovery,
-local-frame canonicalization, path-condition construction, and normalization.
+local-frame canonicalization, and path-condition construction.
 """
 
 from __future__ import annotations
 
-import os
 import random as random_module
-import numpy as np
 import torch
 
-from pathlib import Path
 from typing import Any
 from utils.local_frame import (
     canonicalize_5d,
@@ -46,47 +43,16 @@ class RefinerSampleBuilder:
         n_path: int = 64,
         max_frames: int = 193,
         min_frames: int = 13,
-        normalize: bool = False,
-        stats_dir: str | os.PathLike | None = None,
         sparse_path_point_range: tuple[int, int] = (3, 8),
-        path_feature_stats_dir: str | None = None,
-        sampling_config_hash: str | None = None,
         seed: int | None = None,
     ):
         self.n_hist = int(n_hist)
         self.n_path = int(n_path)
         self.max_frames_value = int(max_frames)
         self.min_frames = int(min_frames)
-        self.normalize = bool(normalize)
         self.sparse_path_point_range = tuple(int(v) for v in sparse_path_point_range)
         self._seed = seed
         self._rng = random_module.Random(seed)
-
-        self._cm_mean = None
-        self._cm_std = None
-        self._cm_norm_idx = None
-        self._wp_mean = None
-        self._wp_std = None
-        self._wp_norm_idx = None
-        if self.normalize:
-            if stats_dir is None:
-                raise ValueError("normalize=True requires stats_dir")
-            self._load_motion_stats(Path(stats_dir))
-
-        self._pf_mean = None
-        self._pf_std = None
-        if path_feature_stats_dir is not None:
-            if sampling_config_hash is None:
-                raise ValueError(
-                    "path_feature_stats_dir was set but sampling_config_hash is None"
-                )
-            from utils.training.root_refiner.path_feature_stats import load_path_feature_stats
-
-            stats = load_path_feature_stats(
-                path_feature_stats_dir, expected_hash=sampling_config_hash,
-            )
-            self._pf_mean = stats.mean
-            self._pf_std = stats.std
 
     @property
     def max_frames(self) -> int:
@@ -134,20 +100,6 @@ class RefinerSampleBuilder:
             anchor_xz,
             anchor_yaw,
         )
-
-        if self.normalize:
-            current_motion = self._apply_zscore(
-                current_motion,
-                self._cm_mean,
-                self._cm_std,
-                self._cm_norm_idx,
-            )
-            target_waypoints = self._apply_zscore(
-                target_waypoints,
-                self._wp_mean,
-                self._wp_std,
-                self._wp_norm_idx,
-            )
 
         base_sample = {
             "text": self._text_of(raw_sample),
@@ -292,9 +244,6 @@ class RefinerSampleBuilder:
         path_tokens = condition.path
         path_features_raw = condition.path_features_raw
         path_features = path_features_raw
-        if self.normalize:
-            path_tokens = self._zscore_path_xz(path_tokens)
-            path_features = self._normalize_path_features(path_features)
 
         return {
             "waypoints": waypoints,
@@ -333,90 +282,6 @@ class RefinerSampleBuilder:
             }
         )
         return out
-
-    def _load_motion_stats(self, stats_dir: Path) -> None:
-        self._cm_mean = torch.as_tensor(
-            np.load(stats_dir / "current_motion_mean.npy"), dtype=torch.float32,
-        )
-        self._cm_std = torch.as_tensor(
-            np.load(stats_dir / "current_motion_std.npy"), dtype=torch.float32,
-        ).clamp(min=1e-6)
-        self._cm_norm_idx = torch.as_tensor(
-            np.load(stats_dir / "current_motion_norm_indices.npy"), dtype=torch.long,
-        )
-        self._wp_mean = torch.as_tensor(
-            np.load(stats_dir / "waypoint_mean.npy"), dtype=torch.float32,
-        )
-        self._wp_std = torch.as_tensor(
-            np.load(stats_dir / "waypoint_std.npy"), dtype=torch.float32,
-        ).clamp(min=1e-6)
-        self._wp_norm_idx = torch.as_tensor(
-            np.load(stats_dir / "waypoint_norm_indices.npy"), dtype=torch.long,
-        )
-        if self._cm_mean.shape != (5,) or self._cm_std.shape != (5,):
-            raise ValueError(
-                f"current_motion stats must be shape (5,), got "
-                f"mean={tuple(self._cm_mean.shape)} std={tuple(self._cm_std.shape)}"
-            )
-        if self._wp_mean.shape != (7,) or self._wp_std.shape != (7,):
-            raise ValueError(
-                f"waypoint stats must be shape (7,), got "
-                f"mean={tuple(self._wp_mean.shape)} std={tuple(self._wp_std.shape)}"
-            )
-        if self._cm_norm_idx.numel() and int(self._cm_norm_idx.max()) >= 5:
-            raise ValueError(
-                f"current_motion_norm_indices out of range for dim 5: "
-                f"{self._cm_norm_idx.tolist()}"
-            )
-        if set(self._cm_norm_idx.tolist()) & {3, 4}:
-            raise ValueError(
-                "current_motion_norm_indices must NOT include heading channels 3/4 "
-                f"(cos/sin yaw are unit-vector invariant): {self._cm_norm_idx.tolist()}"
-            )
-        if self._wp_norm_idx.numel() and int(self._wp_norm_idx.max()) >= 7:
-            raise ValueError(
-                f"waypoint_norm_indices out of range for dim 7: "
-                f"{self._wp_norm_idx.tolist()}"
-            )
-        if set(self._wp_norm_idx.tolist()) & {3, 4}:
-            raise ValueError(
-                "waypoint_norm_indices must NOT include heading channels 3/4 "
-                f"(cos/sin yaw are unit-vector invariant): {self._wp_norm_idx.tolist()}"
-            )
-
-    @staticmethod
-    def _apply_zscore(
-        tensor: torch.Tensor,
-        mean: torch.Tensor,
-        std: torch.Tensor,
-        norm_idx: torch.Tensor,
-    ) -> torch.Tensor:
-        out = tensor.clone()
-        mean = mean.to(device=tensor.device, dtype=tensor.dtype)
-        std = std.to(device=tensor.device, dtype=tensor.dtype)
-        for c in norm_idx.tolist():
-            out[..., c] = (out[..., c] - mean[c]) / std[c]
-        return out
-
-    def _zscore_path_xz(self, path_xz: torch.Tensor) -> torch.Tensor:
-        if self._wp_mean is None or self._wp_std is None or self._wp_norm_idx is None:
-            return path_xz
-        out = path_xz.clone()
-        idx_set = set(self._wp_norm_idx.tolist())
-        mean = self._wp_mean.to(device=path_xz.device, dtype=path_xz.dtype)
-        std = self._wp_std.to(device=path_xz.device, dtype=path_xz.dtype)
-        if 0 in idx_set:
-            out[..., 0] = (out[..., 0] - mean[0]) / std[0]
-        if 2 in idx_set:
-            out[..., 1] = (out[..., 1] - mean[2]) / std[2]
-        return out
-
-    def _normalize_path_features(self, features: torch.Tensor) -> torch.Tensor:
-        if self._pf_mean is None or self._pf_std is None:
-            return features
-        mean = self._pf_mean.to(device=features.device, dtype=features.dtype)
-        std = self._pf_std.to(device=features.device, dtype=features.dtype)
-        return (features - mean) / std
 
 
 __all__ = ["RefinerSampleBuilder"]

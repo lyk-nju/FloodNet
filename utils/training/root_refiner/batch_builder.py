@@ -33,10 +33,6 @@ class RootRefinerBatchBuilder:
             "sparse_path",
         ),
         sparse_path_point_range: tuple[int, int] = (3, 8),
-        normalize: bool = False,
-        stats_dir=None,
-        path_feature_stats_dir: str | None = None,
-        sampling_config_hash: str | None = None,
         seed: int | None = None,
         randomize_caption: bool = True,
     ):
@@ -53,7 +49,6 @@ class RootRefinerBatchBuilder:
         self.offset_start_max_frames = int(offset_start_max_frames)
         self.offset_start_apply_to = tuple(offset_start_apply_to)
         self.sparse_path_point_range = tuple(int(v) for v in sparse_path_point_range)
-        self.normalize = bool(normalize)
         self.randomize_caption = bool(randomize_caption)
         self._seed = seed
         self._rng = random_module.Random(seed)
@@ -77,14 +72,9 @@ class RootRefinerBatchBuilder:
             n_path=self.n_path,
             max_frames=self.max_frames_value,
             min_frames=self.min_frames,
-            normalize=self.normalize,
-            stats_dir=stats_dir if self.normalize else None,
             sparse_path_point_range=self.sparse_path_point_range,
-            path_feature_stats_dir=path_feature_stats_dir,
-            sampling_config_hash=sampling_config_hash,
             seed=seed,
         )
-        self._copy_builder_stats()
 
     @property
     def max_frames(self) -> int:
@@ -171,17 +161,6 @@ class RootRefinerBatchBuilder:
         out.setdefault("dataset", out.get("dataset"))
         return out
 
-    def _copy_builder_stats(self) -> None:
-        self._cm_mean = self.sample_builder._cm_mean
-        self._cm_std = self.sample_builder._cm_std
-        self._cm_norm_idx = self.sample_builder._cm_norm_idx
-        self._wp_mean = self.sample_builder._wp_mean
-        self._wp_std = self.sample_builder._wp_std
-        self._wp_norm_idx = self.sample_builder._wp_norm_idx
-        self._pf_mean = self.sample_builder._pf_mean
-        self._pf_std = self.sample_builder._pf_std
-
-
 class RootRefinerDataset(Dataset):
     """RootRefiner training adapter over a raw HumanML3D dataset."""
 
@@ -201,8 +180,6 @@ class RootRefinerDataset(Dataset):
         self.offset_start_max_frames = self.batch_builder.offset_start_max_frames
         self.offset_start_apply_to = self.batch_builder.offset_start_apply_to
         self.sparse_path_point_range = self.batch_builder.sparse_path_point_range
-        self.normalize = self.batch_builder.normalize
-        self._copy_builder_stats()
 
         self._sample_lengths = [
             self._effective_motion_length(i) for i in range(len(raw_dataset))
@@ -305,17 +282,6 @@ class RootRefinerDataset(Dataset):
     def _sample_motion_length(self, raw_idx: int) -> int:
         sample = self.raw_dataset[int(raw_idx)]
         return int(RootRefinerBatchBuilder._motion_of(sample).shape[0])
-
-    def _copy_builder_stats(self) -> None:
-        self._cm_mean = self.batch_builder._cm_mean
-        self._cm_std = self.batch_builder._cm_std
-        self._cm_norm_idx = self.batch_builder._cm_norm_idx
-        self._wp_mean = self.batch_builder._wp_mean
-        self._wp_std = self.batch_builder._wp_std
-        self._wp_norm_idx = self.batch_builder._wp_norm_idx
-        self._pf_mean = self.batch_builder._pf_mean
-        self._pf_std = self.batch_builder._pf_std
-
 
 def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     out: dict[str, Any] = {
