@@ -98,7 +98,11 @@ class CustomLightningModule(BasicLightningModule):
             inner.load_z_stats(z_stats_dir)
             rank_zero_info(f"[z_stats] loaded cached-z stats from {z_stats_dir}")
 
-    def build_prefix_sample_creator(self) -> SampleCreator:
+    def build_prefix_sample_creator(
+        self,
+        *,
+        min_prefix_tokens: int | None = None,
+    ) -> SampleCreator:
         return SampleCreator(
             window_policy="prefix",
             sample_policy=str(
@@ -111,6 +115,7 @@ class CustomLightningModule(BasicLightningModule):
             min_history_tokens=int(
                 OmegaConf.select(self.cfg, "ldf_training.min_history_tokens", default=1)
             ),
+            min_prefix_tokens=min_prefix_tokens,
             chunk_size=getattr(self.model, "chunk_size", None),
         )
 

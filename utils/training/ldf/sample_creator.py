@@ -349,6 +349,7 @@ class SampleCreator:
         rollout_span: int = 0,
         start_tokens=None,
         end_tokens=None,
+        min_prefix_tokens: int | None = None,
         active_left_tokens=None,
         history_tokens=None,
         sampled_horizon_tokens=None,
@@ -366,6 +367,9 @@ class SampleCreator:
         self.rollout_span = int(rollout_span)
         self.start_tokens = start_tokens
         self.end_tokens = end_tokens
+        self.min_prefix_tokens = (
+            None if min_prefix_tokens is None else int(min_prefix_tokens)
+        )
         self.active_left_tokens = active_left_tokens
         self.history_tokens = history_tokens
         self.sampled_horizon_tokens = sampled_horizon_tokens
@@ -654,11 +658,17 @@ class SampleCreator:
                 name="end_tokens",
             )
         else:
-            low = max(1, int(self.min_history_tokens))
+            low = max(
+                1,
+                int(self.min_history_tokens),
+                1 if self.min_prefix_tokens is None else int(self.min_prefix_tokens),
+            )
             if bool((max_latent < low).any()):
                 raise ValueError(
                     "prefix-window batch found no valid latent window; "
-                    f"max_latent={max_latent.tolist()}, min_history_tokens={low}"
+                    f"max_latent={max_latent.tolist()}, "
+                    f"min_history_tokens={int(self.min_history_tokens)}, "
+                    f"min_prefix_tokens={low}"
                 )
             latent_tokens = torch.stack(
                 [
@@ -673,6 +683,15 @@ class SampleCreator:
             ).to(dtype=torch.long)
         if bool((latent_tokens <= 0).any()):
             raise ValueError(f"end_tokens must be > 0, got {latent_tokens.tolist()}")
+        if self.min_prefix_tokens is not None and bool(
+            (latent_tokens < int(self.min_prefix_tokens)).any()
+        ):
+            raise ValueError(
+                "prefix-window batch produced a prefix shorter than "
+                "min_prefix_tokens; "
+                f"latent_tokens={latent_tokens.tolist()}, "
+                f"min_prefix_tokens={int(self.min_prefix_tokens)}"
+            )
         if bool((latent_tokens > max_latent).any()):
             raise ValueError(
                 "prefix-window latent length must fit token_length; "

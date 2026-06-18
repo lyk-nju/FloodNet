@@ -803,15 +803,24 @@ def test_training_step_prefix_ignores_legacy_horizon_and_uses_full_future_traj()
         },
     }.get(key, default)
 
-    module = SimpleNamespace(cfg=cfg, trainer=None)
-    module.build_prefix_sample_creator = lambda: SampleCreator(
-        context_tokens=30,
-        horizon_tokens=25,
-        window_policy="prefix",
-        sample_policy="fixed_window",
-        min_history_tokens=1,
-        end_tokens=torch.tensor([token_length]),
+    module = SimpleNamespace(
+        cfg=cfg,
+        trainer=None,
+        global_step=0,
+        _resume_step_offset=0,
     )
+    def build_prefix_sample_creator(*, min_prefix_tokens=None):
+        return SampleCreator(
+            context_tokens=30,
+            horizon_tokens=25,
+            window_policy="prefix",
+            sample_policy="fixed_window",
+            min_history_tokens=1,
+            end_tokens=torch.tensor([token_length]),
+            min_prefix_tokens=min_prefix_tokens,
+        )
+
+    module.build_prefix_sample_creator = build_prefix_sample_creator
     trainer = SelfForcingTrainer.__new__(SelfForcingTrainer)
     trainer._module = module
     trainer._preconditions_checked = False
@@ -826,6 +835,72 @@ def test_training_step_prefix_ignores_legacy_horizon_and_uses_full_future_traj()
     assert model_batch["traj_features_length"].tolist() == [token_length]
     assert model_batch["traj_features"].shape[1] == traj_frames
     assert loss_batch["traj_num_tokens"].tolist() == [token_length]
+
+
+@pytest.mark.parametrize(
+    ("target_k", "stride_tokens", "expected_min_prefix_tokens"),
+    [
+        (5, 1, 5),
+        (3, 2, 5),
+    ],
+)
+def test_training_step_prefix_passes_rollout_min_prefix_tokens(
+    target_k,
+    stride_tokens,
+    expected_min_prefix_tokens,
+):
+    token_length = 12
+    traj_frames = num_frames_for_tokens(token_length)
+    batch = {
+        "token": torch.arange(1 * token_length * 3, dtype=torch.float32).view(
+            1,
+            token_length,
+            3,
+        ),
+        "token_length": torch.tensor([token_length]),
+        "traj_cond_7d": torch.zeros(1, traj_frames, 7),
+        "traj_cond": torch.zeros(1, traj_frames, 3),
+        "traj_length": torch.tensor([traj_frames]),
+        "traj_cond_mask": torch.ones(1, traj_frames),
+        "text": ["walk"],
+    }
+    cfg = SimpleNamespace()
+    cfg.self_forcing = SimpleNamespace(
+        k_schedule=[(0.0, target_k)],
+        stride_tokens=stride_tokens,
+    )
+    cfg.get = lambda key, default=None: {
+        "ldf_training": {
+            "window_policy": "prefix",
+        },
+    }.get(key, default)
+
+    captured = {}
+
+    def build_prefix_sample_creator(*, min_prefix_tokens=None):
+        captured["min_prefix_tokens"] = min_prefix_tokens
+        return SampleCreator(
+            sample_policy="fixed_window",
+            end_tokens=torch.tensor([token_length]),
+            min_prefix_tokens=min_prefix_tokens,
+        )
+
+    module = SimpleNamespace(
+        cfg=cfg,
+        trainer=None,
+        global_step=0,
+        _resume_step_offset=0,
+    )
+    module.build_prefix_sample_creator = build_prefix_sample_creator
+    trainer = SelfForcingTrainer.__new__(SelfForcingTrainer)
+    trainer._module = module
+    trainer._preconditions_checked = False
+    trainer._self_forcing_step = MagicMock(return_value=torch.tensor(3.0))
+
+    out = trainer.training_step(batch)
+
+    assert float(out.item()) == 3.0
+    assert captured["min_prefix_tokens"] == expected_min_prefix_tokens
 
 
 def test_training_step_passes_force_start_zero_to_window_local_builder(monkeypatch):
@@ -985,6 +1060,7 @@ def test_self_forcing_step_logs_window_local_metrics(monkeypatch):
     optimizer = torch.optim.SGD([param], lr=0.1)
     captured = {}
     cfg = SimpleNamespace()
+    cfg.self_forcing = SimpleNamespace(k_schedule=[(0.0, 3)], stride_tokens=1)
     cfg.get = lambda key, default=None: {
         "self_forcing_grad_clip": 1.0,
     }.get(key, default)
@@ -1021,7 +1097,7 @@ def test_self_forcing_step_logs_window_local_metrics(monkeypatch):
     )
     trainer._log_metrics = lambda metrics: None
     trainer._run_rollout = MagicMock(
-        return_value=({"loss": param * 0.0 + 1.0}, 1)
+        return_value=({"loss": param * 0.0 + 1.0}, 2)
     )
     trainer._compute_losses = MagicMock(
         return_value=(param * 0.0 + 1.0, param * 0.0 + 1.0, None)
@@ -1042,6 +1118,10 @@ def test_self_forcing_step_logs_window_local_metrics(monkeypatch):
     assert extra["ldf_training/window_len_mean"] == 3.5
     assert extra["ldf_training/active_history_len_mean"] == 4.0
     assert extra["ldf_training/active_abs_end_mean"] == 7.0
+    assert extra["self_forcing/target_k"] == 3.0
+    assert extra["self_forcing/effective_k"] == 2.0
+    assert extra["self_forcing/k"] == 2.0
+    assert extra["self_forcing/k_clipped"] == 1.0
 
 
 def test_run_training_window_returns_pred_latents_for_window_local_traj_features():

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from utils.token_frame import num_frames_for_tokens, num_tokens_for_frame_len, token_start_frame
@@ -162,6 +163,71 @@ def test_sample_creator_default_prefix_samples_active_right_from_token_length(mo
     assert out["feature_length"].tolist() == [1]
     assert out["feature"].shape == (1, 1, 4)
     assert out["traj_num_tokens"].tolist() == [5]
+
+
+def test_sample_creator_prefix_respects_dynamic_min_prefix_tokens(monkeypatch):
+    token = torch.arange(8 * 4, dtype=torch.float32).view(1, 8, 4)
+    traj_frames = num_frames_for_tokens(8)
+    batch = {
+        "token": token,
+        "token_length": torch.tensor([8]),
+        "traj_cond_7d": torch.zeros(1, traj_frames, 7),
+        "traj_cond": torch.zeros(1, traj_frames, 3),
+        "traj_length": torch.tensor([traj_frames]),
+        "traj_cond_mask": torch.ones(1, traj_frames),
+    }
+    monkeypatch.setattr(
+        torch,
+        "randint",
+        lambda low, high, size, device=None: torch.full(
+            size,
+            int(low),
+            device=device,
+            dtype=torch.long,
+        ),
+    )
+
+    out = SampleCreator(min_prefix_tokens=5).create(batch)
+
+    assert out["feature_length"].tolist() == [5]
+    assert out["feature"].shape == (1, 5, 4)
+    assert torch.equal(out["feature"], token[:, :5])
+
+
+def test_sample_creator_prefix_errors_when_token_length_below_min_prefix_tokens():
+    token = torch.arange(4 * 4, dtype=torch.float32).view(1, 4, 4)
+    traj_frames = num_frames_for_tokens(4)
+    batch = {
+        "token": token,
+        "token_length": torch.tensor([4]),
+        "traj_cond_7d": torch.zeros(1, traj_frames, 7),
+        "traj_cond": torch.zeros(1, traj_frames, 3),
+        "traj_length": torch.tensor([traj_frames]),
+        "traj_cond_mask": torch.ones(1, traj_frames),
+    }
+
+    with pytest.raises(ValueError, match="min_prefix_tokens"):
+        SampleCreator(min_prefix_tokens=5).create(batch)
+
+
+def test_sample_creator_prefix_errors_when_end_tokens_below_min_prefix_tokens():
+    token = torch.arange(6 * 4, dtype=torch.float32).view(1, 6, 4)
+    traj_frames = num_frames_for_tokens(6)
+    batch = {
+        "token": token,
+        "token_length": torch.tensor([6]),
+        "traj_cond_7d": torch.zeros(1, traj_frames, 7),
+        "traj_cond": torch.zeros(1, traj_frames, 3),
+        "traj_length": torch.tensor([traj_frames]),
+        "traj_cond_mask": torch.ones(1, traj_frames),
+    }
+
+    with pytest.raises(ValueError, match="min_prefix_tokens"):
+        SampleCreator(
+            sample_policy="fixed_window",
+            end_tokens=torch.tensor([4]),
+            min_prefix_tokens=5,
+        ).create(batch)
 
 
 def test_sample_creator_prefix_window_allows_short_samples_without_horizon_config():

@@ -185,10 +185,17 @@ class SelfForcingTrainer:
             return self._self_forcing_step(loss_batch, model_batch)
 
         prefix_creator = getattr(self._module, "build_prefix_sample_creator", None)
+        semantics = compute_step_semantics(self._module)
+        target_k = self.resolve_k(semantics.progress)
+        min_prefix_tokens = self._required_prefix_tokens(target_k)
         if prefix_creator is not None:
-            model_batch = prefix_creator().create(batch)
+            model_batch = prefix_creator(
+                min_prefix_tokens=min_prefix_tokens,
+            ).create(batch)
         else:
-            model_batch = SampleCreator().create(batch)
+            model_batch = SampleCreator(
+                min_prefix_tokens=min_prefix_tokens,
+            ).create(batch)
         loss_batch = batch.copy()
         for key in _PREFIX_LOSS_BATCH_KEYS:
             if key in model_batch:
@@ -211,7 +218,13 @@ class SelfForcingTrainer:
         final_step_result, effective_k = self._run_rollout(
             model_batch, semantics.progress
         )
+        target_k = self.resolve_k(semantics.progress)
         runtime_metrics["self_forcing/k"] = float(effective_k)
+        runtime_metrics["self_forcing/target_k"] = float(target_k)
+        runtime_metrics["self_forcing/effective_k"] = float(effective_k)
+        runtime_metrics["self_forcing/k_clipped"] = (
+            1.0 if int(effective_k) < int(target_k) else 0.0
+        )
         rollout_metrics = getattr(self, "_last_window_local_rollout_metrics", None)
         if rollout_metrics:
             runtime_metrics.update(rollout_metrics)
@@ -333,6 +346,10 @@ class SelfForcingTrainer:
             else:
                 break
         return max(1, rollout_depth)
+
+    def _required_prefix_tokens(self, target_k: int) -> int:
+        stride_tokens = self_forcing_stride_tokens(self._module.cfg)
+        return 1 + (max(1, int(target_k)) - 1) * int(stride_tokens)
 
     def plan_rollout(
         self,
@@ -835,6 +852,9 @@ class SelfForcingTrainer:
             "self_forcing/active": 1.0,
             "self_forcing/progress": float(semantics.progress),
             "self_forcing/k": 0.0,
+            "self_forcing/target_k": 0.0,
+            "self_forcing/effective_k": 0.0,
+            "self_forcing/k_clipped": 0.0,
             "self_forcing/phase_step": float(semantics.phase_step),
             "self_forcing/absolute_step": float(semantics.absolute_step),
             "self_forcing/resume_step_offset": float(semantics.resume_step_offset),
