@@ -14,4 +14,13 @@
 #   ./scripts/run_pytest.sh tests/test_foo.py -v --tb=short
 set -euo pipefail
 export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
-exec /home/lai/anaconda3/envs/flooddiffusion/bin/python -m pytest "$@"
+if [[ -z "${PY:-}" ]]; then
+  if [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
+    PY="${CONDA_PREFIX}/bin/python"
+  elif [[ -x "/home/yuankai/.conda/envs/flooddiffusion/bin/python" ]]; then
+    PY="/home/yuankai/.conda/envs/flooddiffusion/bin/python"
+  else
+    PY="python3"
+  fi
+fi
+exec "$PY" -m pytest "$@"

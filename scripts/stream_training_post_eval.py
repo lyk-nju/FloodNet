@@ -10,7 +10,6 @@ shape as `stream_training_collect.py`, plus a command execution log.
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import subprocess
 import sys
@@ -26,11 +25,11 @@ try:
 except ImportError:  # pragma: no cover - script entrypoints use top-level imports
     from eval.common.json import write_json_strict
 
-from scripts.stream_training_collect import (
-    _load_json,
-    _materialized_command,
-    _newest_match,
-    collect_validation_status,
+from scripts.stream_training_collect import collect_validation_status
+from scripts.stream_training_manifest import (
+    load_json,
+    materialize_command,
+    newest_match,
 )
 
 
@@ -77,7 +76,7 @@ def _execute_entry(
     comparison_command: bool = False,
 ) -> dict[str, Any]:
     summary = str(entry.get("summary") or "")
-    command = _materialized_command(entry, ckpt)
+    command = materialize_command(entry, ckpt)
     if not rerun and _path_exists(summary):
         return _command_record(
             name=name,
@@ -127,7 +126,7 @@ def run_post_training_eval(
     rerun: bool = False,
     stages: list[str] | None = None,
 ) -> dict[str, Any]:
-    manifest = _load_json(manifest_path)
+    manifest = load_json(manifest_path)
     if manifest.get("kind") != "ldf_stream_training_validation_plan":
         raise ValueError(
             "manifest kind must be 'ldf_stream_training_validation_plan', "
@@ -152,7 +151,7 @@ def run_post_training_eval(
         if not _stage_selected(stage_name, selected):
             continue
         ckpt_glob = str(stage.get("expected_candidate_ckpt_glob") or "")
-        ckpt = _newest_match(ckpt_glob) if ckpt_glob else None
+        ckpt = newest_match(ckpt_glob) if ckpt_glob else None
         post_eval = stage.get("post_training_eval", {})
         candidate_eval = post_eval.get("candidate_eval", {})
         comparison = post_eval.get("comparison", {})
@@ -162,7 +161,7 @@ def run_post_training_eval(
                     name=stage_name,
                     kind="candidate_eval",
                     summary=str(candidate_eval.get("summary") or ""),
-                    command=_materialized_command(candidate_eval, None),
+                    command=materialize_command(candidate_eval, None),
                     status="pending",
                     missing=["candidate checkpoint not found"],
                 )
@@ -172,7 +171,7 @@ def run_post_training_eval(
                     name=stage_name,
                     kind="comparison",
                     summary=str(comparison.get("summary") or ""),
-                    command=_materialized_command(comparison, None),
+                    command=materialize_command(comparison, None),
                     status="pending",
                     missing=["candidate checkpoint not found"],
                 )
@@ -195,7 +194,7 @@ def run_post_training_eval(
                     name=stage_name,
                     kind="comparison",
                     summary=str(comparison.get("summary") or ""),
-                    command=_materialized_command(comparison, ckpt),
+                    command=materialize_command(comparison, ckpt),
                     status="pending",
                     missing=["candidate summary missing"],
                 )

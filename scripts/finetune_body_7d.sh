@@ -13,7 +13,7 @@
 #   step_460000 means: for +50k steps pass MAX_STEPS=510000; for a 1-step smoke
 #   pass MAX_STEPS=460001 (max_steps=1 is already in the past → trains nothing).
 #
-# ⚠ Z_STATS_DIR must point at finite z_mean.npy/z_std.npy from compute_z_stats.py
+# ⚠ Z_STATS_DIR must point at finite z_mean.npy/z_std.npy from tools/compute_z_stats.py
 #   (run it with --skip_nonfinite first; 2 real latents are NaN). Without this the
 #   model keeps z_std=1 and history-corruption noise is uncalibrated (B-P0-1).
 #
@@ -21,7 +21,15 @@
 #   smoke:  scripts/finetune_body_7d.sh outputs/step_460000.ckpt 460001 body_ft_smoke deps/body_stats
 set -euo pipefail
 
-PY="${PY:-/home/lai/anaconda3/envs/floodiffusion/bin/python}"
+if [[ -z "${PY:-}" ]]; then
+  if [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
+    PY="${CONDA_PREFIX}/bin/python"
+  elif [[ -x "/home/yuankai/.conda/envs/flooddiffusion/bin/python" ]]; then
+    PY="/home/yuankai/.conda/envs/flooddiffusion/bin/python"
+  else
+    PY="python3"
+  fi
+fi
 RESUME_CKPT="${1:-outputs/step_460000.ckpt}"
 MAX_STEPS="${2:-510000}"            # ABSOLUTE: 460000 (resume) + 50000 fine-tune
 EXP_NAME="${3:-body_finetune_v1}"

@@ -21,6 +21,8 @@ args for that ablation (consumed by scripts/bench_body_7d_ablation.sh).
 
 from __future__ import annotations
 
+import argparse
+
 _BASE_7D = {
     "model.params.traj_encoder_in_dim": 7,
     "data.traj_feat_dim": 7,
@@ -70,14 +72,18 @@ __all__ = [
 ]
 
 
-if __name__ == "__main__":
-    import sys
-
-    name = sys.argv[1] if len(sys.argv) > 1 else ""
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     table = body_ablation_overrides()
-    if name not in table:
-        sys.stderr.write(
-            f"unknown ablation '{name}'. choices: {', '.join(table)}\n"
-        )
-        sys.exit(2)
-    print(" ".join(overrides_to_cli(table[name])))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("name", choices=sorted(table))
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    print(" ".join(overrides_to_cli(body_ablation_overrides()[args.name])))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

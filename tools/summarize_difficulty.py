@@ -11,7 +11,7 @@ Expected directory layout (same as FloodNet datasets):
   <dataset_root>/texts/<name>.txt
 
 Usage example:
-  python tools/summarize_humanml3d_difficulty.py \
+  python tools/summarize_difficulty.py \
     --meta /path/to/HumanML3D/train.txt \
     --out /path/to/outputs/difficulty.json \
     --bins easy,medium,hard
@@ -25,7 +25,7 @@ import math
 import numpy as np
 
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 from utils.motion_process import extract_root_trajectory_263, extract_root_trajectory_length
 
 

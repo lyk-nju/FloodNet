@@ -12,7 +12,7 @@ does not load T5 weights (only looks up strings in the dict, same as runtime tex
 
 多卡（每 GPU 各加载一份 T5，分片编码，rank0 合并为一个 .pt）::
 
-    torchrun --standalone --nproc_per_node=4 pretokenize_t5_text.py --config configs/ldf.yaml
+    torchrun --standalone --nproc_per_node=4 tools/pretokenize_t5_text.py --config configs/ldf.yaml
 """
 
 from __future__ import annotations
@@ -45,12 +45,11 @@ def _resolve_config_path(path: str) -> str:
         return path
     if os.path.isfile(path):
         return os.path.abspath(path)
-    repo_root = os.path.dirname(os.path.abspath(__file__))
-    alt = os.path.join(repo_root, path)
+    alt = os.path.join(REPO_ROOT, path)
     if os.path.isfile(alt):
         return alt
     raise FileNotFoundError(
-        f"找不到配置文件: {path!r}（已尝试 cwd 与脚本目录 {repo_root!r}）"
+        f"找不到配置文件: {path!r}（已尝试 cwd 与仓库根目录 {REPO_ROOT!r}）"
     )
 
 

@@ -231,7 +231,7 @@ class DiffForcingWanModel(nn.Module):
                     raise KeyError(
                         "Caption not in precomputed T5 table. "
                         f"len={len(text)} preview={preview!r}. "
-                        "Re-run pretokenize_t5_text.py with the same config "
+                        "Re-run tools/pretokenize_t5_text.py with the same config "
                         "(include val/test meta paths), or set use_precomputed_text_emb=false."
                     )
                 out.append(row.to(device))

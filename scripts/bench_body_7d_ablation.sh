@@ -10,7 +10,15 @@
 # Usage:  scripts/bench_body_7d_ablation.sh [RESUME_CKPT] [MAX_STEPS] [VAE_CKPT] [RAW_DATA_DIR]
 set -euo pipefail
 
-PY="${PY:-/home/lai/anaconda3/envs/floodiffusion/bin/python}"
+if [[ -z "${PY:-}" ]]; then
+  if [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
+    PY="${CONDA_PREFIX}/bin/python"
+  elif [[ -x "/home/yuankai/.conda/envs/flooddiffusion/bin/python" ]]; then
+    PY="/home/yuankai/.conda/envs/flooddiffusion/bin/python"
+  else
+    PY="python3"
+  fi
+fi
 RESUME_CKPT="${1:-outputs/step_460000.ckpt}"
 MAX_STEPS="${2:-510000}"            # ABSOLUTE global_step (460000 resume + 50000); see finetune_body_7d.sh
 VAE_CKPT="${3:?pass the VAE ckpt path}"

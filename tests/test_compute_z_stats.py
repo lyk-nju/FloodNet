@@ -1,10 +1,10 @@
-"""Unit tests for scripts/compute_z_stats.py (T_B_02)."""
+"""Unit tests for tools/compute_z_stats.py (T_B_02)."""
 
 from __future__ import annotations
 
 import numpy as np
 
-from scripts.compute_z_stats import (
+from tools.compute_z_stats import (
     compute_z_stats,
     iter_latent_files,
     save_z_stats,

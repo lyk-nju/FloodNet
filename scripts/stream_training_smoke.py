@@ -18,8 +18,10 @@ import sys
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
-
-CANDIDATE_CKPT_PLACEHOLDER = "{candidate_ckpt}"
+from scripts.stream_training_manifest import (
+    CANDIDATE_CKPT_PLACEHOLDER,
+    quote_command,
+)
 
 
 @dataclass
@@ -72,12 +74,6 @@ class ValidationPlanEntry:
 
 def _bool_str(value: bool) -> str:
     return "true" if bool(value) else "false"
-
-
-def _quote_cmd(cmd: list[str]) -> str:
-    import shlex
-
-    return " ".join(shlex.quote(part) for part in cmd)
 
 
 def _split_override(value: str | None) -> list[str]:
@@ -297,7 +293,7 @@ def _stream_eval_entry(cfg: SmokeRunConfig, *, ckpt: str, run_name: str, probe_t
         "run_name": run_name,
         "probe_tag": probe_tag,
         "summary": summary,
-        "command": _quote_cmd(cmd),
+        "command": quote_command(cmd),
         "argv": cmd,
     }
 
@@ -318,7 +314,7 @@ def _comparison_entry(
     )
     return {
         "summary": out_path,
-        "command": _quote_cmd(cmd),
+        "command": quote_command(cmd),
         "argv": cmd,
     }
 
@@ -351,7 +347,7 @@ def build_validation_manifest(base: SmokeRunConfig) -> dict:
                 "stage": entry.stage,
                 "description": entry.description,
                 "config": asdict(entry.config),
-                "command": _quote_cmd(cmd),
+                "command": quote_command(cmd),
                 "argv": cmd,
                 "missing_paths": find_missing_paths(entry.config),
                 "expected_candidate_ckpt_glob": str(
@@ -482,7 +478,7 @@ def main(argv: list[str] | None = None) -> int:
         plan = build_validation_plan(cfg)
         for entry in plan:
             print(f"# {entry.stage}: {entry.description}")
-            print(_quote_cmd(build_train_command(entry.config)))
+            print(quote_command(build_train_command(entry.config)))
         if cfg.manifest:
             write_manifest(cfg.manifest, build_validation_manifest(cfg))
         if cfg.print_only:
@@ -508,14 +504,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     cmd = build_train_command(cfg)
-    print(_quote_cmd(cmd))
+    print(quote_command(cmd))
     if cfg.manifest:
         write_manifest(
             cfg.manifest,
             {
                 "kind": "ldf_stream_training_smoke",
                 "base": asdict(cfg),
-                "command": _quote_cmd(cmd),
+                "command": quote_command(cmd),
                 "argv": cmd,
                 "missing_paths": find_missing_paths(cfg),
             },

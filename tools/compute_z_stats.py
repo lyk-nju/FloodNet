@@ -10,7 +10,7 @@ These are loaded into the Wan model via `WanModel.load_z_stats(stats_dir)` and
 used (with `mask_emb`) by the T_B_03 history-corruption augmentation.
 
 CLI:
-    python scripts/compute_z_stats.py \
+    python tools/compute_z_stats.py \
         --pretokenize_cache <dir of *.npy latents> \
         --output_dir deps/body_stats/ \
         [--channel_axis -1] [--max_files -1]
@@ -24,9 +24,9 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-import numpy as np
-
 from pathlib import Path
+
+import numpy as np
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -79,12 +79,13 @@ def iter_latent_files(cache_dir: str | Path) -> list[Path]:
     return sorted(Path(cache_dir).glob("*.npy"))
 
 
-def compute_z_stats(cache_dir: str | Path,
-                    *,
-                    channel_axis: int = -1,
-                    max_files: int = -1,
-                    skip_nonfinite: bool = False
-                    ) -> tuple[np.ndarray, np.ndarray, int, int]:
+def compute_z_stats(
+    cache_dir: str | Path,
+    *,
+    channel_axis: int = -1,
+    max_files: int = -1,
+    skip_nonfinite: bool = False,
+) -> tuple[np.ndarray, np.ndarray, int, int]:
     """Accumulate per-channel Welford stats over all latent vectors.
 
     Returns (z_mean [D], z_std [D], n_vectors, n_skipped).
@@ -118,8 +119,11 @@ def compute_z_stats(cache_dir: str | Path,
         if not np.isfinite(flat).all():
             n_bad = int((~np.isfinite(flat)).sum())
             if skip_nonfinite:
-                log.warning("skipping non-finite latent file %s (%d non-finite values)",
-                            f, n_bad)
+                log.warning(
+                    "skipping non-finite latent file %s (%d non-finite values)",
+                    f,
+                    n_bad,
+                )
                 n_skipped += 1
                 continue
             raise ValueError(
@@ -149,15 +153,23 @@ def compute_z_stats(cache_dir: str | Path,
             "computed z stats are non-finite after accumulation "
             f"(mean={mean}, std={std}); refusing to save."
         )
-    log.info("z stats over %d files (%d skipped) / %d vectors: mean=%s std=%s",
-             n_files, n_skipped, acc.n, mean, std)
+    log.info(
+        "z stats over %d files (%d skipped) / %d vectors: mean=%s std=%s",
+        n_files,
+        n_skipped,
+        acc.n,
+        mean,
+        std,
+    )
     return mean, std, acc.n, n_skipped
 
 
 def save_z_stats(z_mean: np.ndarray, z_std: np.ndarray, output_dir: str | Path) -> None:
     # Never write non-finite stats — they would silently break history corruption.
     if not (np.isfinite(z_mean).all() and np.isfinite(z_std).all()):
-        raise ValueError(f"refusing to save non-finite z stats: mean={z_mean}, std={z_std}")
+        raise ValueError(
+            f"refusing to save non-finite z stats: mean={z_mean}, std={z_std}"
+        )
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     np.save(out / "z_mean.npy", z_mean.astype(np.float32))
@@ -167,16 +179,33 @@ def save_z_stats(z_mean: np.ndarray, z_std: np.ndarray, output_dir: str | Path) 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pretokenize_cache", type=str, required=True,
-                         help="Directory of per-clip VAE latent *.npy files.")
+    parser.add_argument(
+        "--pretokenize_cache",
+        type=str,
+        required=True,
+        help="Directory of per-clip VAE latent *.npy files.",
+    )
     parser.add_argument("--output_dir", type=str, default="deps/body_stats")
-    parser.add_argument("--channel_axis", type=int, default=-1,
-                         help="Axis that holds the latent channel dim D (default last).")
-    parser.add_argument("--max_files", type=int, default=-1,
-                         help="-1 = all; positive = first N files (dry-run).")
-    parser.add_argument("--skip_nonfinite", action="store_true",
-                         help="Skip latent files containing NaN/Inf (default: "
-                              "fail loud and name the bad file).")
+    parser.add_argument(
+        "--channel_axis",
+        type=int,
+        default=-1,
+        help="Axis that holds the latent channel dim D (default last).",
+    )
+    parser.add_argument(
+        "--max_files",
+        type=int,
+        default=-1,
+        help="-1 = all; positive = first N files (dry-run).",
+    )
+    parser.add_argument(
+        "--skip_nonfinite",
+        action="store_true",
+        help=(
+            "Skip latent files containing NaN/Inf (default: fail loud and name "
+            "the bad file)."
+        ),
+    )
     parser.add_argument("--log_level", type=str, default="INFO")
     args = parser.parse_args(argv)
 

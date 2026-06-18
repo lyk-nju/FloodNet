@@ -9,10 +9,8 @@ passed the configured guardrails.
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import os
-import shlex
 import sys
 from pathlib import Path
 from typing import Any
@@ -26,25 +24,11 @@ try:
 except ImportError:  # pragma: no cover - script entrypoints use top-level imports
     from eval.common.json import write_json_strict
 
-
-CANDIDATE_CKPT_PLACEHOLDER = "{candidate_ckpt}"
-
-
-def _load_json(path: str | Path) -> dict[str, Any]:
-    with Path(path).open() as f:
-        payload = json.load(f)
-    if not isinstance(payload, dict):
-        raise ValueError(f"JSON payload must be a dict: {path}")
-    return payload
-
-
-def _newest_match(pattern: str) -> str | None:
-    matches = [Path(path) for path in glob.glob(pattern, recursive=True)]
-    files = [path for path in matches if path.is_file()]
-    if not files:
-        return None
-    newest = max(files, key=lambda path: (path.stat().st_mtime, str(path)))
-    return str(newest)
+from scripts.stream_training_manifest import (
+    load_json,
+    materialize_command,
+    newest_match,
+)
 
 
 def _baseline_status(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -60,7 +44,7 @@ def _baseline_status(manifest: dict[str, Any]) -> dict[str, Any]:
 
 def _comparison_decision(path: str) -> tuple[str, list[dict[str, Any]]]:
     try:
-        payload = _load_json(path)
+        payload = load_json(path)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         return "failed", [{"reason": f"invalid comparison JSON: {exc}"}]
     decision = payload.get("decision")
@@ -74,32 +58,13 @@ def _comparison_decision(path: str) -> tuple[str, list[dict[str, Any]]]:
     return ("passed" if bool(decision.get("passed")) and not failures else "failed", failures)
 
 
-def _quote_cmd(argv: list[str]) -> str:
-    return " ".join(shlex.quote(str(part)) for part in argv)
-
-
-def _materialized_command(entry: dict[str, Any], ckpt: str | None) -> dict[str, Any]:
-    argv = [str(part) for part in entry.get("argv", [])]
-    if ckpt is not None:
-        argv = [
-            ckpt if part == CANDIDATE_CKPT_PLACEHOLDER else part
-            for part in argv
-        ]
-    ready = bool(argv) and CANDIDATE_CKPT_PLACEHOLDER not in argv
-    return {
-        "ready": ready,
-        "argv": argv,
-        "command": _quote_cmd(argv) if argv else "",
-    }
-
-
 def _stage_status(stage: dict[str, Any]) -> dict[str, Any]:
     post_eval = stage.get("post_training_eval", {})
     candidate_eval = post_eval.get("candidate_eval", {})
     comparison = post_eval.get("comparison", {})
 
     ckpt_glob = str(stage.get("expected_candidate_ckpt_glob") or "")
-    ckpt = _newest_match(ckpt_glob) if ckpt_glob else None
+    ckpt = newest_match(ckpt_glob) if ckpt_glob else None
     candidate_summary = str(candidate_eval.get("summary") or "")
     comparison_summary = str(comparison.get("summary") or "")
 
@@ -125,8 +90,8 @@ def _stage_status(stage: dict[str, Any]) -> dict[str, Any]:
         "candidate_summary": candidate_summary,
         "comparison": comparison_summary,
         "commands": {
-            "candidate_eval": _materialized_command(candidate_eval, ckpt),
-            "comparison": _materialized_command(comparison, ckpt),
+            "candidate_eval": materialize_command(candidate_eval, ckpt),
+            "comparison": materialize_command(comparison, ckpt),
         },
         "missing": missing,
         "failures": failures,
@@ -154,7 +119,7 @@ def _overall_status(
 
 
 def collect_validation_status(manifest_path: str | Path) -> dict[str, Any]:
-    manifest = _load_json(manifest_path)
+    manifest = load_json(manifest_path)
     if manifest.get("kind") != "ldf_stream_training_validation_plan":
         raise ValueError(
             "manifest kind must be 'ldf_stream_training_validation_plan', "
