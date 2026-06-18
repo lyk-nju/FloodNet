@@ -373,8 +373,8 @@ class ModelManager(WebRuntime):
         points = ensure_xyz(raw)
         current_root = self._get_current_root_xyz()
         edit_commit = self._get_commit_index()
-        with self.traj_state_lock:
-            _prev_plan = self.active_traj_plan
+        controller = self._trajectory_controller()
+        _event, _prev_plan = controller.snapshot()
         delay = (
             active_delay_tokens
             if _prev_plan is not None and active_delay_enabled
@@ -417,12 +417,12 @@ class ModelManager(WebRuntime):
         )
 
         if _prev_plan is None:
-            with self.traj_state_lock:
-                self.active_traj_plan = new_plan
-                self.pending_update_event = None
-                self.current_traj_waypoints = points
-                self.current_traj_times = times
-                self.current_traj_mode = mode
+            controller.set_active_route(
+                new_plan,
+                waypoints=points,
+                times=times,
+                mode=mode,
+            )
             self._activate_root_plan_from_stream_plan(new_plan)
             self._trajectory_state = "active_7d"
             preview = sample_route_future(
@@ -435,8 +435,7 @@ class ModelManager(WebRuntime):
                     route_reference_mode == RouteReferenceMode.RELATIVE_TO_ACTOR.value
                 ),
             )
-            with self._display_traj_lock:
-                self._display_traj = preview.copy()
+            controller.set_display(preview)
             print(
                 f"Trajectory updated: {len(points)} points, source={source}, "
                 f"horizon={active_horizon_tokens}, "
@@ -445,12 +444,12 @@ class ModelManager(WebRuntime):
             )
             return self.get_display_traj()
 
-        with self.traj_state_lock:
-            self.pending_update_event = update_event
-            # Compatibility fields used by status/debug endpoints.
-            self.current_traj_waypoints = points
-            self.current_traj_times = times
-            self.current_traj_mode = mode
+        controller.set_pending_update(
+            update_event,
+            waypoints=points,
+            times=times,
+            mode=mode,
+        )
 
         print(
             f"Trajectory updated: {len(points)} points, source={source}, "
@@ -511,6 +510,94 @@ class ModelManager(WebRuntime):
             self.trajectory_controller = controller
         return controller
 
+    @property
+    def traj_state_lock(self):
+        return self._trajectory_controller().lock
+
+    @traj_state_lock.setter
+    def traj_state_lock(self, value):
+        self._trajectory_controller().lock = value
+
+    @property
+    def active_traj_plan(self):
+        return self._trajectory_controller().active_route
+
+    @active_traj_plan.setter
+    def active_traj_plan(self, value):
+        self._trajectory_controller().active_route = value
+
+    @property
+    def pending_update_event(self):
+        return self._trajectory_controller().pending_update
+
+    @pending_update_event.setter
+    def pending_update_event(self, value):
+        self._trajectory_controller().pending_update = value
+
+    @property
+    def current_traj_waypoints(self):
+        return self._trajectory_controller().current_waypoints
+
+    @current_traj_waypoints.setter
+    def current_traj_waypoints(self, value):
+        self._trajectory_controller().current_waypoints = value
+
+    @property
+    def current_traj_times(self):
+        return self._trajectory_controller().current_times
+
+    @current_traj_times.setter
+    def current_traj_times(self, value):
+        self._trajectory_controller().current_times = value
+
+    @property
+    def current_traj_mode(self):
+        return self._trajectory_controller().current_mode
+
+    @current_traj_mode.setter
+    def current_traj_mode(self, value):
+        self._trajectory_controller().current_mode = value
+
+    @property
+    def _trajectory_state(self):
+        return self._trajectory_controller().state
+
+    @_trajectory_state.setter
+    def _trajectory_state(self, value):
+        self._trajectory_controller().state = value
+
+    @property
+    def _plan_version_counter(self):
+        return self._trajectory_controller().plan_version_counter
+
+    @_plan_version_counter.setter
+    def _plan_version_counter(self, value):
+        self._trajectory_controller().plan_version_counter = int(value)
+
+    @property
+    def _display_traj_lock(self):
+        return self._trajectory_controller().display_lock
+
+    @_display_traj_lock.setter
+    def _display_traj_lock(self, value):
+        self._trajectory_controller().display_lock = value
+
+    @property
+    def _display_traj(self):
+        return self._trajectory_controller()._display_traj
+
+    @_display_traj.setter
+    def _display_traj(self, value):
+        self._trajectory_controller().set_display(value)
+
+    @property
+    def _model_traj_plan_version(self):
+        return self._rootplan_controller().model_plan_version
+
+    @_model_traj_plan_version.setter
+    def _model_traj_plan_version(self, value):
+        self._rootplan_controller().model_plan_version = value
+
     def _get_current_root_xyz(self) -> np.ndarray:
         root_xyz = np.zeros(3, dtype=np.float32)
         timeline = getattr(self, "_root_timeline", None)
@@ -554,16 +641,7 @@ class ModelManager(WebRuntime):
         return worker
 
     def _clear_runtime_route_state(self) -> None:
-        with self.traj_state_lock:
-            self.active_traj_plan = None
-            self.pending_update_event = None
-            self.current_traj_waypoints = None
-            self.current_traj_times = None
-            self.current_traj_mode = "replace_future"
-        self._trajectory_state = "none"
-        self._model_traj_plan_version = None
-        with self._display_traj_lock:
-            self._display_traj = None
+        self._trajectory_controller().clear()
         if getattr(self, "stream_generator", None) is not None:
             self._rootplan_controller().clear()
             self.stream_generator.condition_manager.route.clear()
@@ -702,8 +780,7 @@ class ModelManager(WebRuntime):
         return (current_root + (unwrapped - anchor)).astype(np.float32)
 
     def _next_plan_version(self) -> int:
-        self._plan_version_counter += 1
-        return self._plan_version_counter
+        return self._trajectory_controller().next_plan_version()
 
     def _get_commit_index(self) -> int:
         timeline = getattr(self, "_root_timeline", None)
@@ -855,8 +932,10 @@ class ModelManager(WebRuntime):
             return False
         anchor_state = timeline.at_commit(anchor_commit)
         root_plan = self._build_root_plan_from_stream_plan(plan, anchor_state)
-        self._rootplan_controller().set_active(root_plan)
-        self._model_traj_plan_version = int(plan.version)
+        self._rootplan_controller().set_active(
+            root_plan,
+            model_plan_version=int(plan.version),
+        )
         self.stream_generator.timeline = timeline
         return True
 
@@ -874,14 +953,11 @@ class ModelManager(WebRuntime):
             return None
         anchor_state = timeline.at_commit(anchor_commit)
         root_plan = self._build_root_plan_from_stream_plan(plan, anchor_state)
-        previous_version = getattr(self, "_model_traj_plan_version", None)
-        try:
-            with self._rootplan_controller().temporarily_active(root_plan):
-                self._model_traj_plan_version = model_traj_plan_version
-                payload = self._build_rootplan_stream_traj_input()
-        finally:
-            self._model_traj_plan_version = previous_version
-        return payload
+        with self._rootplan_controller().temporarily_active(
+            root_plan,
+            model_plan_version=model_traj_plan_version,
+        ):
+            return self._build_rootplan_stream_traj_input()
 
     def _build_rootplan_stream_traj_input(self):
         """Build direct 7D stream payload from active RootPlan, if available.
@@ -894,7 +970,7 @@ class ModelManager(WebRuntime):
         timeline = getattr(self, "_root_timeline", None)
         if (
             timeline is None
-            or self.stream_generator.active_root_plan is None
+            or self._rootplan_controller().active_plan is None
         ):
             return None
 
@@ -910,9 +986,7 @@ class ModelManager(WebRuntime):
         current_commit = self._get_commit_index()
         current_root = self._get_current_root_xyz()
 
-        with self.traj_state_lock:
-            event = self.pending_update_event
-            plan = self.active_traj_plan
+        event, plan = self._trajectory_controller().snapshot()
 
         if plan is None and event is None:
             rootplan_payload = self._build_rootplan_stream_traj_input()
@@ -924,7 +998,7 @@ class ModelManager(WebRuntime):
 
         # ── No pending update: sample from active plan ──────────────────
         if event is None:
-            if plan is not None and self.stream_generator.active_root_plan is None:
+            if plan is not None and self._rootplan_controller().active_plan is None:
                 self._activate_root_plan_from_stream_plan(plan)
             future = sample_route_future(
                 plan,
@@ -937,8 +1011,7 @@ class ModelManager(WebRuntime):
                 ),
             )
             self._trajectory_state = "active"
-            with self._display_traj_lock:
-                self._display_traj = future.copy()
+            self._trajectory_controller().set_display(future)
             rootplan_payload = self._build_rootplan_stream_traj_input()
             if rootplan_payload is not None:
                 self._trajectory_state = "active_7d"
@@ -996,7 +1069,7 @@ class ModelManager(WebRuntime):
         model_plan_version = getattr(self, "_model_traj_plan_version", None)
         if w <= 0.0:
             self._trajectory_state = "delay"
-            if event.old_route is not None and self.stream_generator.active_root_plan is None:
+            if event.old_route is not None and self._rootplan_controller().active_plan is None:
                 self._activate_root_plan_from_stream_plan(event.old_route)
             rootplan_payload = self._build_rootplan_stream_traj_input()
             model_plan_version = getattr(self, "_model_traj_plan_version", None)
@@ -1024,17 +1097,13 @@ class ModelManager(WebRuntime):
             )
         else:
             self._trajectory_state = "replaced"
-            with self.traj_state_lock:
-                self.active_traj_plan = event.new_route
-                self.pending_update_event = None
+            self._trajectory_controller().replace_with_pending(event)
             self._rootplan_controller().clear()
-            self._model_traj_plan_version = None
             self._activate_root_plan_from_stream_plan(event.new_route)
             rootplan_payload = self._build_rootplan_stream_traj_input()
             model_plan_version = getattr(self, "_model_traj_plan_version", None)
 
-        with self._display_traj_lock:
-            self._display_traj = future.copy()
+        self._trajectory_controller().set_display(future)
         if rootplan_payload is not None:
             rootplan_payload.update({
                 "traj_mode": self.current_traj_mode,
@@ -1243,10 +1312,7 @@ class ModelManager(WebRuntime):
     
     def get_display_traj(self):
         """Return a copy of the latest world-space trajectory for frontend viz, or None."""
-        with self._display_traj_lock:
-            if self._display_traj is None:
-                return None
-            return self._display_traj.copy()
+        return self._trajectory_controller().get_display()
 
     def get_next_frame(self):
         """Get the next frame from buffer and optional trajectory display data."""
@@ -1256,9 +1322,7 @@ class ModelManager(WebRuntime):
     
     def get_buffer_status(self):
         """Get buffer status plus trajectory state and update metadata."""
-        with self.traj_state_lock:
-            ev = self.pending_update_event
-            plan = self.active_traj_plan
+        ev, plan = self._trajectory_controller().snapshot()
         status = {
             "buffer_size": self.frame_buffer.size(),
             "target_size": self.frame_buffer.target_size,
@@ -1266,7 +1330,7 @@ class ModelManager(WebRuntime):
             "generation_state": self.generation_state.value,
             "current_text": self.current_text,
             "trajectory_state": self._trajectory_state,
-            "trajectory_active": self.active_traj_plan is not None,
+            "trajectory_active": plan is not None,
             "trajectory_time_mode": self.traj_time_mode,
             "model_traj_plan_version": self._model_traj_plan_version,
             "smoothing_alpha": self.smoothing_alpha,

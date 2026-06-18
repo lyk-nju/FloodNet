@@ -2,16 +2,27 @@
 
 from __future__ import annotations
 
+import threading
 from numbers import Integral
 
 from .contracts import TrajectoryRuntimeControls
 
 
 class TrajectoryController:
-    """Owns trajectory runtime controls during the staged refactor."""
+    """Owns web trajectory state, pending route updates, and runtime controls."""
 
     def __init__(self, controls: TrajectoryRuntimeControls):
         self.controls = controls
+        self.lock = threading.Lock()
+        self.active_route = None
+        self.pending_update = None
+        self.current_waypoints = None
+        self.current_times = None
+        self.current_mode = "replace_future"
+        self.state = "none"
+        self.plan_version_counter = 0
+        self._display_traj = None
+        self.display_lock = threading.Lock()
 
     def update_controls(
         self,
@@ -57,6 +68,54 @@ class TrajectoryController:
         )
         self.controls = controls
         return controls
+
+    def clear(self) -> None:
+        with self.lock:
+            self.active_route = None
+            self.pending_update = None
+            self.current_waypoints = None
+            self.current_times = None
+            self.current_mode = "replace_future"
+        self.state = "none"
+        self.set_display(None)
+
+    def next_plan_version(self) -> int:
+        self.plan_version_counter += 1
+        return self.plan_version_counter
+
+    def set_active_route(self, route, *, waypoints=None, times=None, mode="replace_future"):
+        with self.lock:
+            self.active_route = route
+            self.pending_update = None
+            self.current_waypoints = waypoints
+            self.current_times = times
+            self.current_mode = mode
+
+    def set_pending_update(self, update, *, waypoints=None, times=None, mode="replace_future"):
+        with self.lock:
+            self.pending_update = update
+            self.current_waypoints = waypoints
+            self.current_times = times
+            self.current_mode = mode
+
+    def replace_with_pending(self, update) -> None:
+        with self.lock:
+            self.active_route = update.new_route
+            self.pending_update = None
+
+    def snapshot(self):
+        with self.lock:
+            return self.pending_update, self.active_route
+
+    def set_display(self, trajectory) -> None:
+        with self.display_lock:
+            self._display_traj = None if trajectory is None else trajectory.copy()
+
+    def get_display(self):
+        with self.display_lock:
+            if self._display_traj is None:
+                return None
+            return self._display_traj.copy()
 
     @staticmethod
     def _coerce_int(value, *, default: int, min_value: int, name: str) -> int:
