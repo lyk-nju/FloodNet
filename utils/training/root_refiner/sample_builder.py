@@ -1,17 +1,12 @@
-"""RootRefiner tensor sample construction.
-
-RefinerSampleBuilder turns a raw HumanML3D-style motion sample and a
-RefinerSample plan into the batch contract consumed by RootRefiner training.
-Sampling decisions live in sample_creator.py; this module owns root recovery,
-local-frame canonicalization, and path-condition construction.
-"""
+"""RootRefiner tensor sample construction."""
 
 from __future__ import annotations
 
 import random as random_module
+from typing import Any
+
 import torch
 
-from typing import Any
 from utils.local_frame import (
     canonicalize_5d,
     canonicalize_7d,
@@ -22,15 +17,15 @@ from utils.training.root_refiner.path_condition import build_path_condition
 from utils.training.root_refiner.sample_creator import RefinerSample
 
 
-def _pad_or_truncate(x: torch.Tensor, target_len: int) -> torch.Tensor:
-    cur = x.shape[0]
-    if cur == target_len:
-        return x
-    if cur > target_len:
-        return x[:target_len]
-    pad_shape = list(x.shape)
-    pad_shape[0] = target_len - cur
-    return torch.cat([x, x.new_zeros(*pad_shape)], dim=0)
+def _pad_or_truncate(values: torch.Tensor, target_len: int) -> torch.Tensor:
+    current_len = values.shape[0]
+    if current_len == target_len:
+        return values
+    if current_len > target_len:
+        return values[:target_len]
+    pad_shape = list(values.shape)
+    pad_shape[0] = target_len - current_len
+    return torch.cat([values, values.new_zeros(*pad_shape)], dim=0)
 
 
 class RefinerSampleBuilder:
@@ -48,7 +43,8 @@ class RefinerSampleBuilder:
     ):
         self.n_hist = int(n_hist)
         self.n_path = int(n_path)
-        self.max_frames_value = int(max_frames)
+        self._max_frames = int(max_frames)
+        self.max_frames_value = self._max_frames
         self.min_frames = int(min_frames)
         self.sparse_path_point_range = tuple(int(v) for v in sparse_path_point_range)
         self._seed = seed
@@ -56,7 +52,7 @@ class RefinerSampleBuilder:
 
     @property
     def max_frames(self) -> int:
-        return self.max_frames_value
+        return self._max_frames
 
     def reset_rng(self) -> None:
         """Reset sparse path sampling to the builder seed."""
@@ -101,7 +97,7 @@ class RefinerSampleBuilder:
             anchor_yaw,
         )
 
-        base_sample = {
+        sample = {
             "text": self._text_of(raw_sample),
             "current_motion": current_motion,
             "history_mask": history_mask,
@@ -125,9 +121,9 @@ class RefinerSampleBuilder:
             "dataset": raw_sample.get("dataset"),
         }
         return self.process_output(
-            base_sample,
+            sample,
             self.process_path(
-                base_sample,
+                sample,
                 path_mode=plan.path_modes[index],
                 offset_start_frames=int(plan.offset_start_frames[index].item()),
             ),
@@ -177,24 +173,24 @@ class RefinerSampleBuilder:
         anchor_xz: torch.Tensor,
         anchor_yaw: torch.Tensor,
     ):
-        current_motion_world = motion_5d_world[history_frame_indices]
-        current_motion_local = canonicalize_5d(
-            current_motion_world, anchor_xz, anchor_yaw,
+        history_motion_world = motion_5d_world[history_frame_indices]
+        history_motion_local = canonicalize_5d(
+            history_motion_world, anchor_xz, anchor_yaw,
         )
         if valid_history_frames < self.n_hist:
-            pad = current_motion_local.new_zeros(
+            pad = history_motion_local.new_zeros(
                 self.n_hist - valid_history_frames, 5,
             )
-            current_motion = torch.cat([pad, current_motion_local], dim=0)
+            history_motion = torch.cat([pad, history_motion_local], dim=0)
         else:
-            current_motion = current_motion_local
+            history_motion = history_motion_local
         history_mask = torch.zeros(
             self.n_hist,
-            device=current_motion.device,
+            device=history_motion.device,
             dtype=torch.bool,
         )
         history_mask[self.n_hist - valid_history_frames :] = True
-        return current_motion, history_mask
+        return history_motion, history_mask
 
     def process_target(
         self,
@@ -225,11 +221,11 @@ class RefinerSampleBuilder:
         path_mode: str,
         offset_start_frames: int,
     ) -> dict[str, Any]:
-        waypoints = sample["target_waypoints"][..., :5]
-        waypoints_mask = sample["target_mask"]
-        valid_frame_count = int(waypoints_mask.sum().item())
-        physical_wp = sample["target_waypoints_physical"]
-        future_xz = physical_wp[:valid_frame_count, [0, 2]]
+        target_waypoints = sample["target_waypoints"][..., :5]
+        target_mask = sample["target_mask"]
+        valid_frame_count = int(target_mask.sum().item())
+        physical_waypoints = sample["target_waypoints_physical"]
+        future_xz = physical_waypoints[:valid_frame_count, [0, 2]]
         condition = build_path_condition(
             future_xz,
             n_path=self.n_path,
@@ -241,18 +237,14 @@ class RefinerSampleBuilder:
             rng=self._rng,
         )
 
-        path_tokens = condition.path
-        path_features_raw = condition.path_features_raw
-        path_features = path_features_raw
-
         return {
-            "waypoints": waypoints,
-            "waypoints_mask": waypoints_mask,
-            "physical_waypoints": physical_wp,
+            "waypoints": target_waypoints,
+            "waypoints_mask": target_mask,
+            "physical_waypoints": physical_waypoints,
             "condition": condition,
-            "path_tokens": path_tokens,
-            "path_features": path_features,
-            "path_features_raw": path_features_raw,
+            "path_tokens": condition.path,
+            "path_features": condition.path_features,
+            "path_features_raw": condition.path_features_raw,
         }
 
     @staticmethod

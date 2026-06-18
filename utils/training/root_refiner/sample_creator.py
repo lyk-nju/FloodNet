@@ -1,18 +1,16 @@
-"""RootRefiner sample creation.
+"""RootRefiner sampling decisions.
 
-RefinerSampleCreator owns motion-window and path-mode sampling only. Root
-recovery, local-frame canonicalization, path tensor construction, and
-normalization stay outside this file so dataset and online training paths can
-share the same sample contract.
+This module chooses history mode, anchor frame, target horizon, path condition
+mode, and path offset. Tensor construction lives in `sample_builder.py`.
 """
 
 from __future__ import annotations
 
 import random as random_module
-import torch
-
 from dataclasses import dataclass
 from typing import Iterable
+
+import torch
 
 
 _PATH_MODES = ("dense_path", "sparse_path", "goal_point")
@@ -64,11 +62,11 @@ class RefinerSampleCreator:
         self.path_condition_ratios = dict(
             path_condition_ratios or _DEFAULT_PATH_RATIOS
         )
-        unknown_ratio_keys = set(self.path_condition_ratios) - set(_PATH_MODES)
-        if unknown_ratio_keys:
+        unknown_keys = set(self.path_condition_ratios) - set(_PATH_MODES)
+        if unknown_keys:
             raise ValueError(
                 "unknown path_condition_ratios keys: "
-                f"{sorted(unknown_ratio_keys)}; expected keys from {_PATH_MODES}"
+                f"{sorted(unknown_keys)}; expected keys from {_PATH_MODES}"
             )
         self.offset_start_enabled = bool(offset_start_enabled)
         self.offset_start_prob = float(offset_start_prob)
@@ -91,9 +89,6 @@ class RefinerSampleCreator:
         force_path_mode: str | Iterable[str] | None = None,
         force_no_path_aug: bool = False,
     ) -> RefinerSample:
-        ##############################
-        # inputs
-        ##############################
         if torch.is_tensor(motion_lengths):
             device = motion_lengths.device
             lengths = motion_lengths.to(device=device, dtype=torch.long).view(-1)
@@ -113,9 +108,6 @@ class RefinerSampleCreator:
                 f"max_frames={self.max_frames}, min_frames={self.min_frames}"
             )
 
-        ##############################
-        # forced decisions
-        ##############################
         force_modes = _to_str_batch(
             force_mode, batch_size=batch_size, name="force_mode",
         )
@@ -139,9 +131,6 @@ class RefinerSampleCreator:
             )
         )
 
-        ##############################
-        # buffers
-        ##############################
         modes: list[str] = []
         path_modes: list[str] = []
         anchor_frames = torch.zeros(batch_size, device=device, dtype=torch.long)
@@ -154,78 +143,74 @@ class RefinerSampleCreator:
         )
         target_frame_counts = torch.zeros(batch_size, device=device, dtype=torch.long)
 
-        min_full_length = self.min_frames + 1
-        min_sliding = self.n_hist + self.min_frames
-        if bool((lengths < min_full_length).any()):
+        min_full_motion_length = self.min_frames + 1
+        min_sliding_motion_length = self.n_hist + self.min_frames
+        if bool((lengths < min_full_motion_length).any()):
             raise ValueError(
                 "motion length is too short for min_frames; "
-                f"motion_lengths={lengths.tolist()}, min_required_frames={min_full_length}"
+                f"motion_lengths={lengths.tolist()}, "
+                f"min_required_frames={min_full_motion_length}"
             )
 
-        ##############################
-        # per-sample decisions
-        ##############################
-        for b in range(batch_size):
-            T = int(lengths[b].item())
+        for batch_idx in range(batch_size):
+            motion_length = int(lengths[batch_idx].item())
             mode = self._sample_mode(
-                T,
-                force_mode=None if force_modes is None else force_modes[b],
-                min_sliding=min_sliding,
+                motion_length,
+                force_mode=None if force_modes is None else force_modes[batch_idx],
+                min_sliding=min_sliding_motion_length,
             )
             anchor = self._sample_anchor(
-                T,
+                motion_length,
                 mode=mode,
                 min_future_frames=self.min_frames,
                 forced_anchor=(
                     None
                     if forced_anchors is None
-                    else int(forced_anchors[b].item())
+                    else int(forced_anchors[batch_idx].item())
                 ),
             )
-            max_valid_frames = min(self.max_frames, T - anchor - 1)
+            max_valid_frames = min(self.max_frames, motion_length - anchor - 1)
             target_frames = self._sample_num_frames(
                 max_valid_frames,
                 forced_frames=(
                     None
                     if forced_frames is None
-                    else int(forced_frames[b].item())
+                    else int(forced_frames[batch_idx].item())
                 ),
             )
-            if anchor + 1 + target_frames > T:
+            if anchor + 1 + target_frames > motion_length:
                 raise ValueError(
                     "sampled target window exceeds motion length; "
-                    f"sample={b}, anchor_frame={anchor}, "
-                    f"target_frame_count={target_frames}, motion_length={T}"
+                    f"sample={batch_idx}, anchor_frame={anchor}, "
+                    f"target_frame_count={target_frames}, "
+                    f"motion_length={motion_length}"
                 )
 
-            anchor_frames[b] = anchor
-            target_frame_counts[b] = target_frames
+            anchor_frames[batch_idx] = anchor
+            target_frame_counts[batch_idx] = target_frames
             modes.append(mode)
             if mode == "full":
-                valid_history_frames[b] = 1
-                history_frame_indices[b, -1] = anchor
-                history_mask[b, -1] = True
+                valid_history_frames[batch_idx] = 1
+                history_frame_indices[batch_idx, -1] = anchor
+                history_mask[batch_idx, -1] = True
             else:
-                valid_history_frames[b] = self.n_hist
+                valid_history_frames[batch_idx] = self.n_hist
                 indices = torch.arange(
                     anchor - self.n_hist + 1,
                     anchor + 1,
                     device=device,
                     dtype=torch.long,
                 )
-                history_frame_indices[b] = indices
-                history_mask[b] = True
+                history_frame_indices[batch_idx] = indices
+                history_mask[batch_idx] = True
 
             path_mode = (
-                self._validate_path_mode(force_path_modes[b])
+                self._validate_path_mode(force_path_modes[batch_idx])
                 if force_path_modes is not None
                 else self._sample_path_mode()
             )
             path_modes.append(path_mode)
 
-        ##############################
-        # path augmentation
-        ##############################
         offset_start_frames = self._sample_offset_start_frames(
             target_frame_counts,
             path_modes,
@@ -250,16 +235,16 @@ class RefinerSampleCreator:
         min_sliding: int,
     ) -> str:
         if force_mode is not None:
-            mode_drawn = str(force_mode)
+            mode = str(force_mode)
         elif self._rng.random() < self.full_plan_ratio:
-            mode_drawn = "full"
+            mode = "full"
         else:
-            mode_drawn = "sliding"
-        if mode_drawn not in {"full", "sliding"}:
-            raise ValueError(f"mode must be 'full' or 'sliding', got {mode_drawn!r}")
-        if mode_drawn == "sliding" and motion_length < min_sliding:
+            mode = "sliding"
+        if mode not in {"full", "sliding"}:
+            raise ValueError(f"mode must be 'full' or 'sliding', got {mode!r}")
+        if mode == "sliding" and motion_length < min_sliding:
             return "full"
-        return mode_drawn
+        return mode
 
     def _sample_anchor(
         self,
@@ -270,30 +255,38 @@ class RefinerSampleCreator:
         forced_anchor: int | None,
     ) -> int:
         if mode == "full":
-            lo = 0
-            hi = motion_length - int(min_future_frames) - 1
-            if hi < lo:
+            min_anchor = 0
+            max_anchor = motion_length - int(min_future_frames) - 1
+            if max_anchor < min_anchor:
                 raise ValueError(
                     "full anchor range invalid; "
-                    f"lo={lo}, hi={hi}, motion_length={motion_length}"
+                    f"lo={min_anchor}, hi={max_anchor}, "
+                    f"motion_length={motion_length}"
                 )
             anchor = (
                 int(forced_anchor)
                 if forced_anchor is not None
-                else self._rng.randint(lo, hi)
+                else self._rng.randint(min_anchor, max_anchor)
             )
         else:
-            lo = self.n_hist - 1
-            hi = motion_length - int(min_future_frames) - 1
-            if hi < lo:
+            min_anchor = self.n_hist - 1
+            max_anchor = motion_length - int(min_future_frames) - 1
+            if max_anchor < min_anchor:
                 raise ValueError(
                     "sliding anchor range invalid; "
-                    f"lo={lo}, hi={hi}, motion_length={motion_length}"
+                    f"lo={min_anchor}, hi={max_anchor}, "
+                    f"motion_length={motion_length}"
                 )
             anchor = (
                 int(forced_anchor)
                 if forced_anchor is not None
-                else self._rng.randint(lo, hi)
+                else self._rng.randint(min_anchor, max_anchor)
+            )
+        if anchor < min_anchor or anchor > max_anchor:
+            raise ValueError(
+                "anchor_frame must be within the valid anchor range for "
+                f"{mode} mode; anchor_frame={anchor}, "
+                f"valid_range=[{min_anchor}, {max_anchor}]"
             )
         if anchor < 0:
             raise ValueError(f"anchor_frame must be >= 0, got {anchor}")
@@ -370,22 +363,23 @@ class RefinerSampleCreator:
         offsets = torch.zeros_like(target_frame_counts)
         if force_no_path_aug or not self.offset_start_enabled:
             return offsets
-        for b, path_mode in enumerate(path_modes):
+        for batch_idx, path_mode in enumerate(path_modes):
             if path_mode not in self.offset_start_apply_to:
                 continue
             if self._rng.random() >= self.offset_start_prob:
                 continue
-            valid_frame_count = int(target_frame_counts[b].item())
+            valid_frame_count = int(target_frame_counts[batch_idx].item())
             max_offset = min(
                 self.offset_start_max_frames,
                 max(0, valid_frame_count - 2),
             )
-            offsets[b] = (
+            offsets[batch_idx] = (
                 self._rng.randint(0, max_offset)
                 if max_offset > 0
                 else 0
             )
         return offsets
+
 
 def _to_long_batch(value, *, batch_size: int, device, name: str) -> torch.Tensor:
     if torch.is_tensor(value):
@@ -396,7 +390,8 @@ def _to_long_batch(value, *, batch_size: int, device, name: str) -> torch.Tensor
         out = out.expand(batch_size)
     if out.numel() != batch_size:
         raise ValueError(
-            f"{name} must be scalar or length {batch_size}; got shape {tuple(out.shape)}"
+            f"{name} must be scalar or length {batch_size}; "
+            f"got shape {tuple(out.shape)}"
         )
     return out
 
@@ -417,5 +412,6 @@ def _to_str_batch(
     if len(out) != batch_size:
         raise ValueError(f"{name} must be scalar or length {batch_size}; got {out!r}")
     return out
+
 
 __all__ = ["RefinerSample", "RefinerSampleCreator"]

@@ -68,6 +68,26 @@ def test_sliding_sample_uses_forced_anchor_and_history_indices():
     assert sample.target_frame_counts.tolist() == [17]
 
 
+def test_forced_sliding_anchor_before_history_window_raises():
+    creator = RefinerSampleCreator(
+        n_hist=8,
+        max_frames=45,
+        min_frames=5,
+        full_plan_ratio=0.0,
+        horizon_policy="random",
+        path_condition_policy="dense_path",
+        seed=0,
+    )
+
+    with pytest.raises(ValueError, match="anchor_frame must be within"):
+        creator.create(
+            torch.tensor([80]),
+            force_mode="sliding",
+            force_anchor_frame=torch.tensor([3]),
+            force_num_frames=torch.tensor([17]),
+        )
+
+
 def test_sliding_draw_falls_back_to_full_when_clip_is_not_sliding_eligible():
     min_frames = 13
     n_hist = 20

@@ -82,6 +82,26 @@ def test_offset_start_changes_supervision_mask_but_not_valid_frame_count():
     assert torch.allclose(result.path[0], future[4], atol=1e-5)
 
 
+def test_offset_start_keeps_duration_features_on_full_future():
+    future = _future_xz(21)
+    result = build_path_condition(
+        future,
+        n_path=8,
+        valid_frame_count=future.shape[0],
+        path_mode="dense_path",
+        offset_start_frames=4,
+        sparse_point_range=(3, 8),
+        rng=random.Random(1),
+    )
+
+    visible_path_features = compute_path_features(result.path)
+    full_future_features = compute_path_features(future)
+
+    assert not torch.allclose(visible_path_features, full_future_features)
+    assert torch.allclose(result.path_features, visible_path_features, atol=1e-5)
+    assert torch.allclose(result.path_features_raw, full_future_features, atol=1e-5)
+
+
 def test_path_features_are_5d_raw_geometry_features():
     path = torch.tensor([[1.0, 2.0], [4.0, 6.0], [7.0, 6.0]])
     features = compute_path_features(path)
