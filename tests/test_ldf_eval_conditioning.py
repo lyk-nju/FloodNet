@@ -8,6 +8,8 @@ import torch
 from eval.ldf.conditioning import (
     LdfEvalStreamConditioner,
     build_gt_rootplan_from_batch,
+)
+from utils.training.ldf.validation_conditioning import (
     prepare_ldf_eval_model_batch,
 )
 from metrics.traj import _compute_deterministic_fwd_ctrl_loss_sample
@@ -105,7 +107,7 @@ def test_prepare_ldf_eval_model_batch_prefix_window_uses_full_future_traj(monkey
     model = SimpleNamespace(ldf_window_context_tokens=3, ldf_window_horizon_tokens=99)
 
     monkeypatch.setattr(
-        "eval.ldf.conditioning.prepare_generate_condition",
+        "utils.training.ldf.validation_conditioning.prepare_generate_condition",
         lambda model_arg, model_batch, device: {"prepared": True},
     )
     monkeypatch.setattr(

@@ -40,11 +40,28 @@ def test_training_package_no_longer_exports_async_eval_helpers():
 
 
 def test_validation_eval_uses_validation_function_names():
+    from utils.training.ldf.validation_generation import run_validation_generation_eval
+    from utils.training.ldf.validation_summary import (
+        process_validation_generation_results,
+    )
+
+    assert callable(run_validation_generation_eval)
+    assert callable(process_validation_generation_results)
+
+
+def test_eval_validation_wrappers_preserve_legacy_imports():
     from eval.eval_runner import run_validation_generation_eval
     from eval.eval_summary import process_validation_generation_results
 
     assert callable(run_validation_generation_eval)
     assert callable(process_validation_generation_results)
+
+
+def test_train_ldf_does_not_import_eval_package():
+    train_source = (_ROOT / "train_ldf.py").read_text()
+
+    assert "from eval." not in train_source
+    assert "import eval." not in train_source
 
 
 def test_t2m_metric_enabled_is_validation_scoped():

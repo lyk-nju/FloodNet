@@ -24,13 +24,13 @@ from torch.utils.data import DataLoader
 from torch_ema import ExponentialMovingAverage
 
 from metrics.t2m import T2MMetrics
-from eval.ldf.conditioning import (
+from utils.training.ldf.validation_conditioning import (
     build_windowed_metric_ground_truth as _build_windowed_metric_ground_truth,
     prepare_ldf_eval_model_batch,
 )
-from eval.ldf.t2m_generation import run_t2m_generation_mode
-from eval.eval_runner import run_validation_generation_eval
-from eval.eval_summary import process_validation_generation_results
+from utils.training.ldf.t2m_generation import run_t2m_generation_mode
+from utils.training.ldf.validation_generation import run_validation_generation_eval
+from utils.training.ldf.validation_summary import process_validation_generation_results
 from utils.initialize import (
     check_state_dict,
     get_function,

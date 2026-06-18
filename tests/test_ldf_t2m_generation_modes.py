@@ -2,7 +2,7 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from eval.ldf.t2m_generation import run_t2m_generation_mode
+from utils.training.ldf.t2m_generation import run_t2m_generation_mode
 from utils.training.ldf.t2m_generation_modes import resolve_t2m_generation_modes
 
 

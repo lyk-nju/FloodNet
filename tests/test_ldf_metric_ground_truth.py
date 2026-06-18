@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import torch
 
-from eval.ldf.conditioning import build_windowed_metric_ground_truth
 from utils.token_frame import num_frames_for_tokens
+from utils.training.ldf.validation_conditioning import build_windowed_metric_ground_truth
 
 
 def test_windowed_metric_ground_truth_uses_model_batch_prefix():
