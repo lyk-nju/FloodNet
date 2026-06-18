@@ -1113,7 +1113,7 @@ class ModelManager(WebRuntime):
         self._trajectory_state = f"{self._trajectory_state}_7d_unavailable"
         return None
     
-    def pause_generation(self):
+    def pause_generation(self, *, target_state=GenerationState.PAUSED):
         """Pause generation (keeps all state)"""
         worker = self._generation_worker()
         if worker.is_running and not worker.stop(timeout=5.0):
@@ -1121,7 +1121,7 @@ class ModelManager(WebRuntime):
             self.generation_state = GenerationState.ERROR
             return False
         self.is_generating = False
-        self.generation_state = GenerationState.PAUSED
+        self.generation_state = target_state
         print("Generation paused (state preserved)")
         return True
     
@@ -1151,7 +1151,7 @@ class ModelManager(WebRuntime):
         self.generation_state = GenerationState.RESETTING
         # Stop if running, then poll until thread truly exits (max 10s total)
         if self.is_generating:
-            if not self.pause_generation():
+            if not self.pause_generation(target_state=GenerationState.RESETTING):
                 self.generation_state = GenerationState.ERROR
                 return False
         worker = self._generation_worker()

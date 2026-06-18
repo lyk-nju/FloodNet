@@ -19,6 +19,13 @@ class SessionClaim:
     previous_session_id: str | None = None
 
 
+@dataclass(frozen=True)
+class TimeoutCandidate:
+    session_id: str
+    elapsed: float
+    last_frame_consumed_time: float
+
+
 class SessionService:
     """Owns active session state and frame-consumption timeout tracking."""
 
@@ -105,17 +112,31 @@ class SessionService:
         with self._consumption_lock:
             self._last_frame_consumed_time = None
 
-    def _timeout_candidate(self) -> tuple[str, float] | None:
+    def _timeout_candidate(self) -> TimeoutCandidate | None:
         with self._consumption_lock:
-            if self._last_frame_consumed_time is None:
+            last_frame_consumed_time = self._last_frame_consumed_time
+            if last_frame_consumed_time is None:
                 return None
-            elapsed = time.time() - self._last_frame_consumed_time
+            elapsed = time.time() - last_frame_consumed_time
             if elapsed <= self.consumption_timeout:
                 return None
         with self._session_lock:
             if self._active_session_id is None:
                 return None
-            return self._active_session_id, elapsed
+            return TimeoutCandidate(
+                session_id=self._active_session_id,
+                elapsed=elapsed,
+                last_frame_consumed_time=last_frame_consumed_time,
+            )
+
+    def _timeout_candidate_still_current(self, candidate: TimeoutCandidate) -> bool:
+        with self._consumption_lock:
+            if self._last_frame_consumed_time != candidate.last_frame_consumed_time:
+                return False
+            if time.time() - candidate.last_frame_consumed_time <= self.consumption_timeout:
+                return False
+        with self._session_lock:
+            return self._active_session_id == candidate.session_id
 
     def start_consumption_monitor(
         self,
@@ -130,16 +151,22 @@ class SessionService:
         )
         self._monitor_thread.start()
 
+    def handle_timeout_once(self, reset_callback: Callable[[str, float], bool]) -> bool:
+        candidate = self._timeout_candidate()
+        if candidate is None:
+            return False
+        if not self._timeout_candidate_still_current(candidate):
+            return False
+        if not reset_callback(candidate.session_id, candidate.elapsed):
+            return False
+        self.release(candidate.session_id)
+        self.clear_consumption()
+        return True
+
     def _monitor_loop(self, reset_callback: Callable[[str, float], bool]) -> None:
         while True:
             time.sleep(self.poll_interval)
-            candidate = self._timeout_candidate()
-            if candidate is None:
-                continue
-            session_id, elapsed = candidate
-            if reset_callback(session_id, elapsed):
-                self.release(session_id)
-                self.clear_consumption()
+            self.handle_timeout_once(reset_callback)
 
 
-__all__ = ["SessionClaim", "SessionService"]
+__all__ = ["SessionClaim", "SessionService", "TimeoutCandidate"]

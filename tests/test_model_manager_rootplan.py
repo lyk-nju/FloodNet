@@ -15,6 +15,7 @@ from utils.inference.timeline import RootFrameState, RootTimeline
 from utils.token_frame import token_range_to_frame_slice, token_start_frame
 from web_demo.model_manager import ModelManager
 from web_demo.runtime.model_bundle import ModelBundle
+from web_demo.runtime.state import GenerationState
 
 
 def test_web_demo_layered_runtime_import_contract():
@@ -133,6 +134,24 @@ def test_model_manager_init_uses_model_bundle_not_stream_generator_helper(monkey
     assert mgr.cfg is fake_bundle.cfg
     assert mgr.stream_generator is fake_stream_generator
     assert mgr.rootplan_controller.stream_generator is fake_stream_generator
+
+
+def test_pause_generation_can_preserve_resetting_state():
+    class _IdleWorker:
+        is_running = False
+
+        def stop(self, timeout):
+            raise AssertionError("stop should not be called when worker is idle")
+
+    mgr = ModelManager.__new__(ModelManager)
+    mgr.generation_worker = _IdleWorker()
+    mgr.is_generating = True
+    mgr.generation_state = GenerationState.RUNNING
+
+    assert mgr.pause_generation(target_state=GenerationState.RESETTING) is True
+
+    assert mgr.is_generating is False
+    assert mgr.generation_state is GenerationState.RESETTING
 
 
 class _DummyModel(nn.Module):
