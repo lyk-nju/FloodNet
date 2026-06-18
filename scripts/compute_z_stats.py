@@ -32,9 +32,46 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from scripts.compute_5d_stats import WelfordAccumulator   # noqa: E402  (reuse)
-
 log = logging.getLogger(__name__)
+
+
+class WelfordAccumulator:
+    """Numerically stable per-channel running mean/std accumulator."""
+
+    def __init__(self, dim: int):
+        self.dim = int(dim)
+        self.n = 0
+        self.mean = np.zeros(self.dim, dtype=np.float64)
+        self.m2 = np.zeros(self.dim, dtype=np.float64)
+
+    def update_batch(self, values: np.ndarray) -> None:
+        values = np.asarray(values, dtype=np.float64)
+        if values.ndim != 2 or values.shape[1] != self.dim:
+            raise ValueError(
+                f"expected [N,{self.dim}] values, got {tuple(values.shape)}"
+            )
+        if values.shape[0] == 0:
+            return
+        batch_n = values.shape[0]
+        batch_mean = values.mean(axis=0)
+        batch_m2 = ((values - batch_mean) ** 2).sum(axis=0)
+        if self.n == 0:
+            self.n = batch_n
+            self.mean = batch_mean
+            self.m2 = batch_m2
+            return
+        total = self.n + batch_n
+        delta = batch_mean - self.mean
+        self.mean = self.mean + delta * (batch_n / total)
+        self.m2 = self.m2 + batch_m2 + delta * delta * self.n * batch_n / total
+        self.n = total
+
+    def finalize(self, eps: float = 1e-6) -> tuple[np.ndarray, np.ndarray]:
+        if self.n == 0:
+            return self.mean.copy(), np.ones(self.dim, dtype=np.float64)
+        var = self.m2 / max(self.n, 1)
+        std = np.sqrt(np.maximum(var, eps * eps))
+        return self.mean.copy(), std
 
 
 def iter_latent_files(cache_dir: str | Path) -> list[Path]:
