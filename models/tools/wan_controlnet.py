@@ -1,10 +1,3 @@
-# ControlNet-style residual branch for WanModel (1D / t2v usage).
-#
-# Design goals:
-# - Same inputs as WanModel.forward (noisy latent + time + text + traj_emb).
-# - Outputs per-layer residuals (B, seq_len, dim) to be injected into WanModel blocks.
-# - Zero-initialized residual heads so initial behavior matches the backbone.
-
 import math
 import warnings
 import torch
@@ -14,22 +7,13 @@ from typing import List, Optional
 from .wan_model import (
     WanAttentionBlock,
     _embed_text_context,
-    _normalize_traj_token_mask_for_attention,
+    _prepare_traj_attn_mask,
     rope_params,
     sinusoidal_embedding_1d,
 )
 
 
-def _zero_linear(dim: int) -> nn.Linear:
-    m = nn.Linear(dim, dim)
-    nn.init.zeros_(m.weight)
-    nn.init.zeros_(m.bias)
-    return m
-
-
 class WanControlNet(nn.Module):
-    """A lightweight ControlNet branch matching WanModel's internal representations."""
-
     def __init__(
         self,
         *,
@@ -41,7 +25,7 @@ class WanControlNet(nn.Module):
         ffn_dim: int = 2048,
         freq_dim: int = 256,
         text_dim: int = 4096,
-        out_dim: int = 256,  # unused, kept for interface parity
+        out_dim: int = 256,  # useless, kept for interface parity
         num_heads: int = 8,
         num_layers: int = 8,
         window_size=(-1, -1),
@@ -99,7 +83,7 @@ class WanControlNet(nn.Module):
             ]
         )
 
-        # FlexTraj tokens.
+        # Traj-token embedding and type embedding
         if traj_enc_dim > 0:
             self.traj_in_proj = nn.Linear(traj_enc_dim, dim)
             self.traj_type_embed = nn.Parameter(torch.zeros(1, 1, dim))
@@ -107,20 +91,22 @@ class WanControlNet(nn.Module):
             self.traj_in_proj = None
             self.traj_type_embed = None
 
-        # RoPE freqs (same construction as WanModel).
+        # RoPE freqs 
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
-        d = dim // num_heads
+        head_dim = dim // num_heads
         self.freqs = torch.cat(
             [
-                rope_params(1024, d - 4 * (d // 6)),
-                rope_params(1024, 2 * (d // 6)),
-                rope_params(1024, 2 * (d // 6)),
+                rope_params(1024, head_dim - 4 * (head_dim // 6)),
+                rope_params(1024, 2 * (head_dim // 6)),
+                rope_params(1024, 2 * (head_dim // 6)),
             ],
             dim=1,
         )
 
-        # Per-layer residual heads (zero-init).
-        self.zero_out = nn.ModuleList([_zero_linear(dim) for _ in range(num_layers)])
+        # ControlNet like zero-init.
+        self.zero_out = nn.ModuleList(
+            [self._make_zero_linear(dim) for _ in range(num_layers)]
+        )
 
         # Init to match WanModel defaults for shared layers.
         self.init_weights()
@@ -129,13 +115,12 @@ class WanControlNet(nn.Module):
             nn.init.zeros_(self.traj_in_proj.bias)
 
     def init_weights(self):
-        # Same init policy as WanModel (linear xavier; embeddings normal; residual heads already zero).
-        # Exclude zero_out heads and traj_in_proj — both get explicit zero-init after this call.
-        _exclude = set(self.zero_out)
+        # Match WanModel init, except for explicitly zero-initialized layers.
+        excluded = set(self.zero_out)
         if self.traj_in_proj is not None:
-            _exclude.add(self.traj_in_proj)
+            excluded.add(self.traj_in_proj)
         for m in self.modules():
-            if isinstance(m, nn.Linear) and m not in _exclude:
+            if isinstance(m, nn.Linear) and m not in excluded:
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
@@ -148,19 +133,24 @@ class WanControlNet(nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, std=0.02)
 
+    @staticmethod
+    def _make_zero_linear(dim: int) -> nn.Linear:
+        layer = nn.Linear(dim, dim)
+        nn.init.zeros_(layer.weight)
+        nn.init.zeros_(layer.bias)
+        return layer
+
     @torch.no_grad()
     def init_from_backbone(self, backbone) -> None:
         """Copy matching weights from a WanModel instance."""
         result = self.load_state_dict(backbone.state_dict(), strict=False)
         if result.missing_keys:
-            # Expected: ControlNet-only layers (zero_out heads, traj_in_proj) have no backbone counterpart.
             warnings.warn(
                 f"init_from_backbone: {len(result.missing_keys)} ControlNet-only keys "
                 f"not copied from backbone (will keep current init): {result.missing_keys}",
                 stacklevel=2,
             )
         if result.unexpected_keys:
-            # Keys present in backbone but absent from ControlNet — silently ignored by strict=False.
             warnings.warn(
                 f"init_from_backbone: {len(result.unexpected_keys)} backbone keys have no "
                 f"ControlNet counterpart (ignored): {result.unexpected_keys}",
@@ -214,41 +204,46 @@ class WanControlNet(nn.Module):
         if self.traj_in_proj is not None and traj_emb is not None:
             traj_t = self.traj_in_proj(traj_emb.to(dtype=x.dtype, device=x.device))
             traj_t = traj_t + self.traj_type_embed
-            # Mask AFTER traj_in_proj + traj_type_embed: zero-init bias of
-            # traj_type_embed (and traj_in_proj.bias) would otherwise leak into
-            # invalid tokens once those parameters move off zero in training.
+            # Mask after projection because proj/type-embed bias can affect invalid tokens.
             if traj_token_mask is not None:
-                tm = traj_token_mask.to(device=x.device, dtype=traj_t.dtype)
-                if tm.dim() == 2:
-                    tm = tm[..., None]
-                tm_len = tm.shape[1]
-                proj_len = traj_t.shape[1]
-                if tm_len < proj_len:
-                    tm = torch.cat(
-                        [tm, tm.new_zeros(tm.shape[0], proj_len - tm_len, 1)], dim=1
+                traj_mask = traj_token_mask.to(device=x.device, dtype=traj_t.dtype)
+                if traj_mask.dim() == 2:
+                    traj_mask = traj_mask[..., None]
+                mask_len = traj_mask.shape[1]
+                traj_len = traj_t.shape[1]
+                if mask_len < traj_len:
+                    traj_mask = torch.cat(
+                        [
+                            traj_mask,
+                            traj_mask.new_zeros(traj_mask.shape[0], traj_len - mask_len, 1),
+                        ],
+                        dim=1,
                     )
-                elif tm_len > proj_len:
-                    tm = tm[:, :proj_len, :]
-                traj_t = traj_t * tm
-            bt, tlen, _ = traj_t.shape
-            traj_pad_len = max(seq_len, int(tlen))
+                elif mask_len > traj_len:
+                    traj_mask = traj_mask[:, :traj_len, :]
+                traj_t = traj_t * traj_mask
+            batch_size, traj_len, _ = traj_t.shape
+            traj_pad_len = max(seq_len, int(traj_len))
             if traj_token_mask is not None:
-                traj_token_mask_attn = _normalize_traj_token_mask_for_attention(
+                traj_token_mask_attn = _prepare_traj_attn_mask(
                     traj_token_mask,
-                    batch_size=bt,
+                    batch_size=batch_size,
                     traj_pad_len=traj_pad_len,
                     device=x.device,
                 )
-            if tlen < traj_pad_len:
+            if traj_len < traj_pad_len:
                 traj_t = torch.cat(
-                    [traj_t, traj_t.new_zeros(bt, traj_pad_len - tlen, traj_t.size(-1))],
+                    [
+                        traj_t,
+                        traj_t.new_zeros(batch_size, traj_pad_len - traj_len, traj_t.size(-1)),
+                    ],
                     dim=1,
                 )
-            elif tlen > traj_pad_len:
+            elif traj_len > traj_pad_len:
                 traj_t = traj_t[:, :traj_pad_len, :]
             x = torch.cat([x, traj_t], dim=1)
             if traj_seq_lens is None:
-                traj_seq_lens_attn = torch.full_like(seq_lens, int(tlen))
+                traj_seq_lens_attn = torch.full_like(seq_lens, int(traj_len))
             else:
                 traj_seq_lens_attn = (
                     traj_seq_lens.to(device=device, dtype=torch.long).clamp(
@@ -261,11 +256,11 @@ class WanControlNet(nn.Module):
         if t.dim() == 1:
             t = t.unsqueeze(1).expand(-1, seq_len)
         with torch.amp.autocast("cuda", dtype=torch.float32):
-            bt = t.size(0)
-            tflat = t.flatten()
+            batch_size = t.size(0)
+            t_flat = t.flatten()
             e = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim, tflat)
-                .unflatten(0, (bt, seq_len))
+                sinusoidal_embedding_1d(self.freq_dim, t_flat)
+                .unflatten(0, (batch_size, seq_len))
                 .float()
             )
             e0 = self.time_projection(e).unflatten(2, (6, self.dim))
@@ -297,6 +292,6 @@ class WanControlNet(nn.Module):
         residuals: List[torch.Tensor] = []
         for i, block in enumerate(self.blocks):
             x = block(x, **kwargs)
-            h_lat = x[:, :seq_len, :]
-            residuals.append(self.zero_out[i](h_lat))
+            latent_hidden = x[:, :seq_len, :]
+            residuals.append(self.zero_out[i](latent_hidden))
         return residuals

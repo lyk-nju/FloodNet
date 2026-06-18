@@ -11,7 +11,7 @@ from models.tools.wan_model import (
     WanCrossAttention,
     WanModel,
     WanSelfAttention,
-    rope_apply_concat_latent_traj,
+    rope_apply_latent_traj,
     rope_params,
 )
 
@@ -27,13 +27,13 @@ def _freqs_for_head_dim(head_dim: int) -> torch.Tensor:
     )
 
 
-def test_rope_concat_default_keeps_legacy_padded_traj_tail_unchanged():
+def test_rope_latent_traj_default_keeps_padded_traj_tail_unchanged():
     torch.manual_seed(123)
     latent_pad_len = 5
     grid_len = 3
     x = torch.randn(1, 2 * latent_pad_len, 2, 6)
 
-    out = rope_apply_concat_latent_traj(
+    out = rope_apply_latent_traj(
         x,
         grid_sizes=torch.tensor([[grid_len, 1, 1]]),
         freqs=_freqs_for_head_dim(6),

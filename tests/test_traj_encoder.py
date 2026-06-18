@@ -15,8 +15,6 @@ import pytest
 import torch
 
 from models.tools.traj_encoder import (
-    LOCAL_OUT_DIM,
-    TRAJ_OUT_DIM,
     FrameTrajEncoder,
     TokenTrajEncoder,
     TrajectoryEncoder,
@@ -117,13 +115,13 @@ def _build_direct_traj_condition(model, x, model_sl, window_start_token, device,
 def test_frame_encoder_7d_forward_shape():
     enc = FrameTrajEncoder()
     out = enc(torch.randn(2, 5, 4, 7))
-    assert out.shape == (2, 5, LOCAL_OUT_DIM)
+    assert out.shape == (2, 5, 128)
 
 
 def test_token_encoder_default_forward_shape():
     enc = TokenTrajEncoder()                                  # 128 → 128
-    out = enc(torch.randn(2, 5, LOCAL_OUT_DIM))
-    assert out.shape == (2, 5, TRAJ_OUT_DIM)
+    out = enc(torch.randn(2, 5, 128))
+    assert out.shape == (2, 5, 128)
 
 
 def test_frame_encoder_rejects_non_7d_input():
@@ -159,6 +157,26 @@ def test_frame_encoder_zeros_invalid_frames_before_conv():
         o_clean = enc(base, frame_mask=mask)
         o_perturbed = enc(perturbed, frame_mask=mask)
     assert torch.allclose(o_clean, o_perturbed, atol=1e-5)
+
+
+def test_frame_encoder_masks_invalid_hidden_between_conv_layers():
+    enc = FrameTrajEncoder(hidden_dim=1, out_dim=1).eval()
+    with torch.no_grad():
+        enc.conv1.weight.zero_()
+        enc.conv1.bias.zero_()
+        enc.conv2.weight.zero_()
+        enc.conv2.bias.zero_()
+        enc.conv1.weight[0, 0, 0] = 1.0
+        enc.conv2.weight[0, 0, 0] = 1.0
+
+    x = torch.zeros(1, 1, 4, 7)
+    x[0, 0, 0, 0] = 1.0
+    mask = torch.tensor([[[1.0, 0.0, 1.0, 1.0]]])
+
+    with torch.no_grad():
+        out = enc(x, frame_mask=mask)
+
+    assert torch.allclose(out, torch.zeros_like(out), atol=1e-6)
 
 
 # ---------------------------------------------------------------------------

@@ -1,9 +1,7 @@
 # This module uses modified code from Alibaba Wan Team
 # Original source: https://github.com/Wan-Video/Wan2.2
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
-# Modified to support stream mode for cross-attention.
-# Added causal attention for self-attention (1d case)
-# Added context length corrrection.
+# Modified for FloodNet LDF windowed and FlexTraj paths.
 
 import math
 import os
@@ -28,6 +26,131 @@ def sinusoidal_embedding_1d(dim, position):
     )
     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
     return x
+
+
+@torch.amp.autocast("cuda", enabled=False)
+def rope_params(max_seq_len, dim, theta=10000):
+    assert dim % 2 == 0
+    freqs = torch.outer(
+        torch.arange(max_seq_len),
+        1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float64).div(dim)),
+    )
+    freqs = torch.polar(torch.ones_like(freqs), freqs)
+    return freqs
+
+
+@torch.amp.autocast("cuda", enabled=False)
+def rope_apply(x, grid_sizes, freqs):
+    n, c = x.size(2), x.size(3) // 2
+
+    # split freqs
+    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+
+    # loop over samples
+    output = []
+    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+        seq_len = f * h * w
+
+        # precompute multipliers
+        x_i = torch.view_as_complex(
+            x[i, :seq_len].to(torch.float64).reshape(seq_len, n, -1, 2)
+        )
+        freqs_i = torch.cat(
+            [
+                freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
+            ],
+            dim=-1,
+        ).reshape(seq_len, 1, -1)
+
+        # apply rotary embedding
+        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+        x_i = torch.cat([x_i, x[i, seq_len:]])
+
+        # append to collection
+        output.append(x_i)
+    return torch.stack(output).float()
+
+
+@torch.amp.autocast("cuda", enabled=False)
+def rope_apply_latent_traj(x, grid_sizes, freqs, latent_pad_len, traj_pad_len=None):
+    """
+    RoPE for sequences [latent_0..L || traj_0..T].
+
+    If trajectory length is omitted, it matches the latent length. When
+    trajectory length is longer, future trajectory tokens receive their own
+    temporal RoPE positions on the 1D body token grid.
+    """
+    n, c = x.size(2), x.size(3) // 2
+    freqs_split = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    latent_len = latent_pad_len
+    traj_len = latent_len if traj_pad_len is None else int(traj_pad_len)
+    assert x.size(1) == latent_len + traj_len
+    output = []
+    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+        grid_len = f * h * w
+
+        def freqs_for_grid(f_len: int) -> torch.Tensor:
+            return torch.cat(
+                [
+                    freqs_split[0][:f_len].view(f_len, 1, 1, -1).expand(f_len, h, w, -1),
+                    freqs_split[1][:h].view(1, h, 1, -1).expand(f_len, h, w, -1),
+                    freqs_split[2][:w].view(1, 1, w, -1).expand(f_len, h, w, -1),
+                ],
+                dim=-1,
+            ).reshape(f_len * h * w, 1, -1)
+
+        freqs_i = freqs_for_grid(f)
+
+        def apply_rope_prefix(x_prefix: torch.Tensor, freqs_prefix: torch.Tensor) -> torch.Tensor:
+            # rotate first grid_len tokens; leave tail of prefix unchanged
+            prefix_len = min(x_prefix.shape[0], freqs_prefix.shape[0])
+            if prefix_len == 0:
+                return x_prefix
+            x_rot = torch.view_as_complex(
+                x_prefix[:prefix_len].to(torch.float64).reshape(prefix_len, n, -1, 2)
+            )
+            x_rot = torch.view_as_real(x_rot * freqs_prefix[:prefix_len]).flatten(2)
+            return torch.cat([x_rot, x_prefix[prefix_len:]], dim=0)
+
+        x_latent = apply_rope_prefix(x[i, :latent_len], freqs_i)
+        if traj_len == latent_len:
+            traj_freqs = freqs_i
+        else:
+            traj_freqs = freqs_for_grid(traj_len) if h == 1 and w == 1 else freqs_i
+        x_traj = apply_rope_prefix(x[i, latent_len : latent_len + traj_len], traj_freqs)
+        output.append(torch.cat([x_latent, x_traj], dim=0))
+    return torch.stack(output).float()
+
+
+def _prepare_traj_attn_mask(
+    traj_token_mask,
+    *,
+    batch_size: int,
+    traj_pad_len: int,
+    device,
+):
+    mask = traj_token_mask.to(device=device, dtype=torch.bool)
+    if mask.dim() == 3 and mask.shape[-1] == 1:
+        mask = mask[..., 0]
+    if mask.dim() != 2:
+        raise ValueError(f"traj_token_mask must have shape [B,T], got {tuple(mask.shape)}")
+    if mask.shape[0] != batch_size:
+        raise ValueError(
+            f"traj_token_mask batch size {mask.shape[0]} does not match {batch_size}"
+        )
+    if mask.shape[1] < traj_pad_len:
+        mask = torch.cat(
+            [
+                mask,
+                mask.new_zeros(mask.shape[0], traj_pad_len - mask.shape[1]),
+            ],
+            dim=1,
+        )
+    elif mask.shape[1] > traj_pad_len:
+        mask = mask[:, :traj_pad_len]
+    return mask
 
 
 def _embed_text_context(text_embedding, context, text_len, dim, device):
@@ -101,133 +224,6 @@ def _embed_text_context(text_embedding, context, text_len, dim, device):
 
     idx_t = torch.tensor(ctx_indices, device=unique_embedded.device, dtype=torch.long)
     return unique_embedded[idx_t], context_lens
-
-
-@torch.amp.autocast("cuda", enabled=False)
-def rope_params(max_seq_len, dim, theta=10000):
-    assert dim % 2 == 0
-    freqs = torch.outer(
-        torch.arange(max_seq_len),
-        1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float64).div(dim)),
-    )
-    freqs = torch.polar(torch.ones_like(freqs), freqs)
-    return freqs
-
-
-@torch.amp.autocast("cuda", enabled=False)
-def rope_apply(x, grid_sizes, freqs):
-    n, c = x.size(2), x.size(3) // 2
-
-    # split freqs
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
-
-    # loop over samples
-    output = []
-    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
-        seq_len = f * h * w
-
-        # precompute multipliers
-        x_i = torch.view_as_complex(
-            x[i, :seq_len].to(torch.float64).reshape(seq_len, n, -1, 2)
-        )
-        freqs_i = torch.cat(
-            [
-                freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-                freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-                freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
-            ],
-            dim=-1,
-        ).reshape(seq_len, 1, -1)
-
-        # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
-
-        # append to collection
-        output.append(x_i)
-    return torch.stack(output).float()
-
-
-@torch.amp.autocast("cuda", enabled=False)
-def rope_apply_concat_latent_traj(x, grid_sizes, freqs, latent_pad_len, traj_pad_len=None):
-    """
-    RoPE for sequences [latent_0..L || traj_0..T].
-
-    Default T == L keeps the legacy checkpoint contract: each segment only
-    rotates the real grid prefix and leaves padded tail tokens untouched.
-    Streaming can opt into T > L so latent tokens attend to a future trajectory
-    horizon. For the body model's 1D token grid (H=W=1), future traj tokens
-    receive the next temporal RoPE positions.
-    """
-    n, c = x.size(2), x.size(3) // 2
-    freqs_split = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
-    L = latent_pad_len
-    T = L if traj_pad_len is None else int(traj_pad_len)
-    assert x.size(1) == L + T
-    output = []
-    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
-        grid_len = f * h * w
-
-        def freqs_for_grid(f_len: int) -> torch.Tensor:
-            return torch.cat(
-                [
-                    freqs_split[0][:f_len].view(f_len, 1, 1, -1).expand(f_len, h, w, -1),
-                    freqs_split[1][:h].view(1, h, 1, -1).expand(f_len, h, w, -1),
-                    freqs_split[2][:w].view(1, 1, w, -1).expand(f_len, h, w, -1),
-                ],
-                dim=-1,
-            ).reshape(f_len * h * w, 1, -1)
-
-        freqs_i = freqs_for_grid(f)
-
-        def apply_rope_prefix(x_prefix: torch.Tensor, freqs_prefix: torch.Tensor) -> torch.Tensor:
-            # rotate first grid_len tokens; leave tail of prefix unchanged
-            prefix_len = min(x_prefix.shape[0], freqs_prefix.shape[0])
-            if prefix_len == 0:
-                return x_prefix
-            x_rot = torch.view_as_complex(
-                x_prefix[:prefix_len].to(torch.float64).reshape(prefix_len, n, -1, 2)
-            )
-            x_rot = torch.view_as_real(x_rot * freqs_prefix[:prefix_len]).flatten(2)
-            return torch.cat([x_rot, x_prefix[prefix_len:]], dim=0)
-
-        x_lat = apply_rope_prefix(x[i, :L], freqs_i)
-        if T == L:
-            traj_freqs = freqs_i
-        else:
-            traj_freqs = freqs_for_grid(T) if h == 1 and w == 1 else freqs_i
-        x_traj = apply_rope_prefix(x[i, L : L + T], traj_freqs)
-        output.append(torch.cat([x_lat, x_traj], dim=0))
-    return torch.stack(output).float()
-
-
-def _normalize_traj_token_mask_for_attention(
-    traj_token_mask,
-    *,
-    batch_size: int,
-    traj_pad_len: int,
-    device,
-):
-    mask = traj_token_mask.to(device=device, dtype=torch.bool)
-    if mask.dim() == 3 and mask.shape[-1] == 1:
-        mask = mask[..., 0]
-    if mask.dim() != 2:
-        raise ValueError(f"traj_token_mask must have shape [B,T], got {tuple(mask.shape)}")
-    if mask.shape[0] != batch_size:
-        raise ValueError(
-            f"traj_token_mask batch size {mask.shape[0]} does not match {batch_size}"
-        )
-    if mask.shape[1] < traj_pad_len:
-        mask = torch.cat(
-            [
-                mask,
-                mask.new_zeros(mask.shape[0], traj_pad_len - mask.shape[1]),
-            ],
-            dim=1,
-        )
-    elif mask.shape[1] > traj_pad_len:
-        mask = mask[:, :traj_pad_len]
-    return mask
 
 
 class WanRMSNorm(nn.Module):
@@ -305,8 +301,8 @@ class WanSelfAttention(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
             latent_pad_len: if set, x is [latent || traj] with
-                L = latent_pad_len + traj_pad_len; traj segment
-                starts at this index. Self-attn 使用 Task4 块稀疏（见 ``flextraj_self_attention``）。
+                latent length controlling diffusion tokens, followed by
+                trajectory condition tokens that may be longer.
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
@@ -324,10 +320,10 @@ class WanSelfAttention(nn.Module):
                 latent_pad_len if traj_pad_len is None else int(traj_pad_len)
             )
             assert s == latent_pad_len + effective_traj_pad_len
-            q = rope_apply_concat_latent_traj(
+            q = rope_apply_latent_traj(
                 q, grid_sizes, freqs, latent_pad_len, traj_pad_len
             )
-            k = rope_apply_concat_latent_traj(
+            k = rope_apply_latent_traj(
                 k, grid_sizes, freqs, latent_pad_len, traj_pad_len
             )
         else:
@@ -369,73 +365,75 @@ class WanSelfAttention(nn.Module):
 class WanCrossAttention(WanSelfAttention):
     def forward(self, x, context, context_lens, latent_pad_len=None):
         r"""
-        Args non-stream mode:
+        Args sample-aligned text:
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
-        Args stream mode (frame-aligned, plain):
+        Args frame-aligned text:
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [BxL1, L2, C]
             context_lens(Tensor): Shape [BxL1]
-        Args stream mode (frame-aligned, FlexTraj):
+        Args frame-aligned text with trajectory tokens:
             x(Tensor): Shape [B, L_lat + L_traj, C]  — [latent || traj]
             context(Tensor): Shape [BxL1, L2, C]
             context_lens(Tensor): Shape [BxL1]
         """
         out_sizes = x.size()
-        bq = x.size(0)
-        b_ctx = context.size(0)
+        query_batch = x.size(0)
+        context_batch = context.size(0)
         n, d = self.num_heads, self.head_dim
         zero_traj_from = None
-        if b_ctx != bq:
-            if b_ctx % bq != 0:
+        if context_batch != query_batch:
+            if context_batch % query_batch != 0:
                 raise ValueError(
                     "frame-aligned cross-attn context batch must be a multiple "
-                    f"of query batch; got context batch {b_ctx}, query batch {bq}."
+                    f"of query batch; got context batch {context_batch}, "
+                    f"query batch {query_batch}."
                 )
-            Lq = x.size(1)
-            L_lat = b_ctx // bq
-            if latent_pad_len is not None and int(latent_pad_len) != L_lat:
+            query_len = x.size(1)
+            latent_len = context_batch // query_batch
+            if latent_pad_len is not None and int(latent_pad_len) != latent_len:
                 raise ValueError(
                     "frame-aligned cross-attn context length must match latent_pad_len; "
-                    f"context-derived L_lat {L_lat}, latent_pad_len {int(latent_pad_len)}."
+                    f"context-derived latent_len {latent_len}, "
+                    f"latent_pad_len {int(latent_pad_len)}."
                 )
-            if latent_pad_len is None and Lq < L_lat:
+            if latent_pad_len is None and query_len < latent_len:
                 raise ValueError(
                     "frame-aligned cross-attn requires x length to be at least "
                     "the context-derived latent length. Got "
-                    f"x length {Lq}, context-derived L_lat {L_lat}."
+                    f"x length {query_len}, context-derived latent_len {latent_len}."
                 )
 
-        k = self.norm_k(self.k(context)).view(b_ctx, -1, n, d)
-        v = self.v(context).view(b_ctx, -1, n, d)
+        k = self.norm_k(self.k(context)).view(context_batch, -1, n, d)
+        v = self.v(context).view(context_batch, -1, n, d)
 
-        if b_ctx == bq:
+        if context_batch == query_batch:
             # Standard: one context per sample (no frame-alignment)
-            q = self.norm_q(self.q(x)).view(bq, -1, n, d)
+            q = self.norm_q(self.q(x)).view(query_batch, -1, n, d)
             x = flash_attention(q, k, v, k_lens=context_lens)
             x = x.flatten(2).view(*out_sizes)
         else:
-            # Frame-aligned: b_ctx = bq * L_lat
-            Lq = x.size(1)
-            L_lat = b_ctx // bq
-            q_all = self.norm_q(self.q(x)).view(bq, Lq, n, d)  # (bq, Lq, n, d)
+            # Frame-aligned: one text context per latent token.
+            query_len = x.size(1)
+            latent_len = context_batch // query_batch
+            q_all = self.norm_q(self.q(x)).view(query_batch, query_len, n, d)
 
-            if Lq == L_lat:
+            if query_len == latent_len:
                 # Plain frame-aligned: each token has its own context
-                q = q_all.reshape(b_ctx, 1, n, d)
+                q = q_all.reshape(context_batch, 1, n, d)
                 x = flash_attention(q, k, v, k_lens=context_lens)
                 x = x.flatten(2).view(*out_sizes)
             else:
-                # FlexTraj: only latent tokens query frame-aligned text.
+                # Only latent tokens query frame-aligned text.
                 # Trajectory tokens are known control tokens, so their cross-attn
-                # output stays zero even when L_traj != L_lat.
-                q_lat = q_all[:, :L_lat].reshape(b_ctx, 1, n, d)
-                out_lat = flash_attention(q_lat, k, v, k_lens=context_lens)
-                out_lat = out_lat.flatten(2).view(bq, L_lat, -1)
+                # output stays zero even when trajectory length differs.
+                q_latent = q_all[:, :latent_len].reshape(context_batch, 1, n, d)
+                out_latent = flash_attention(q_latent, k, v, k_lens=context_lens)
+                out_latent = out_latent.flatten(2).view(query_batch, latent_len, -1)
                 x = x.new_zeros(*out_sizes)
-                x[:, :L_lat, :] = out_lat
-                zero_traj_from = L_lat
+                x[:, :latent_len, :] = out_latent
+                zero_traj_from = latent_len
 
         x = self.o(x)
         if zero_traj_from is not None:
@@ -508,7 +506,7 @@ class WanAttentionBlock(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
             latent_pad_len: optional; when set, L = latent_pad_len + traj_pad_len
-                (latent || traj).
+                with latent tokens first and trajectory condition tokens after.
         """
         assert e.dtype == torch.float32
         with torch.amp.autocast("cuda", dtype=torch.float32):
@@ -531,8 +529,7 @@ class WanAttentionBlock(nn.Module):
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
-            # FlexTraj论文语义：condition/trajectory tokens不应该通过 cross-attn
-            # 去查询文本tokens（只允许噪声/主干去查询）。
+            # Only latent tokens query text; trajectory tokens are known control.
             cross_out = self.cross_attn(
                 self.norm3(x),
                 context,
@@ -540,7 +537,7 @@ class WanAttentionBlock(nn.Module):
                 latent_pad_len=latent_pad_len,
             )
             if latent_pad_len is not None:
-                # x = [latent_tokens || traj_tokens], 仅更新latent部分
+                # x = [latent_tokens || traj_tokens]
                 cross_out[:, latent_pad_len:, :] = 0
             x = x + cross_out
             y = self.ffn(
@@ -653,7 +650,7 @@ class WanModel(ModelMixin, ConfigMixin):
             eps (`float`, *optional*, defaults to 1e-6):
                 Epsilon value for normalization layers
             traj_enc_dim (`int`, *optional*, defaults to 0):
-                Trajectory encoder output dim; 0 disables FlexTraj token concat.
+                Trajectory encoder output dim; 0 disables trajectory-token concat.
         """
 
         super().__init__()
@@ -677,7 +674,7 @@ class WanModel(ModelMixin, ConfigMixin):
         self.eps = eps
         self.causal = causal
         self.traj_enc_dim = traj_enc_dim
-        # embeddings
+        # Embedding layers.
         self.patch_embedding = nn.Conv3d(
             in_dim, dim, kernel_size=patch_size, stride=patch_size
         )
@@ -707,9 +704,10 @@ class WanModel(ModelMixin, ConfigMixin):
             ]
         )
 
-        # head
+        # Output head.
         self.head = Head(dim, out_dim, patch_size, eps)
 
+        # Trajectory-token projection and type embedding.
         if traj_enc_dim > 0:
             self.traj_in_proj = nn.Linear(traj_enc_dim, dim)
             self.traj_type_embed = nn.Parameter(torch.zeros(1, 1, dim))
@@ -717,7 +715,7 @@ class WanModel(ModelMixin, ConfigMixin):
             self.traj_in_proj = None
             self.traj_type_embed = None
 
-        # buffers (don't use register_buffer otherwise dtype will be changed in to())
+        # Rotary frequencies. Avoid register_buffer so module dtype casts do not change them.
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
         d = dim // num_heads
         self.freqs = torch.cat(
@@ -729,18 +727,13 @@ class WanModel(ModelMixin, ConfigMixin):
             dim=1,
         )
 
-        # initialize weights
+        # Initialize weights.
         self.init_weights()
         if self.traj_in_proj is not None:
             nn.init.zeros_(self.traj_in_proj.weight)
             nn.init.zeros_(self.traj_in_proj.bias)
 
-        # T_B_02: history-corruption support fields (consumed by T_B_03).
-        # Added AFTER init_weights() so the generic initializer doesn't touch them.
-        #   mask_emb: learned replacement vector for corrupted history tokens,
-        #             in the in_dim (VAE latent) space.
-        #   z_mean / z_std: VAE latent per-channel stats, loaded via load_z_stats.
-        # All three are persistent and must be present in current checkpoints.
+        # Learned replacement token and latent stats for history corruption.
         self.mask_emb = nn.Parameter(torch.randn(self.in_dim) * 0.02)
         self.register_buffer("z_mean", torch.zeros(self.in_dim))
         self.register_buffer("z_std", torch.ones(self.in_dim))
@@ -784,7 +777,7 @@ class WanModel(ModelMixin, ConfigMixin):
                 Conditional video inputs for image-to-video mode, same shape as x
             traj_emb (`Tensor`, *optional*):
                 Trajectory encoder output before `traj_in_proj`, shape (B, T, traj_enc_dim).
-                When set, concatenated as a second half of the self-attention sequence (FlexTraj).
+                When set, appended after latent tokens as trajectory condition tokens.
 
         Returns:
             List[Tensor]:
@@ -792,7 +785,7 @@ class WanModel(ModelMixin, ConfigMixin):
         """
         if self.model_type == "i2v":
             assert y is not None
-        # params
+        # Resolve device-local buffers.
         device = self.patch_embedding.weight.device
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
@@ -800,7 +793,7 @@ class WanModel(ModelMixin, ConfigMixin):
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
-        # embeddings
+        # Patch latent tokens.
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x]
@@ -820,40 +813,49 @@ class WanModel(ModelMixin, ConfigMixin):
         traj_seq_lens_attn = None
         traj_token_mask_attn = None
         if self.traj_in_proj is not None and traj_emb is not None:
+            # Append trajectory condition tokens. Latent length controls
+            # diffusion tokens; trajectory length may be longer for horizon.
             traj_t = self.traj_in_proj(traj_emb.to(dtype=x.dtype))
             traj_t = traj_t + self.traj_type_embed
             if traj_token_mask is not None:
-                tm = traj_token_mask.to(device=x.device, dtype=traj_t.dtype)
-                if tm.dim() == 2:
-                    tm = tm[..., None]
-                tm_len = tm.shape[1]
-                proj_len = traj_t.shape[1]
-                if tm_len < proj_len:
-                    tm = torch.cat(
-                        [tm, tm.new_zeros(tm.shape[0], proj_len - tm_len, 1)], dim=1
+                traj_mask = traj_token_mask.to(device=x.device, dtype=traj_t.dtype)
+                if traj_mask.dim() == 2:
+                    traj_mask = traj_mask[..., None]
+                mask_len = traj_mask.shape[1]
+                traj_len = traj_t.shape[1]
+                if mask_len < traj_len:
+                    traj_mask = torch.cat(
+                        [
+                            traj_mask,
+                            traj_mask.new_zeros(traj_mask.shape[0], traj_len - mask_len, 1),
+                        ],
+                        dim=1,
                     )
-                elif tm_len > proj_len:
-                    tm = tm[:, :proj_len, :]
-                traj_t = traj_t * tm
-            bt, tlen, _ = traj_t.shape
-            traj_pad_len = max(seq_len, int(tlen))
+                elif mask_len > traj_len:
+                    traj_mask = traj_mask[:, :traj_len, :]
+                traj_t = traj_t * traj_mask
+            batch_size, traj_len, _ = traj_t.shape
+            traj_pad_len = max(seq_len, int(traj_len))
             if traj_token_mask is not None:
-                traj_token_mask_attn = _normalize_traj_token_mask_for_attention(
+                traj_token_mask_attn = _prepare_traj_attn_mask(
                     traj_token_mask,
-                    batch_size=bt,
+                    batch_size=batch_size,
                     traj_pad_len=traj_pad_len,
                     device=x.device,
                 )
-            if tlen < traj_pad_len:
+            if traj_len < traj_pad_len:
                 traj_t = torch.cat(
-                    [traj_t, traj_t.new_zeros(bt, traj_pad_len - tlen, traj_t.size(-1))],
+                    [
+                        traj_t,
+                        traj_t.new_zeros(batch_size, traj_pad_len - traj_len, traj_t.size(-1)),
+                    ],
                     dim=1,
                 )
-            elif tlen > traj_pad_len:
+            elif traj_len > traj_pad_len:
                 traj_t = traj_t[:, :traj_pad_len, :]
             x = torch.cat([x, traj_t], dim=1)
             if traj_seq_lens is None:
-                traj_seq_lens_attn = torch.full_like(seq_lens, int(tlen))
+                traj_seq_lens_attn = torch.full_like(seq_lens, int(traj_len))
             else:
                 traj_seq_lens_attn = (
                     traj_seq_lens.to(device=seq_lens.device, dtype=torch.long)
@@ -861,32 +863,31 @@ class WanModel(ModelMixin, ConfigMixin):
                 )
             latent_pad_len = seq_len
 
-        # time embeddings
+        # Build time modulation.
         if t.dim() == 1:  # per-sample scalar → (B, seq_len)
             t = t.unsqueeze(1).expand(-1, seq_len)
         with torch.amp.autocast("cuda", dtype=torch.float32):
-            bt = t.size(0)
+            batch_size = t.size(0)
             t = t.flatten()
             e = self.time_embedding(
                 sinusoidal_embedding_1d(self.freq_dim, t)
-                .unflatten(0, (bt, seq_len))
+                .unflatten(0, (batch_size, seq_len))
                 .float()
             )
             e0 = self.time_projection(e).unflatten(2, (6, self.dim))
             if latent_pad_len is not None:
-                # FlexTraj: latent tokens depend on diffusion timestep (time modulation),
-                # while traj tokens are treated as known control and should not be
-                # time-modulated by the diffusion step.
+                # Trajectory tokens are known conditions, so only latent tokens
+                # receive diffusion time modulation.
                 e0_traj = e0.new_zeros(e0.shape[0], traj_pad_len, *e0.shape[2:])
                 e0 = torch.cat([e0, e0_traj], dim=1)
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
-        # context
+        # Embed text context.
         context, context_lens = _embed_text_context(
             self.text_embedding, context, self.text_len, self.dim, device
         )
 
-        # arguments
+        # Run transformer blocks.
         kwargs = dict(
             e=e0,
             seq_lens=seq_lens,
@@ -922,13 +923,13 @@ class WanModel(ModelMixin, ConfigMixin):
                 # Only apply residuals to latent tokens (first seq_len tokens).
                 x[:, :seq_len, :] = x[:, :seq_len, :] + r
 
-        # head (latent tokens only)
+        # Decode latent tokens only.
         if latent_pad_len is not None:
             x = self.head(x[:, :seq_len], e)
         else:
             x = self.head(x, e)
 
-        # unpatchify
+        # Unpatchify.
         x = self.unpatchify(x, grid_sizes)
         return [u.float() for u in x]
 

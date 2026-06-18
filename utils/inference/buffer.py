@@ -464,8 +464,8 @@ class TrajStreamBuffer:
                 "FrameTrajEncoder. Until that landing, route streaming traj "
                 "through the training-time encode_traj_batch path."
             )
-        if hasattr(self.traj_encoder, "encode_tokens"):
-            emb = self.traj_encoder.encode_tokens(feats)
+        if hasattr(self.traj_encoder, "encode_traj_token"):
+            emb = self.traj_encoder.encode_traj_token(feats)
         else:
             emb = self.traj_encoder(feats)
         if self.use_emb_cache:

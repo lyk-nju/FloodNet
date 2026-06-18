@@ -78,6 +78,8 @@ class DiffForcingWanModel(nn.Module):
         self.text_len = text_len
         self._precomputed_text_emb = None
         self.text_encoder = None
+        # Text encoding cache 
+        self.text_cache = {}
 
         if build_text_encoder:
             self.text_encoder = T5EncoderModel(
@@ -89,8 +91,6 @@ class DiffForcingWanModel(nn.Module):
                 shard_fn=None,
             )
 
-        # Text encoding cache (only used when running live T5)
-        self.text_cache = {}
         # Backbone is unconditional on traj; ControlNet is the sole trajectory consumer.
         traj_enc_dim_backbone = 0
         traj_enc_dim_controlnet = self.traj_out_dim
@@ -186,7 +186,8 @@ class DiffForcingWanModel(nn.Module):
         if condition is None:
             raise ValueError(
                 "DiffForcingWanModel requires prepared LDFCondition. "
-                "Build it outside the model before calling generate or stream_generate_step."
+                "Build it outside the model before calling generate, "
+                "stream_generate, or stream_generate_step."
             )
         if condition.text_null_context is None:
             raise ValueError("LDFCondition.text_null_context is required for CFG.")
@@ -335,18 +336,10 @@ class DiffForcingWanModel(nn.Module):
         batch_size: int,
         traj_token_mask=None,
     ) -> list:
-        """Unified CFG denoising step shared by generate / stream_generate / stream_generate_step.
-
-        Handles three modes transparently:
-          - 2-batch text CFG (cfg_scale_text != 1) + optional separated traj CFG
-          - Single-batch with post-hoc null-text forward (cfg_scale_text != 1, no double-batch context)
-          - Unconditioned (cfg_scale_text == 1)
-        Returns a list of per-sample predicted tensors (C, T, 1, 1).
-        """
+        """CFG denoising shared by generate / stream_generate / stream_generate_step."""
         ctx_double = None
         if self.cfg_scale_text != 1.0:
-            # Text CFG supports per-sample context (B) and token-expanded
-            # stream context (B * seq_len).
+            # Text CFG supports per-sample or frame-aligned contexts.
             n_text_ctx = len(text_cond_ctx)
             if n_text_ctx == batch_size:
                 ctx_double = list(text_cond_ctx) + list(text_null_ctx)
@@ -436,12 +429,7 @@ class DiffForcingWanModel(nn.Module):
                 traj_token_mask=traj_mask_double,
             )
             if self.cfg_scale_traj > 0.0:
-                # Separated CFG: batch all 3 passes into one 3B backbone forward.
-                # ControlNet runs on 2B with traj and on B with null traj so the
-                # uncond slot matches the project-wide no-traj semantics.
-                #   out = out_uncond
-                #       + w_text * (out_full - out_null_text+traj)   ← pure text effect, traj fixed
-                #       + w_traj * (out_null_text+traj - out_uncond) ← pure traj effect, text=null
+                # Compose text/traj CFG from full, no-text, and null branches.
                 noisy_triple = list(noisy_double) + list(noisy_input)
                 t_triple = torch.cat([t_double, t_scaled], dim=0)
                 if len(ctx_double) == 2 * batch_size:
@@ -496,9 +484,7 @@ class DiffForcingWanModel(nn.Module):
                 y=None, traj_emb=None, traj_seq_lens=None, controlnet_residuals=residuals,
             )
             if self.cfg_scale_text != 1.0:
-                # Re-compute ControlNet residuals with null text so the uncond branch is
-                # truly unconditioned (Bug fix: reusing cond residuals made CFG uncond
-                # branch not truly null).
+                # Recompute residuals with null text for a true CFG null branch.
                 residuals_null = self._controlnet_forward(
                     noisy_input, t_scaled, text_null_ctx, seq_len, traj_emb, traj_seq_lens,
                     traj_token_mask=traj_token_mask,
@@ -555,10 +541,10 @@ class DiffForcingWanModel(nn.Module):
             full_text = [" ////////// ".join(map(str, item)) for item in full_text]
 
         # Progressively advance from t=0 to t=max_t
-        latent_attn_len = condition.seq_len
-        if latent_attn_len is None:
-            latent_attn_len = gen_seq_len
-        latent_attn_len = int(latent_attn_len)
+        latent_seq_len = condition.seq_len
+        if latent_seq_len is None:
+            latent_seq_len = gen_seq_len
+        latent_seq_len = int(latent_seq_len)
         for step in range(total_steps):
             # Current time step
             t = step * dt
@@ -576,17 +562,17 @@ class DiffForcingWanModel(nn.Module):
             for i in range(batch_size):
                 noisy_input.append(generated[i, :, :end_index, ...])
 
-            if latent_attn_len == gen_seq_len:
-                noise_level_for_attn = noise_level
+            if latent_seq_len == gen_seq_len:
+                noise_level_for_model = noise_level
             else:
-                noise_level_for_attn = self._get_noise_levels(
-                    device, latent_attn_len, time_steps
+                noise_level_for_model = self._get_noise_levels(
+                    device, latent_seq_len, time_steps
                 )
-            t_scaled = noise_level_for_attn * self.time_embedding_scale
+            t_scaled = noise_level_for_model * self.time_embedding_scale
             predicted_result = self._denoise_with_cfg(
                 noisy_input, t_scaled,
                 condition.text_context, condition.text_null_context,
-                condition.traj_emb, condition.traj_seq_lens, latent_attn_len, batch_size,
+                condition.traj_emb, condition.traj_seq_lens, latent_seq_len, batch_size,
                 traj_token_mask=condition.traj_token_mask,
             )
 
@@ -678,10 +664,10 @@ class DiffForcingWanModel(nn.Module):
 
         commit_index = 0
         # Progressively advance from t=0 to t=max_t
-        latent_attn_len = condition.seq_len
-        if latent_attn_len is None:
-            latent_attn_len = gen_seq_len
-        latent_attn_len = int(latent_attn_len)
+        latent_seq_len = condition.seq_len
+        if latent_seq_len is None:
+            latent_seq_len = gen_seq_len
+        latent_seq_len = int(latent_seq_len)
         for step in range(total_steps):
             # Current time step
             t = step * dt
@@ -699,17 +685,17 @@ class DiffForcingWanModel(nn.Module):
             for i in range(batch_size):
                 noisy_input.append(generated[i, :, :end_index, ...])
 
-            if latent_attn_len == gen_seq_len:
-                noise_level_for_attn = noise_level
+            if latent_seq_len == gen_seq_len:
+                noise_level_for_model = noise_level
             else:
-                noise_level_for_attn = self._get_noise_levels(
-                    device, latent_attn_len, time_steps
+                noise_level_for_model = self._get_noise_levels(
+                    device, latent_seq_len, time_steps
                 )
-            t_scaled = noise_level_for_attn * self.time_embedding_scale
+            t_scaled = noise_level_for_model * self.time_embedding_scale
             predicted_result = self._denoise_with_cfg(
                 noisy_input, t_scaled,
                 condition.text_context, condition.text_null_context,
-                condition.traj_emb, condition.traj_seq_lens, latent_attn_len, batch_size,
+                condition.traj_emb, condition.traj_seq_lens, latent_seq_len, batch_size,
                 traj_token_mask=condition.traj_token_mask,
             )
 

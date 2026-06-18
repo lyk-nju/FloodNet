@@ -268,43 +268,54 @@ def test_ldf_training_window_sampling_rejects_invalid_horizon_range():
         validate_ldf_training_config(cfg)
 
 
-def test_ldf_training_rejects_min_history_below_chunk_size():
+def test_ldf_training_rolling_requires_window_sampling_enabled():
     cfg = OmegaConf.create({
         "model": {"params": {"chunk_size": 5}},
         "ldf_training": {
             "formulation": "windowed",
             "window_policy": "rolling",
             "context_tokens": 30,
-            "min_history_tokens": 4,
         },
     })
-    with pytest.raises(ValueError, match="min_history_tokens"):
+
+    with pytest.raises(ValueError, match="window_sampling.enabled"):
         validate_ldf_training_config(cfg)
 
 
-def test_ldf_training_rejects_context_below_min_history():
-    cfg = OmegaConf.create({
-        "model": {"params": {"chunk_size": 5}},
-        "ldf_training": {
-            "formulation": "windowed",
-            "window_policy": "rolling",
-            "context_tokens": 6,
-            "min_history_tokens": 8,
-        },
-    })
-    with pytest.raises(ValueError, match="context_tokens"):
-        validate_ldf_training_config(cfg)
-
-
-def test_ldf_training_accepts_fixed_window_sample_policy():
+def test_ldf_training_rejects_disabled_rolling_window_sampling():
     cfg = OmegaConf.create({
         "model": {"params": {"chunk_size": 5}},
         "ldf_training": {
             "formulation": "windowed",
             "window_policy": "rolling",
             "context_tokens": 30,
-            "min_history_tokens": 8,
+            "window_sampling": {"enabled": False},
+        },
+    })
+
+    with pytest.raises(ValueError, match="window_sampling.enabled"):
+        validate_ldf_training_config(cfg)
+
+
+def test_ldf_training_window_sampling_accepts_fixed_window_sample_policy():
+    cfg = OmegaConf.create({
+        "model": {"params": {"chunk_size": 5}},
+        "self_forcing": {
+            "k_schedule": [[0.0, 5]],
+            "stride_tokens": 1,
+        },
+        "ldf_training": {
+            "formulation": "windowed",
+            "window_policy": "rolling",
+            "context_tokens": 30,
             "sample_policy": "fixed_window",
+            "window_sampling": {
+                "enabled": True,
+                "history_tokens_min": 0,
+                "history_tokens_max": "auto",
+                "horizon_tokens_min": 5,
+                "horizon_tokens_max": 25,
+            },
         },
     })
     validate_ldf_training_config(cfg)
@@ -313,11 +324,21 @@ def test_ldf_training_accepts_fixed_window_sample_policy():
 def test_ldf_training_rejects_unknown_sample_policy():
     cfg = OmegaConf.create({
         "model": {"params": {"chunk_size": 5}},
+        "self_forcing": {
+            "k_schedule": [[0.0, 5]],
+            "stride_tokens": 1,
+        },
         "ldf_training": {
             "formulation": "windowed",
             "window_policy": "rolling",
             "context_tokens": 30,
-            "min_history_tokens": 8,
+            "window_sampling": {
+                "enabled": True,
+                "history_tokens_min": 0,
+                "history_tokens_max": "auto",
+                "horizon_tokens_min": 5,
+                "horizon_tokens_max": 25,
+            },
             "sample_policy": "middle_window",
         },
     })
@@ -358,11 +379,21 @@ def test_ldf_training_rejects_removed_latent_source():
 def test_ldf_training_rejects_anchor_move_in_rollout_until_supported():
     cfg = OmegaConf.create({
         "model": {"params": {"chunk_size": 5}},
+        "self_forcing": {
+            "k_schedule": [[0.0, 5]],
+            "stride_tokens": 1,
+        },
         "ldf_training": {
             "formulation": "windowed",
             "window_policy": "rolling",
             "context_tokens": 30,
-            "min_history_tokens": 8,
+            "window_sampling": {
+                "enabled": True,
+                "history_tokens_min": 0,
+                "history_tokens_max": "auto",
+                "horizon_tokens_min": 5,
+                "horizon_tokens_max": 25,
+            },
             "anchor_move_in_rollout": True,
         },
     })

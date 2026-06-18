@@ -159,9 +159,13 @@ ldf_training:
     formulation: windowed
     window_policy: rolling
     context_tokens: 30
-    horizon_tokens: 20
-    min_history_tokens: 8
     sample_policy: variable_history
+    window_sampling:
+        enabled: true
+        history_tokens_min: 0
+        history_tokens_max: auto
+        horizon_tokens_min: 5
+        horizon_tokens_max: 20
 
 body_aux_loss:
     enabled: true

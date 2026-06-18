@@ -157,6 +157,16 @@ def validate_ldf_training_config(cfg) -> None:
     anchor_move = bool(
         OmegaConf.select(cfg, "ldf_training.anchor_move_in_rollout", default=False)
     )
+    if sample_policy not in {"variable_history", "fixed_window"}:
+        raise ValueError(
+            "ldf_training.sample_policy must be 'variable_history' or "
+            f"'fixed_window'; got {sample_policy!r}."
+        )
+    if policy == "rolling" and not window_sampling_enabled:
+        raise ValueError(
+            "ldf_training.window_policy='rolling' requires "
+            "ldf_training.window_sampling.enabled=true."
+        )
     if window_sampling_enabled:
         if policy != "rolling":
             raise ValueError(
@@ -230,11 +240,6 @@ def validate_ldf_training_config(cfg) -> None:
     if policy == "rolling" and horizon_tokens < 0:
         raise ValueError(
             f"ldf_training.horizon_tokens must be >= 0, got {horizon_tokens}"
-        )
-    if sample_policy not in {"variable_history", "fixed_window"}:
-        raise ValueError(
-            "ldf_training.sample_policy must be 'variable_history' or "
-            f"'fixed_window'; got {sample_policy!r}."
         )
     if anchor_move:
         raise ValueError(
