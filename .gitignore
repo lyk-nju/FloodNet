@@ -49,6 +49,7 @@ eval/eval_*/
 eval/baeline_*/
 eval/baseline_*/
 eval/async_eval/
+eval/output_eval/
 eval/result
 
 # markdown

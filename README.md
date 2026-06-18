@@ -3,19 +3,20 @@
 FloodNet 是一个基于 FloodDiffusion 的研究型代码库，当前重点在三个方向：
 
 - 文本驱动的人体动作生成
-- 轨迹条件控制与 ControlNet 训练
-- self-forcing / streaming 相关训练与评测
+- LDF / RootRefiner 两阶段轨迹条件建模
+- self-forcing / streaming 相关训练、评测与 Web runtime
 
 这不是一个“只做推理演示”的轻量仓库，而是一个包含训练、验证、调试、结构重构和实验记录的工作仓库。下面的说明以**当前代码真实可用的流程**为准，而不是沿用旧版 `FloodDiffusion` 的模板文案。
 
 ## 当前能力
 
 - `train_ldf.py`：LDF / ControlNet / self-forcing 训练与验证
+- `train_refiner.py`：RootRefiner 训练与验证
 - `train_vae.py`：VAE 训练与验证
 - `generate_ldf.py`：离线生成、流式生成、逐步流式生成示例
 - `web_demo/`：实时 3D 动作生成演示
-- `eval/`：inline generation eval、artifact 保存、summary 聚合
-- `test/`：单测、冒烟脚本、调试笔记、对齐检查
+- `eval/`：生成评测、runtime benchmark、artifact 保存、summary 聚合
+- `tests/`：单测、冒烟测试、重构边界检查
 
 ## 仓库结构
 
@@ -25,14 +26,16 @@ FloodNet 是一个基于 FloodDiffusion 的研究型代码库，当前重点在�
 FloodNet/
 ├── configs/                  # 训练、验证、流式生成配置
 ├── datasets/                 # HumanML3D / BABEL 数据集封装
+├── docs/                     # 架构说明、设计记录、问题记录
 ├── eval/                     # 生成评测、汇总、结果处理
 ├── metrics/                  # T2M / MR 等指标
 ├── models/                   # VAE / Diffusion Forcing / ControlNet 模型
-├── test/                     # 单测、冒烟脚本、调试笔记
+├── tests/                    # 单测、冒烟测试、重构边界检查
 ├── tools/                    # 辅助脚本
-├── utils/                    # 通用工具与 Lightning 骨架
-├── web_demo/                 # Web 演示
+├── utils/                    # 条件契约、训练工具、推理 runtime、可视化工具
+├── web_demo/                 # Web 演示与 Web runtime adapter
 ├── train_ldf.py              # LDF 训练入口
+├── train_refiner.py          # RootRefiner 训练入口
 ├── train_vae.py              # VAE 训练入口
 ├── generate_ldf.py           # 生成入口
 └── download_assets.py        # 依赖/数据/预训练模型下载
@@ -40,12 +43,14 @@ FloodNet/
 
 当前几个比较关键的模块：
 
-- `utils/lightning_module.py`：共享 Lightning 骨架
-- `utils/training/step_semantics.py`：resume、absolute step、phase step 语义
-- `utils/training/control_loss.py`：XZ trajectory control loss
-- `eval/inline_eval_runner.py`：inline generation eval 主流程
-- `eval/inline_eval_summary.py`：summary 聚合、render、wandb logging
-- `models/diffusion_forcing_wan.py`：主模型实现
+- `utils/conditions/`：LDF / RootRefiner 共享 condition contract
+- `utils/training/ldf/`：LDF 采样、conditioning、loss、self-forcing、validation helper
+- `utils/training/root_refiner/`：RootRefiner sample / dataset / Lightning / text encoder / loss
+- `utils/inference/`：ConditionManager、RootPlan、RootTimeline、StreamGenerator 等纯推理 runtime
+- `web_demo/runtime/`：WebRuntime、trajectory/rootplan controller、generation worker、model loader
+- `utils/visualization/`：渲染与 skeleton 可视化工具
+- `models/diffusion_forcing_wan.py`：LDF/Wan 主模型实现
+- `models/root_refiner.py`：RootRefiner 模型实现
 
 ## 环境安装
 ## 0. 创建环境
@@ -233,7 +238,7 @@ python train_ldf.py \
 - `self_forcing/progress`
 - `self_forcing/replace_abs_diff`
 
-详细背景见 [test/调试笔记.md](test/调试笔记.md)。
+相关训练与 runtime 边界主要在 `utils/training/ldf/`、`utils/inference/` 和 `web_demo/runtime/`。
 
 ## 4. 生成
 
@@ -287,21 +292,19 @@ cd web_demo
 运行单测：
 
 ```bash
-python -m pytest test/test_*.py
+python -m pytest tests
 ```
 
-某些检查脚本推荐直接运行，例如：
+常用聚焦检查：
 
 ```bash
-PYTHONPATH=. python test/smoke_zero_residuals.py
-PYTHONPATH=. python test/viz_traj_heading_from_dataset.py --split val --num-samples 6
+python -m pytest tests/test_refiner_sample_creator.py tests/test_refiner_dataset.py -q
+python -m pytest tests/test_model_manager_rootplan.py -q
 ```
-
-更多测试说明见 [test/README.md](test/README.md)。
 
 ## 评测与产物
 
-`train_ldf.py` 当前支持 inline generation eval。运行验证后会在 `save_dir` 下保存：
+`train_ldf.py` 当前支持 validation generation eval。运行验证后会在 `save_dir` 下保存：
 
 - text
 - token
@@ -315,15 +318,15 @@ PYTHONPATH=. python test/viz_traj_heading_from_dataset.py --split val --num-samp
 
 相关代码位于：
 
-- `eval/inline_eval_runner.py`
-- `eval/inline_eval_artifacts.py`
-- `eval/inline_eval_summary.py`
+- `utils/training/ldf/validation_generation.py`
+- `utils/training/ldf/validation_conditioning.py`
+- `utils/training/ldf/validation_summary.py`
+- `eval/ldf/` 与 `eval/runtime/` 中的评测专用入口
 
 ## 调试与设计文档
 
-仓库里保留了较完整的调试和重构记录，建议在动训练主链前先看：
+仓库里保留了较完整的重构记录。建议在动训练主链或 runtime 前先看：
 
-- [test/调试笔记.md](test/调试笔记.md)
 - [ref/Todolists/Refactor-CustomLightningModule.md](ref/Todolists/Refactor-CustomLightningModule.md)
 - [ref/Todolists/Refactor-FloodDiffusion-Alignment.md](ref/Todolists/Refactor-FloodDiffusion-Alignment.md)
 - [ref/Todolists/Refactor-Module-Boundaries-Plan.md](ref/Todolists/Refactor-Module-Boundaries-Plan.md)
@@ -347,6 +350,6 @@ PYTHONPATH=. python test/viz_traj_heading_from_dataset.py --split val --num-samp
 
 如果你要继续开发：
 
-1. 先看 `test/调试笔记.md`
+1. 先看 README 里的当前模块列表
 2. 再看 `ref/Todolists/` 里的重构计划
-3. 最后再动 `train_ldf.py` 和 `models/diffusion_forcing_wan.py`
+3. 最后再动训练入口、模型文件或 runtime 文件
