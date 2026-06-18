@@ -21,6 +21,17 @@ class _DummyModel(nn.Module):
         self.param = nn.Parameter(torch.zeros(()))
         self.commit_index = 10
         self.chunk_size = 5
+        self.init_calls = []
+
+    def init_generated(self, history_length, *, batch_size, num_denoise_steps, traj_buffer=None):
+        self.init_calls.append(
+            {
+                "history_length": history_length,
+                "batch_size": batch_size,
+                "num_denoise_steps": num_denoise_steps,
+                "traj_buffer": traj_buffer,
+            }
+        )
 
 
 def _state(commit_idx: int, xz=(0.0, 0.0)):
@@ -52,6 +63,19 @@ def _plan(valid_frames=200, *, source="test", anchor_commit_idx=0):
         anchor_world_xz=torch.zeros(2),
         anchor_world_yaw=torch.tensor(0.0),
         source=source,
+    )
+
+
+def _route(version=1, *, start_commit_index=0, source="manual", end_x=0.0, end_z=1.0):
+    return RoutePlan(
+        times=np.array([0.0, 1.0], dtype=np.float32),
+        points_xyz=np.array(
+            [[0.0, 0.0, 0.0], [end_x, 0.0, end_z]],
+            dtype=np.float32,
+        ),
+        start_commit_index=int(start_commit_index),
+        version=int(version),
+        source=str(source),
     )
 
 
@@ -97,6 +121,27 @@ def _trajectory_manager():
     mgr.route_reference_mode = "relative_to_actor"
     mgr.stream_generator.root_refiner = None
     return mgr
+
+
+class _FakeFrameBuffer:
+    target_size = 0
+
+    def __init__(self):
+        self.cleared = False
+
+    def clear(self):
+        self.cleared = True
+
+    def size(self):
+        return 0
+
+
+class _FakeVae:
+    def __init__(self):
+        self.cleared = False
+
+    def clear_cache(self):
+        self.cleared = True
 
 
 def test_rootplan_stream_payload_uses_body_window_left_commit():
@@ -177,3 +222,142 @@ def test_update_trajectory_sets_absolute_route_mode_without_reanchoring():
         route,
         atol=1e-6,
     )
+
+
+def test_reset_clears_model_manager_and_stream_generator_route_state():
+    mgr = _trajectory_manager()
+    mgr.frame_buffer = _FakeFrameBuffer()
+    mgr.vae = _FakeVae()
+    mgr.first_chunk = False
+    mgr.root_xz_history = [np.zeros(2, dtype=np.float32)]
+    mgr.root_5d_history = [(0, np.zeros(5, dtype=np.float32))]
+    mgr._generated_frame_count = 7
+    mgr._absolute_commit_index = 3
+    mgr.is_generating = False
+    mgr.generation_thread = None
+    mgr.reset_pending = False
+    mgr.smoothing_alpha = 1.0
+    mgr.denoise_steps = 10
+    mgr.active_traj_plan = _route(version=1)
+    mgr.pending_update_event = object()
+    mgr.current_traj_waypoints = np.ones((2, 3), dtype=np.float32)
+    mgr.current_traj_times = np.array([0.0, 1.0], dtype=np.float32)
+    mgr._display_traj = np.ones((2, 3), dtype=np.float32)
+    mgr.stream_generator.active_root_plan = _plan(source="stale")
+    mgr.stream_generator.condition_manager.route.route = _route(version=2)
+    mgr.stream_generator.condition_manager.route.pending_update = object()
+
+    assert mgr.reset() is True
+
+    assert mgr.active_traj_plan is None
+    assert mgr.pending_update_event is None
+    assert mgr.get_display_traj() is None
+    assert mgr.stream_generator.active_root_plan is None
+    assert mgr.stream_generator.condition_manager.route.route is None
+    assert mgr.stream_generator.condition_manager.route.pending_update is None
+
+
+def test_stream_recovery_append_uses_session_anchor_after_timeline_trim():
+    mgr = _trajectory_manager()
+    mgr._session_anchor_state = _state(0, xz=(0.0, 0.0))
+    timeline = RootTimeline(_state(5, xz=(100.0, 0.0)))
+    mgr._root_timeline = timeline
+    mgr.stream_generator.timeline = timeline
+    mgr.stream_recovery = SimpleNamespace(
+        r_pos_accum=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        r_rot_ang_accum=0.0,
+    )
+
+    assert mgr._append_root_state_from_stream_recovery(frame_idx=token_start_frame(6)) is True
+
+    assert mgr._root_timeline.head.commit_idx == 6
+    assert torch.allclose(
+        mgr._root_timeline.head.world_xz,
+        torch.tensor([1.0, 0.0]),
+    )
+
+
+def test_build_stream_traj_input_retries_activation_after_anchor_state_arrives():
+    mgr = _trajectory_manager()
+    mgr.route_reference_mode = "absolute"
+    mgr.history_length = 1
+    mgr.stream_generator.history_length = 1
+    mgr._root_timeline = _timeline(2)
+    mgr.stream_generator.timeline = mgr._root_timeline
+    mgr.stream_generator.active_root_plan = None
+    mgr.model.commit_index = 3
+    mgr.model.chunk_size = 1
+    mgr.active_traj_plan = _route(version=1, start_commit_index=3, end_z=4.0)
+    mgr._absolute_commit_index = 3
+
+    assert mgr._activate_root_plan_from_stream_plan(mgr.active_traj_plan) is False
+    mgr._root_timeline.append(_state(3))
+
+    payload = mgr._build_stream_traj_input()
+
+    assert payload is not None
+    assert mgr.stream_generator.active_root_plan is not None
+    assert mgr._trajectory_state == "active_7d"
+
+
+def test_pending_route_blend_payload_uses_temporary_blended_root_plan():
+    mgr = _trajectory_manager()
+    mgr.route_reference_mode = "absolute"
+    mgr.history_length = 1
+    mgr.stream_generator.history_length = 1
+    mgr._root_timeline = _timeline(2)
+    mgr.stream_generator.timeline = mgr._root_timeline
+    mgr.model.commit_index = 2
+    mgr.model.chunk_size = 1
+    old_active_root_plan = _plan(source="old_active")
+    old_active_root_plan.waypoints_local_7d[:, 0] = 100.0
+    mgr.stream_generator.active_root_plan = old_active_root_plan
+    mgr.active_traj_plan = _route(version=1, start_commit_index=0, end_x=0.0)
+    mgr.pending_update_event = SimpleNamespace(
+        old_route=mgr.active_traj_plan,
+        new_route=_route(version=2, start_commit_index=0, end_x=10.0),
+        edit_commit_index=0,
+        effective_commit_index=0,
+        delay_tokens=0,
+        blend_tokens=4,
+        version=2,
+    )
+
+    payload = mgr._build_stream_traj_input()
+
+    assert payload is not None
+    assert payload["trajectory_state"] == "blend"
+    assert payload["model_traj_plan_version"] == "blend:1->2"
+    assert mgr.stream_generator.active_root_plan is old_active_root_plan
+    assert not torch.allclose(
+        payload["traj_cond_7d_frame"][0, :, 0],
+        torch.full_like(payload["traj_cond_7d_frame"][0, :, 0], 100.0),
+    )
+
+
+def test_load_stream_generator_rejects_normalized_root_refiner_config(tmp_path):
+    mgr = _trajectory_manager()
+    config_path = tmp_path / "root_refiner_normalized.yaml"
+    config_path.write_text(
+        "data:\n"
+        "  normalize: true\n"
+        "model:\n"
+        "  target: models.root_refiner.RootRefiner\n"
+        "  params: {}\n"
+    )
+
+    try:
+        mgr._load_stream_generator(
+            None,
+            {
+                "root_refiner": {
+                    "enabled": True,
+                    "config_path": str(config_path),
+                    "ckpt": str(tmp_path / "missing.ckpt"),
+                }
+            },
+        )
+    except ValueError as exc:
+        assert "physical RootRefiner output" in str(exc)
+    else:
+        raise AssertionError("normalized RootRefiner config should fail fast")

@@ -131,6 +131,7 @@ class ModelManager:
         self.active_traj_plan: RoutePlan | None = None
         self.pending_update_event: RouteUpdate | None = None
         self._trajectory_state = "none"
+        self._model_traj_plan_version = None
         self._plan_version_counter = 0
 
         self.current_traj_mode = "replace_future"
@@ -357,6 +358,7 @@ class ModelManager:
             )
 
             cfg = resolve_cfg_interpolations(_load_cfg(refiner_config))
+            self._reject_normalized_root_refiner_config(cfg)
             module = RootRefinerLightningModule(cfg)
             ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
             state_dict = ckpt.get("state_dict", ckpt)
@@ -392,6 +394,22 @@ class ModelManager:
             token_dt=float((traj_mask_cfg or {}).get("token_dt", 0.20)),
             history_length=int(getattr(self, "history_length", 30)),
             traj_horizon_tokens=int((traj_mask_cfg or {}).get("horizon_tokens", 20)),
+        )
+
+    @staticmethod
+    def _reject_normalized_root_refiner_config(cfg) -> None:
+        data_cfg = (cfg.get("data", {}) or {}) if isinstance(cfg, dict) else {}
+        legacy_keys = {
+            key
+            for key in ("normalize", "stats_dir", "path_feature_stats_dir")
+            if key in data_cfg
+        }
+        if not legacy_keys:
+            return
+        raise ValueError(
+            "web_demo StreamGenerator currently expects physical RootRefiner output; "
+            "normalized RootRefiner checkpoints need wp_mean/wp_std runtime support. "
+            f"Remove legacy data config key(s): {sorted(legacy_keys)}"
         )
     
     def start_generation(self, text, history_length=None):
@@ -480,17 +498,7 @@ class ModelManager:
 
         # ── Clear ────────────────────────────────────────────────────
         if waypoints is None or len(waypoints) == 0:
-            with self.traj_state_lock:
-                self.active_traj_plan = None
-                self.pending_update_event = None
-                # Also clear backwards-compat fields.
-                self.current_traj_waypoints = None
-                self.current_traj_times = None
-            self.stream_generator.active_root_plan = None
-            self.stream_generator.condition_manager.route.clear()
-            self._trajectory_state = "none"
-            with self._display_traj_lock:
-                self._display_traj = None
+            self._clear_runtime_route_state()
             print("Trajectory control cleared")
             return None
 
@@ -584,6 +592,21 @@ class ModelManager:
         self.route_reference_mode = mode
         self.stream_generator.condition_manager.set_route_mode(mode)
         return mode
+
+    def _clear_runtime_route_state(self) -> None:
+        with self.traj_state_lock:
+            self.active_traj_plan = None
+            self.pending_update_event = None
+            self.current_traj_waypoints = None
+            self.current_traj_times = None
+            self.current_traj_mode = "replace_future"
+        self._trajectory_state = "none"
+        self._model_traj_plan_version = None
+        with self._display_traj_lock:
+            self._display_traj = None
+        if getattr(self, "stream_generator", None) is not None:
+            self.stream_generator.active_root_plan = None
+            self.stream_generator.condition_manager.route.clear()
 
     def _prepare_manual_route_points(
         self,
@@ -723,6 +746,9 @@ class ModelManager:
         return self._plan_version_counter
 
     def _get_commit_index(self) -> int:
+        timeline = getattr(self, "_root_timeline", None)
+        if timeline is not None:
+            return int(timeline.head.commit_idx)
         return int(getattr(self, "_absolute_commit_index", getattr(self.model, "commit_index", 0)))
 
     def _get_root_refiner_history_5d(self, anchor_commit: int):
@@ -740,9 +766,11 @@ class ModelManager:
         return np.stack(frames, axis=0).astype(np.float32)
 
     def _reset_root_timeline(self):
-        self._root_timeline = RootTimeline(
-            RootFrameState.initial(device=self.device, dtype=torch.float32)
+        self._session_anchor_state = RootFrameState.initial(
+            device=self.device,
+            dtype=torch.float32,
         )
+        self._root_timeline = RootTimeline(self._session_anchor_state)
         if getattr(self, "stream_generator", None) is not None:
             self.stream_generator.timeline = self._root_timeline
 
@@ -756,6 +784,7 @@ class ModelManager:
             timeline,
             frame_idx=frame_idx,
             recovery=self.stream_recovery,
+            session_anchor_state=getattr(self, "_session_anchor_state", None),
             source="stream_recovery",
         )
         if appended:
@@ -826,6 +855,37 @@ class ModelManager:
             source=str(plan.source),
         )
 
+    def _build_root_plan_from_stream_plan(
+        self,
+        plan: RoutePlan,
+        anchor_state: RootFrameState,
+    ) -> RootPlan:
+        if (
+            getattr(self, "stream_generator", None) is not None
+            and self.stream_generator.root_refiner is not None
+        ):
+            return self.stream_generator.build_root_plan(
+                text=getattr(self, "current_text", ""),
+                route=plan,
+                anchor_state=anchor_state,
+                history_motion_world_5d=self._get_root_refiner_history_5d(
+                    anchor_state.commit_idx
+                ),
+            )
+
+        root_plan_input = plan
+        route_mode = getattr(
+            self,
+            "route_reference_mode",
+            RouteReferenceMode.RELATIVE_TO_ACTOR.value,
+        )
+        if route_mode == RouteReferenceMode.RELATIVE_TO_ACTOR.value:
+            root_plan_input = reanchor_route_to_xz(
+                plan,
+                anchor_state.world_xz.detach().cpu().numpy(),
+            )
+        return self._stream_plan_to_root_plan(root_plan_input, anchor_state)
+
     def _activate_root_plan_from_stream_plan(self, plan: RoutePlan) -> bool:
         timeline = getattr(self, "_root_timeline", None)
         if timeline is None:
@@ -834,32 +894,36 @@ class ModelManager:
         if not timeline.has_exact_state(anchor_commit):
             return False
         anchor_state = timeline.at_commit(anchor_commit)
-        if (
-            getattr(self, "stream_generator", None) is not None
-            and self.stream_generator.root_refiner is not None
-        ):
-            root_plan = self.stream_generator.build_root_plan(
-                text=getattr(self, "current_text", ""),
-                route=plan,
-                anchor_state=anchor_state,
-                history_motion_world_5d=self._get_root_refiner_history_5d(anchor_commit),
-            )
-        else:
-            root_plan_input = plan
-            route_mode = getattr(
-                self,
-                "route_reference_mode",
-                RouteReferenceMode.RELATIVE_TO_ACTOR.value,
-            )
-            if route_mode == RouteReferenceMode.RELATIVE_TO_ACTOR.value:
-                root_plan_input = reanchor_route_to_xz(
-                    plan,
-                    anchor_state.world_xz.detach().cpu().numpy(),
-                )
-            root_plan = self._stream_plan_to_root_plan(root_plan_input, anchor_state)
+        root_plan = self._build_root_plan_from_stream_plan(plan, anchor_state)
         self.stream_generator.active_root_plan = root_plan
+        self._model_traj_plan_version = int(plan.version)
         self.stream_generator.timeline = timeline
         return True
+
+    def _build_temporary_rootplan_payload(
+        self,
+        plan: RoutePlan,
+        *,
+        model_traj_plan_version,
+    ):
+        timeline = getattr(self, "_root_timeline", None)
+        if timeline is None:
+            return None
+        anchor_commit = int(plan.start_commit_index)
+        if not timeline.has_exact_state(anchor_commit):
+            return None
+        anchor_state = timeline.at_commit(anchor_commit)
+        root_plan = self._build_root_plan_from_stream_plan(plan, anchor_state)
+        previous = self.stream_generator.active_root_plan
+        previous_version = getattr(self, "_model_traj_plan_version", None)
+        try:
+            self.stream_generator.active_root_plan = root_plan
+            self._model_traj_plan_version = model_traj_plan_version
+            payload = self._build_rootplan_stream_traj_input()
+        finally:
+            self.stream_generator.active_root_plan = previous
+            self._model_traj_plan_version = previous_version
+        return payload
 
     def _build_rootplan_stream_traj_input(self):
         """Build direct 7D stream payload from active RootPlan, if available.
@@ -902,6 +966,8 @@ class ModelManager:
 
         # ── No pending update: sample from active plan ──────────────────
         if event is None:
+            if plan is not None and self.stream_generator.active_root_plan is None:
+                self._activate_root_plan_from_stream_plan(plan)
             future = sample_route_future(
                 plan,
                 current_commit=current_commit,
@@ -921,6 +987,7 @@ class ModelManager:
                 rootplan_payload.update({
                     "traj_mode": self.current_traj_mode,
                     "traj_plan_version": plan.version if plan else 0,
+                    "model_traj_plan_version": self._model_traj_plan_version,
                 })
                 return rootplan_payload
             self._trajectory_state = "active_7d_unavailable"
@@ -967,24 +1034,54 @@ class ModelManager:
         )
 
         # ── Transition management ───────────────────────────────────────
+        rootplan_payload = None
+        model_plan_version = getattr(self, "_model_traj_plan_version", None)
         if w <= 0.0:
             self._trajectory_state = "delay"
+            if event.old_route is not None and self.stream_generator.active_root_plan is None:
+                self._activate_root_plan_from_stream_plan(event.old_route)
+            rootplan_payload = self._build_rootplan_stream_traj_input()
+            model_plan_version = getattr(self, "_model_traj_plan_version", None)
         elif w < 1.0:
             self._trajectory_state = "blend"
+            blend_route = RoutePlan(
+                times=(
+                    np.arange(len(future), dtype=np.float32)
+                    * np.float32(self.token_dt)
+                ),
+                points_xyz=future.astype(np.float32),
+                start_commit_index=int(current_commit),
+                version=int(event.version),
+                source="blend",
+            )
+            old_version = (
+                int(event.old_route.version)
+                if event.old_route is not None
+                else int(event.version)
+            )
+            model_plan_version = f"blend:{old_version}->{int(event.version)}"
+            rootplan_payload = self._build_temporary_rootplan_payload(
+                blend_route,
+                model_traj_plan_version=model_plan_version,
+            )
         else:
             self._trajectory_state = "replaced"
             with self.traj_state_lock:
                 self.active_traj_plan = event.new_route
                 self.pending_update_event = None
+            self.stream_generator.active_root_plan = None
+            self._model_traj_plan_version = None
             self._activate_root_plan_from_stream_plan(event.new_route)
+            rootplan_payload = self._build_rootplan_stream_traj_input()
+            model_plan_version = getattr(self, "_model_traj_plan_version", None)
 
         with self._display_traj_lock:
             self._display_traj = future.copy()
-        rootplan_payload = self._build_rootplan_stream_traj_input()
         if rootplan_payload is not None:
             rootplan_payload.update({
                 "traj_mode": self.current_traj_mode,
                 "traj_plan_version": event.version,
+                "model_traj_plan_version": model_plan_version,
                 "traj_update_blend_weight": w,
                 "trajectory_state": self._trajectory_state,
             })
@@ -1054,15 +1151,7 @@ class ModelManager:
         self.root_5d_history.clear()
         self._generated_frame_count = 0
         self._absolute_commit_index = 0
-        with self.traj_state_lock:
-            self.active_traj_plan = None
-            self.pending_update_event = None
-            self.current_traj_waypoints = None
-            self.current_traj_times = None
-            self.current_traj_mode = "replace_future"
-        self._trajectory_state = "none"
-        with self._display_traj_lock:
-            self._display_traj = None
+        self._clear_runtime_route_state()
         
         if history_length is not None:
             self.history_length = history_length
@@ -1219,6 +1308,7 @@ class ModelManager:
             "trajectory_route_mode": self.route_reference_mode,
             "trajectory_time_mode": self.traj_time_mode,
             "trajectory_horizon_tokens": self.traj_horizon_tokens,
+            "model_traj_plan_version": self._model_traj_plan_version,
             "smoothing_alpha": self.smoothing_alpha,
             "denoise_steps": self.denoise_steps,
         }
