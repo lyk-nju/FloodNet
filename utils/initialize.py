@@ -127,18 +127,27 @@ def get_function(target: str):
 
 def save_config_and_codes(config, save_dir) -> None:
     os.makedirs(save_dir, exist_ok=True)
-    sanity_check_dir = os.path.join(save_dir, "sanity_check")
-    os.makedirs(sanity_check_dir, exist_ok=True)
-    with open(os.path.join(sanity_check_dir, f"{config.exp_name}.yaml"), "w") as f:
+    sanity_check_dir = Path(save_dir) / "sanity_check"
+    sanity_check_dir.mkdir(parents=True, exist_ok=True)
+    with open(sanity_check_dir / f"{config.exp_name}.yaml", "w") as f:
         OmegaConf.save(config.config, f)
     current_dir = Path.cwd()
-    exclude_dir = current_dir / "outputs"
-    for py_file in current_dir.rglob("*.py"):
-        if exclude_dir in py_file.parents:
-            continue
-        dest_path = Path(sanity_check_dir) / py_file.relative_to(current_dir)
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy(py_file, dest_path)
+    excluded_names = {
+        ".git",
+        "__pycache__",
+        ".pytest_cache",
+        "outputs",
+    }
+    for root, dirnames, filenames in os.walk(current_dir, topdown=True):
+        dirnames[:] = [name for name in dirnames if name not in excluded_names]
+        root_path = Path(root)
+        for filename in filenames:
+            if not filename.endswith(".py"):
+                continue
+            py_file = root_path / filename
+            dest_path = sanity_check_dir / py_file.relative_to(current_dir)
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(py_file, dest_path)
 
 
 def print_model_size(model) -> None:
