@@ -3,7 +3,7 @@ seed: 1234
 debug: false
 train: true
 deterministic: false
-save_dir: /data1/yuankai/text2Motion/FloodDiffusion/outputs
+save_dir: ${dirs.outputs}
 resume_ckpt:
 
 logger:
@@ -100,7 +100,7 @@ canonicalization:
 optimizer:
   target: AdamW
   params:
-    lr: 1.0e-4
+    lr: 5.0e-4
     weight_decay: 0.01
 
 lr_scheduler:
@@ -118,7 +118,7 @@ loss_weights:
   pace: 1.0
   frame_pace: 0.03
 
-  xyz: 5.0
+  xyz: 20.0
   heading: 1.0
   fwd_delta: 0.0
   yaw_delta: 0.0
@@ -136,12 +136,12 @@ text_encoder:
 data:
   target: datasets.humanml3d.HumanML3DDataset
   collate_fn: utils.training.root_refiner.collate_fn
-  train_bs: 128
+  train_bs: 64
   val_bs: 128
   test_bs: 128
   num_workers: 4
 
-  raw_data_dir: /data1/yuankai/text2Motion/FloodDiffusion/raw_data
+  raw_data_dir: ${dirs.raw_data}
   dataset: humanml3d
   train_split_file: train.txt
   val_split_file: val.txt

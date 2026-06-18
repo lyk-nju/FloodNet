@@ -1,6 +1,6 @@
 dirs:
     deps: /home/yuankai/Text2Motion/FloodDiffusion/deps
-    outputs: outputs
+    outputs: /home/yuankai/Text2Motion/FloodNet/outputs
     raw_data: /home/yuankai/Text2Motion/FloodDiffusion/raw_data
 
 # FloodNet / LDF training (train_ldf.py resolves ${wandb_info.*}).

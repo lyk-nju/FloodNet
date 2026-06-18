@@ -3,7 +3,7 @@ seed: 1234 # Seed value
 debug: false
 train: true
 
-save_dir: ./outputs
+save_dir: ${dirs.outputs}
 resume_ckpt: null
 test_ckpt: "${dirs.outputs}/20251219_01492_ldf_tiny_stream/step_step=200000.ckpt"
 test_vae_ckpt: "${dirs.outputs}/vae_1d_z4_step=300000.ckpt"

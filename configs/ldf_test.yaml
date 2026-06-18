@@ -3,16 +3,11 @@ seed: 1234 # Seed value
 debug: false
 train: true
 
-dirs:
-    deps: /data1/yuankai/text2Motion/FloodDiffusion/deps
-    outputs: ./outputs
-    raw_data: /data1/yuankai/text2Motion/FloodDiffusion/raw_data
+save_dir: ${dirs.outputs}
+resume_ckpt: ${dirs.outputs}/step_485000.ckpt
+test_ckpt: ${dirs.outputs}/step_485000.ckpt
 
-save_dir: ./outputs
-resume_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/step_485000.ckpt
-test_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/step_485000.ckpt
-
-test_vae_ckpt: /home/yuankai/Text2Motion/FloodNet/outputs/vae_1d_z4_step=300000.ckpt
+test_vae_ckpt: ${dirs.outputs}/vae_1d_z4_step=300000.ckpt
 test_vae:
     target: models.vae_wan_1d.VAEWanModel
     ema_decay: 0.99
@@ -183,7 +178,7 @@ body_aux_loss:
 
 history_corruption:
     enabled: true
-    z_stats_dir: /home/yuankai/Text2Motion/FloodNet/deps/body_stats
+    z_stats_dir: ${dirs.deps}/body_stats
     curriculum:
         early_prob: 0.2         # progress < 1/3
         mid_prob: 0.3           # 1/3 <= progress < 2/3

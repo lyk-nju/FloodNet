@@ -3,12 +3,7 @@ seed: 1234 # Seed value
 debug: true
 train: false
 
-dirs:
-    deps: /data1/yuankai/text2motion/FloodDiffusion/deps
-    outputs: ./outputs
-    raw_data: /data1/yuankai/text2motion/FloodDiffusion/raw_data
-
-save_dir: ./outputs
+save_dir: ${dirs.outputs}
 resume_ckpt: "${dirs.outputs}/20251219_01492_ldf_tiny_stream/step_step=200000.ckpt"
 test_ckpt: "${dirs.outputs}/20251219_01492_ldf_tiny_stream/step_step=200000.ckpt"
 test_vae_ckpt: "${dirs.outputs}/vae_1d_z4_step=300000.ckpt"
