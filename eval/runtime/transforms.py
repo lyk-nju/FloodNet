@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from typing import Any
-from utils.inference.glue import InferenceGlueState
+from utils.inference.timeline import RootFrameState
 from utils.local_frame import (
     canonicalize_7d,
     uncanonicalize_7d,
@@ -38,7 +38,7 @@ def _infer_physical_yaw_from_points(points_xyz: torch.Tensor) -> torch.Tensor:
 def build_eval_root_plan_from_points(
     points_xyz: Any,
     *,
-    anchor_state: InferenceGlueState,
+    anchor_state: RootFrameState,
     token_dt: float,
     frames_per_token: int = 4,
     source: str = "eval_route",
@@ -142,7 +142,7 @@ def rotate_xz_points(points: Any, anchor: Any, degrees: float) -> np.ndarray:
 def build_eval_root_plan_from_world_7d(
     traj_7d_world: Any,
     *,
-    anchor_state: InferenceGlueState,
+    anchor_state: RootFrameState,
     token_dt: float,
     frames_per_token: int = 4,
     source: str = "eval_gt_motion_7d",

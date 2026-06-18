@@ -6,12 +6,9 @@ from lightning import seed_everything
 from torch_ema import ExponentialMovingAverage
 
 from utils.initialize import check_state_dict, instantiate, load_config
-from utils.inference.ldf_conditioning import (
-    build_stream_step_condition_provider,
-    prepare_generate_condition,
-)
-from utils.inference.stream_state import init_stream_generation
+from utils.inference.stream_generator import StreamGenerator
 from utils.motion_process import StreamJointRecovery263
+from utils.training.ldf.conditioning import prepare_generate_condition
 from utils.training.ldf.model_factory import instantiate_ldf_model
 from utils.visualization.skeleton import get_humanml3d_chains, render_simple_skeleton_video
 from utils.visualization.video import render_single_video
@@ -193,7 +190,8 @@ if __name__ == "__main__":
         # streaming generate step
         print("Streaming generate step...")
         vae.clear_cache()
-        init_stream_generation(model, 30, batch_size=1)
+        stream_generator = StreamGenerator(ldf_model=model, device=next(model.parameters()).device)
+        stream_generator.init_ldf_generation(history_length=30, batch_size=1)
         text_end_with_zero = [0] + text_end
         durations = [
             t - b for t, b in zip(text_end_with_zero[1:], text_end_with_zero[:-1])
@@ -215,10 +213,8 @@ if __name__ == "__main__":
         for text_item, duration in zip(text_list, durations):
             for i in range(duration):
                 start_time = time.time()
-                x = {}
-                x["text"] = [text_item]  # text_item is a string
-                condition_provider = build_stream_step_condition_provider(
-                    model,
+                x = stream_generator.build_step_input(text_item)
+                condition_provider = stream_generator.build_ldf_condition_provider(
                     x,
                     first_chunk=first_chunk,
                     device=next(model.parameters()).device,

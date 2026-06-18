@@ -13,7 +13,7 @@ from flask_cors import CORS
 from omegaconf import OmegaConf
 from model_manager import get_model_manager
 from utils.motion_process import extract_root_trajectory_263
-from utils.inference.trajectory import resample_polyline
+from utils.inference.geometry import resample_polyline
 
 app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
@@ -434,6 +434,7 @@ def update_trajectory():
         mode = data.get('mode', 'replace_future')
         source = data.get('source', 'manual')
         duration_seconds = data.get('duration_seconds')
+        route_mode = data.get('route_mode')
         
         if not session_id:
             return jsonify({
@@ -459,6 +460,7 @@ def update_trajectory():
             mode=mode,
             source=source,
             duration_seconds=duration_seconds,
+            route_mode=route_mode,
         )
         target_len = 0 if target_traj is None else len(target_traj)
         print(
@@ -471,6 +473,7 @@ def update_trajectory():
             'status': 'success',
             'message': 'Trajectory updated' if waypoints else 'Trajectory cleared',
             'mode': mode,
+            'route_mode': getattr(model_manager, 'route_reference_mode', None),
             'trajectory': target_traj.tolist() if target_traj is not None else None,
         })
     except Exception as e:

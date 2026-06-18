@@ -1,59 +1,8 @@
-"""Streaming trajectory geometry helpers shared by web_demo and eval.
-
-Extracted from ``web_demo/model_manager.py`` so that metrics can construct
-trajectory conditioning with the same logic as the live demo.
-"""
+"""Pure route geometry helpers shared by inference, web demo, and eval."""
 
 from __future__ import annotations
 
 import numpy as np
-
-from dataclasses import dataclass
-
-
-# ── Task 001 dataclasses ──────────────────────────────────────────────
-
-
-@dataclass
-class StreamTrajectoryPlan:
-    """A timestamped trajectory plan for streaming generation.
-
-    Attributes:
-        times: (N,) monotonically increasing seconds from plan-local t=0.
-        points_xyz: (N,3) world-space positions (arc-length resampled).
-        start_commit_index: the commit index where plan-local t=0 starts.
-        version: monotonic plan version for debugging.
-        source: ``manual`` / ``debug`` / ``repeat`` / ``update``.
-    """
-    times: np.ndarray
-    points_xyz: np.ndarray
-    start_commit_index: int
-    version: int
-    source: str
-
-
-@dataclass
-class TrajectoryUpdateEvent:
-    """A pending mid-session trajectory update.
-
-    Attributes:
-        old_plan: the currently active plan (may be None).
-        new_plan: the replacing plan with plan-local time origin at
-            *effective_commit_index*.
-        edit_commit_index: where the user triggered the update.
-        effective_commit_index: where new_plan's t=0 begins (edit + delay).
-        delay_tokens: number of tokens in the delay zone.
-        blend_tokens: number of tokens in the smooth transition zone.
-        version: monotonically increasing event version.
-    """
-    old_plan: StreamTrajectoryPlan | None
-    new_plan: StreamTrajectoryPlan
-    edit_commit_index: int
-    effective_commit_index: int
-    delay_tokens: int
-    blend_tokens: int
-    version: int
-
 
 def project_point_to_polyline(
     point_xyz: np.ndarray, waypoints_xyz: np.ndarray
@@ -434,68 +383,3 @@ def blend_future_trajs(
     out = old.copy()
     out[:n] = (1.0 - w) * old[:n] + w * new[:n]
     return out.astype(np.float32)
-
-
-def sample_plan_future(
-    plan: StreamTrajectoryPlan,
-    *,
-    current_commit: int,
-    current_root_xyz: np.ndarray,
-    horizon_tokens: int,
-    token_dt: float,
-    reanchor_to_current_root: bool,
-) -> np.ndarray:
-    """Build the future H-token trajectory condition for the current step.
-
-    Uses plan-local time:  plan.start_commit_index → t=0.
-    When *reanchor_to_current_root* is True, translates the sampled
-    positions so the first queried point maps to *current_root_xyz*.
-    """
-    elapsed_tokens = max(0, current_commit - plan.start_commit_index)
-    query_times = (
-        float(elapsed_tokens) * token_dt
-        + np.arange(horizon_tokens, dtype=np.float32) * token_dt
-    )
-    future = sample_plan_by_time(plan.times, plan.points_xyz, query_times)
-    if reanchor_to_current_root and len(future) > 0:
-        root = np.asarray(current_root_xyz, dtype=np.float32).reshape(3)
-        anchor = sample_plan_by_time(
-            plan.times, plan.points_xyz,
-            np.asarray([query_times[0]], dtype=np.float32),
-        )[0]
-        future = root[None, :] + (future - anchor[None, :])
-    return future.astype(np.float32)
-
-
-def reanchor_stream_plan_to_xz(
-    plan: StreamTrajectoryPlan,
-    anchor_xz,
-) -> StreamTrajectoryPlan:
-    """Translate a stream plan so its local t=0 point matches ``anchor_xz``.
-
-    Delayed updates are authored at edit time but evaluated from an effective
-    timeline anchor (usually edit + delay). The body/RootRefiner boundary
-    expects plan-local t=0 to live at that effective anchor, so only the XZ
-    translation is adjusted; timestamps and relative path shape are preserved.
-    """
-    points = np.asarray(plan.points_xyz, dtype=np.float32)
-    if points.size == 0:
-        return plan
-    anchor = np.asarray(anchor_xz, dtype=np.float32).reshape(2)
-    plan_zero = sample_plan_by_time(
-        np.asarray(plan.times, dtype=np.float32),
-        points,
-        np.asarray([0.0], dtype=np.float32),
-    )[0]
-    offset = anchor - plan_zero[[0, 2]]
-    if float(np.linalg.norm(offset)) <= 1e-7:
-        return plan
-    shifted = points.copy()
-    shifted[:, [0, 2]] += offset[None, :]
-    return StreamTrajectoryPlan(
-        times=np.asarray(plan.times, dtype=np.float32).copy(),
-        points_xyz=shifted.astype(np.float32),
-        start_commit_index=int(plan.start_commit_index),
-        version=int(plan.version),
-        source=str(plan.source),
-    )

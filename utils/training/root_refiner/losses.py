@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from utils.training.root_refiner.path_condition import (
+from utils.conditions.root_refiner import (
     map_path_control_mask_to_frame_mask,
 )
 

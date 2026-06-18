@@ -17,29 +17,26 @@ from eval.runtime.transforms import (
     rotate_xz_points,
     rotate_world_7d_about_anchor,
 )
-from utils.inference.glue import InferenceGlueState, InferenceGlueTimeline
+from utils.inference.timeline import (
+    RootFrameState,
+    RootTimeline,
+    append_timeline_state_at_token_start_frame,
+)
 from utils.motion_process import (
     StreamJointRecovery263,
     extract_root_traj_feats_7d_263,
     extract_root_trajectory_263,
 )
-from utils.inference.root_plan import build_rootplan_stream_payload_from_buffer
-from utils.inference.timeline import append_timeline_state_at_token_start_frame
-from utils.inference.ldf_conditioning import build_stream_step_condition_provider
-from utils.inference.rollout import (
-    StreamTextSegment,
-    StreamTextRolloutController,
-    build_stream_step_model_input,
-    build_stream_suffix_conditioning,
+from utils.inference.root_plan import build_root_plan_stream_payload
+from utils.inference.route_condition import (
+    RoutePlan,
+    sample_route_future,
 )
-from utils.inference.stream_state import init_stream_generation
-from utils.inference.trajectory import (
-    StreamTrajectoryPlan,
+from utils.inference.stream_generator import StreamGenerator
+from utils.inference.geometry import (
     assign_uniform_timestamps,
     blend_future_trajs,
-    reanchor_stream_plan_to_xz,
     resample_polyline_by_arclength,
-    sample_plan_future,
     sample_plan_by_time,
     sample_timestamped_trajectory,
     smoothstep01,
@@ -59,6 +56,23 @@ class RuntimeGenerationResult:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class StreamTextSegment:
+    text: str
+    token_end: int
+
+
+class StreamTextRolloutController:
+    def __init__(self, segments: list[StreamTextSegment]):
+        self.segments = segments or [StreamTextSegment(text="", token_end=0)]
+
+    def get_text_for_commit_index(self, commit_index: int) -> str:
+        for segment in self.segments:
+            if int(commit_index) < int(segment.token_end):
+                return segment.text
+        return self.segments[-1].text
+
+
 def build_rootplan_stream_step_payload(
     model: Any,
     timeline: Any,
@@ -69,14 +83,14 @@ def build_rootplan_stream_step_payload(
 ) -> dict | None:
     """Build the direct 7D payload consumed by ``stream_generate_step``."""
 
-    traj_buf = getattr(model, "_traj_buf", None)
+    root_plan = getattr(model, "_active_root_plan", None)
     chunk_size = int(getattr(model, "chunk_size", 1))
     local_commit = int(getattr(model, "commit_index", 0))
     absolute_commit = (
         local_commit if absolute_commit_index is None else int(absolute_commit_index)
     )
-    return build_rootplan_stream_payload_from_buffer(
-        traj_buf,
+    return build_root_plan_stream_payload(
+        root_plan,
         timeline,
         local_commit_index=local_commit,
         absolute_commit_index=absolute_commit,
@@ -86,15 +100,15 @@ def build_rootplan_stream_step_payload(
     )
 
 
-def new_eval_timeline() -> InferenceGlueTimeline:
-    return InferenceGlueTimeline(
-        InferenceGlueState.initial(xz=(0.0, 0.0), yaw=0.0, dtype=torch.float32)
+def new_eval_timeline() -> RootTimeline:
+    return RootTimeline(
+        RootFrameState.initial(xz=(0.0, 0.0), yaw=0.0, dtype=torch.float32)
     )
 
 
-def _initial_anchor_state_from_world_7d(traj_7d_world: Any) -> InferenceGlueState:
+def _initial_anchor_state_from_world_7d(traj_7d_world: Any) -> RootFrameState:
     first = torch.as_tensor(traj_7d_world[0], dtype=torch.float32)
-    return InferenceGlueState.initial(
+    return RootFrameState.initial(
         xz=(float(first[0]), float(first[2])),
         yaw=float(torch.atan2(first[4], first[3])),
         dtype=torch.float32,
@@ -102,11 +116,11 @@ def _initial_anchor_state_from_world_7d(traj_7d_world: Any) -> InferenceGlueStat
 
 
 def append_eval_timeline_state(
-    timeline: InferenceGlueTimeline,
+    timeline: RootTimeline,
     *,
     commit_idx: int,
     recovery: Any,
-    session_anchor_state: InferenceGlueState | None = None,
+    session_anchor_state: RootFrameState | None = None,
 ) -> None:
     commit_idx = int(commit_idx)
     if commit_idx <= timeline.head.commit_idx:
@@ -115,7 +129,7 @@ def append_eval_timeline_state(
         session_anchor_state = timeline.at_commit(0)
     root, yaw = recovery_root_state_to_world(recovery, session_anchor_state)
     timeline.append(
-        InferenceGlueState(
+        RootFrameState(
             commit_idx=commit_idx,
             world_xz=torch.tensor(root[[0, 2]], dtype=torch.float32),
             world_yaw=torch.tensor(yaw, dtype=torch.float32),
@@ -129,7 +143,7 @@ def append_eval_root_history(
     frame_idx: int,
     recovery: Any,
     *,
-    session_anchor_state: InferenceGlueState | None = None,
+    session_anchor_state: RootFrameState | None = None,
 ) -> int:
     if session_anchor_state is None:
         root = np.asarray(recovery.r_pos_accum, dtype=np.float32).copy()
@@ -162,22 +176,16 @@ def get_eval_root_refiner_history_5d(
 
 
 def clear_model_traj_state(model: Any) -> None:
-    traj_buf = getattr(model, "_traj_buf", None)
-    if traj_buf is None:
-        return
-    if hasattr(traj_buf, "reset"):
-        traj_buf.reset()
-    if hasattr(traj_buf, "clear"):
-        traj_buf.clear()
+    model._active_root_plan = None
 
 
 def build_eval_root_plan_for_stream_plan(
-    timeline: InferenceGlueTimeline,
+    timeline: RootTimeline,
     stream_plan: Any,
     *,
     text: str,
     token_dt: float,
-    root_refiner_runtime: Any = None,
+    root_refiner: Any = None,
     root_5d_history: list | None = None,
     frames_per_token: int = 4,
     forced_num_tokens: int | None = None,
@@ -188,24 +196,20 @@ def build_eval_root_plan_for_stream_plan(
     if not timeline.has_exact_state(int(stream_plan.start_commit_index)):
         return None
     anchor_state = timeline.at_commit(int(stream_plan.start_commit_index))
-    root_plan_input = reanchor_stream_plan_to_xz(
-        stream_plan,
-        anchor_state.world_xz.detach().cpu().numpy(),
-    )
-    if root_refiner_runtime is not None:
+    root_plan_input = stream_plan
+    if root_refiner is not None:
         refiner_kwargs = {
             "text": text,
-            "plan": root_plan_input,
+            "route": root_plan_input,
             "anchor_state": anchor_state,
-            "token_dt": token_dt,
             "history_motion_world_5d": get_eval_root_refiner_history_5d(
                 root_5d_history or [],
                 int(stream_plan.start_commit_index),
             ),
         }
         if forced_num_tokens is not None:
-            refiner_kwargs["forced_num_tokens"] = int(forced_num_tokens)
-        root_plan = root_refiner_runtime.build_root_plan(**refiner_kwargs)
+            refiner_kwargs["forced_num_frames"] = int(1 + 4 * (int(forced_num_tokens) - 1))
+        root_plan = root_refiner.build_root_plan(**refiner_kwargs)
         if hybrid_gt_mode is not None:
             if gt_root_7d_world is None:
                 raise ValueError("gt_root_7d_world is required for hybrid RootPlan mode")
@@ -227,7 +231,7 @@ def build_eval_root_plan_for_stream_plan(
 
 
 def _activate_eval_root_plan(model: Any, root_plan: Any) -> None:
-    model._traj_buf.set_root_plan(root_plan)
+    model._active_root_plan = root_plan
     setattr(model, "_runtime_last_root_plan", root_plan)
 
 
@@ -265,12 +269,12 @@ def _record_eval_root_plan_event(
 
 def set_eval_root_plan(
     model: Any,
-    timeline: InferenceGlueTimeline,
+    timeline: RootTimeline,
     stream_plan: Any,
     *,
     text: str,
     token_dt: float,
-    root_refiner_runtime: Any = None,
+    root_refiner: Any = None,
     root_5d_history: list | None = None,
     replan_events: list | None = None,
     root_plan_events: list | None = None,
@@ -286,7 +290,7 @@ def set_eval_root_plan(
         stream_plan,
         text=text,
         token_dt=token_dt,
-        root_refiner_runtime=root_refiner_runtime,
+        root_refiner=root_refiner,
         root_5d_history=root_5d_history,
         frames_per_token=frames_per_token,
         forced_num_tokens=forced_num_tokens,
@@ -301,7 +305,7 @@ def set_eval_root_plan(
         root_plan=root_plan,
         stream_plan=stream_plan,
         text=text,
-        root_refiner=root_refiner_runtime is not None,
+        root_refiner=root_refiner is not None,
         replan_events=replan_events,
         root_plan_events=root_plan_events,
         diagnostic_plan=diagnostic_plan,
@@ -311,7 +315,7 @@ def set_eval_root_plan(
 
 def set_eval_root_plan_from_world_7d(
     model: Any,
-    timeline: InferenceGlueTimeline,
+    timeline: RootTimeline,
     traj_7d_world: Any,
     *,
     start_commit_index: int,
@@ -366,7 +370,7 @@ def slice_stream_plan_from_commit(
     waypoint_dt: float,
     version: int,
     source: str,
-) -> StreamTrajectoryPlan:
+) -> RoutePlan:
     """Build a future-only stream plan anchored at an absolute commit index."""
 
     plan_times = np.asarray(plan_times, dtype=np.float32)
@@ -385,7 +389,7 @@ def slice_stream_plan_from_commit(
         query_abs = elapsed + np.arange(npt, dtype=np.float32) * np.float32(waypoint_dt)
         points = sample_plan_by_time(plan_times, plan_points_xyz, query_abs)
         times = query_abs - np.float32(elapsed)
-    return StreamTrajectoryPlan(
+    return RoutePlan(
         times=times.astype(np.float32),
         points_xyz=points.astype(np.float32),
         start_commit_index=start_commit_index,
@@ -470,14 +474,21 @@ def run_step_case(
     tdt = float(kwargs.get("tdt", 0.20))
     fps = float(kwargs.get("fps", 20.0))
     condition_path = str(kwargs.get("condition_path", "rootplan_7d"))
-    root_refiner_runtime = kwargs.get("root_refiner_runtime")
+    root_refiner = kwargs.get("root_refiner")
     replan_events = kwargs.get("replan_events")
     root_plan_events = kwargs.get("root_plan_events")
     force_no_traj = bool(kwargs.get("force_no_traj", False))
     text = sample["text"] if isinstance(sample["text"], str) else sample["text"][0]
     timeline = new_eval_timeline()
     vae.clear_cache()
-    init_stream_generation(model, hl, batch_size=1, num_denoise_steps=nds)
+    stream = StreamGenerator(
+        ldf_model=model,
+        device=device,
+        history_length=hl,
+        traj_horizon_tokens=hz,
+        token_dt=tdt,
+    )
+    stream.init_ldf_generation(history_length=hl, batch_size=1, num_denoise_steps=nds)
     model.generated = model.generated.to(device)
     clear_model_traj_state(model)
     root_5d_history, frame_idx = [], 0
@@ -489,7 +500,7 @@ def run_step_case(
         "traj_mask": sample["traj_mask"].unsqueeze(0),
     }
     if condition_path == "rootplan_7d" and mode != "step_no_traj" and not force_no_traj:
-        plan = StreamTrajectoryPlan(
+        plan = RoutePlan(
             times=np.arange(len(sample["traj"]), dtype=np.float32) / fps,
             points_xyz=sample["traj"].numpy().astype(np.float32),
             start_commit_index=0,
@@ -502,7 +513,7 @@ def run_step_case(
             plan,
             text=text,
             token_dt=tdt,
-            root_refiner_runtime=root_refiner_runtime,
+            root_refiner=root_refiner,
             root_5d_history=root_5d_history,
             replan_events=replan_events,
             root_plan_events=root_plan_events,
@@ -521,28 +532,12 @@ def run_step_case(
                 traj_horizon_tokens=hz,
                 absolute_commit_index=commit_idx,
             )
-        elif condition_path == "legacy_xyz" and mode == "step_predroot":
-            traj_input = build_stream_suffix_conditioning(
-                batch_sample, commit_idx, prefer_xyz=True
-            )
-            if traj_input is not None and len(roots) > 0:
-                pred_root = roots[-1]
-                gt_root = sample["traj"].numpy()[
-                    min(commit_idx * 4, len(sample["traj"]) - 1)
-                ].astype(np.float32)
-                offset = pred_root.astype(np.float32) - gt_root
-                traj = traj_input["traj"]
-                if torch.is_tensor(traj):
-                    traj_input["traj"] = traj + torch.from_numpy(offset).float().to(traj)
         elif condition_path == "legacy_xyz":
-            traj_input = build_stream_suffix_conditioning(
-                batch_sample, commit_idx, prefer_xyz=True
-            )
+            raise ValueError("legacy_xyz streaming conditioning has been removed")
         else:
             raise ValueError(f"unknown traj_condition_path {condition_path!r}")
-        step_payload = build_stream_step_model_input(text, traj_input=traj_input)
-        condition_provider = build_stream_step_condition_provider(
-            model,
+        step_payload = stream.build_step_input(text, traj_input=traj_input)
+        condition_provider = stream.build_ldf_condition_provider(
             step_payload,
             first_chunk=first_chunk,
             device=device,
@@ -602,7 +597,7 @@ def run_babel_case(
     fps: float,
     mode: str,
     condition_path: str = "rootplan_7d",
-    root_refiner_runtime: Any = None,
+    root_refiner: Any = None,
     replan_events: list | None = None,
     force_no_traj: bool = False,
     root_plan_events: list | None = None,
@@ -622,7 +617,14 @@ def run_babel_case(
     text_controller = StreamTextRolloutController(segments)
     gt_root = extract_root_trajectory_263(sample["feature"].numpy()[:tfs])
     vae.clear_cache()
-    init_stream_generation(model, hl, batch_size=1, num_denoise_steps=nds)
+    stream = StreamGenerator(
+        ldf_model=model,
+        device=device,
+        history_length=hl,
+        traj_horizon_tokens=hz,
+        token_dt=tdt,
+    )
+    stream.init_ldf_generation(history_length=hl, batch_size=1, num_denoise_steps=nds)
     model.generated = model.generated.to(device)
     clear_model_traj_state(model)
     root_5d_history, frame_idx = [], 0
@@ -643,7 +645,7 @@ def run_babel_case(
             ),
             text=initial_text,
             token_dt=tdt,
-            root_refiner_runtime=root_refiner_runtime,
+            root_refiner=root_refiner,
             root_5d_history=root_5d_history,
             replan_events=replan_events,
             root_plan_events=root_plan_events,
@@ -659,7 +661,7 @@ def run_babel_case(
         elif condition_path == "rootplan_7d":
             text_anchor_commit = _text_segment_start_commit(segments, commit_idx)
             if (
-                root_refiner_runtime is not None
+                root_refiner is not None
                 and text != active_root_refiner_text
                 and timeline.has_exact_state(text_anchor_commit)
             ):
@@ -677,7 +679,7 @@ def run_babel_case(
                     ),
                     text=text,
                     token_dt=tdt,
-                    root_refiner_runtime=root_refiner_runtime,
+                    root_refiner=root_refiner,
                     root_5d_history=root_5d_history,
                     replan_events=replan_events,
                     root_plan_events=root_plan_events,
@@ -691,50 +693,12 @@ def run_babel_case(
                 traj_horizon_tokens=hz,
                 absolute_commit_index=commit_idx,
             )
-        elif condition_path == "legacy_xyz" and mode == "babel_timestamped":
-            current_root = np.zeros(3, dtype=np.float32)
-            current_root[[0, 2]] = recovery.r_pos_accum[[0, 2]].astype(np.float32)
-            query_times = float(commit_idx) * tdt + np.arange(
-                hz, dtype=np.float32
-            ) * tdt
-            gt_times = np.arange(len(gt_route), dtype=np.float32) / 20.0
-            future = sample_timestamped_trajectory(gt_times, gt_route, query_times)
-            anchor = sample_timestamped_trajectory(
-                gt_times,
-                gt_route,
-                np.asarray([query_times[0]], dtype=np.float32),
-            )[0]
-            future = current_root + (future - anchor.astype(np.float32))
-            traj_input = {
-                "traj": torch.from_numpy(future).float().unsqueeze(0),
-                "token_mask": torch.ones(1, hz),
-            }
         elif condition_path == "legacy_xyz":
-            current_root = np.zeros(3, dtype=np.float32)
-            current_root[[0, 2]] = recovery.r_pos_accum[[0, 2]].astype(np.float32)
-            future = sample_plan_future(
-                StreamTrajectoryPlan(
-                    times=plan_times,
-                    points_xyz=plan_points,
-                    start_commit_index=0,
-                    version=0,
-                    source="bench",
-                ),
-                current_commit=commit_idx,
-                current_root_xyz=current_root,
-                horizon_tokens=hz,
-                token_dt=tdt,
-                reanchor_to_current_root=True,
-            )
-            traj_input = {
-                "traj": torch.from_numpy(future).float().unsqueeze(0),
-                "token_mask": torch.ones(1, hz),
-            }
+            raise ValueError("legacy_xyz streaming conditioning has been removed")
         else:
             raise ValueError(f"unknown traj_condition_path {condition_path!r}")
-        step_payload = build_stream_step_model_input(text, traj_input=traj_input)
-        condition_provider = build_stream_step_condition_provider(
-            model,
+        step_payload = stream.build_step_input(text, traj_input=traj_input)
+        condition_provider = stream.build_ldf_condition_provider(
             step_payload,
             first_chunk=first_chunk,
             device=device,
@@ -794,7 +758,7 @@ def run_real_case(
     mode: str,
     rotate_plan_deg: float = 0.0,
     condition_path: str = "rootplan_7d",
-    root_refiner_runtime: Any = None,
+    root_refiner: Any = None,
     replan_events: list | None = None,
     force_no_traj: bool = False,
     gt_motion_7d: bool = False,
@@ -808,7 +772,7 @@ def run_real_case(
     text = sample["text"] if isinstance(sample["text"], str) else sample["text"][0]
     gr = extract_root_trajectory_263(sample["feature"].numpy()[:tfs])
     gt_traj_7d_world = None
-    session_anchor_state = InferenceGlueState.initial(
+    session_anchor_state = RootFrameState.initial(
         xz=(0.0, 0.0),
         yaw=0.0,
         dtype=torch.float32,
@@ -816,7 +780,7 @@ def run_real_case(
     need_gt_world_7d = (
         gt_motion_7d
         or root_refiner_gt_override is not None
-        or (float(rotate_plan_deg) != 0.0 and root_refiner_runtime is not None)
+        or (float(rotate_plan_deg) != 0.0 and root_refiner is not None)
     )
     if need_gt_world_7d:
         gt_traj_7d_world = extract_root_traj_feats_7d_263(
@@ -840,7 +804,7 @@ def run_real_case(
     else:
         if (
             float(rotate_plan_deg) != 0.0
-            and root_refiner_runtime is not None
+            and root_refiner is not None
             and gt_traj_7d_world is not None
         ):
             session_anchor_state = _initial_anchor_state_from_world_7d(
@@ -852,9 +816,16 @@ def run_real_case(
         plan_t = assign_uniform_timestamps(npt, wpdt)
         if rotate_plan_deg:
             plan_pts = rotate_xz_points(plan_pts, plan_pts[0], float(rotate_plan_deg))
-    timeline = InferenceGlueTimeline(session_anchor_state)
+    timeline = RootTimeline(session_anchor_state)
     vae.clear_cache()
-    init_stream_generation(model, hl, batch_size=1, num_denoise_steps=nds)
+    stream = StreamGenerator(
+        ldf_model=model,
+        device=device,
+        history_length=hl,
+        traj_horizon_tokens=hz,
+        token_dt=tdt,
+    )
+    stream.init_ldf_generation(history_length=hl, batch_size=1, num_denoise_steps=nds)
     model.generated = model.generated.to(device)
     clear_model_traj_state(model)
     root_5d_history, frame_idx = [], 0
@@ -875,7 +846,7 @@ def run_real_case(
             set_eval_root_plan(
                 model,
                 timeline,
-                StreamTrajectoryPlan(
+                RoutePlan(
                     times=plan_t,
                     points_xyz=plan_pts,
                     start_commit_index=0,
@@ -884,7 +855,7 @@ def run_real_case(
                 ),
                 text=text,
                 token_dt=tdt,
-                root_refiner_runtime=root_refiner_runtime,
+                root_refiner=root_refiner,
                 root_5d_history=root_5d_history,
                 replan_events=replan_events,
                 root_plan_events=root_plan_events,
@@ -916,36 +887,11 @@ def run_real_case(
                 absolute_commit_index=commit_idx,
             )
         elif condition_path == "legacy_xyz":
-            current_root = np.zeros(3, dtype=np.float32)
-            if mode == "real_gtroot":
-                current_root = gr_arr[min(commit_idx * 4, len(gr_arr) - 1)].astype(
-                    np.float32
-                )
-            else:
-                current_root[[0, 2]] = recovery.r_pos_accum[[0, 2]].astype(np.float32)
-            future = sample_plan_future(
-                StreamTrajectoryPlan(
-                    times=plan_t,
-                    points_xyz=plan_pts,
-                    start_commit_index=0,
-                    version=0,
-                    source="bench",
-                ),
-                current_commit=commit_idx,
-                current_root_xyz=current_root,
-                horizon_tokens=hz,
-                token_dt=tdt,
-                reanchor_to_current_root=True,
-            )
-            traj_input = {
-                "traj": torch.from_numpy(future).float().unsqueeze(0),
-                "token_mask": torch.ones(1, hz),
-            }
+            raise ValueError("legacy_xyz streaming conditioning has been removed")
         else:
             raise ValueError(f"unknown traj_condition_path {condition_path!r}")
-        step_payload = build_stream_step_model_input(text, traj_input=traj_input)
-        condition_provider = build_stream_step_condition_provider(
-            model,
+        step_payload = stream.build_step_input(text, traj_input=traj_input)
+        condition_provider = stream.build_ldf_condition_provider(
             step_payload,
             first_chunk=first_chunk,
             device=device,
@@ -1006,7 +952,7 @@ def run_turn_case(
     delay_tokens: int | float = 20,
     blend_tokens: int | float = 4,
     condition_path: str = "rootplan_7d",
-    root_refiner_runtime: Any = None,
+    root_refiner: Any = None,
     replan_events: list | None = None,
     force_no_traj: bool = False,
     root_plan_events: list | None = None,
@@ -1055,13 +1001,20 @@ def run_turn_case(
     rot_t = np.arange(len(rot_pts), dtype=np.float32) * wpdt
     gr = extract_root_trajectory_263(sample["feature"].numpy()[:tfs])
     vae.clear_cache()
-    init_stream_generation(model, hl, batch_size=1, num_denoise_steps=nds)
+    stream = StreamGenerator(
+        ldf_model=model,
+        device=device,
+        history_length=hl,
+        traj_horizon_tokens=hz,
+        token_dt=tdt,
+    )
+    stream.init_ldf_generation(history_length=hl, batch_size=1, num_denoise_steps=nds)
     model.generated = model.generated.to(device)
     clear_model_traj_state(model)
     root_5d_history, frame_idx = [], 0
     edit_commit = split_tok
     effective_commit = edit_commit + edit_delay
-    old_plan = StreamTrajectoryPlan(
+    old_plan = RoutePlan(
         times=plan_t,
         points_xyz=plan_pts,
         start_commit_index=0,
@@ -1084,7 +1037,7 @@ def run_turn_case(
             old_plan,
             text=text,
             token_dt=tdt,
-            root_refiner_runtime=root_refiner_runtime,
+            root_refiner=root_refiner,
             root_5d_history=root_5d_history,
             replan_events=replan_events,
             root_plan_events=root_plan_events,
@@ -1111,7 +1064,7 @@ def run_turn_case(
                     new_plan,
                     text=text,
                     token_dt=tdt,
-                    root_refiner_runtime=root_refiner_runtime,
+                    root_refiner=root_refiner,
                     root_5d_history=root_5d_history,
                 )
                 if old_root_plan is not None and new_root_plan is not None:
@@ -1124,7 +1077,7 @@ def run_turn_case(
                     )
                     _activate_eval_root_plan(model, composed_root_plan)
                     diagnostic_root_plan = composed_root_plan
-                    composed_stream_plan = StreamTrajectoryPlan(
+                    composed_stream_plan = RoutePlan(
                         times=rot_t,
                         points_xyz=rot_pts,
                         start_commit_index=actual_activation_commit,
@@ -1135,7 +1088,7 @@ def run_turn_case(
                         root_plan=composed_root_plan,
                         stream_plan=composed_stream_plan,
                         text=text,
-                        root_refiner=root_refiner_runtime is not None,
+                        root_refiner=root_refiner is not None,
                         replan_events=replan_events,
                         root_plan_events=root_plan_events,
                         diagnostic_plan=True,
@@ -1149,33 +1102,11 @@ def run_turn_case(
                 absolute_commit_index=commit_idx,
             )
         elif condition_path == "legacy_xyz":
-            current_root = np.zeros(3, dtype=np.float32)
-            current_root[[0, 2]] = recovery.r_pos_accum[[0, 2]].astype(np.float32)
-            reanchor = dict(
-                current_commit=commit_idx,
-                current_root_xyz=current_root,
-                horizon_tokens=hz,
-                token_dt=tdt,
-                reanchor_to_current_root=True,
-            )
-            old_future = sample_plan_future(old_plan, **reanchor)
-            if offset < edit_delay:
-                future = old_future
-            elif offset < edit_delay + edit_blend and edit_blend > 0:
-                new_future = sample_plan_future(new_plan, **reanchor)
-                weight = smoothstep01(float(offset - edit_delay) / edit_blend)
-                future = blend_future_trajs(old_future, new_future, weight)
-            else:
-                future = sample_plan_future(new_plan, **reanchor)
-            traj_input = {
-                "traj": torch.from_numpy(future).float().unsqueeze(0),
-                "token_mask": torch.ones(1, hz),
-            }
+            raise ValueError("legacy_xyz streaming conditioning has been removed")
         else:
             raise ValueError(f"unknown traj_condition_path {condition_path!r}")
-        step_payload = build_stream_step_model_input(text, traj_input=traj_input)
-        condition_provider = build_stream_step_condition_provider(
-            model,
+        step_payload = stream.build_step_input(text, traj_input=traj_input)
+        condition_provider = stream.build_ldf_condition_provider(
             step_payload,
             first_chunk=first_chunk,
             device=device,

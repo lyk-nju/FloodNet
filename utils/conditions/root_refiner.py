@@ -1,4 +1,4 @@
-"""RootRefiner path-condition construction."""
+"""RootRefiner path-condition contract and builders."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from utils.path_arclength import arclength_resample
 
 
 @dataclass(frozen=True)
-class PathConditionResult:
+class RootRefinerPathCondition:
     path: Tensor
     path_valid_mask: Tensor
     path_control_mask: Tensor
@@ -116,12 +116,12 @@ def build_dense_path_condition(
     n_path: int,
     valid_frame_count: int,
     max_frames: int | None = None,
-) -> PathConditionResult:
+) -> RootRefinerPathCondition:
     max_frames = int(max_frames or valid_frame_count)
     path, valid_mask = _resample_path(future_xz, n_path)
     control_mask = valid_mask.clone()
     supervision_mask = _path_supervision_mask(max_frames, valid_frame_count, 0)
-    return PathConditionResult(
+    return RootRefinerPathCondition(
         path=path,
         path_valid_mask=valid_mask,
         path_control_mask=control_mask,
@@ -139,7 +139,7 @@ def build_goal_point_condition(
     n_path: int,
     valid_frame_count: int,
     max_frames: int | None = None,
-) -> PathConditionResult:
+) -> RootRefinerPathCondition:
     max_frames = int(max_frames or valid_frame_count)
     goal = future_xz[-1].to(dtype=torch.float32)
     alpha = torch.linspace(0.0, 1.0, n_path, dtype=torch.float32, device=goal.device)
@@ -148,7 +148,7 @@ def build_goal_point_condition(
     control_mask = torch.zeros(n_path, dtype=torch.bool)
     control_mask[-1] = True
     supervision_mask = _path_supervision_mask(max_frames, valid_frame_count, 0)
-    return PathConditionResult(
+    return RootRefinerPathCondition(
         path=path.cpu(),
         path_valid_mask=valid_mask,
         path_control_mask=control_mask,
@@ -168,7 +168,7 @@ def build_sparse_path_condition(
     max_frames: int | None = None,
     point_range: tuple[int, int],
     rng: random.Random,
-) -> PathConditionResult:
+) -> RootRefinerPathCondition:
     max_frames = int(max_frames or valid_frame_count)
     min_points, max_points = int(point_range[0]), int(point_range[1])
     point_count = rng.randint(min(min_points, max_points), max(min_points, max_points))
@@ -184,7 +184,7 @@ def build_sparse_path_condition(
         control_mask[max(0, min(n_path - 1, int(path_index)))] = True
     control_mask[-1] = True
     supervision_mask = _path_supervision_mask(max_frames, valid_frame_count, 0)
-    return PathConditionResult(
+    return RootRefinerPathCondition(
         path=path,
         path_valid_mask=valid_mask,
         path_control_mask=control_mask,
@@ -196,7 +196,7 @@ def build_sparse_path_condition(
     )
 
 
-def build_path_condition(
+def build_root_refiner_path_condition(
     future_xz: Tensor,
     *,
     n_path: int,
@@ -206,7 +206,7 @@ def build_path_condition(
     offset_start_frames: int,
     sparse_point_range: tuple[int, int],
     rng: random.Random,
-) -> PathConditionResult:
+) -> RootRefinerPathCondition:
     max_frames = int(max_frames or valid_frame_count)
     offset = max(0, min(int(offset_start_frames), int(valid_frame_count) - 2))
     source = future_xz[offset:] if path_mode != "goal_point" else future_xz
@@ -241,7 +241,7 @@ def build_path_condition(
     else:
         raise ValueError(f"unknown path_mode {path_mode!r}")
 
-    return PathConditionResult(
+    return RootRefinerPathCondition(
         path=result.path,
         path_valid_mask=result.path_valid_mask,
         path_control_mask=result.path_control_mask,
@@ -286,11 +286,11 @@ def map_path_control_mask_to_frame_mask(
 
 
 __all__ = [
-    "PathConditionResult",
+    "RootRefinerPathCondition",
     "build_dense_path_condition",
     "build_sparse_path_condition",
     "build_goal_point_condition",
-    "build_path_condition",
+    "build_root_refiner_path_condition",
     "compute_path_features",
     "map_path_control_mask_to_frame_mask",
 ]

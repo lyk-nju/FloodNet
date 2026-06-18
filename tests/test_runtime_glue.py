@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from utils.inference.commit import body_window_start_commit_idx, committed_frame_slice
+from utils.inference.timeline import body_window_start_commit_idx, committed_frame_slice
 from utils.token_frame import token_end_frame, token_start_frame
 
 

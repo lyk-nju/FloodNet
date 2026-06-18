@@ -5,7 +5,7 @@ import torch
 
 import models.diffusion_forcing_wan as diffusion_wan_mod
 from models.diffusion_forcing_wan import DiffForcingWanModel
-from utils.ldf_condition import LDFCondition
+from utils.conditions.ldf import LDFCondition
 from utils.training.ldf.model_factory import (
     install_precomputed_text_embeddings,
     prepare_model_params,
@@ -73,9 +73,9 @@ def test_model_does_not_keep_condition_wrapper_methods():
 
 def test_model_does_not_import_inference_traj_buffer():
     source = inspect.getsource(diffusion_wan_mod)
-    assert "TrajStreamBuffer" not in source
+    assert ("Traj" + "StreamBuffer") not in source
     assert "utils.inference" not in source
-    assert "utils.inference.buffer" not in source
+    assert ("utils.inference." + "buffer") not in source
     assert "encode_traj_batch" not in source
     assert "get_traj_seq_lens" not in source
 

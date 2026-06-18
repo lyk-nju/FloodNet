@@ -4,10 +4,10 @@ import random
 
 import torch
 
-from utils.training.root_refiner.path_condition import (
+from utils.conditions.root_refiner import (
     build_dense_path_condition,
     build_goal_point_condition,
-    build_path_condition,
+    build_root_refiner_path_condition,
     build_sparse_path_condition,
     compute_path_features,
     map_path_control_mask_to_frame_mask,
@@ -66,7 +66,7 @@ def test_sparse_path_marks_visible_controls_and_includes_endpoint():
 
 def test_offset_start_changes_supervision_mask_but_not_valid_frame_count():
     future = _future_xz(21)
-    result = build_path_condition(
+    result = build_root_refiner_path_condition(
         future,
         n_path=8,
         valid_frame_count=future.shape[0],
@@ -84,7 +84,7 @@ def test_offset_start_changes_supervision_mask_but_not_valid_frame_count():
 
 def test_offset_start_keeps_duration_features_on_full_future():
     future = _future_xz(21)
-    result = build_path_condition(
+    result = build_root_refiner_path_condition(
         future,
         n_path=8,
         valid_frame_count=future.shape[0],

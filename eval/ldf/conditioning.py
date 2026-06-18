@@ -11,17 +11,15 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from utils.inference.glue import InferenceGlueState, InferenceGlueTimeline
+from utils.inference.timeline import RootFrameState, RootTimeline
 from utils.local_frame import (
     canonicalize_7d,
     transform_xz_local_delta_to_world,
     wrap_angle,
 )
-from utils.inference.root_plan import RootPlan
-from utils.inference.root_plan import build_rootplan_stream_payload_from_buffer
+from utils.inference.root_plan import RootPlan, build_root_plan_stream_payload
 from utils.token_frame import num_tokens_for_frame_len, token_range_to_frame_slice
-from utils.inference.buffer import TrajStreamBuffer
-from utils.inference.ldf_conditioning import prepare_generate_condition
+from utils.training.ldf.conditioning import prepare_generate_condition
 from utils.training.ldf.sample_creator import SampleCreator
 
 
@@ -228,20 +226,8 @@ class LdfEvalStreamConditioner:
             device=self.device,
             tail_hold_tokens=self.traj_horizon_tokens,
         )
-        token_length = _first_scalar(sample_batch.get("token_length"), self.root_plan.num_tokens_pred)
-        buf_len = max(
-            self.history_length * 2 + 1,
-            token_length + self.history_length + self.traj_horizon_tokens + 4,
-        )
-        self.traj_buf = TrajStreamBuffer(
-            batch_size=1,
-            buf_len=buf_len,
-            device=self.device,
-            dtype=self.root_plan.waypoints_local_7d.dtype,
-        )
-        self.traj_buf.set_root_plan(self.root_plan)
-        self.timeline = InferenceGlueTimeline(
-            InferenceGlueState(
+        self.timeline = RootTimeline(
+            RootFrameState(
                 commit_idx=0,
                 world_xz=self.root_plan.anchor_world_xz.clone(),
                 world_yaw=self.root_plan.anchor_world_yaw.clone(),
@@ -263,8 +249,8 @@ class LdfEvalStreamConditioner:
             if absolute_commit_index is None
             else int(absolute_commit_index)
         )
-        return build_rootplan_stream_payload_from_buffer(
-            self.traj_buf,
+        return build_root_plan_stream_payload(
+            self.root_plan,
             self.timeline,
             local_commit_index=int(local_commit_index),
             absolute_commit_index=absolute_commit,
@@ -297,7 +283,7 @@ class LdfEvalStreamConditioner:
         world_yaw = wrap_angle(self._anchor_yaw + local_yaw)
         if int(commit_idx) > self.timeline.head.commit_idx:
             self.timeline.append(
-                InferenceGlueState(
+                RootFrameState(
                     commit_idx=int(commit_idx),
                     world_xz=world_xz,
                     world_yaw=world_yaw,

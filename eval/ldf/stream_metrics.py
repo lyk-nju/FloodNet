@@ -51,9 +51,6 @@ try:
         LdfEvalStreamConditioner,
         prepare_ldf_eval_model_batch,
     )
-    from FloodNet.utils.inference.ldf_conditioning import (
-        build_stream_step_condition_provider,
-    )
     from FloodNet.eval.common.visualization import (
         plot_xz_trajectories,
         plot_yaw_series,
@@ -66,13 +63,7 @@ try:
         StreamJointRecovery263,
         extract_root_trajectory_263_torch,
     )
-    from FloodNet.utils.inference.rollout import (
-        StreamTextRolloutController,
-        build_stream_step_model_input,
-        build_stream_suffix_conditioning,
-        clip_traj_input_to_horizon,
-    )
-    from FloodNet.utils.inference.stream_state import init_stream_generation
+    from FloodNet.utils.inference.stream_generator import StreamGenerator
     from FloodNet.utils.training.ldf.model_factory import instantiate_ldf_model
 except ImportError:  # pragma: no cover - script entrypoints use top-level imports
     from metrics.stream import (
@@ -92,7 +83,6 @@ except ImportError:  # pragma: no cover - script entrypoints use top-level impor
         _stable_eval_seed,
     )
     from eval.ldf.conditioning import LdfEvalStreamConditioner, prepare_ldf_eval_model_batch
-    from utils.inference.ldf_conditioning import build_stream_step_condition_provider
     from eval.common.visualization import (
         plot_xz_trajectories,
         plot_yaw_series,
@@ -105,14 +95,35 @@ except ImportError:  # pragma: no cover - script entrypoints use top-level impor
         StreamJointRecovery263,
         extract_root_trajectory_263_torch,
     )
-    from utils.inference.rollout import (
-        StreamTextRolloutController,
-        build_stream_step_model_input,
-        build_stream_suffix_conditioning,
-        clip_traj_input_to_horizon,
-    )
-    from utils.inference.stream_state import init_stream_generation
+    from utils.inference.stream_generator import StreamGenerator
     from utils.training.ldf.model_factory import instantiate_ldf_model
+
+
+class StreamTextRolloutController:
+    def __init__(self, texts, token_ends):
+        self.texts = [str(text) for text in texts]
+        self.token_ends = [int(end) for end in token_ends]
+        if not self.texts:
+            self.texts = [""]
+            self.token_ends = [0]
+
+    @classmethod
+    def from_sample_batch(cls, sample_batch):
+        text = sample_batch.get("text", [""])
+        if isinstance(text, list) and len(text) == 1 and isinstance(text[0], list):
+            text = text[0]
+        if not isinstance(text, list):
+            text = [str(text)]
+        token_end = sample_batch.get("token_text_end", [[0]])
+        if isinstance(token_end, list) and len(token_end) == 1:
+            token_end = token_end[0]
+        return cls(text, token_end)
+
+    def get_text_for_commit_index(self, commit_index: int) -> str:
+        for text, token_end in zip(self.texts, self.token_ends):
+            if int(commit_index) < int(token_end):
+                return text
+        return self.texts[-1]
 
 
 class InMemorySampleDataset(Dataset):
@@ -460,9 +471,15 @@ def run_stream_generate_step_sample(
     if num_denoise_steps is None:
         num_denoise_steps = int(getattr(model, "noise_steps"))
 
-    init_stream_generation(
-        model,
-        history_length,
+    stream = StreamGenerator(
+        ldf_model=model,
+        device=device,
+        history_length=history_length,
+        traj_horizon_tokens=int(traj_horizon_tokens or 0),
+        token_dt=float(token_dt),
+    )
+    stream.init_ldf_generation(
+        history_length=history_length,
         batch_size=1,
         num_denoise_steps=num_denoise_steps,
     )
@@ -504,15 +521,12 @@ def run_stream_generate_step_sample(
                     chunk_size=chunk_size,
                 )
             else:
-                traj_input = build_stream_suffix_conditioning(sample_batch, commit_index)
-                if traj_horizon_tokens is not None and traj_horizon_tokens > 0:
-                    traj_input = clip_traj_input_to_horizon(traj_input, traj_horizon_tokens)
-            step_payload = build_stream_step_model_input(
+                traj_input = None
+            step_payload = stream.build_step_input(
                 current_text,
                 traj_input=traj_input,
             )
-            condition_provider = build_stream_step_condition_provider(
-                model,
+            condition_provider = stream.build_ldf_condition_provider(
                 step_payload,
                 first_chunk=first_chunk,
                 device=device,

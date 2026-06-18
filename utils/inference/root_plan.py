@@ -1,55 +1,29 @@
-"""RootPlan dataclass + plan-local slicing + plan-local→body-window-local helper.
-
-References:
-- docs/TODO.md §T_A_03 lines 535-630 — RootPlan / slice_plan_with_mask /
-  plan_local_to_body_window_local spec.
-- docs/design.md §0.3 (Anchor Convention v1) and §3.6.1 (plan-local two-step
-  conversion).
-
-Two anchors (HARD CONSTRAINT, dual anchor §0.3):
-    plan anchor:  Refiner anchor at plan-creation time
-                  (= timeline.head when Refiner ran)
-    body anchor:  body window history0 (leftmost frame of the body window)
-                  — NOT head_state. Body diffusion training distribution is
-                  history0-anchored, never current-root-anchored.
-
-`plan_local_to_body_window_local` is the canonical helper that bridges them
-(uncanonicalize from plan anchor → canonicalize to body anchor).
-"""
+"""RootPlan payloads and coordinate conversion for streaming LDF runtime."""
 
 from __future__ import annotations
 
 import torch
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from torch import Tensor
 
 
 @dataclass
 class RootPlan:
-    """Refiner output in **plan-anchor-local frame** (B-full convention).
+    """Refiner output in plan-anchor-local coordinates."""
 
-    A single plan can span multiple body windows. `valid_frames` is the real
-    plan length in frame units; `num_tokens_pred` is only the LDF/VAE backend
-    allocation derived from that frame length.
-    """
+    num_tokens_pred: int
+    valid_frames: int
+    waypoints_local_7d: Tensor
 
-    num_tokens_pred: int                   # LDF token allocation derived from valid_frames
-    valid_frames: int                      # real plan length in frames, including anchor
-    waypoints_local_7d: Tensor             # [valid_frames, 7] plan-anchor-local
+    frame_dt: float
+    frames_per_token: int = 4
 
-    frame_dt: float                        # = 1 / fps
-    frames_per_token: int = 4              # causal VAE token width
-
-    # Plan anchor (used when switching frame across body windows).
-    # IMPORTANT: anchor_commit_idx is the global token index where this plan's
-    # local origin sits — typically == timeline.head.commit_idx at plan creation
-    # (the Refiner anchor / effective_commit for delayed edits).
     anchor_commit_idx: int = 0
-    anchor_world_xz: Tensor = None         # [2] world xz of the plan anchor
-    anchor_world_yaw: Tensor = None        # scalar physical yaw
+    anchor_world_xz: Tensor = None
+    anchor_world_yaw: Tensor = None
 
-    source: str = "refiner"                # "refiner" | "gt" | "debug"
+    source: str = "refiner"
 
     def __post_init__(self):
         if self.waypoints_local_7d.ndim != 2 or self.waypoints_local_7d.shape[-1] != 7:
@@ -64,6 +38,15 @@ class RootPlan:
             )
         if self.anchor_world_xz is None or self.anchor_world_yaw is None:
             raise ValueError("anchor_world_xz and anchor_world_yaw must be provided")
+
+    def to(self, *, device=None, dtype=None) -> "RootPlan":
+        """Return a shallow copy with tensor fields moved to `device`/`dtype`."""
+        return replace(
+            self,
+            waypoints_local_7d=self.waypoints_local_7d.to(device=device, dtype=dtype),
+            anchor_world_xz=self.anchor_world_xz.to(device=device, dtype=dtype),
+            anchor_world_yaw=self.anchor_world_yaw.to(device=device, dtype=dtype),
+        )
 
 
 def slice_plan_with_mask(plan: RootPlan,
@@ -172,8 +155,118 @@ def plan_local_to_body_window_local(
     return traj_body_local
 
 
-def _build_single_rootplan_payload(
-    traj_buf,
+def root_plan_to_body_condition(
+    root_plan: RootPlan | None,
+    *,
+    head_state,
+    body_anchor_state,
+    horizon_tokens: int,
+    expected_horizon_frame_slice=None,
+    device=None,
+    dtype=None,
+) -> tuple[Tensor, Tensor]:
+    """Convert a RootPlan slice to body-window-local 7D frames and a valid mask."""
+    from utils.local_frame import canonicalize_7d, uncanonicalize_7d
+    from utils.token_frame import (
+        frame_idx_to_token_idx,
+        token_range_to_frame_slice,
+        token_start_frame,
+    )
+
+    if expected_horizon_frame_slice is None:
+        if root_plan is None:
+            raise ValueError("no-plan fallback requires expected_horizon_frame_slice")
+        current_plan_token = int(head_state.commit_idx) - int(root_plan.anchor_commit_idx)
+        expected_horizon_frame_slice = token_range_to_frame_slice(
+            max(0, current_plan_token),
+            int(horizon_tokens),
+            root_plan.frames_per_token,
+        )
+    frame_count = expected_horizon_frame_slice.stop - expected_horizon_frame_slice.start
+    if frame_count < 0:
+        raise ValueError(
+            f"expected_horizon_frame_slice has negative length: "
+            f"{expected_horizon_frame_slice}"
+        )
+
+    if root_plan is None:
+        device = device or getattr(body_anchor_state.world_xz, "device", None)
+        dtype = dtype or getattr(body_anchor_state.world_xz, "dtype", torch.float32)
+        return (
+            torch.zeros(frame_count, 7, device=device, dtype=dtype),
+            torch.zeros(frame_count, device=device, dtype=torch.bool),
+        )
+
+    plan = root_plan.to(device=device, dtype=dtype)
+    device = plan.waypoints_local_7d.device
+    dtype = plan.waypoints_local_7d.dtype
+    current_plan_token = int(head_state.commit_idx) - int(plan.anchor_commit_idx)
+
+    if current_plan_token < 0:
+        output = plan.waypoints_local_7d.new_zeros(frame_count, 7)
+        mask = torch.zeros(frame_count, device=device, dtype=torch.bool)
+        if current_plan_token + int(horizon_tokens) <= 0:
+            return output, mask
+
+        output_start_token = frame_idx_to_token_idx(
+            expected_horizon_frame_slice.start,
+            plan.frames_per_token,
+        )
+        anchor_output_token = output_start_token - current_plan_token
+        anchor_output_frame = token_start_frame(
+            anchor_output_token,
+            plan.frames_per_token,
+        )
+        prefix_frames = max(
+            0,
+            min(
+                frame_count,
+                anchor_output_frame - expected_horizon_frame_slice.start,
+            ),
+        )
+        suffix_frames = max(0, frame_count - prefix_frames)
+        if suffix_frames <= 0:
+            return output, mask
+
+        traj_plan_local, suffix_mask = slice_plan_with_mask(
+            plan,
+            frame_slice=slice(0, suffix_frames),
+            hold_last_on_overflow=True,
+        )
+        traj_world = uncanonicalize_7d(
+            traj_plan_local,
+            plan.anchor_world_xz,
+            plan.anchor_world_yaw,
+        )
+        body_anchor_xz = body_anchor_state.world_xz.to(device=device, dtype=dtype)
+        body_anchor_yaw = body_anchor_state.world_yaw.to(device=device, dtype=dtype)
+        output[prefix_frames:] = canonicalize_7d(
+            traj_world,
+            body_anchor_xz,
+            body_anchor_yaw,
+        )
+        mask[prefix_frames:] = suffix_mask
+        return output, mask
+
+    plan_frame_start = token_start_frame(current_plan_token, plan.frames_per_token)
+    frame_slice = slice(plan_frame_start, plan_frame_start + frame_count)
+    traj_plan_local, mask = slice_plan_with_mask(
+        plan,
+        frame_slice=frame_slice,
+        hold_last_on_overflow=True,
+    )
+    traj_world = uncanonicalize_7d(
+        traj_plan_local,
+        plan.anchor_world_xz,
+        plan.anchor_world_yaw,
+    )
+    body_anchor_xz = body_anchor_state.world_xz.to(device=device, dtype=dtype)
+    body_anchor_yaw = body_anchor_state.world_yaw.to(device=device, dtype=dtype)
+    return canonicalize_7d(traj_world, body_anchor_xz, body_anchor_yaw), mask
+
+
+def _build_single_root_plan_payload(
+    root_plan: RootPlan,
     timeline,
     *,
     local_start_token: int,
@@ -192,7 +285,8 @@ def _build_single_rootplan_payload(
 
     body_anchor_state = timeline.at_commit(absolute_start_token)
     frame_slice = token_range_to_frame_slice(absolute_start_token, num_tokens)
-    traj_cond, traj_mask = traj_buf.get_body_traj_cond(
+    traj_cond, traj_mask = root_plan_to_body_condition(
+        root_plan,
         head_state=body_anchor_state,
         body_anchor_state=body_anchor_state,
         horizon_tokens=num_tokens,
@@ -209,8 +303,8 @@ def _build_single_rootplan_payload(
     }
 
 
-def build_rootplan_stream_payload_from_buffer(
-    traj_buf,
+def build_root_plan_stream_payload(
+    root_plan: RootPlan | None,
     timeline,
     *,
     local_commit_index: int,
@@ -219,19 +313,14 @@ def build_rootplan_stream_payload_from_buffer(
     history_length: int,
     traj_horizon_tokens: int,
 ) -> dict | None:
-    """Build the direct 7D RootPlan payload consumed by stream_generate_step.
+    """Build the direct 7D RootPlan payload consumed by LDF stream generation.
 
     ``local_commit_index`` indexes the model's rolling latent cache.
     ``absolute_commit_index`` indexes the world-space inference timeline and
     RootPlan anchor state. Keeping them separate is required after the model
     rolls its internal generated buffer.
     """
-    if (
-        traj_buf is None
-        or timeline is None
-        or not hasattr(traj_buf, "has_active_plan")
-        or not traj_buf.has_active_plan()
-    ):
+    if root_plan is None or timeline is None:
         return None
 
     local_commit = int(local_commit_index)
@@ -263,8 +352,8 @@ def build_rootplan_stream_payload_from_buffer(
         seen_starts.add(sub_local_start)
         absolute_right_token = absolute_commit + (local_right_token - local_commit)
         sub_abs_start = max(0, absolute_right_token - model_sl)
-        subpayload = _build_single_rootplan_payload(
-            traj_buf,
+        subpayload = _build_single_root_plan_payload(
+            root_plan,
             timeline,
             local_start_token=sub_local_start,
             absolute_start_token=sub_abs_start,
@@ -288,7 +377,8 @@ def build_rootplan_stream_payload_from_buffer(
 
 __all__ = [
     "RootPlan",
-    "build_rootplan_stream_payload_from_buffer",
+    "build_root_plan_stream_payload",
     "slice_plan_with_mask",
     "plan_local_to_body_window_local",
+    "root_plan_to_body_condition",
 ]

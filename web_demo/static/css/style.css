@@ -94,6 +94,16 @@ body {
     min-height: 60px;
 }
 
+.trajectory-mode-select {
+    width: 100%;
+    margin-bottom: 8px;
+    padding: 8px 12px;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    font-size: 0.95em;
+    background: #ffffff;
+}
+
 .trajectory-buttons {
     display: flex;
     gap: 10px;

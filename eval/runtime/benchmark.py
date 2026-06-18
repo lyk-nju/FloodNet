@@ -1486,15 +1486,32 @@ def main():
     if args.root_refiner_config or args.root_refiner_ckpt:
         if not (args.root_refiner_config and args.root_refiner_ckpt):
             p.error("--root_refiner_config and --root_refiner_ckpt must be provided together")
-        from utils.inference.root_refiner import RootRefinerRuntime
+        from train_refiner import _load_cfg, resolve_cfg_interpolations
+        from utils.inference.stream_generator import StreamGenerator
+        from utils.training.root_refiner.lightning_module import RootRefinerLightningModule
 
-        print("Loading RootRefiner runtime ...")
-        root_refiner_runtime = RootRefinerRuntime.from_config(
-            config_path=args.root_refiner_config,
-            ckpt_path=args.root_refiner_ckpt,
+        print("Loading RootRefiner modules ...")
+        root_cfg = resolve_cfg_interpolations(_load_cfg(args.root_refiner_config))
+        root_module = RootRefinerLightningModule(root_cfg)
+        ckpt = torch.load(args.root_refiner_ckpt, map_location="cpu", weights_only=False)
+        state_dict = ckpt.get("state_dict", ckpt)
+        try:
+            root_module.load_state_dict(
+                state_dict,
+                strict=not args.root_refiner_non_strict,
+            )
+        except RuntimeError:
+            if not args.root_refiner_non_strict:
+                raise
+            root_module.load_state_dict(state_dict, strict=False)
+        root_refiner_runtime = StreamGenerator(
+            ldf_model=model,
+            root_refiner=root_module.refiner,
+            root_text_encoder=root_module.text_encoder,
             device=dev,
-            strict=not args.root_refiner_non_strict,
-            path_mode=args.root_refiner_path_mode,
+            token_dt=args.token_dt,
+            history_length=args.history_length,
+            traj_horizon_tokens=args.traj_horizon_tokens,
         )
 
     condition_variants = parse_condition_variants(

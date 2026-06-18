@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from utils.ldf_condition import LDFCondition, LDFTrainingCondition
+from utils.conditions.ldf import LDFCondition, LDFTrainingCondition
 
 
 def test_ldf_condition_accepts_prepared_model_inputs():

@@ -41,17 +41,28 @@ from utils.initialize import (
     load_config,
 )
 from utils.motion_process import StreamJointRecovery263, extract_root_trajectory_263
-from utils.inference.rollout import (
-    StreamTextRolloutController,
-    StreamTextSegment,
-    build_stream_step_model_input,
-)
-from utils.inference.ldf_conditioning import build_stream_step_condition_provider
-from utils.inference.stream_state import init_stream_generation
-from utils.inference.trajectory import sample_timestamped_trajectory
+from utils.inference.stream_generator import StreamGenerator
+from utils.inference.geometry import sample_timestamped_trajectory
 from utils.training.ldf.model_factory import instantiate_ldf_model
 from utils.traj_batch import root_to_traj_feats
 from utils.visualization.video import render_single_video
+
+
+class StreamTextSegment:
+    def __init__(self, text: str, token_end: int):
+        self.text = str(text)
+        self.token_end = int(token_end)
+
+
+class StreamTextRolloutController:
+    def __init__(self, segments):
+        self.segments = list(segments) or [StreamTextSegment("", 0)]
+
+    def get_text_for_commit_index(self, commit_index: int) -> str:
+        for segment in self.segments:
+            if int(commit_index) < int(segment.token_end):
+                return segment.text
+        return self.segments[-1].text
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -322,9 +333,13 @@ def _run_stream_session(model, vae, sample: dict, device,
     text_ctrl = StreamTextRolloutController(segments)
 
     vae.clear_cache()
-    init_stream_generation(
-        model,
-        history_length,
+    stream = StreamGenerator(
+        ldf_model=model,
+        device=device,
+        history_length=history_length,
+    )
+    stream.init_ldf_generation(
+        history_length=history_length,
         batch_size=1,
         num_denoise_steps=num_denoise_steps,
     )
@@ -340,24 +355,14 @@ def _run_stream_session(model, vae, sample: dict, device,
 
         if mode == "no_traj":
             traj_input = None
-        elif mode == "gt_suffix":
-            remain = token_length - commit_idx
-            traj_input = {
-                "traj": sample["traj"][4 * commit_idx:].unsqueeze(0).float(),
-                "token_mask": torch.ones(1, max(1, remain)),
-            }
-        elif mode == "timestamped_gt_plan":
-            traj_input = _build_timestamped_input(
-                sample, commit_idx, horizon_tokens, token_dt)
-        elif mode == "duration_waypoints":
-            traj_input = _build_duration_waypoint_input(
-                sample, commit_idx, horizon_tokens, token_dt, waypoint_dt)
         else:
-            raise ValueError(f"Unknown mode: {mode}")
+            raise ValueError(
+                f"Mode {mode!r} used legacy xyz trajectory conditioning, "
+                "which has been removed from inference runtime."
+            )
 
-        step_payload = build_stream_step_model_input(current_text, traj_input=traj_input)
-        condition_provider = build_stream_step_condition_provider(
-            model,
+        step_payload = stream.build_step_input(current_text, traj_input=traj_input)
+        condition_provider = stream.build_ldf_condition_provider(
             step_payload,
             first_chunk=first_chunk,
             device=device,

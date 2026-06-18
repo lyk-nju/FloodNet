@@ -265,6 +265,7 @@ class MotionApp {
         this.forceTakeoverBtn = document.getElementById('forceTakeoverBtn');
         this.cancelTakeoverBtn = document.getElementById('cancelTakeoverBtn');
         this.trajectoryWaypoints = document.getElementById('trajectoryWaypoints');
+        this.trajectoryRouteMode = document.getElementById('trajectoryRouteMode');
         this.updateTrajBtn = document.getElementById('updateTrajBtn');
         this.clearTrajBtn = document.getElementById('clearTrajBtn');
 
@@ -475,6 +476,10 @@ class MotionApp {
         return points.length > 0 ? points : null;
     }
 
+    getTrajectoryRouteMode() {
+        return this.trajectoryRouteMode ? this.trajectoryRouteMode.value : 'relative_to_actor';
+    }
+
     async updateTrajectory() {
         if (this.isProcessing) return;
         const waypoints = this.parseWaypointsFromTextarea();
@@ -487,7 +492,11 @@ class MotionApp {
             const response = await fetch('/api/update_trajectory', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ session_id: this.sessionId, waypoints })
+                body: JSON.stringify({
+                    session_id: this.sessionId,
+                    waypoints,
+                    route_mode: this.getTrajectoryRouteMode()
+                })
             });
             const data = await response.json();
             if (data.status === 'success') {
@@ -514,7 +523,11 @@ class MotionApp {
             const response = await fetch('/api/update_trajectory', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ session_id: this.sessionId, waypoints: null })
+                body: JSON.stringify({
+                    session_id: this.sessionId,
+                    waypoints: null,
+                    route_mode: this.getTrajectoryRouteMode()
+                })
             });
             const data = await response.json();
             if (data.status === 'success') {
@@ -900,7 +913,8 @@ class MotionApp {
                 body: JSON.stringify({
                     session_id: this.sessionId,
                     waypoints: waypoints && waypoints.length > 0 ? waypoints : null,
-                    mode: 'replace_future'
+                    mode: 'replace_future',
+                    route_mode: this.getTrajectoryRouteMode()
                 })
             });
             const data = await response.json();

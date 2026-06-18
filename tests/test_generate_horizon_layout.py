@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import torch
 
 from models.diffusion_forcing_wan import DiffForcingWanModel
-from utils.ldf_condition import LDFCondition
+from utils.conditions.ldf import LDFCondition
 
 
 def _make_generate_harness():

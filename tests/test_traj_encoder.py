@@ -20,7 +20,7 @@ from models.tools.traj_encoder import (
     TrajectoryEncoder,
 )
 from models.diffusion_forcing_wan import DiffForcingWanModel
-from utils.inference.stream_conditioning import build_stream_direct_traj_condition
+from utils.inference.stream_generator import build_stream_direct_traj_condition
 from utils.token_frame import (
     frames_to_token_mask,
     num_frames_for_tokens,

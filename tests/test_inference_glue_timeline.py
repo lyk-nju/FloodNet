@@ -1,4 +1,4 @@
-"""Unit tests for InferenceGlueTimeline (T_A_03c).
+"""Unit tests for RootTimeline (T_A_03c).
 
 Covers G09-G13 (timeline ops, at_commit, has_reached, has_exact_state,
 trim_before) and G23-G25 (pending-edit / effective_commit gating expressed
@@ -12,16 +12,16 @@ import logging
 import pytest
 import torch
 
-from utils.inference.glue import (
-    InferenceGlueState,
-    InferenceGlueTimeline,
+from utils.inference.timeline import (
+    RootFrameState,
+    RootTimeline,
 )
 
 ATOL = 1e-5
 
 
 def _state(commit_idx: int, xz=(0.0, 0.0), yaw=0.0, source="commit"):
-    return InferenceGlueState(
+    return RootFrameState(
         commit_idx=commit_idx,
         world_xz=torch.tensor(xz, dtype=torch.float64),
         world_yaw=torch.tensor(yaw, dtype=torch.float64),
@@ -35,7 +35,7 @@ def _build_timeline(commits, *, xz_fn=None, yaw_fn=None):
     yaw_fn = yaw_fn or (lambda c: 0.0)
     initial = _state(commits[0], xz=xz_fn(commits[0]), yaw=yaw_fn(commits[0]),
                      source="init")
-    timeline = InferenceGlueTimeline(initial)
+    timeline = RootTimeline(initial)
     for c in commits[1:]:
         timeline.append(_state(c, xz=xz_fn(c), yaw=yaw_fn(c)))
     return timeline
@@ -167,7 +167,7 @@ def test_append_rejects_non_monotone_commit_idx():
 
 def test_init_requires_inference_glue_state():
     with pytest.raises(TypeError):
-        InferenceGlueTimeline("not a state")   # type: ignore
+        RootTimeline("not a state")   # type: ignore
 
 
 # ---------------------------------------------------------------------------

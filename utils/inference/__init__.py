@@ -1,60 +1,57 @@
-from .buffer import TrajStreamBuffer
-from .commit import body_window_start_commit_idx, committed_frame_slice
-from .glue import (
-    InferenceGlueState,
-    InferenceGlueTimeline,
-    advance_head_from_body_window,
-)
+"""Inference runtime API."""
+
+from .condition_manager import ConditionManager, RuntimeRootRefinerCondition
 from .root_plan import (
     RootPlan,
-    build_rootplan_stream_payload_from_buffer,
+    build_root_plan_stream_payload,
     plan_local_to_body_window_local,
+    root_plan_to_body_condition,
     slice_plan_with_mask,
 )
-from .root_refiner import RootRefinerRuntime
-from .rollout import (
-    StreamTextRolloutController,
-    StreamTextSegment,
-    build_stream_step_model_input,
+from .route_condition import (
+    RouteConditionState,
+    RoutePlan,
+    RouteReferenceMode,
+    RouteUpdate,
+    reanchor_route_to_xz,
+    sample_route_future,
 )
-from .stream_state import build_stream_traj_buffer, init_stream_generation
-from .stream_conditioning import (
-    build_stream_direct_traj_condition,
-    extend_stream_text_context,
-)
-from .ldf_conditioning import (
-    build_stream_step_condition_provider,
-    prepare_generate_condition,
-)
+from .stream_generator import StreamGenerator, StreamStepInput
+from .text_condition import TextConditionBundle, TextConditionState, TextSegment
 from .timeline import (
+    RootFrameState,
+    RootTimeline,
+    advance_head_from_body_window,
     append_timeline_state_at_token_start_frame,
+    body_window_start_commit_idx,
+    committed_frame_slice,
     recovery_root_state_to_world,
 )
-from .trajectory import StreamTrajectoryPlan, TrajectoryUpdateEvent
 
 __all__ = [
-    "InferenceGlueState",
-    "InferenceGlueTimeline",
+    "ConditionManager",
+    "RootFrameState",
     "RootPlan",
-    "RootRefinerRuntime",
-    "StreamTextRolloutController",
-    "StreamTextSegment",
-    "StreamTrajectoryPlan",
-    "TrajStreamBuffer",
-    "TrajectoryUpdateEvent",
+    "RuntimeRootRefinerCondition",
+    "RootTimeline",
+    "RouteConditionState",
+    "RoutePlan",
+    "RouteReferenceMode",
+    "RouteUpdate",
+    "StreamGenerator",
+    "StreamStepInput",
+    "TextConditionBundle",
+    "TextConditionState",
+    "TextSegment",
     "advance_head_from_body_window",
     "append_timeline_state_at_token_start_frame",
     "body_window_start_commit_idx",
-    "build_stream_traj_buffer",
-    "build_rootplan_stream_payload_from_buffer",
-    "build_stream_step_model_input",
-    "build_stream_direct_traj_condition",
-    "build_stream_step_condition_provider",
+    "build_root_plan_stream_payload",
     "committed_frame_slice",
-    "extend_stream_text_context",
-    "init_stream_generation",
     "plan_local_to_body_window_local",
-    "prepare_generate_condition",
+    "reanchor_route_to_xz",
     "recovery_root_state_to_world",
+    "root_plan_to_body_condition",
+    "sample_route_future",
     "slice_plan_with_mask",
 ]

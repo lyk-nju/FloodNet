@@ -13,7 +13,7 @@ from utils.local_frame import (
     root_quat_to_physical_yaw,
 )
 from utils.motion_process import recover_root_rot_pos, root_to_traj_feats_7d
-from utils.training.root_refiner.path_condition import build_path_condition
+from utils.conditions.root_refiner import build_root_refiner_path_condition
 from utils.training.root_refiner.sample_creator import RefinerSample
 
 
@@ -226,7 +226,7 @@ class RefinerSampleBuilder:
         valid_frame_count = int(target_mask.sum().item())
         physical_waypoints = sample["target_waypoints_physical"]
         future_xz = physical_waypoints[:valid_frame_count, [0, 2]]
-        condition = build_path_condition(
+        condition = build_root_refiner_path_condition(
             future_xz,
             n_path=self.n_path,
             valid_frame_count=valid_frame_count,

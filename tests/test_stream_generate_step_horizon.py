@@ -4,7 +4,7 @@ import torch
 
 from types import SimpleNamespace
 from models.diffusion_forcing_wan import DiffForcingWanModel
-from utils.ldf_condition import LDFCondition
+from utils.conditions.ldf import LDFCondition
 
 
 class _NoopTrajBuffer:

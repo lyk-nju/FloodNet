@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
-from utils.ldf_condition import LDFCondition
+from utils.conditions.ldf import LDFCondition
 from utils.traj_batch import encode_traj_batch, get_traj_seq_lens
 
 
@@ -290,3 +290,92 @@ def _resolve_traj_pad_len(batch, seq_len: int, device) -> int:
             pad_len = max(pad_len, int(tensor.max().item()))
             break
     return pad_len
+
+
+def prepare_generate_condition(
+    model,
+    batch: dict,
+    device,
+    *,
+    seq_len: int | None = None,
+) -> LDFCondition:
+    """Build the prepared condition used by offline LDF generation."""
+    feature_length = batch["feature_length"]
+    batch_size = len(feature_length)
+    if seq_len is None:
+        seq_len = _max_length(feature_length, device)
+    latent_len = int(seq_len) + int(model.chunk_size)
+    traj_len = _resolve_traj_pad_len(batch, latent_len, device)
+
+    text_context = prepare_generate_text_context(model, batch, latent_len, device)
+    text_null_context = [
+        item.to(model.param_dtype)
+        for item in model.encode_text_with_cache([""] * batch_size, device)
+    ]
+    traj_emb, traj_token_mask = encode_traj_batch(
+        batch,
+        traj_len,
+        device,
+        model.traj_encoder,
+        return_token_mask=True,
+    )
+    traj_seq_lens = get_traj_seq_lens(batch, traj_len, device)
+    return LDFCondition(
+        text_context=text_context,
+        text_null_context=text_null_context,
+        traj_emb=traj_emb,
+        traj_seq_lens=traj_seq_lens,
+        traj_token_mask=traj_token_mask,
+        seq_len=latent_len,
+        attn_len=traj_len,
+    )
+
+
+def prepare_generate_text_context(model, batch: dict, seq_len: int, device) -> list:
+    """Build text context for offline generation batches."""
+    if model.use_text_cond and "text" in batch:
+        text_list = batch["text"]
+        if text_list and isinstance(text_list[0], list):
+            all_text_context = []
+            for single_text_list, single_text_end_list in zip(
+                text_list,
+                batch["feature_text_end"],
+            ):
+                single_text_end_list = [0] + [
+                    min(int(end), int(seq_len)) for end in single_text_end_list
+                ]
+                single_text_length_list = [
+                    end - begin
+                    for end, begin in zip(
+                        single_text_end_list[1:],
+                        single_text_end_list[:-1],
+                    )
+                ]
+                single_context = [
+                    item.to(model.param_dtype)
+                    for item in model.encode_text_with_cache(single_text_list, device)
+                ]
+                for item, duration in zip(single_context, single_text_length_list):
+                    all_text_context.extend([item] * duration)
+                all_text_context.extend(
+                    [single_context[-1]] * (int(seq_len) - single_text_end_list[-1])
+                )
+            return all_text_context
+        return [
+            item.to(model.param_dtype)
+            for item in model.encode_text_with_cache(list(text_list), device)
+        ]
+
+    batch_size = int(batch["feature"].shape[0]) if "feature" in batch else len(batch["feature_length"])
+    return [
+        item.to(model.param_dtype)
+        for item in model.encode_text_with_cache([""] * batch_size, device)
+    ]
+
+
+def _max_length(value, device) -> int:
+    if torch.is_tensor(value):
+        tensor = value.to(device=device, dtype=torch.long)
+    else:
+        tensor = torch.as_tensor(value, device=device, dtype=torch.long)
+    return int(tensor.reshape(-1).max().item())

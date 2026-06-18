@@ -15,18 +15,25 @@ import torch
 import numpy as np
 from torch_ema import ExponentialMovingAverage
 from utils.initialize import instantiate, load_config
-from utils.inference.glue import InferenceGlueState, InferenceGlueTimeline
 from utils.motion_process import StreamJointRecovery263, append_traj_deltas_5d_to_7d
+from utils.inference.condition_manager import ConditionManager
 from utils.inference.root_plan import RootPlan
-from utils.inference.root_plan import build_rootplan_stream_payload_from_buffer
-from utils.inference.timeline import append_timeline_state_at_token_start_frame
-from utils.inference.ldf_conditioning import build_stream_step_condition_provider
-from utils.inference.rollout import build_stream_step_model_input
-from utils.inference.stream_state import init_stream_generation
+from utils.inference.route_condition import (
+    RoutePlan,
+    RouteReferenceMode,
+    RouteUpdate,
+    reanchor_route_to_xz,
+    sample_route_future,
+)
+from utils.inference.stream_generator import StreamGenerator
+from utils.inference.timeline import (
+    RootFrameState,
+    RootTimeline,
+    append_timeline_state_at_token_start_frame,
+)
 from utils.token_frame import num_frames_for_tokens, token_start_frame
-from utils.inference.trajectory import (
-    StreamTrajectoryPlan,
-    TrajectoryUpdateEvent,
+from utils.inference.geometry import (
+    assign_uniform_timestamps,
     blend_future_trajs,
     build_remaining_polyline,
     dedupe_polyline,
@@ -34,11 +41,11 @@ from utils.inference.trajectory import (
     estimate_token_step_distance,
     normalize_manual_waypoints,
     project_point_to_polyline,
-    reanchor_stream_plan_to_xz,
     resample_polyline,
-    sample_plan_future,
+    resample_polyline_by_arclength,
     sample_timestamped_trajectory,
     smoothstep01,
+    translate_plan_to_current_root,
 )
 from utils.training.ldf.model_factory import instantiate_ldf_model
 
@@ -100,7 +107,7 @@ class ModelManager:
         
         # Load models
         self.vae, self.model, self.cfg = self._load_models(config_path)
-        self.root_refiner_runtime = self._load_root_refiner_runtime(
+        self.stream_generator = self._load_stream_generator(
             config_path, traj_mask_cfg
         )
         
@@ -110,7 +117,7 @@ class ModelManager:
         # Stream joint recovery with smoothing
         self.smoothing_alpha = 0.5  # Default: medium smoothing
         self.stream_recovery = StreamJointRecovery263(joints_num=22, smoothing_alpha=self.smoothing_alpha)
-        self._reset_glue_timeline()
+        self._reset_root_timeline()
         
         # Generation state
         self.current_text = ""
@@ -121,12 +128,13 @@ class ModelManager:
         
         # ── Trajectory control (Task 001 refactor) ──────────────────────
         self.traj_state_lock = threading.Lock()
-        self.active_traj_plan: StreamTrajectoryPlan | None = None
-        self.pending_update_event: TrajectoryUpdateEvent | None = None
+        self.active_traj_plan: RoutePlan | None = None
+        self.pending_update_event: RouteUpdate | None = None
         self._trajectory_state = "none"
         self._plan_version_counter = 0
 
         self.current_traj_mode = "replace_future"
+        self.route_reference_mode = self.stream_generator.condition_manager.route.mode.value
         self.traj_horizon_tokens = int(traj_mask_cfg.get("horizon_tokens", 20))
         self.traj_time_mode = str(traj_mask_cfg.get("time_mode", "timestamped"))
         self.waypoint_dt = float(traj_mask_cfg.get("waypoint_dt", 0.05))
@@ -321,35 +329,70 @@ class ModelManager:
         parent_dir = os.path.dirname(os.path.dirname(__file__))
         return os.path.abspath(os.path.join(parent_dir, path))
 
-    def _load_root_refiner_runtime(self, config_path, traj_mask_cfg):
+    def _load_stream_generator(self, config_path, traj_mask_cfg):
         root_cfg = (traj_mask_cfg or {}).get("root_refiner", {}) or {}
-        if not bool(root_cfg.get("enabled", False)):
-            print("RootRefiner runtime disabled")
-            return None
-        refiner_config = self._resolve_repo_path(
-            root_cfg.get("config_path") or root_cfg.get("config")
+        refiner = None
+        text_encoder = None
+        sparse_point_range = (
+            (root_cfg.get("sparse_path", {}) or {}).get("point_range", (3, 8))
         )
-        ckpt_path = self._resolve_repo_path(
-            root_cfg.get("ckpt")
-            or root_cfg.get("checkpoint")
-            or root_cfg.get("checkpoint_path")
-        )
-        if refiner_config is None:
-            raise ValueError("traj_mask.root_refiner.enabled=true requires config_path")
-        if ckpt_path is None:
-            raise ValueError("traj_mask.root_refiner.enabled=true requires ckpt")
-        print(f"Loading RootRefiner runtime: config={refiner_config}, ckpt={ckpt_path}")
-        from utils.inference.root_refiner import RootRefinerRuntime
 
-        runtime = RootRefinerRuntime.from_config(
-            config_path=refiner_config,
-            ckpt_path=ckpt_path,
-            device=self.device,
-            strict=bool(root_cfg.get("strict", True)),
-            path_mode=str(root_cfg.get("path_mode", "dense_path")),
+        if bool(root_cfg.get("enabled", False)):
+            refiner_config = self._resolve_repo_path(
+                root_cfg.get("config_path") or root_cfg.get("config")
+            )
+            ckpt_path = self._resolve_repo_path(
+                root_cfg.get("ckpt")
+                or root_cfg.get("checkpoint")
+                or root_cfg.get("checkpoint_path")
+            )
+            if refiner_config is None:
+                raise ValueError("traj_mask.root_refiner.enabled=true requires config_path")
+            if ckpt_path is None:
+                raise ValueError("traj_mask.root_refiner.enabled=true requires ckpt")
+            print(f"Loading RootRefiner modules: config={refiner_config}, ckpt={ckpt_path}")
+            from train_refiner import _load_cfg, resolve_cfg_interpolations
+            from utils.training.root_refiner.lightning_module import (
+                RootRefinerLightningModule,
+            )
+
+            cfg = resolve_cfg_interpolations(_load_cfg(refiner_config))
+            module = RootRefinerLightningModule(cfg)
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            state_dict = ckpt.get("state_dict", ckpt)
+            try:
+                module.load_state_dict(state_dict, strict=bool(root_cfg.get("strict", True)))
+            except RuntimeError:
+                if bool(root_cfg.get("strict", True)):
+                    raise
+                module.load_state_dict(state_dict, strict=False)
+            refiner = module.refiner
+            text_encoder = module.text_encoder
+            sparse_point_range = (
+                (cfg.get("sampling", {}) or {})
+                .get("path_condition", {})
+                .get("sparse_path", {})
+                .get("point_range", sparse_point_range)
+            )
+            print("Loaded RootRefiner modules")
+        else:
+            print("RootRefiner modules disabled")
+
+        manager = ConditionManager(
+            initial_text="",
+            route_mode=str(root_cfg.get("route_mode", "relative_to_actor")),
+            sparse_point_range=tuple(int(v) for v in sparse_point_range),
         )
-        print("Loaded RootRefiner runtime")
-        return runtime
+        return StreamGenerator(
+            ldf_model=self.model,
+            condition_manager=manager,
+            root_refiner=refiner,
+            root_text_encoder=text_encoder,
+            device=self.device,
+            token_dt=float((traj_mask_cfg or {}).get("token_dt", 0.20)),
+            history_length=int(getattr(self, "history_length", 30)),
+            traj_horizon_tokens=int((traj_mask_cfg or {}).get("horizon_tokens", 20)),
+        )
     
     def start_generation(self, text, history_length=None):
         """Start or update generation with new text"""
@@ -362,19 +405,19 @@ class ModelManager:
             # Reset state before starting (only once at the beginning)
             self.frame_buffer.clear()
             self.stream_recovery.reset()
-            self._reset_glue_timeline()
+            self._reset_root_timeline()
             self.vae.clear_cache()
             self.first_chunk = True
             self.root_xz_history.clear()
             self.root_5d_history.clear()
             self._generated_frame_count = 0
             self._absolute_commit_index = 0
-            init_stream_generation(
-                self.model,
-                self.history_length,
+            self.stream_generator.init_ldf_generation(
+                history_length=self.history_length,
                 batch_size=1,
                 num_denoise_steps=self.denoise_steps,
             )
+            self.stream_generator.condition_manager.update_text(text, commit_idx=0)
             print(f"Model initialized with history length: {self.history_length}, denoise steps: {self.denoise_steps}")
             
             # Start generation thread
@@ -389,6 +432,10 @@ class ModelManager:
         if text != self.current_text:
             old_text = self.current_text
             self.current_text = text
+            self.stream_generator.condition_manager.update_text(
+                text,
+                commit_idx=self._get_commit_index(),
+            )
             # Don't reset first_chunk, stream_recovery, or vae cache
             # This allows continuous generation with text changes
             print(f"Text updated: '{old_text}' -> '{text}' (continuous generation)")
@@ -417,18 +464,19 @@ class ModelManager:
 
     def update_trajectory(
         self, waypoints, mode="replace_future", *, source="manual",
-        duration_seconds=None,
+        duration_seconds=None, route_mode=None,
     ):
         """Update trajectory control (Task 001: delayed blended replace).
 
         Does NOT immediately overwrite the active plan.  Instead creates a
-        pending ``TrajectoryUpdateEvent`` that takes effect after
+        pending ``RouteUpdate`` that takes effect after
         ``update_delay_tokens`` tokens with a smooth blend transition.
         ``waypoints is None`` clears trajectory.
         """
         mode = mode or "replace_future"
         if mode != "replace_future":
             raise ValueError(f"Unsupported trajectory mode: {mode}")
+        route_reference_mode = self._set_route_reference_mode(route_mode)
 
         # ── Clear ────────────────────────────────────────────────────
         if waypoints is None or len(waypoints) == 0:
@@ -438,14 +486,12 @@ class ModelManager:
                 # Also clear backwards-compat fields.
                 self.current_traj_waypoints = None
                 self.current_traj_times = None
-            if hasattr(self.model, "_traj_buf"):
-                self.model._traj_buf.reset()
-                if hasattr(self.model._traj_buf, "clear"):
-                    self.model._traj_buf.clear()
+            self.stream_generator.active_root_plan = None
+            self.stream_generator.condition_manager.route.clear()
             self._trajectory_state = "none"
             with self._display_traj_lock:
                 self._display_traj = None
-            print("Trajectory control cleared (plan + buffer reset)")
+            print("Trajectory control cleared")
             return None
 
         raw = np.asarray(waypoints, dtype=np.float32)
@@ -466,24 +512,32 @@ class ModelManager:
         effective_commit = edit_commit + delay
 
         if explicit_times is not None:
-            times = explicit_times - explicit_times[0]
-        else:
-            _dur = (float(duration_seconds) if duration_seconds is not None
-                     else self.manual_duration_seconds)
-            times, points = normalize_manual_waypoints(
+            times, points = self._prepare_timestamped_route_points(
+                explicit_times,
                 points,
-                current_root_xyz=current_root,
-                waypoint_dt=self.waypoint_dt,
-                manual_duration_seconds=_dur,
-                resample_arclength=self.manual_resample_arclength,
+                current_root=current_root,
+                route_mode=route_reference_mode,
+            )
+        else:
+            times, points = self._prepare_manual_route_points(
+                points,
+                current_root=current_root,
+                duration_seconds=duration_seconds,
+                route_mode=route_reference_mode,
             )
 
-        new_plan = StreamTrajectoryPlan(
+        new_plan = RoutePlan(
             times=times.astype(np.float32),
             points_xyz=points.astype(np.float32),
             start_commit_index=effective_commit,
             version=self._next_plan_version(),
             source=str(source),
+        )
+        update_event = self.stream_generator.condition_manager.route.update_route(
+            new_plan,
+            edit_commit_idx=edit_commit,
+            delay_tokens=delay,
+            blend_tokens=self.traj_update_blend_tokens if _prev_plan is not None else 0,
         )
 
         if _prev_plan is None:
@@ -504,15 +558,7 @@ class ModelManager:
             return self.get_display_traj()
 
         with self.traj_state_lock:
-            self.pending_update_event = TrajectoryUpdateEvent(
-                old_plan=_prev_plan,
-                new_plan=new_plan,
-                edit_commit_index=edit_commit,
-                effective_commit_index=effective_commit,
-                delay_tokens=delay,
-                blend_tokens=self.traj_update_blend_tokens,
-                version=new_plan.version,
-            )
+            self.pending_update_event = update_event
             # Backwards-compat.
             self.current_traj_waypoints = points
             self.current_traj_times = times
@@ -531,8 +577,65 @@ class ModelManager:
         root_xyz[[0, 2]] = self.stream_recovery.r_pos_accum[[0, 2]].astype(np.float32)
         return root_xyz
 
+    def _set_route_reference_mode(self, route_mode=None) -> str:
+        mode = RouteReferenceMode(
+            route_mode or getattr(self, "route_reference_mode", "relative_to_actor")
+        ).value
+        self.route_reference_mode = mode
+        self.stream_generator.condition_manager.set_route_mode(mode)
+        return mode
+
+    def _prepare_manual_route_points(
+        self,
+        points: np.ndarray,
+        *,
+        current_root: np.ndarray,
+        duration_seconds,
+        route_mode: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if route_mode == RouteReferenceMode.RELATIVE_TO_ACTOR.value:
+            duration = (
+                float(duration_seconds)
+                if duration_seconds is not None
+                else self.manual_duration_seconds
+            )
+            return normalize_manual_waypoints(
+                points,
+                current_root_xyz=current_root,
+                waypoint_dt=self.waypoint_dt,
+                manual_duration_seconds=duration,
+                resample_arclength=self.manual_resample_arclength,
+            )
+
+        out_points = np.asarray(points, dtype=np.float32)
+        if self.manual_resample_arclength and len(out_points) >= 2:
+            duration = (
+                float(duration_seconds)
+                if duration_seconds is not None
+                else self.manual_duration_seconds
+            )
+            num_points = max(2, int(duration / float(self.waypoint_dt)) + 1)
+            out_points = resample_polyline_by_arclength(out_points, num_points)
+        times = assign_uniform_timestamps(len(out_points), self.waypoint_dt)
+        return times.astype(np.float32), out_points.astype(np.float32)
+
+    @staticmethod
+    def _prepare_timestamped_route_points(
+        times: np.ndarray,
+        points: np.ndarray,
+        *,
+        current_root: np.ndarray,
+        route_mode: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        out_times = np.asarray(times, dtype=np.float32)
+        out_times = out_times - out_times[0] if len(out_times) > 0 else out_times
+        out_points = np.asarray(points, dtype=np.float32)
+        if route_mode == RouteReferenceMode.RELATIVE_TO_ACTOR.value:
+            out_points = translate_plan_to_current_root(out_points, current_root)
+        return out_times.astype(np.float32), out_points.astype(np.float32)
+
     def _estimate_token_step_distance(self) -> float:
-        """Thin wrapper — see ``utils.inference.trajectory.estimate_token_step_distance``."""
+        """Thin wrapper around runtime geometry distance estimation."""
         return estimate_token_step_distance(
             list(self.root_xz_history),
             default=self.default_token_step,
@@ -542,21 +645,21 @@ class ModelManager:
 
     @staticmethod
     def _project_point_to_polyline(point_xyz: np.ndarray, waypoints_xyz: np.ndarray):
-        """Thin wrapper — see ``utils.inference.trajectory.project_point_to_polyline``."""
+        """Thin wrapper around runtime geometry projection."""
         return project_point_to_polyline(point_xyz, waypoints_xyz)
 
     @staticmethod
     def _dedupe_polyline(points: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-        """Thin wrapper — see ``utils.inference.trajectory.dedupe_polyline``."""
+        """Thin wrapper around runtime geometry dedupe."""
         return dedupe_polyline(points, eps)
 
     def _build_remaining_polyline(self, root_xyz: np.ndarray, waypoints_xyz: np.ndarray) -> np.ndarray:
-        """Thin wrapper — see ``utils.inference.trajectory.build_remaining_polyline``."""
+        """Thin wrapper around runtime geometry path trimming."""
         return build_remaining_polyline(root_xyz, waypoints_xyz)
 
     @staticmethod
     def _resample_polyline(points_xyz: np.ndarray, num_tokens: int, token_step: float) -> np.ndarray:
-        """Thin wrapper — see ``utils.inference.trajectory.resample_polyline``."""
+        """Thin wrapper around runtime geometry path resampling."""
         return resample_polyline(points_xyz, num_tokens, token_step)
 
     def _sample_timestamped_with_repeat(
@@ -573,9 +676,8 @@ class ModelManager:
         horizon is expressed as relative displacement from that phase.
 
         This keeps repeated plans under the character instead of leaving them in
-        the original world location.  The returned trajectory remains
-        world-space; model-side TrajStreamBuffer still performs its own
-        history-window anchor subtract.
+        the original world location. The returned trajectory remains world-space;
+        RootPlan conversion handles body-window anchoring later.
         """
         times = np.asarray(traj_times, dtype=np.float32).reshape(-1)
         points = np.asarray(waypoints, dtype=np.float32)
@@ -637,16 +739,18 @@ class ModelManager:
             return None
         return np.stack(frames, axis=0).astype(np.float32)
 
-    def _reset_glue_timeline(self):
-        self._glue_timeline = InferenceGlueTimeline(
-            InferenceGlueState.initial(device=self.device, dtype=torch.float32)
+    def _reset_root_timeline(self):
+        self._root_timeline = RootTimeline(
+            RootFrameState.initial(device=self.device, dtype=torch.float32)
         )
+        if getattr(self, "stream_generator", None) is not None:
+            self.stream_generator.timeline = self._root_timeline
 
-    def _append_glue_state_from_stream_recovery(self, *, frame_idx: int) -> bool:
-        timeline = getattr(self, "_glue_timeline", None)
+    def _append_root_state_from_stream_recovery(self, *, frame_idx: int) -> bool:
+        timeline = getattr(self, "_root_timeline", None)
         if timeline is None:
-            self._reset_glue_timeline()
-            timeline = self._glue_timeline
+            self._reset_root_timeline()
+            timeline = self._root_timeline
 
         appended = append_timeline_state_at_token_start_frame(
             timeline,
@@ -663,10 +767,10 @@ class ModelManager:
 
     def _stream_plan_to_root_plan(
         self,
-        plan: StreamTrajectoryPlan,
-        anchor_state: InferenceGlueState,
+        plan: RoutePlan,
+        anchor_state: RootFrameState,
     ) -> RootPlan:
-        """Convert a world-space StreamTrajectoryPlan to plan-anchor-local 7D."""
+        """Convert a world-space RoutePlan to plan-anchor-local 7D."""
         from utils.local_frame import canonicalize_7d
 
         device = torch.device(getattr(self, "device", "cpu"))
@@ -722,30 +826,39 @@ class ModelManager:
             source=str(plan.source),
         )
 
-    def _activate_root_plan_from_stream_plan(self, plan: StreamTrajectoryPlan) -> bool:
-        timeline = getattr(self, "_glue_timeline", None)
-        traj_buf = getattr(getattr(self, "model", None), "_traj_buf", None)
-        if timeline is None or traj_buf is None:
+    def _activate_root_plan_from_stream_plan(self, plan: RoutePlan) -> bool:
+        timeline = getattr(self, "_root_timeline", None)
+        if timeline is None:
             return False
         anchor_commit = int(plan.start_commit_index)
         if not timeline.has_exact_state(anchor_commit):
             return False
         anchor_state = timeline.at_commit(anchor_commit)
-        root_plan_input = reanchor_stream_plan_to_xz(
-            plan,
-            anchor_state.world_xz.detach().cpu().numpy(),
-        )
-        if getattr(self, "root_refiner_runtime", None) is not None:
-            root_plan = self.root_refiner_runtime.build_root_plan(
+        if (
+            getattr(self, "stream_generator", None) is not None
+            and self.stream_generator.root_refiner is not None
+        ):
+            root_plan = self.stream_generator.build_root_plan(
                 text=getattr(self, "current_text", ""),
-                plan=root_plan_input,
+                route=plan,
                 anchor_state=anchor_state,
-                token_dt=self.token_dt,
                 history_motion_world_5d=self._get_root_refiner_history_5d(anchor_commit),
             )
         else:
+            root_plan_input = plan
+            route_mode = getattr(
+                self,
+                "route_reference_mode",
+                RouteReferenceMode.RELATIVE_TO_ACTOR.value,
+            )
+            if route_mode == RouteReferenceMode.RELATIVE_TO_ACTOR.value:
+                root_plan_input = reanchor_route_to_xz(
+                    plan,
+                    anchor_state.world_xz.detach().cpu().numpy(),
+                )
             root_plan = self._stream_plan_to_root_plan(root_plan_input, anchor_state)
-        traj_buf.set_root_plan(root_plan)
+        self.stream_generator.active_root_plan = root_plan
+        self.stream_generator.timeline = timeline
         return True
 
     def _build_rootplan_stream_traj_input(self):
@@ -756,27 +869,19 @@ class ModelManager:
         current one-token commit. The model-side direct 7D helper then slices it
         per denoise sub-step.
         """
-        traj_buf = getattr(self.model, "_traj_buf", None)
-        timeline = getattr(self, "_glue_timeline", None)
+        timeline = getattr(self, "_root_timeline", None)
         if (
-            traj_buf is None
-            or timeline is None
-            or not hasattr(traj_buf, "has_active_plan")
-            or not traj_buf.has_active_plan()
+            timeline is None
+            or self.stream_generator.active_root_plan is None
         ):
             return None
 
         absolute_commit = self._get_commit_index()
         local_commit = int(getattr(self.model, "commit_index", absolute_commit))
-        chunk_size = int(getattr(self.model, "chunk_size", 1))
-        return build_rootplan_stream_payload_from_buffer(
-            traj_buf,
-            timeline,
+        self.stream_generator.timeline = timeline
+        return self.stream_generator.build_root_plan_stream_payload(
             local_commit_index=local_commit,
             absolute_commit_index=absolute_commit,
-            chunk_size=chunk_size,
-            history_length=int(self.history_length),
-            traj_horizon_tokens=int(getattr(self, "traj_horizon_tokens", 0)),
         )
 
     def _build_stream_traj_input(self):
@@ -797,13 +902,15 @@ class ModelManager:
 
         # ── No pending update: sample from active plan ──────────────────
         if event is None:
-            future = sample_plan_future(
+            future = sample_route_future(
                 plan,
                 current_commit=current_commit,
                 current_root_xyz=current_root,
                 horizon_tokens=self.traj_horizon_tokens,
                 token_dt=self.token_dt,
-                reanchor_to_current_root=True,
+                reanchor_to_current_root=(
+                    self.route_reference_mode == RouteReferenceMode.RELATIVE_TO_ACTOR.value
+                ),
             )
             self._trajectory_state = "active"
             with self._display_traj_lock:
@@ -832,22 +939,26 @@ class ModelManager:
 
         # Sample old and new futures using plan-local time.
         old_future = None
-        if event.old_plan is not None:
-            old_future = sample_plan_future(
-                event.old_plan,
+        if event.old_route is not None:
+            old_future = sample_route_future(
+                event.old_route,
                 current_commit=current_commit,
                 current_root_xyz=current_root,
                 horizon_tokens=self.traj_horizon_tokens,
                 token_dt=self.token_dt,
-                reanchor_to_current_root=True,
+                reanchor_to_current_root=(
+                    self.route_reference_mode == RouteReferenceMode.RELATIVE_TO_ACTOR.value
+                ),
             )
-        new_future = sample_plan_future(
-            event.new_plan,
+        new_future = sample_route_future(
+            event.new_route,
             current_commit=current_commit,
             current_root_xyz=current_root,
             horizon_tokens=self.traj_horizon_tokens,
             token_dt=self.token_dt,
-            reanchor_to_current_root=True,
+            reanchor_to_current_root=(
+                self.route_reference_mode == RouteReferenceMode.RELATIVE_TO_ACTOR.value
+            ),
         )
 
         future = blend_future_trajs(
@@ -863,9 +974,9 @@ class ModelManager:
         else:
             self._trajectory_state = "replaced"
             with self.traj_state_lock:
-                self.active_traj_plan = event.new_plan
+                self.active_traj_plan = event.new_route
                 self.pending_update_event = None
-            self._activate_root_plan_from_stream_plan(event.new_plan)
+            self._activate_root_plan_from_stream_plan(event.new_route)
 
         with self._display_traj_lock:
             self._display_traj = future.copy()
@@ -974,12 +1085,11 @@ class ModelManager:
             joints_num=22, 
             smoothing_alpha=self.smoothing_alpha
         )
-        self._reset_glue_timeline()
+        self._reset_root_timeline()
         
         # Initialize model with denoise steps
-        init_stream_generation(
-            self.model,
-            self.history_length,
+        self.stream_generator.init_ldf_generation(
+            history_length=self.history_length,
             batch_size=1,
             num_denoise_steps=self.denoise_steps,
         )
@@ -991,8 +1101,7 @@ class ModelManager:
 
         When trajectory control is active, each step passes a future token-horizon in
         world coordinates. The model-side streaming path then rewrites only the future
-        conditioning slots and normalizes the full visible context window back to a
-        clip-local origin before trajectory encoding.
+        conditioning slots before trajectory encoding.
         """
         print("Generation loop started")
         
@@ -1009,17 +1118,10 @@ class ModelManager:
                         
                         # Generate one token (produces 4 frames from VAE)
                         traj_input = self._build_stream_traj_input()
-                        if (
-                            traj_input is None
-                            and getattr(self, "_trajectory_state", "none") == "none"
-                            and hasattr(self.model, "_traj_buf")
-                        ):
-                            self.model._traj_buf.reset()
-                        x = build_stream_step_model_input(
+                        x = self.stream_generator.build_step_input(
                             self.current_text, traj_input=traj_input
                         )
-                        condition_provider = build_stream_step_condition_provider(
-                            self.model,
+                        condition_provider = self.stream_generator.build_ldf_condition_provider(
                             x,
                             first_chunk=self.first_chunk,
                             device=next(self.model.parameters()).device,
@@ -1059,7 +1161,7 @@ class ModelManager:
                                 dtype=np.float32,
                             )
                             self.root_5d_history.append((int(self._generated_frame_count), root5d))
-                            self._append_glue_state_from_stream_recovery(
+                            self._append_root_state_from_stream_recovery(
                                 frame_idx=int(self._generated_frame_count)
                             )
                             self._generated_frame_count += 1
@@ -1114,6 +1216,7 @@ class ModelManager:
             "current_text": self.current_text,
             "trajectory_state": self._trajectory_state,
             "trajectory_active": self.active_traj_plan is not None,
+            "trajectory_route_mode": self.route_reference_mode,
             "trajectory_time_mode": self.traj_time_mode,
             "trajectory_horizon_tokens": self.traj_horizon_tokens,
             "smoothing_alpha": self.smoothing_alpha,

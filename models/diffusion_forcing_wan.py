@@ -7,7 +7,7 @@ from .tools.t5 import T5EncoderModel
 from .tools.traj_encoder import TrajectoryEncoder
 from .tools.wan_model import WanModel
 from .tools.wan_controlnet import WanControlNet
-from utils.ldf_condition import LDFCondition
+from utils.conditions.ldf import LDFCondition
 
 
 class DiffForcingWanModel(nn.Module):

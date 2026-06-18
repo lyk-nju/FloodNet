@@ -84,6 +84,10 @@
 
             <div class="input-group trajectory-group">
                 <label for="trajectoryWaypoints">Trajectory (root path) — optional:</label>
+                <select id="trajectoryRouteMode" class="trajectory-mode-select">
+                    <option value="relative_to_actor" selected>Relative to actor</option>
+                    <option value="absolute">Absolute world</option>
+                </select>
                 <textarea id="trajectoryWaypoints" rows="3"
                     placeholder="One waypoint per line: x z  or  x y z&#10;Example:&#10;0 0&#10;1 0&#10;1 1&#10;0 1"></textarea>
                 <div class="trajectory-buttons">

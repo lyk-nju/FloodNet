@@ -65,7 +65,10 @@ from eval.root_refiner.metrics import (  # noqa: E402
     _lateral_component,
     compute_sample_metrics,
 )
-from utils.inference.root_refiner import _state_dict_has_pace_duration  # noqa: E402
+
+
+def _state_dict_has_pace_duration(state_dict) -> bool:
+    return any(str(key).startswith("refiner.pace_head.") for key in state_dict.keys())
 
 
 @dataclass(frozen=True)

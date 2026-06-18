@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class LDFCondition:
-    """ Prepared condition consumed by DiffForcingWanModel """
+    """Prepared condition consumed by DiffForcingWanModel."""
 
     text_context: list
     text_null_context: list | None = None

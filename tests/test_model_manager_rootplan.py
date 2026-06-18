@@ -1,49 +1,51 @@
 from __future__ import annotations
 
-import threading
-import torch
 import numpy as np
+import torch
+from torch import nn
 
-from collections import deque
 from types import SimpleNamespace
-from utils.inference.glue import InferenceGlueState, InferenceGlueTimeline
+import threading
+
 from utils.inference.root_plan import RootPlan
+from utils.inference.route_condition import RoutePlan
+from utils.inference.stream_generator import StreamGenerator
+from utils.inference.timeline import RootFrameState, RootTimeline
 from utils.token_frame import token_range_to_frame_slice, token_start_frame
-from utils.inference.buffer import TrajStreamBuffer
-from utils.inference.trajectory import StreamTrajectoryPlan, TrajectoryUpdateEvent
 from web_demo.model_manager import ModelManager
 
 
-class _DummyModel:
+class _DummyModel(nn.Module):
     def __init__(self):
+        super().__init__()
+        self.param = nn.Parameter(torch.zeros(()))
         self.commit_index = 10
         self.chunk_size = 5
-        self._traj_buf = TrajStreamBuffer(device="cpu", dtype=torch.float32)
 
 
-def _state(commit_idx: int):
-    return InferenceGlueState(
+def _state(commit_idx: int, xz=(0.0, 0.0)):
+    return RootFrameState(
         commit_idx=commit_idx,
-        world_xz=torch.zeros(2),
+        world_xz=torch.tensor(xz, dtype=torch.float32),
         world_yaw=torch.tensor(0.0),
     )
 
 
 def _timeline(up_to: int):
-    timeline = InferenceGlueTimeline(_state(0))
+    timeline = RootTimeline(_state(0))
     for idx in range(1, up_to + 1):
         timeline.append(_state(idx))
     return timeline
 
 
 def _plan(valid_frames=200, *, source="test", anchor_commit_idx=0):
-    wp = torch.zeros(valid_frames, 7)
-    wp[:, 0] = torch.arange(valid_frames, dtype=torch.float32)
-    wp[:, 3] = 1.0
+    waypoints = torch.zeros(valid_frames, 7)
+    waypoints[:, 0] = torch.arange(valid_frames, dtype=torch.float32)
+    waypoints[:, 3] = 1.0
     return RootPlan(
         num_tokens_pred=30,
         valid_frames=valid_frames,
-        waypoints_local_7d=wp,
+        waypoints_local_7d=waypoints,
         frame_dt=0.05,
         frames_per_token=4,
         anchor_commit_idx=anchor_commit_idx,
@@ -53,46 +55,47 @@ def _plan(valid_frames=200, *, source="test", anchor_commit_idx=0):
     )
 
 
-class _FakeRootRefinerRuntime:
-    def __init__(self):
-        self.calls = []
-
-    def build_root_plan(
-        self,
-        *,
-        text,
-        plan,
-        anchor_state,
-        token_dt,
-        history_motion_world_5d=None,
-    ):
-        self.calls.append(
-            {
-                "text": text,
-                "plan": plan,
-                "anchor_state": anchor_state,
-                "token_dt": token_dt,
-                "history_motion_world_5d": history_motion_world_5d,
-            }
-        )
-        return _plan(
-            valid_frames=120,
-            source="root_refiner",
-            anchor_commit_idx=anchor_state.commit_idx,
-        )
-
-
 def _manager():
     mgr = ModelManager.__new__(ModelManager)
+    mgr.device = "cpu"
     mgr.model = _DummyModel()
     mgr.history_length = 9
     mgr.traj_horizon_tokens = 20
     mgr.token_dt = 0.20
-    mgr._glue_timeline = _timeline(10)
+    mgr._root_timeline = _timeline(10)
+    mgr.stream_generator = StreamGenerator(
+        ldf_model=mgr.model,
+        device="cpu",
+        history_length=mgr.history_length,
+        traj_horizon_tokens=mgr.traj_horizon_tokens,
+        token_dt=mgr.token_dt,
+    )
+    mgr.stream_generator.timeline = mgr._root_timeline
+    mgr.stream_generator.active_root_plan = _plan()
     mgr.stream_recovery = SimpleNamespace(r_pos_accum=np.zeros(3, dtype=np.float32))
-    mgr.root_5d_history = deque()
-    mgr.root_refiner_runtime = None
-    mgr.model._traj_buf.set_root_plan(_plan())
+    return mgr
+
+
+def _trajectory_manager():
+    mgr = _manager()
+    mgr.traj_state_lock = threading.Lock()
+    mgr.active_traj_plan = None
+    mgr.pending_update_event = None
+    mgr._trajectory_state = "none"
+    mgr._plan_version_counter = 0
+    mgr.current_traj_mode = "replace_future"
+    mgr.current_traj_waypoints = None
+    mgr.current_traj_times = None
+    mgr.traj_update_delay_tokens = 2
+    mgr.traj_update_blend_tokens = 3
+    mgr.manual_duration_seconds = 1.0
+    mgr.waypoint_dt = 0.2
+    mgr.manual_resample_arclength = False
+    mgr._display_traj_lock = threading.Lock()
+    mgr._display_traj = None
+    mgr._absolute_commit_index = 0
+    mgr.route_reference_mode = "relative_to_actor"
+    mgr.stream_generator.root_refiner = None
     return mgr
 
 
@@ -101,438 +104,76 @@ def test_rootplan_stream_payload_uses_body_window_left_commit():
 
     payload = mgr._build_rootplan_stream_traj_input()
 
-    start_token = 2  # earliest right token 11, history_length 9 -> left edge 2
-    num_tokens = 33  # final right token 15 + horizon 20 - start 2
+    start_token = 2
+    num_tokens = 33
     frame_slice = token_range_to_frame_slice(start_token, num_tokens)
     assert payload["traj_start_token"] == start_token
     assert payload["traj_abs_start_token"] == start_token
     assert payload["traj_num_tokens"] == num_tokens
     assert payload["body_anchor_token"] == start_token
     assert payload["body_anchor_abs_token"] == start_token
-    assert payload["traj_cond_7d_frame"].shape == (1, frame_slice.stop - frame_slice.start, 7)
-    assert payload["traj_cond_frame_mask"].shape == (1, frame_slice.stop - frame_slice.start)
+    assert payload["traj_cond_7d_frame"].shape == (
+        1,
+        frame_slice.stop - frame_slice.start,
+        7,
+    )
+    assert payload["traj_cond_frame_mask"].shape == (
+        1,
+        frame_slice.stop - frame_slice.start,
+    )
     assert payload["traj_cond_frame_mask"].all()
-    assert float(payload["traj_cond_7d_frame"][0, 0, 0]) == float(token_start_frame(start_token))
-
-
-def test_rootplan_stream_payload_uses_absolute_commit_after_model_roll():
-    mgr = _manager()
-    mgr.history_length = 9
-    mgr.model.commit_index = 30
-    mgr._absolute_commit_index = 60
-    mgr._glue_timeline = _timeline(100)
-    mgr.model._traj_buf.set_root_plan(_plan(valid_frames=400))
-
-    payload = mgr._build_rootplan_stream_traj_input()
-
-    local_start_token = 22
-    absolute_start_token = 52
-    num_tokens = 33
-    frame_slice = token_range_to_frame_slice(absolute_start_token, num_tokens)
-    assert payload["traj_start_token"] == local_start_token
-    assert payload["traj_abs_start_token"] == absolute_start_token
-    assert payload["traj_num_tokens"] == num_tokens
-    assert payload["body_anchor_token"] == local_start_token
-    assert payload["body_anchor_abs_token"] == absolute_start_token
-    assert payload["traj_cond_7d_frame"].shape == (
-        1,
-        frame_slice.stop - frame_slice.start,
-        7,
-    )
     assert float(payload["traj_cond_7d_frame"][0, 0, 0]) == float(
-        token_start_frame(absolute_start_token)
+        token_start_frame(start_token)
     )
 
 
-def test_rootplan_stream_payload_frame_slice_uses_absolute_start_after_roll_to_local_zero():
+def test_activate_root_plan_from_route_sets_stream_generator_active_plan():
     mgr = _manager()
-    mgr.history_length = 9
-    mgr.model.commit_index = 1
-    mgr.model.chunk_size = 1
-    mgr._absolute_commit_index = 31
-    mgr._glue_timeline = _timeline(100)
-    mgr.model._traj_buf.set_root_plan(_plan(valid_frames=400))
-
-    payload = mgr._build_rootplan_stream_traj_input()
-
-    local_start_token = 0
-    absolute_start_token = 30
-    num_tokens = 2 + mgr.traj_horizon_tokens
-    frame_slice = token_range_to_frame_slice(absolute_start_token, num_tokens)
-    assert payload["traj_start_token"] == local_start_token
-    assert payload["traj_abs_start_token"] == absolute_start_token
-    assert payload["traj_num_tokens"] == num_tokens
-    assert payload["body_anchor_token"] == local_start_token
-    assert payload["body_anchor_abs_token"] == absolute_start_token
-    assert payload["traj_cond_7d_frame"].shape == (
-        1,
-        frame_slice.stop - frame_slice.start,
-        7,
-    )
-    assert float(payload["traj_cond_7d_frame"][0, 0, 0]) == float(
-        token_start_frame(absolute_start_token)
-    )
-
-
-def test_rootplan_stream_payload_requires_exact_body_anchor_state():
-    mgr = _manager()
-    mgr._glue_timeline.trim_before(8)
-
-    payload = mgr._build_rootplan_stream_traj_input()
-
-    assert payload is None
-
-
-def test_build_stream_traj_input_prefers_active_rootplan_payload():
-    mgr = _manager()
-    mgr.traj_state_lock = threading.Lock()
-    mgr.active_traj_plan = None
-    mgr.pending_update_event = None
-
-    payload = mgr._build_stream_traj_input()
-
-    assert payload is not None
-    assert "traj_cond_7d_frame" in payload
-    assert "traj" not in payload
-    assert payload["traj_start_token"] == 2
-    assert payload["body_anchor_token"] == 2
-    assert mgr._trajectory_state == "active_7d"
-
-
-def test_build_stream_traj_input_does_not_fallback_to_legacy_xyz_when_rootplan_unavailable():
-    mgr = _manager()
-    mgr.traj_state_lock = threading.Lock()
-    mgr._display_traj_lock = threading.Lock()
-    mgr.active_traj_plan = StreamTrajectoryPlan(
-        times=np.array([0.0, 1.0], dtype=np.float32),
-        points_xyz=np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32),
-        start_commit_index=0,
-        version=1,
-        source="test",
-    )
-    mgr.pending_update_event = None
-    mgr.current_traj_mode = "replace_future"
-    mgr._display_traj = None
-    mgr._glue_timeline.trim_before(8)
-
-    payload = mgr._build_stream_traj_input()
-
-    assert payload is None
-    assert mgr._trajectory_state == "active_7d_unavailable"
-
-
-def test_pending_update_delay_uses_existing_rootplan_payload_not_legacy_xyz():
-    mgr = _manager()
-    mgr.traj_state_lock = threading.Lock()
-    mgr._display_traj_lock = threading.Lock()
-    mgr.current_traj_mode = "replace_future"
-    mgr._display_traj = None
-    old_plan = StreamTrajectoryPlan(
-        times=np.array([0.0, 1.0], dtype=np.float32),
-        points_xyz=np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32),
-        start_commit_index=0,
-        version=1,
-        source="old",
-    )
-    new_plan = StreamTrajectoryPlan(
-        times=np.array([0.0, 1.0], dtype=np.float32),
-        points_xyz=np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32),
-        start_commit_index=30,
-        version=2,
-        source="new",
-    )
-    mgr.active_traj_plan = old_plan
-    mgr.pending_update_event = TrajectoryUpdateEvent(
-        old_plan=old_plan,
-        new_plan=new_plan,
-        edit_commit_index=10,
-        effective_commit_index=30,
-        delay_tokens=20,
-        blend_tokens=4,
-        version=2,
-    )
-
-    payload = mgr._build_stream_traj_input()
-
-    assert payload is not None
-    assert "traj_cond_7d_frame" in payload
-    assert "traj" not in payload
-    assert payload["trajectory_state"] == "delay"
-
-
-def test_pending_update_replacement_activates_new_rootplan_payload_not_legacy_xyz():
-    mgr = _manager()
-    mgr.traj_state_lock = threading.Lock()
-    mgr._display_traj_lock = threading.Lock()
-    mgr.current_traj_mode = "replace_future"
-    mgr._display_traj = None
-    old_plan = StreamTrajectoryPlan(
-        times=np.array([0.0, 1.0], dtype=np.float32),
-        points_xyz=np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32),
-        start_commit_index=0,
-        version=1,
-        source="old",
-    )
-    new_plan = StreamTrajectoryPlan(
-        times=np.array([0.0, 1.0], dtype=np.float32),
-        points_xyz=np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32),
-        start_commit_index=0,
-        version=2,
-        source="new",
-    )
-    mgr.active_traj_plan = old_plan
-    mgr.pending_update_event = TrajectoryUpdateEvent(
-        old_plan=old_plan,
-        new_plan=new_plan,
-        edit_commit_index=0,
-        effective_commit_index=0,
-        delay_tokens=0,
-        blend_tokens=0,
-        version=2,
-    )
-
-    payload = mgr._build_stream_traj_input()
-
-    assert payload is not None
-    assert "traj_cond_7d_frame" in payload
-    assert "traj" not in payload
-    assert payload["trajectory_state"] == "replaced"
-    assert mgr.active_traj_plan is new_plan
-    assert mgr.pending_update_event is None
-
-
-def test_reset_glue_timeline_initializes_commit_zero_state():
-    mgr = ModelManager.__new__(ModelManager)
-    mgr.device = "cpu"
-
-    mgr._reset_glue_timeline()
-
-    assert mgr._glue_timeline.head.commit_idx == 0
-    assert torch.allclose(mgr._glue_timeline.head.world_xz, torch.zeros(2))
-    assert torch.allclose(mgr._glue_timeline.head.world_yaw, torch.tensor(0.0))
-
-
-def test_append_glue_state_from_stream_recovery_records_only_token_start_frames():
-    mgr = ModelManager.__new__(ModelManager)
-    mgr.device = "cpu"
-    mgr.model = _DummyModel()
-    mgr.stream_recovery = SimpleNamespace(
-        r_pos_accum=np.array([1.0, 0.0, 2.0], dtype=np.float32),
-        r_rot_ang_accum=0.25,
-    )
-    mgr._reset_glue_timeline()
-
-    assert mgr._append_glue_state_from_stream_recovery(frame_idx=0) is False
-    assert mgr._append_glue_state_from_stream_recovery(frame_idx=1) is True
-    assert mgr._append_glue_state_from_stream_recovery(frame_idx=4) is False
-    mgr.stream_recovery.r_pos_accum = np.array([1.0, 0.0, 5.0], dtype=np.float32)
-    assert mgr._append_glue_state_from_stream_recovery(frame_idx=5) is True
-
-    assert len(mgr._glue_timeline) == 3
-    assert mgr._glue_timeline.head.commit_idx == 2
-    assert torch.allclose(mgr._glue_timeline.head.world_xz, torch.tensor([1.0, 5.0]))
-    assert torch.allclose(mgr._glue_timeline.head.world_yaw, torch.tensor(-0.5))
-
-
-def test_stream_plan_to_root_plan_builds_plan_anchor_local_7d():
-    mgr = ModelManager.__new__(ModelManager)
-    mgr.device = "cpu"
-    mgr.token_dt = 0.20
-    mgr.traj_horizon_tokens = 20
-    mgr.history_length = 9
-    mgr.model = _DummyModel()
-    plan = StreamTrajectoryPlan(
-        times=np.array([0.0, 1.0], dtype=np.float32),
-        points_xyz=np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32),
-        start_commit_index=0,
-        version=1,
-        source="test",
-    )
-
-    root_plan = mgr._stream_plan_to_root_plan(plan, _state(0))
-
-    assert root_plan.anchor_commit_idx == 0
-    assert root_plan.waypoints_local_7d.shape[1] == 7
-    assert torch.allclose(root_plan.waypoints_local_7d[0, :3], torch.zeros(3))
-    assert torch.allclose(root_plan.waypoints_local_7d[1, 3:5], torch.tensor([1.0, 0.0]))
-    assert root_plan.waypoints_local_7d[1, 5] > 0.0
-    assert torch.allclose(root_plan.waypoints_local_7d[1, 6], torch.tensor(0.0))
-
-
-def test_activate_root_plan_from_stream_plan_sets_traj_buffer():
-    mgr = ModelManager.__new__(ModelManager)
-    mgr.device = "cpu"
-    mgr.token_dt = 0.20
-    mgr.traj_horizon_tokens = 20
-    mgr.history_length = 9
-    mgr.model = _DummyModel()
-    mgr.root_refiner_runtime = None
-    mgr._glue_timeline = _timeline(10)
-    plan = StreamTrajectoryPlan(
-        times=np.array([0.0, 1.0], dtype=np.float32),
-        points_xyz=np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32),
-        start_commit_index=0,
-        version=1,
-        source="test",
-    )
-
-    ok = mgr._activate_root_plan_from_stream_plan(plan)
-
-    assert ok is True
-    assert mgr.model._traj_buf.has_active_plan()
-
-
-def test_activate_root_plan_from_stream_plan_uses_root_refiner_runtime():
-    mgr = ModelManager.__new__(ModelManager)
-    mgr.device = "cpu"
-    mgr.token_dt = 0.20
-    mgr.traj_horizon_tokens = 20
-    mgr.history_length = 9
-    mgr.model = _DummyModel()
-    mgr.current_text = "walk along the route"
-    mgr._glue_timeline = _timeline(10)
-    refiner = _FakeRootRefinerRuntime()
-    mgr.root_refiner_runtime = refiner
-    plan = StreamTrajectoryPlan(
-        times=np.array([0.0, 1.0], dtype=np.float32),
-        points_xyz=np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32),
-        start_commit_index=0,
-        version=1,
-        source="manual",
-    )
-
-    ok = mgr._activate_root_plan_from_stream_plan(plan)
-
-    assert ok is True
-    assert len(refiner.calls) == 1
-    assert refiner.calls[0]["text"] == "walk along the route"
-    assert refiner.calls[0]["plan"] is plan
-    assert refiner.calls[0]["anchor_state"].commit_idx == 0
-    assert refiner.calls[0]["token_dt"] == 0.20
-    assert mgr.model._traj_buf._active_plan.source == "root_refiner"
-
-
-def test_activate_root_plan_reanchors_plan_points_to_anchor_state_for_refiner():
-    mgr = ModelManager.__new__(ModelManager)
-    mgr.device = "cpu"
-    mgr.token_dt = 0.20
-    mgr.traj_horizon_tokens = 20
-    mgr.history_length = 9
-    mgr.model = _DummyModel()
-    mgr.current_text = "turn right"
-    timeline = InferenceGlueTimeline(_state(0))
-    timeline.append(
-        InferenceGlueState(
-            commit_idx=5,
-            world_xz=torch.tensor([2.0, 3.0]),
-            world_yaw=torch.tensor(0.0),
-        )
-    )
-    mgr._glue_timeline = timeline
-    refiner = _FakeRootRefinerRuntime()
-    mgr.root_refiner_runtime = refiner
-    plan = StreamTrajectoryPlan(
-        times=np.array([0.0, 1.0], dtype=np.float32),
-        points_xyz=np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32),
-        start_commit_index=5,
-        version=2,
-        source="manual",
-    )
-
-    ok = mgr._activate_root_plan_from_stream_plan(plan)
-
-    assert ok is True
-    refiner_plan = refiner.calls[0]["plan"]
-    assert refiner_plan is not plan
-    assert np.allclose(refiner_plan.points_xyz[0, [0, 2]], [2.0, 3.0])
-    assert np.allclose(refiner_plan.points_xyz[1, [0, 2]], [2.0, 4.0])
-
-
-def test_activate_root_plan_passes_anchor_aligned_history_to_root_refiner_runtime():
-    mgr = ModelManager.__new__(ModelManager)
-    mgr.device = "cpu"
-    mgr.token_dt = 0.20
-    mgr.traj_horizon_tokens = 20
-    mgr.history_length = 9
-    mgr.model = _DummyModel()
-    mgr.current_text = "walk along the route"
-    mgr._glue_timeline = _timeline(10)
-    mgr.root_5d_history = deque(
-        [
-            (0, np.array([0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float32)),
-            (1, np.array([0.0, 0.0, 1.0, 1.0, 0.0], dtype=np.float32)),
-            (5, np.array([0.0, 0.0, 5.0, 1.0, 0.0], dtype=np.float32)),
-        ]
-    )
-    refiner = _FakeRootRefinerRuntime()
-    mgr.root_refiner_runtime = refiner
-    plan = StreamTrajectoryPlan(
-        times=np.array([0.0, 1.0], dtype=np.float32),
-        points_xyz=np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32),
-        start_commit_index=1,
-        version=1,
-        source="manual",
-    )
-
-    ok = mgr._activate_root_plan_from_stream_plan(plan)
-
-    assert ok is True
-    history = refiner.calls[0]["history_motion_world_5d"]
-    assert history.shape == (2, 5)
-    assert np.allclose(history[:, 2], np.array([0.0, 1.0], dtype=np.float32))
-
-
-def test_update_trajectory_clear_clears_active_rootplan():
-    mgr = _manager()
-    mgr.traj_state_lock = threading.Lock()
-    mgr._display_traj_lock = threading.Lock()
-    mgr.active_traj_plan = None
-    mgr.pending_update_event = None
-    mgr.current_traj_waypoints = None
-    mgr.current_traj_times = None
-    mgr.current_traj_mode = "replace_future"
-    mgr._display_traj = None
-
-    mgr.update_trajectory(None)
-
-    assert not mgr.model._traj_buf.has_active_plan()
-    assert mgr._trajectory_state == "none"
-
-
-def test_initial_update_trajectory_activates_rootplan_immediately():
-    mgr = ModelManager.__new__(ModelManager)
-    mgr.device = "cpu"
-    mgr.model = _DummyModel()
     mgr.model.commit_index = 0
-    mgr.history_length = 9
-    mgr.traj_horizon_tokens = 20
-    mgr.token_dt = 0.20
-    mgr.waypoint_dt = 0.05
-    mgr.manual_duration_seconds = 1.0
-    mgr.manual_resample_arclength = False
-    mgr.traj_update_delay_tokens = 20
-    mgr.traj_update_blend_tokens = 4
-    mgr.traj_state_lock = threading.Lock()
-    mgr._display_traj_lock = threading.Lock()
-    mgr._display_traj = None
-    mgr._trajectory_state = "none"
-    mgr.active_traj_plan = None
-    mgr.pending_update_event = None
-    mgr.current_traj_waypoints = None
-    mgr.current_traj_times = None
-    mgr.current_traj_mode = "replace_future"
-    mgr._plan_version_counter = 0
-    mgr.stream_recovery = SimpleNamespace(r_pos_accum=np.zeros(3, dtype=np.float32))
-    mgr._glue_timeline = _timeline(0)
-    refiner = _FakeRootRefinerRuntime()
-    mgr.root_refiner_runtime = refiner
     mgr.current_text = "turn right"
+    mgr._root_timeline = _timeline(0)
+    mgr.stream_generator.timeline = mgr._root_timeline
+    mgr.stream_generator.root_refiner = None
 
-    mgr.update_trajectory(np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32))
+    route = RoutePlan(
+        times=np.array([0.0, 1.0], dtype=np.float32),
+        points_xyz=np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32),
+        start_commit_index=0,
+        version=1,
+        source="manual",
+    )
 
+    ok = mgr._activate_root_plan_from_stream_plan(route)
+
+    assert ok is True
+    assert mgr.stream_generator.active_root_plan is not None
+    assert mgr.stream_generator.active_root_plan.source == "manual"
+
+
+def test_update_trajectory_second_edit_uses_route_update_contract():
+    mgr = _trajectory_manager()
+    first = np.array([[0.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+    second = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float32)
+
+    mgr.update_trajectory(first, source="manual", route_mode="relative_to_actor")
+    mgr.update_trajectory(second, source="manual", route_mode="relative_to_actor")
+
+    assert mgr.pending_update_event is not None
+    assert mgr.pending_update_event.old_route is not None
+    assert mgr.pending_update_event.new_route is not None
+    assert mgr.stream_generator.condition_manager.route.mode.value == "relative_to_actor"
+
+
+def test_update_trajectory_sets_absolute_route_mode_without_reanchoring():
+    mgr = _trajectory_manager()
+    route = np.array([[10.0, 0.0], [10.0, 2.0]], dtype=np.float32)
+
+    mgr.update_trajectory(route, source="manual", route_mode="absolute")
+
+    assert mgr.stream_generator.condition_manager.route.mode.value == "absolute"
     assert mgr.active_traj_plan is not None
-    assert mgr.pending_update_event is None
-    assert mgr.model._traj_buf.has_active_plan()
-    assert len(refiner.calls) == 1
-    assert refiner.calls[0]["text"] == "turn right"
-    assert mgr.model._traj_buf._active_plan.source == "root_refiner"
+    np.testing.assert_allclose(
+        mgr.active_traj_plan.points_xyz[:, [0, 2]],
+        route,
+        atol=1e-6,
+    )

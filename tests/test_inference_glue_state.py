@@ -1,4 +1,4 @@
-"""Unit tests for utils/runtime/glue.py InferenceGlueState + advance helper (T_A_03b).
+"""Unit tests for utils/runtime/glue.py RootFrameState + advance helper (T_A_03b).
 
 Covers G01-G08 per docs/TODO.md §T_A_03 Unit tests:
     G01-G04: commit_idx exclusive-end semantics
@@ -11,8 +11,8 @@ import math
 
 import torch
 
-from utils.inference.glue import (
-    InferenceGlueState,
+from utils.inference.timeline import (
+    RootFrameState,
     advance_head_from_body_window,
 )
 
@@ -21,7 +21,7 @@ PI = math.pi
 
 
 def _make_state(commit_idx=0, xz=(0.0, 0.0), yaw=0.0, source="init"):
-    return InferenceGlueState(
+    return RootFrameState(
         commit_idx=commit_idx,
         world_xz=torch.tensor(xz, dtype=torch.float64),
         world_yaw=torch.tensor(yaw, dtype=torch.float64),
@@ -45,7 +45,7 @@ def _zero_delta_inputs():
 
 
 def test_G01_initial_commit_idx_zero():
-    s = InferenceGlueState.initial()
+    s = RootFrameState.initial()
     assert s.commit_idx == 0
 
 
@@ -212,7 +212,7 @@ def test_G08b_inf_yaw_delta_preserves_old_state():
 
 
 def test_initial_injects_device_and_dtype():
-    s = InferenceGlueState.initial(xz=(1.5, -0.5), yaw=0.4,
+    s = RootFrameState.initial(xz=(1.5, -0.5), yaw=0.4,
                                     device=torch.device("cpu"), dtype=torch.float32)
     assert s.commit_idx == 0
     assert s.world_xz.dtype == torch.float32
@@ -223,7 +223,7 @@ def test_initial_injects_device_and_dtype():
 
 
 def test_to_cast_returns_new_state_with_new_dtype_and_preserves_fields():
-    s = InferenceGlueState.initial(xz=(1.5, -0.5), yaw=0.4, dtype=torch.float32)
+    s = RootFrameState.initial(xz=(1.5, -0.5), yaw=0.4, dtype=torch.float32)
     casted = s.to(dtype=torch.float64)
     assert casted is not s   # new instance
     assert casted.commit_idx == s.commit_idx
