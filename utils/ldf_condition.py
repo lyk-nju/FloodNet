@@ -7,12 +7,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class LDFCondition:
-    """Prepared condition consumed by DiffForcingWanModel.
-
-    This contract intentionally starts after raw batch parsing. It does not know
-    about traj_features/traj_cond/traj priority, horizon masking, stream payload
-    slicing, or text embedding lookup policy.
-    """
+    """ Prepared condition consumed by DiffForcingWanModel """
 
     text_context: list
     text_null_context: list | None = None

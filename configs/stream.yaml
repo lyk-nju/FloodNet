@@ -47,7 +47,7 @@ traj_mask:
     max_token_step: 0.12
 
     # Optional RootRefiner planner for web runtime:
-    # user route + current text -> normalized 5D -> physical 7D RootPlan -> LDF.
+    # user route + current text -> physical-local 5D -> physical 7D RootPlan -> LDF.
     # Keep disabled until a trained RootRefiner checkpoint is available.
     root_refiner:
         enabled: false

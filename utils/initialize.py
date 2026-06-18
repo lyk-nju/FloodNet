@@ -2,21 +2,25 @@ import argparse
 import os
 import shutil
 import time
-import torch
 
 from datetime import datetime
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+import torch
 from lightning.pytorch.utilities import rank_zero_info
 from omegaconf import OmegaConf
 
 
 class Config:
-    def __init__(self, config_path: str = None, override_args: Dict[str, Any] = None):
+    def __init__(
+        self,
+        config_path: Optional[str] = None,
+        override_args: Optional[Dict[str, Any]] = None,
+    ):
         self.config = OmegaConf.create({})
 
-        # Load paths config if exists
         paths_config_path = os.path.join("configs", "paths.yaml")
         if not os.path.exists(paths_config_path):
             paths_config_path = os.path.join("configs", "paths_default.yaml")
@@ -28,39 +32,26 @@ class Config:
         if override_args:
             self.override_config(override_args)
 
-    def load_yaml(self, config_path: str):
+    def load_yaml(self, config_path: str) -> None:
         """Load YAML configuration file"""
         loaded_config = OmegaConf.load(config_path)
         self.config = OmegaConf.merge(self.config, loaded_config)
 
-    def override_config(self, override_args: Dict[str, Any]):
+    def override_config(self, override_args: Dict[str, Any]) -> None:
         """Handle command line override arguments"""
-        dotlist = []
         for key, value in override_args.items():
-            # Handle values that might be converted types but should be strings for paths
-            # The user issue "modify a path having suffix ..yaml" suggests type inference might be wrong
-            # or splitting logic is wrong.
-            # Using OmegaConf's standard from_dotlist approach is safest.
-            # It expects "key=value" strings.
-            # We need to be careful about value conversion.
-            # Our _convert_value handles basic types.
+            OmegaConf.update(self.config, key, self._convert_value(value))
 
-            val = self._convert_value(value)
-            # If val is a string, we keep it as is.
-            # OmegaConf.from_dotlist parses the string again if we pass "key=value".
-            # But we can construct a config from dict and merge.
-
-            # If we use OmegaConf.update(self.config, key, val) it should work for dotted keys.
-            # However, `update` takes a key and value.
-            OmegaConf.update(self.config, key, val)
-
-    def _convert_value(self, value: str) -> Any:
+    def _convert_value(self, value: Any) -> Any:
         """Convert string value to appropriate type"""
-        if value.lower() == "true":
+        if not isinstance(value, str):
+            return value
+        lowered = value.lower()
+        if lowered == "true":
             return True
-        elif value.lower() == "false":
+        elif lowered == "false":
             return False
-        elif value.lower() == "null":
+        elif lowered == "null":
             return None
         try:
             return int(value)
@@ -82,12 +73,12 @@ class Config:
         """Support dictionary-like access"""
         return self.config[key]
 
-    def export_config(self, path: str):
+    def export_config(self, path: str) -> None:
         """Export current configuration to file"""
         OmegaConf.save(self.config, path)
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     """Parse command line arguments"""
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -115,27 +106,26 @@ def load_config(
     return Config(config_path, override_args)
 
 
-def instantiate(target, cfg=None, hfstyle=False, **init_args):
+def instantiate(target: str, cfg=None, hfstyle: bool = False, **init_args):
     module_name, class_name = target.rsplit(".", 1)
     module = import_module(module_name)
     class_ = getattr(module, class_name)
     if cfg is None:
         return class_(**init_args)
-    else:
-        if hfstyle:
-            config_class = class_.config_class
-            cfg = config_class(config_obj=cfg)
-        return class_(cfg, **init_args)
+    if hfstyle:
+        config_class = class_.config_class
+        cfg = config_class(config_obj=cfg)
+    return class_(cfg, **init_args)
 
 
-def get_function(target):
+def get_function(target: str):
     module_name, function_name = target.rsplit(".", 1)
     module = import_module(module_name)
     function_ = getattr(module, function_name)
     return function_
 
 
-def save_config_and_codes(config, save_dir):
+def save_config_and_codes(config, save_dir) -> None:
     os.makedirs(save_dir, exist_ok=True)
     sanity_check_dir = os.path.join(save_dir, "sanity_check")
     os.makedirs(sanity_check_dir, exist_ok=True)
@@ -151,7 +141,7 @@ def save_config_and_codes(config, save_dir):
         shutil.copy(py_file, dest_path)
 
 
-def print_model_size(model):
+def print_model_size(model) -> None:
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     rank_zero_info(f"Total parameters: {total_params:,}")
@@ -159,44 +149,41 @@ def print_model_size(model):
     rank_zero_info(f"Non-trainable parameters: {(total_params - trainable_params):,}")
 
 
-def check_state_dict(state_dict, named_parameters, named_buffers):
+def check_state_dict(state_dict, named_parameters, named_buffers) -> None:
     """Compare differences between state_dict and parameters"""
-    # Get all keys in state_dict
     state_dict_keys = set(state_dict.keys())
-
-    # Get all keys in named_parameters
-    named_params_keys = set(name for name, _ in named_parameters)
+    parameter_keys = set(name for name, _ in named_parameters)
+    buffer_keys = set(name for name, _ in named_buffers)
 
     # Find keys that only exist in state_dict
-    only_in_state_dict = state_dict_keys - named_params_keys
+    only_in_state_dict = state_dict_keys - parameter_keys
 
     # Find keys that only exist in named_parameters
-    only_in_named_params = named_params_keys - state_dict_keys
+    only_in_named_params = parameter_keys - state_dict_keys
 
-    # Print results
     if only_in_state_dict:
         print(f"Only in state_dict (not in parameters): {sorted(only_in_state_dict)}")
 
     if only_in_named_params:
         print(
-            f"Only in named_parameters (not in state_dict): {sorted(only_in_named_params)}"
+            "Only in named_parameters (not in state_dict): "
+            f"{sorted(only_in_named_params)}"
         )
 
     if not only_in_state_dict and not only_in_named_params:
         print("All parameters match between state_dict and named_parameters")
 
-    # Additionally compare buffers (non-parameter states, such as BatchNorm's running_mean)
-    named_buffers_keys = set(name for name, _ in named_buffers)
-    buffers_only = state_dict_keys - named_params_keys - named_buffers_keys
+    buffers_only = state_dict_keys - parameter_keys - buffer_keys
 
     if buffers_only:
         print(
-            f"Other items in state_dict (neither params nor buffers): {sorted(buffers_only)}"
+            "Other items in state_dict (neither params nor buffers): "
+            f"{sorted(buffers_only)}"
         )
 
     print(f"Total state_dict items: {len(state_dict_keys)}")
-    print(f"Total named_parameters: {len(named_params_keys)}")
-    print(f"Total named_buffers: {len(named_buffers_keys)}")
+    print(f"Total named_parameters: {len(parameter_keys)}")
+    print(f"Total named_buffers: {len(buffer_keys)}")
 
 
 def _resolve_global_rank() -> int:
@@ -211,8 +198,7 @@ def _resolve_global_rank() -> int:
 
 
 def get_shared_run_time(base_dir: str, env_key: str = "PL_RUN_TIME") -> str:
-    """
-    Get a synchronized run time across all processes.
+    """Get a synchronized run time across all processes.
 
     This function ensures all processes (both in distributed training and multi-process
     scenarios) use the same timestamp for output directories and experiment tracking.
@@ -256,7 +242,6 @@ def get_shared_run_time(base_dir: str, env_key: str = "PL_RUN_TIME") -> str:
 
     global_rank = _resolve_global_rank()
     if global_rank == 0:
-        # Remove the sync file if it exists to avoid stale reads by other ranks
         if os.path.exists(sync_file):
             try:
                 os.remove(sync_file)
@@ -273,13 +258,10 @@ def get_shared_run_time(base_dir: str, env_key: str = "PL_RUN_TIME") -> str:
                 try:
                     with open(sync_file, "r", encoding="utf-8") as f:
                         run_time = f.read().strip()
-                    # Check if the timestamp is fresh (within 60 seconds)
-                    # This prevents reading a stale timestamp from a previous run
                     dt = datetime.strptime(run_time, timestamp_format)
                     if abs((datetime.now() - dt).total_seconds()) < 60:
                         break
                 except (ValueError, OSError):
-                    # File might be empty or partially written, or format mismatch
                     pass
 
             if time.monotonic() > timeout:

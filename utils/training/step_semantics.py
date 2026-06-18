@@ -55,14 +55,6 @@ def resolve_scheduler_steps(
     absolute_target_step: int,
     runtime_max_steps: int,
 ) -> int:
-    """Map lr-scheduler horizon to the runtime phase when config follows trainer.max_steps.
-
-    Most configs set ``lr_scheduler.params.num_training_steps`` to
-    ``${trainer.max_steps}``. After self-forcing resume rewrites the Trainer's
-    runtime ``max_steps`` to a shorter phase length, the scheduler should follow
-    that shorter horizon too. If the scheduler was configured independently, we
-    preserve the explicit override.
-    """
     configured = int(configured_num_training_steps)
     if configured == int(absolute_target_step):
         return int(runtime_max_steps)
