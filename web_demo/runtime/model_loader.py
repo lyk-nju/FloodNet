@@ -191,6 +191,7 @@ def load_model_bundle(config_path, traj_mask_cfg=None, device="cpu") -> ModelBun
         ldf_model=ldf_model,
         cfg=cfg,
         device=device,
+        stream_generator=stream_generator,
         root_refiner=stream_generator.root_refiner,
         root_text_encoder=stream_generator.root_text_encoder,
     )

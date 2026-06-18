@@ -15,7 +15,7 @@ if PROJECT_ROOT not in sys.path:
 
 from flask import Flask, render_template, jsonify, request
 from flask_cors import CORS
-from model_manager import get_model_manager
+from web_demo.model_manager import get_model_manager
 from web_demo.api.schemas import UpdateTrajectoryRequest
 from web_demo.config import load_debug_preset_cfg, load_traj_mask_cfg
 from utils.motion_process import extract_root_trajectory_263

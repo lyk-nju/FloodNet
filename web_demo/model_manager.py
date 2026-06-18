@@ -49,6 +49,7 @@ from web_demo.runtime.generation_worker import GenerationWorker
 from web_demo.runtime.model_loader import (
     build_stream_generator,
     load_ldf_models,
+    load_model_bundle,
     reject_normalized_root_refiner_config,
     resolve_repo_path,
 )
@@ -73,11 +74,13 @@ class ModelManager(WebRuntime):
         self._last_traj_mask_keep = None
         self._last_traj_mask_total = None
         
-        # Load models
-        self.vae, self.model, self.cfg = self._load_models(config_path)
-        self.stream_generator = self._load_stream_generator(
-            config_path, traj_mask_cfg
-        )
+        # Load the complete runtime bundle once so RootRefiner modules are not
+        # constructed again through a second StreamGenerator path.
+        bundle = self._load_model_bundle(config_path, traj_mask_cfg)
+        self.vae = bundle.vae
+        self.model = bundle.ldf_model
+        self.cfg = bundle.cfg
+        self.stream_generator = bundle.stream_generator
         self.rootplan_controller = RootPlanController(self.stream_generator)
         
         # Frame buffer
@@ -225,6 +228,13 @@ class ModelManager(WebRuntime):
     
     def _load_models(self, config_path):
         return load_ldf_models(config_path, self.device)
+
+    def _load_model_bundle(self, config_path, traj_mask_cfg):
+        return load_model_bundle(
+            config_path,
+            traj_mask_cfg=traj_mask_cfg,
+            device=self.device,
+        )
 
     def _resolve_repo_path(self, path):
         return resolve_repo_path(path)

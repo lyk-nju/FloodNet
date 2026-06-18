@@ -14,12 +14,15 @@ from utils.inference.stream_generator import StreamGenerator
 from utils.inference.timeline import RootFrameState, RootTimeline
 from utils.token_frame import token_range_to_frame_slice, token_start_frame
 from web_demo.model_manager import ModelManager
+from web_demo.runtime.model_bundle import ModelBundle
 
 
 def test_web_demo_layered_runtime_import_contract():
+    import web_demo.app
     from web_demo.model_manager import ModelManager, get_model_manager
     from web_demo.runtime.state import GenerationState
 
+    assert web_demo.app is not None
     assert ModelManager is not None
     assert get_model_manager is not None
     assert GenerationState.IDLE.value == "idle"
@@ -40,6 +43,84 @@ def test_web_demo_layered_runtime_import_contract():
         "web_demo.runtime.generation_worker",
     ):
         assert importlib.import_module(module_name) is not None
+
+
+def test_load_model_bundle_builds_one_stream_generator_with_root_modules(monkeypatch):
+    from web_demo.runtime import model_loader
+
+    fake_vae = object()
+    fake_ldf = _DummyModel()
+    fake_cfg = SimpleNamespace(name="cfg")
+    fake_refiner = object()
+    fake_text_encoder = object()
+    calls = []
+
+    def fake_load_ldf_models(config_path, device):
+        assert config_path == "cfg.yaml"
+        assert device == "cpu"
+        return fake_vae, fake_ldf, fake_cfg
+
+    def fake_load_root_refiner_modules(root_cfg):
+        calls.append(root_cfg)
+        return fake_refiner, fake_text_encoder, (3, 8)
+
+    monkeypatch.setattr(model_loader, "load_ldf_models", fake_load_ldf_models)
+    monkeypatch.setattr(
+        model_loader,
+        "load_root_refiner_modules",
+        fake_load_root_refiner_modules,
+    )
+
+    bundle = model_loader.load_model_bundle(
+        "cfg.yaml",
+        traj_mask_cfg={"root_refiner": {"enabled": True}},
+        device="cpu",
+    )
+
+    assert calls == [{"enabled": True}]
+    assert bundle.vae is fake_vae
+    assert bundle.ldf_model is fake_ldf
+    assert bundle.cfg is fake_cfg
+    assert bundle.stream_generator.ldf_model is fake_ldf
+    assert bundle.stream_generator.root_refiner is fake_refiner
+    assert bundle.root_refiner is fake_refiner
+    assert bundle.stream_generator.root_text_encoder is fake_text_encoder
+    assert bundle.root_text_encoder is fake_text_encoder
+
+
+def test_model_manager_init_uses_model_bundle_not_stream_generator_helper(monkeypatch):
+    fake_model = _DummyModel()
+    fake_stream_generator = StreamGenerator(ldf_model=fake_model, device="cpu")
+    fake_bundle = ModelBundle(
+        vae=SimpleNamespace(),
+        ldf_model=fake_model,
+        cfg=SimpleNamespace(name="cfg"),
+        device="cpu",
+        stream_generator=fake_stream_generator,
+    )
+
+    def fake_load_model_bundle(self, config_path, traj_mask_cfg):
+        assert config_path == "cfg.yaml"
+        assert traj_mask_cfg == {}
+        return fake_bundle
+
+    def fail_load_stream_generator(self, config_path, traj_mask_cfg):
+        raise AssertionError("ModelManager.__init__ must use _load_model_bundle")
+
+    monkeypatch.setattr(ModelManager, "_load_model_bundle", fake_load_model_bundle)
+    monkeypatch.setattr(
+        ModelManager,
+        "_load_stream_generator",
+        fail_load_stream_generator,
+    )
+
+    mgr = ModelManager(config_path="cfg.yaml", traj_mask_cfg={})
+
+    assert mgr.vae is fake_bundle.vae
+    assert mgr.model is fake_model
+    assert mgr.cfg is fake_bundle.cfg
+    assert mgr.stream_generator is fake_stream_generator
+    assert mgr.rootplan_controller.stream_generator is fake_stream_generator
 
 
 class _DummyModel(nn.Module):

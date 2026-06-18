@@ -12,9 +12,9 @@ class ModelBundle:
     ldf_model: Any
     cfg: Any
     device: str
+    stream_generator: Any
     root_refiner: Any | None = None
     root_text_encoder: Any | None = None
 
 
 __all__ = ["ModelBundle"]
-
