@@ -148,11 +148,6 @@ def resolve_suite_config(suite: str) -> RootRefinerEvalSuite:
     return _ROOT_REFINER_SUITES[key]
 
 
-# ---------------------------------------------------------------------------
-# Aggregate benchmark
-# ---------------------------------------------------------------------------
-
-
 def _get_eval_sample(
     dataset,
     idx: int,
@@ -285,11 +280,11 @@ def _max_frames_for_full_route(dataset, idx: int, anchor_frame: int = 0) -> int:
         )
         return _to_int(sample.get("num_frames"), default=0)
     if "feature_length" in record:
-        T = int(record["feature_length"])
+        clip_frames = int(record["feature_length"])
     else:
         motion = record.get("feature", record.get("motion_263"))
-        T = int(motion.shape[0])
-    remaining = max(0, T - int(anchor_frame) - 1)
+        clip_frames = int(motion.shape[0])
+    remaining = max(0, clip_frames - int(anchor_frame) - 1)
     max_frames = int(getattr(dataset, "max_frames", remaining))
     return min(max_frames, remaining)
 
@@ -868,7 +863,18 @@ def build_refiner_dataset_from_config(
 ):
     from utils.training.root_refiner import build_root_refiner_dataset
 
-    data_cfg = cfg.get("data", {}) or {}
+    cfg = dict(cfg)
+    data_cfg = dict(cfg.get("data", {}) or {})
+    model_cfg = dict(cfg.get("model", {}) or {})
+    model_cfg.setdefault("target", "models.root_refiner.RootRefiner")
+    model_cfg.setdefault("params", {})
+    data_cfg.setdefault("collate_fn", "utils.training.root_refiner.collate_fn")
+    data_cfg.setdefault("train_bs", 1)
+    data_cfg.setdefault("val_bs", 1)
+    data_cfg.setdefault("num_workers", 0)
+    cfg["data"] = data_cfg
+    cfg["model"] = model_cfg
+    cfg.setdefault("optimizer", {"target": "AdamW", "params": {"lr": 1.0e-4}})
     return build_root_refiner_dataset(
         cfg,
         split_file or data_cfg.get("val_split_file") or data_cfg.get("train_split_file"),
@@ -1052,11 +1058,6 @@ def write_report(
         write_json_strict(dirs["metrics"] / "metrics.json", payload)
         write_json_strict(dirs["metrics"] / "summary.json", payload["summary"])
         _write_per_sample_csv(dirs["per_sample"] / "per_sample.csv", per_sample)
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 
 def _load_model_from_ckpt(ckpt_path: str, device: str):

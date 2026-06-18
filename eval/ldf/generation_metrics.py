@@ -1,6 +1,6 @@
-"""
-eval_generation_metrics.py
-==========================
+"""LDF generation metric evaluation entrypoint.
+
+Two-pass evaluation:
 Two-pass evaluation:
 
   Pass 1 — test_meta_paths (small set, e.g. test_min.txt)
@@ -24,6 +24,9 @@ Usage:
     python tools/eval_generation_metrics.py --config configs/ldf.yaml \\
         --forward_control_loss --traj_ablation --viz_traj --topk 3
 """
+
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -54,11 +57,11 @@ from metrics.traj import (
     _stable_eval_seed,
     _to_device,
 )
-from eval.ldf.conditioning import (
+from utils.training.ldf.validation_conditioning import (
     build_windowed_metric_ground_truth,
     prepare_ldf_eval_model_batch,
 )
-from eval.ldf.t2m_generation import run_t2m_generation_mode
+from utils.training.ldf.t2m_generation import run_t2m_generation_mode
 from utils.initialize import get_function, instantiate, load_config
 from utils.motion_process import extract_root_trajectory_263_torch
 from utils.training.ldf.t2m_generation_modes import (
@@ -89,10 +92,6 @@ def _default_output_dir() -> Path:
     """Legacy default artifact root used by the old top-level eval script."""
     return Path(__file__).resolve().parents[1]
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -149,10 +148,6 @@ def parse_args():
                         help="Override cfg.data.test_meta_paths for this evaluation run.")
     return parser.parse_args()
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _set_seed(seed: int):
     random.seed(seed)
@@ -251,10 +246,6 @@ def _load_vae(cfg, device: torch.device):
     return vae
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# XZ trajectory visualization
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _plot_traj_xz(
     name: str,
     gt_xz: np.ndarray,
@@ -285,8 +276,8 @@ def _plot_traj_xz(
     ax.scatter([pred_xz[0, 0]], [pred_xz[0, 1]], color="steelblue", s=60, zorder=5)
     if traj_mask is not None:
         mask_bool = np.asarray(traj_mask, dtype=bool)
-        T = min(len(mask_bool), len(gt_xz))
-        constrained = np.where(mask_bool[:T])[0]
+        mask_frames = min(len(mask_bool), len(gt_xz))
+        constrained = np.where(mask_bool[:mask_frames])[0]
         if len(constrained) > 0:
             ax.scatter(gt_xz[constrained, 0], gt_xz[constrained, 1],
                        color="lime", s=20, zorder=4, label="GT constrained")
@@ -295,17 +286,17 @@ def _plot_traj_xz(
     ax.legend(fontsize=8); ax.axis("equal"); ax.grid(True, alpha=0.3)
 
     ax = axes[1]
-    T = min(len(gt_xz), len(pred_xz))
-    t = np.arange(T)
-    ax.plot(t, gt_xz[:T, 0], color="green", lw=1.5, label="GT X")
-    ax.plot(t, pred_xz[:T, 0], color="steelblue", lw=1.2, label="Pred X")
+    num_frames = min(len(gt_xz), len(pred_xz))
+    frame_idx = np.arange(num_frames)
+    ax.plot(frame_idx, gt_xz[:num_frames, 0], color="green", lw=1.5, label="GT X")
+    ax.plot(frame_idx, pred_xz[:num_frames, 0], color="steelblue", lw=1.2, label="Pred X")
     if pred_no_traj_xz is not None:
-        Tn = min(T, len(pred_no_traj_xz))
-        ax.plot(t[:Tn], pred_no_traj_xz[:Tn, 0], color="darkorange",
+        no_traj_frames = min(num_frames, len(pred_no_traj_xz))
+        ax.plot(frame_idx[:no_traj_frames], pred_no_traj_xz[:no_traj_frames, 0], color="darkorange",
                 lw=1.2, ls="--", label="No-traj X")
     ax2 = ax.twinx()
-    ax2.plot(t, gt_xz[:T, 1], color="green", lw=1.5, alpha=0.5, ls=":")
-    ax2.plot(t, pred_xz[:T, 1], color="steelblue", lw=1.2, alpha=0.5, ls=":")
+    ax2.plot(frame_idx, gt_xz[:num_frames, 1], color="green", lw=1.5, alpha=0.5, ls=":")
+    ax2.plot(frame_idx, pred_xz[:num_frames, 1], color="steelblue", lw=1.2, alpha=0.5, ls=":")
     ax2.set_ylabel("Z (dotted, right axis)", color="gray", fontsize=8)
     ax.set_title("X(t) time series  [Z dotted on right axis]")
     ax.set_xlabel("Frame"); ax.set_ylabel("X")

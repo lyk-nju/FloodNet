@@ -18,124 +18,12 @@ from utils.local_frame import (
     wrap_angle,
 )
 from utils.inference.root_plan import RootPlan, build_root_plan_stream_payload
-from utils.token_frame import num_tokens_for_frame_len, token_range_to_frame_slice
-from utils.training.ldf.conditioning import prepare_generate_condition
-from utils.training.ldf.sample_creator import SampleCreator
-
-
-def _as_tensor(value, *, device=None, dtype=torch.float32) -> torch.Tensor:
-    if torch.is_tensor(value):
-        out = value
-    elif isinstance(value, np.ndarray):
-        out = torch.from_numpy(value)
-    else:
-        out = torch.as_tensor(value)
-    if dtype is not None and torch.is_floating_point(out):
-        out = out.to(dtype=dtype)
-    if device is not None:
-        out = out.to(device=device)
-    return out
-
-
-def _to_device(obj, device):
-    if torch.is_tensor(obj):
-        return obj.to(device)
-    if isinstance(obj, dict):
-        return {key: _to_device(value, device) for key, value in obj.items()}
-    if isinstance(obj, list):
-        return [_to_device(value, device) for value in obj]
-    if isinstance(obj, tuple):
-        return tuple(_to_device(value, device) for value in obj)
-    return obj
-
-
-def _has_7d_traj(batch: dict) -> bool:
-    value = batch.get("traj_cond_7d", batch.get("traj_features"))
-    if value is None:
-        return False
-    shape = value.shape if hasattr(value, "shape") else None
-    return shape is not None and len(shape) >= 2 and int(shape[-1]) == 7
-
-
-def build_windowed_metric_ground_truth(batch: dict, model_batch: dict):
-    """Return GT tensors cropped to the same latent window as generation.
-
-    Windowed LDF eval may generate only a prefix/sub-window. Offline metrics must
-    compare that result against the matching GT window rather than the original
-    full clip.
-    """
-    gt_token = model_batch["token"]
-    gt_token_length = model_batch["token_length"]
-    raw_feature = batch["feature"]
-    raw_feature_length = batch["feature_length"]
-    latent_lengths = model_batch.get("feature_length", gt_token_length)
-    starts = model_batch.get("_window_global_start_token")
-    batch_size = int(gt_token.shape[0])
-    device = gt_token.device
-    if starts is None:
-        starts = torch.zeros(batch_size, device=device, dtype=torch.long)
-    else:
-        starts = starts.to(device=device, dtype=torch.long).view(-1)
-        if starts.numel() == 1 and batch_size > 1:
-            starts = starts.expand(batch_size)
-    latent_lengths = latent_lengths.to(device=device, dtype=torch.long).view(-1)
-    raw_feature_length = raw_feature_length.to(device=device, dtype=torch.long).view(-1)
-
-    gt_feature = []
-    gt_feature_length = []
-    for i in range(batch_size):
-        start_token = int(starts[i].item())
-        num_tokens = int(latent_lengths[i].item())
-        frame_slice = token_range_to_frame_slice(start_token, num_tokens)
-        raw_len = int(raw_feature_length[i].item())
-        start_frame = min(int(frame_slice.start), raw_len)
-        stop_frame = min(int(frame_slice.stop), raw_len)
-        gt_feature.append(raw_feature[i, start_frame:stop_frame])
-        gt_feature_length.append(max(0, stop_frame - start_frame))
-    return gt_token, gt_token_length, gt_feature, gt_feature_length
-
-
-def _canonicalize_7d_clip_start(traj_7d) -> torch.Tensor:
-    traj = _as_tensor(traj_7d, dtype=torch.float32)
-    if traj.dim() == 2:
-        traj = traj.unsqueeze(0)
-    if traj.dim() != 3 or traj.shape[-1] != 7:
-        raise ValueError(f"traj_cond_7d must be [B,T,7], got {tuple(traj.shape)}")
-    if traj.shape[1] <= 0:
-        return traj
-    anchor_xz = traj[:, 0, [0, 2]]
-    anchor_yaw = torch.atan2(traj[:, 0, 4], traj[:, 0, 3])
-    return canonicalize_7d(traj, anchor_xz, anchor_yaw)
-
-
-def prepare_ldf_eval_model_batch(batch: dict, device, model=None) -> dict:
-    """Prepare a model batch for LDF eval with 7D clip-start-local conditioning.
-
-    ``SampleCreator`` preserves the training field routing, but it does not
-    canonicalize 7D world-frame trajectory conditions. Offline eval has no
-    rolling body window, so the stable eval convention is clip-start-local.
-    """
-    if "token_length" not in batch:
-        raise ValueError("prepare_ldf_eval_model_batch requires batch['token_length']")
-    model_batch = SampleCreator(
-        window_policy="prefix",
-        sample_policy="fixed_window",
-        end_tokens=batch["token_length"],
-    ).create(batch)
-    if _has_7d_traj(model_batch):
-        source = model_batch.get("traj_features", model_batch.get("traj_cond_7d"))
-        canon = _canonicalize_7d_clip_start(source)
-        model_batch["traj_features"] = canon
-        if "traj_cond_7d" in model_batch:
-            model_batch["traj_cond_7d"] = canon
-    model_batch = _to_device(model_batch, device)
-    if model is not None:
-        model_batch["ldf_condition"] = prepare_generate_condition(
-            model,
-            model_batch,
-            device,
-        )
-    return model_batch
+from utils.token_frame import num_tokens_for_frame_len
+from utils.training.ldf.validation_conditioning import (
+    _as_tensor,
+    build_windowed_metric_ground_truth,
+    prepare_ldf_eval_model_batch,
+)
 
 
 def _first_scalar(value, default: int) -> int:
@@ -295,5 +183,6 @@ class LdfEvalStreamConditioner:
 __all__ = [
     "LdfEvalStreamConditioner",
     "build_gt_rootplan_from_batch",
+    "build_windowed_metric_ground_truth",
     "prepare_ldf_eval_model_batch",
 ]
