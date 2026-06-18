@@ -22,13 +22,13 @@ def _prepare_noisy_window(model, clean_feature, feature_length, time_steps):
     noise_ref = []
     noisy_feature_input = []
     end_indices = []
-    for i in range(batch_size):
-        end_index = int(model.chunk_size * time_steps[i].item()) + 1
-        valid_len = int(feature_length[i].item())
+    for sample_idx in range(batch_size):
+        end_index = int(model.chunk_size * time_steps[sample_idx].item()) + 1
+        valid_len = int(feature_length[sample_idx].item())
         end_index = min(valid_len, end_index)
-        feature_ref.append(feature[i, :, :end_index, ...])
-        noise_ref.append(noise[i, :, :end_index, ...])
-        noisy_feature_input.append(noisy_feature[i, :, :end_index, ...])
+        feature_ref.append(feature[sample_idx, :, :end_index, ...])
+        noise_ref.append(noise[sample_idx, :, :end_index, ...])
+        noisy_feature_input.append(noisy_feature[sample_idx, :, :end_index, ...])
         end_indices.append(end_index)
 
     return noise_level, feature_ref, noise_ref, noisy_feature_input, end_indices
@@ -69,45 +69,45 @@ def run_training_window(
     loss = 0.0
     # Two lists with different x0-recovery formulas, each tuned to its
     # consumer (both formulas are mathematically valid; they differ only in
-    # how prediction error δ propagates):
+    # how prediction error propagates):
     #
-    #   loss_x0_list  (Formula 1, "z = pred_vel + ε"):
-    #     error  = δ           (β-independent, fully exposes the model's
+    #   loss_x0_list  (Formula 1, "z = pred_vel + eps"):
+    #     error  = delta       (beta-independent, fully exposes the model's
     #                           velocity-prediction error)
-    #     ∂x0/∂pred_vel = 1    (full-strength gradient at every position)
-    #     → used by control loss so the gradient signal is not damped at
-    #       low β, where Formula 2 would let noisy_x carry the loss with
+    #     dx0/dpred_vel = 1    (full-strength gradient at every position)
+    #     Used by control loss so the gradient signal is not damped at
+    #       low beta, where Formula 2 would let noisy_x carry the loss with
     #       almost no gradient flowing back into the model.
     #
-    #   sf_x0_list  (Formula 2, "z = noisy_x + β·pred_vel"):
-    #     error  = β·δ         (low-variance estimate of z, especially
-    #                           important at low β)
-    #     ∂x0/∂pred_vel = β    (β-attenuated gradient — irrelevant here,
+    #   sf_x0_list  (Formula 2, "z = noisy_x + beta * pred_vel"):
+    #     error  = beta * delta (low-variance estimate of z, especially
+    #                           important at low beta)
+    #     dx0/dpred_vel = beta (beta-attenuated gradient; irrelevant here,
     #                           because SF rollout consumes the *value*
     #                           after .detach())
-    #     → used by self-forcing rollout to substitute the chunk's
-    #       leftmost token where β ≈ 1/cs is small; Formula 1 there
-    #       collapses to z + ε (pure noise injection) and corrupts the
+    #     Used by self-forcing rollout to substitute the chunk's
+    #       leftmost token where beta ~= 1/cs is small; Formula 1 there
+    #       collapses to z + eps (pure noise injection) and corrupts the
     #       next rollout step's context.
     loss_x0_list = []
     sf_x0_list = []
-    for b in range(batch_size):
-        t_b = noisy_feature_input[b].shape[1]
+    for sample_idx in range(batch_size):
+        sample_tokens = noisy_feature_input[sample_idx].shape[1]
         if model.prediction_type == "vel":
-            vel = feature_ref[b] - noise_ref[b]
+            velocity = feature_ref[sample_idx] - noise_ref[sample_idx]
             squared_error = (
-                predicted_result[b][:, -model.chunk_size :, ...]
-                - vel[:, -model.chunk_size :, ...]
+                predicted_result[sample_idx][:, -model.chunk_size :, ...]
+                - velocity[:, -model.chunk_size :, ...]
             ) ** 2
         elif model.prediction_type == "x0":
             squared_error = (
-                predicted_result[b][:, -model.chunk_size :, ...]
-                - feature_ref[b][:, -model.chunk_size :, ...]
+                predicted_result[sample_idx][:, -model.chunk_size :, ...]
+                - feature_ref[sample_idx][:, -model.chunk_size :, ...]
             ) ** 2
         elif model.prediction_type == "noise":
             squared_error = (
-                predicted_result[b][:, -model.chunk_size :, ...]
-                - noise_ref[b][:, -model.chunk_size :, ...]
+                predicted_result[sample_idx][:, -model.chunk_size :, ...]
+                - noise_ref[sample_idx][:, -model.chunk_size :, ...]
             ) ** 2
             loss_x0_list.append(None)
             sf_x0_list.append(None)
@@ -118,17 +118,20 @@ def run_training_window(
         sample_loss = squared_error.mean()
         loss += sample_loss
         if model.prediction_type == "vel":
-            # Formula 1 — full-gradient estimate, for control loss.
-            pred_x0_loss = predicted_result[b] + noise_ref[b]
+            # Formula 1: full-gradient estimate, for control loss.
+            pred_x0_loss = predicted_result[sample_idx] + noise_ref[sample_idx]
             loss_x0_list.append(pred_x0_loss[:, :, 0, 0].permute(1, 0))
-            # Formula 2 — low-variance estimate, for SF rollout.
-            beta_b = noise_level[b, :t_b].view(1, -1, 1, 1)
-            pred_x0_sf = noisy_feature_input[b] + beta_b * predicted_result[b]
+            # Formula 2: low-variance estimate, for SF rollout.
+            beta = noise_level[sample_idx, :sample_tokens].view(1, -1, 1, 1)
+            pred_x0_sf = (
+                noisy_feature_input[sample_idx]
+                + beta * predicted_result[sample_idx]
+            )
             sf_x0_list.append(pred_x0_sf[:, :, 0, 0].permute(1, 0))
         elif model.prediction_type == "x0":
             # x0-prediction: model directly outputs z, so the two formulas
             # coincide. Share the same tensor for both consumers.
-            pred_x0 = predicted_result[b]
+            pred_x0 = predicted_result[sample_idx]
             latent = pred_x0[:, :, 0, 0].permute(1, 0)
             loss_x0_list.append(latent)
             sf_x0_list.append(latent)
@@ -149,17 +152,17 @@ def run_training_window(
 
     return {
         "loss": loss,
-        # Consumed by control loss → Formula 1 (full-gradient).
+        # Consumed by control loss: Formula 1 (full-gradient).
         "pred_x0_latent_list": pred_x0_latent_list,
-        # Consumed by self-forcing rollout → Formula 2 (low-variance).
+        # Consumed by self-forcing rollout: Formula 2 (low-variance).
         "x0_latent_list": sf_x0_list,
         "end_indices": end_indices,
     }
 
 
 def run_model_step(model, batch) -> dict:
-    feature = batch["feature"]  # (B, T, C)
-    feature_length = batch["feature_length"]  # (B,)
+    feature = batch["feature"]
+    feature_length = batch["feature_length"]
     batch_size, seq_len, _ = feature.shape
     device = feature.device
 
@@ -179,14 +182,12 @@ def run_model_step(model, batch) -> dict:
                 f"for batch_size={batch_size}"
             )
     else:
-        # Randomly use a time step
         time_steps = []
-        for i in range(batch_size):
-            valid_len = feature_length[i].item()
-            # Random float from 0 to valid_len/chunk_size, not an integer
+        for sample_idx in range(batch_size):
+            valid_len = feature_length[sample_idx].item()
             max_time = valid_len / model.chunk_size
             time_steps.append(torch.FloatTensor(1).uniform_(0, max_time).item())
-        time_steps = torch.tensor(time_steps, device=device)  # (B,)
+        time_steps = torch.tensor(time_steps, device=device)
 
     condition = prepare_condition(model, batch, seq_len, device)
 

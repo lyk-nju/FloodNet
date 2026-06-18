@@ -8,11 +8,13 @@ optimizer/scheduler construction.
 from __future__ import annotations
 
 import logging
+
 import lightning.pytorch as pl
 import torch
 import torch.nn.functional as F
 
 from torch import nn
+
 from models.root_refiner import RootRefiner
 from utils.initialize import instantiate
 from utils.motion_process import build_physical_7d_from_5d
@@ -43,7 +45,12 @@ class RootRefinerLightningModule(pl.LightningModule):
         if target == "models.root_refiner.RootRefiner":
             self.refiner = RootRefiner(**model_cfg)
         else:
-            self.refiner = instantiate(target=target, cfg=None, hfstyle=False, **model_cfg)
+            self.refiner = instantiate(
+                target=target,
+                cfg=None,
+                hfstyle=False,
+                **model_cfg,
+            )
         self.min_frames = model_cfg["min_frames"]
         self.max_frames = model_cfg["max_frames"]
         text_emb_dim = model_cfg.get("text_emb_dim", 512)
@@ -63,14 +70,23 @@ class RootRefinerLightningModule(pl.LightningModule):
         ]
         return names or ["default"]
 
-    def forward(self, batch: dict, *, duration_mode: str = "groundtruth_duration") -> dict:
+    def forward(
+        self,
+        batch: dict,
+        *,
+        duration_mode: str = "groundtruth_duration",
+    ) -> dict:
         if duration_mode not in {"groundtruth_duration", "pred_duration"}:
             raise ValueError(
                 "duration_mode must be 'groundtruth_duration' or 'pred_duration', "
                 f"got {duration_mode!r}."
             )
         text_emb = self.text_encoder.encode(batch["text"], device=self.device)
-        num_frames = batch.get("num_frames") if duration_mode == "groundtruth_duration" else None
+        num_frames = (
+            batch.get("num_frames")
+            if duration_mode == "groundtruth_duration"
+            else None
+        )
         return self.refiner(
             text_emb=text_emb,
             path=batch["path"],
@@ -116,56 +132,74 @@ class RootRefinerLightningModule(pl.LightningModule):
             target_log_pace,
             reduction="none",
         )
-        L_pace = masked_mean(pace_terms, pace_valid)
+        loss_pace = masked_mean(pace_terms, pace_valid)
         frame_pace_terms = F.smooth_l1_loss(
             out["pred_frames_float"],
             target_frames,
             reduction="none",
         )
-        L_frame_pace = masked_mean(frame_pace_terms, pace_valid)
+        loss_frame_pace = masked_mean(frame_pace_terms, pace_valid)
 
-        L_xyz = smooth_l1_masked(out["waypoints"][..., 0:3], target_wp[..., 0:3], target_mask)
+        loss_xyz = smooth_l1_masked(
+            out["waypoints"][..., 0:3],
+            target_wp[..., 0:3],
+            target_mask,
+        )
 
         pred_h = F.normalize(out["waypoints"][..., 3:5], dim=-1, eps=1e-6)
         gt_h = target_wp[..., 3:5]
         if self.heading_form == "cosine":
             head_term = 1.0 - (pred_h * gt_h).sum(-1)
-            L_head = masked_mean(head_term, target_mask)
+            loss_heading = masked_mean(head_term, target_mask)
         else:
-            L_head = smooth_l1_masked(pred_h, gt_h, target_mask)
+            loss_heading = smooth_l1_masked(pred_h, gt_h, target_mask)
 
-        pred5 = torch.cat([out["waypoints"][..., :3], pred_h], dim=-1)
-        gt5 = torch.cat(
+        pred_waypoints5 = torch.cat([out["waypoints"][..., :3], pred_h], dim=-1)
+        target_waypoints5 = torch.cat(
             [target_wp[..., :3], F.normalize(target_wp[..., 3:5], dim=-1, eps=1e-6)],
             dim=-1,
         )
-        pred_delta = self._to_physical_7d(pred5)[..., 5:7]
+        pred_delta = self._to_physical_7d(pred_waypoints5)[..., 5:7]
         if "waypoints_physical" in batch:
-            gt7_phys = batch["waypoints_physical"].to(device=pred5.device, dtype=pred5.dtype)
+            target_physical = batch["waypoints_physical"].to(
+                device=pred_waypoints5.device,
+                dtype=pred_waypoints5.dtype,
+            )
         elif "target_waypoints_physical" in batch:
-            gt7_phys = batch["target_waypoints_physical"].to(device=pred5.device, dtype=pred5.dtype)
+            target_physical = batch["target_waypoints_physical"].to(
+                device=pred_waypoints5.device,
+                dtype=pred_waypoints5.dtype,
+            )
         else:
-            gt7_phys = self._to_physical_7d(gt5)
-        gt_delta = gt7_phys[..., 5:7]
+            target_physical = self._to_physical_7d(target_waypoints5)
+        target_delta = target_physical[..., 5:7]
         delta_mask = target_mask.clone()
         delta_mask[:, 0] = False
-        L_fwd_delta = smooth_l1_masked(pred_delta[..., 0:1], gt_delta[..., 0:1], delta_mask)
-        L_yaw_delta = smooth_l1_masked(pred_delta[..., 1:2], gt_delta[..., 1:2], delta_mask)
-        w = self.loss_weights
-        L_smooth = second_order_diff_l2(pred_delta, delta_mask)
-        if float(w.get("path_control", 0.0)) == 0.0:
-            L_path_control = out["waypoints"].new_zeros(())
+        loss_fwd_delta = smooth_l1_masked(
+            pred_delta[..., 0:1],
+            target_delta[..., 0:1],
+            delta_mask,
+        )
+        loss_yaw_delta = smooth_l1_masked(
+            pred_delta[..., 1:2],
+            target_delta[..., 1:2],
+            delta_mask,
+        )
+        weights = self.loss_weights
+        loss_smoothness = second_order_diff_l2(pred_delta, delta_mask)
+        if float(weights.get("path_control", 0.0)) == 0.0:
+            loss_path_control = out["waypoints"].new_zeros(())
         else:
-            L_path_control = self._compute_path_control_loss(out, batch, target_mask)
+            loss_path_control = self._compute_path_control_loss(out, batch, target_mask)
         loss = (
-            w.get("pace", 0.0) * L_pace
-            + w.get("frame_pace", 1.0) * L_frame_pace
-            + w.get("xyz", 5.0) * L_xyz
-            + w.get("heading", 1.0) * L_head
-            + w.get("fwd_delta", 0.5) * L_fwd_delta
-            + w.get("yaw_delta", 0.5) * L_yaw_delta
-            + w.get("path_control", 0.0) * L_path_control
-            + w.get("smoothness", 0.0) * L_smooth
+            weights.get("pace", 0.0) * loss_pace
+            + weights.get("frame_pace", 1.0) * loss_frame_pace
+            + weights.get("xyz", 5.0) * loss_xyz
+            + weights.get("heading", 1.0) * loss_heading
+            + weights.get("fwd_delta", 0.5) * loss_fwd_delta
+            + weights.get("yaw_delta", 0.5) * loss_yaw_delta
+            + weights.get("path_control", 0.0) * loss_path_control
+            + weights.get("smoothness", 0.0) * loss_smoothness
         )
 
         with torch.no_grad():
@@ -174,17 +208,21 @@ class RootRefinerLightningModule(pl.LightningModule):
                 - target_frames
             ).abs()
             float_err_mean = masked_mean(float_err, pace_valid.to(float_err.device))
-            physical_metrics = self._compute_physical_xyz_metrics(out, batch, target_mask)
+            physical_metrics = self._compute_physical_xyz_metrics(
+                out,
+                batch,
+                target_mask,
+            )
         return {
             "loss": loss,
-            "pace": L_pace,
-            "frame_pace": L_frame_pace,
-            "xyz": L_xyz,
-            "heading": L_head,
-            "fwd_delta": L_fwd_delta,
-            "yaw_delta": L_yaw_delta,
-            "path_control": L_path_control,
-            "smoothness": L_smooth,
+            "pace": loss_pace,
+            "frame_pace": loss_frame_pace,
+            "xyz": loss_xyz,
+            "heading": loss_heading,
+            "fwd_delta": loss_fwd_delta,
+            "yaw_delta": loss_yaw_delta,
+            "path_control": loss_path_control,
+            "smoothness": loss_smoothness,
             "frame_pace_mae": float_err_mean,
             "frame_pace_acc_pm1": masked_mean(
                 (float_err <= 1.0).to(float_err.dtype),
@@ -218,22 +256,39 @@ class RootRefinerLightningModule(pl.LightningModule):
 
         losses = []
         for mode in ("dense_path", "sparse_path", "goal_point"):
-            idx = [i for i, sample_mode in enumerate(path_modes) if sample_mode == mode]
-            if not idx:
+            sample_indices = [
+                sample_idx
+                for sample_idx, sample_mode in enumerate(path_modes)
+                if sample_mode == mode
+            ]
+            if not sample_indices:
                 continue
-            index = torch.as_tensor(idx, dtype=torch.long, device=out["waypoints"].device)
-            pred = out["waypoints"].index_select(0, index)
-            path = batch["path"].to(out["waypoints"].device).index_select(0, index)
-            control = batch["path_control_mask"].to(out["waypoints"].device).index_select(0, index)
+            index_tensor = torch.as_tensor(
+                sample_indices,
+                dtype=torch.long,
+                device=out["waypoints"].device,
+            )
+            pred_waypoints = out["waypoints"].index_select(0, index_tensor)
+            path = batch["path"].to(out["waypoints"].device).index_select(
+                0,
+                index_tensor,
+            )
+            control_mask = batch["path_control_mask"].to(
+                out["waypoints"].device
+            ).index_select(0, index_tensor)
             if mode == "dense_path":
                 base_supervision = batch.get("path_supervision_mask", target_mask)
                 supervision = (
-                    base_supervision.to(out["waypoints"].device).bool().index_select(0, index)
-                    & target_mask.to(out["waypoints"].device).bool().index_select(0, index)
+                    base_supervision.to(out["waypoints"].device)
+                    .bool()
+                    .index_select(0, index_tensor)
+                    & target_mask.to(out["waypoints"].device)
+                    .bool()
+                    .index_select(0, index_tensor)
                 )
                 losses.append(
                     dense_path_control_loss(
-                        pred,
+                        pred_waypoints,
                         path,
                         supervision,
                     )
@@ -241,25 +296,32 @@ class RootRefinerLightningModule(pl.LightningModule):
             elif mode == "sparse_path":
                 base_supervision = batch.get("path_supervision_mask", target_mask)
                 supervision = (
-                    base_supervision.to(out["waypoints"].device).bool().index_select(0, index)
-                    & target_mask.to(out["waypoints"].device).bool().index_select(0, index)
+                    base_supervision.to(out["waypoints"].device)
+                    .bool()
+                    .index_select(0, index_tensor)
+                    & target_mask.to(out["waypoints"].device)
+                    .bool()
+                    .index_select(0, index_tensor)
                 )
                 losses.append(
                     sparse_path_control_loss(
-                        pred,
+                        pred_waypoints,
                         path,
-                        control,
+                        control_mask,
                         supervision,
-                        offset_start_frames.index_select(0, index),
+                        offset_start_frames.index_select(0, index_tensor),
                     )
                 )
             else:
                 losses.append(
                     goal_point_control_loss(
-                        pred,
-                        target_mask.to(out["waypoints"].device).index_select(0, index),
+                        pred_waypoints,
+                        target_mask.to(out["waypoints"].device).index_select(
+                            0,
+                            index_tensor,
+                        ),
                         path,
-                        control,
+                        control_mask,
                     )
                 )
         if not losses:
@@ -289,31 +351,34 @@ class RootRefinerLightningModule(pl.LightningModule):
         batch: dict,
         mask: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        pred7 = self._to_physical_7d(out["waypoints"])
+        pred_physical = self._to_physical_7d(out["waypoints"])
         if "waypoints_physical" in batch:
-            gt7 = batch["waypoints_physical"].to(
-                device=pred7.device,
-                dtype=pred7.dtype,
+            target_physical = batch["waypoints_physical"].to(
+                device=pred_physical.device,
+                dtype=pred_physical.dtype,
             )
         else:
-            gt5 = torch.cat(
+            target_waypoints5 = torch.cat(
                 [
                     batch["waypoints"][..., :3],
                     F.normalize(batch["waypoints"][..., 3:5], dim=-1, eps=1e-6),
                 ],
                 dim=-1,
             )
-            gt7 = self._to_physical_7d(gt5)
-        valid = mask.to(device=pred7.device).bool()
-        xyz_err = (pred7[..., :3] - gt7[..., :3]).norm(dim=-1)
-        valid_f = valid.to(dtype=xyz_err.dtype)
-        ade = (xyz_err * valid_f).sum() / valid_f.sum().clamp_min(1.0)
-        valid_count = valid.long().sum(dim=1)
-        has_valid = valid_count > 0
-        last_idx = valid_count.sub(1).clamp(min=0)
-        fde_per_sample = xyz_err.gather(1, last_idx.view(-1, 1)).squeeze(1)
-        has_valid_f = has_valid.to(dtype=xyz_err.dtype)
-        fde = (fde_per_sample * has_valid_f).sum() / has_valid_f.sum().clamp_min(1.0)
+            target_physical = self._to_physical_7d(target_waypoints5)
+        valid = mask.to(device=pred_physical.device).bool()
+        xyz_err = (pred_physical[..., :3] - target_physical[..., :3]).norm(dim=-1)
+        valid_float = valid.to(dtype=xyz_err.dtype)
+        ade = (xyz_err * valid_float).sum() / valid_float.sum().clamp_min(1.0)
+        valid_counts = valid.long().sum(dim=1)
+        has_valid = valid_counts > 0
+        last_indices = valid_counts.sub(1).clamp(min=0)
+        fde_per_sample = xyz_err.gather(1, last_indices.view(-1, 1)).squeeze(1)
+        has_valid_float = has_valid.to(dtype=xyz_err.dtype)
+        fde = (
+            (fde_per_sample * has_valid_float).sum()
+            / has_valid_float.sum().clamp_min(1.0)
+        )
         return {"xyz_ADE_m": ade, "xyz_FDE_m": fde}
 
     def training_step(self, batch: dict, batch_idx: int):
@@ -326,17 +391,29 @@ class RootRefinerLightningModule(pl.LightningModule):
                 "skipping optimizer step for this batch.",
                 loss.detach().item(), self.global_step, batch_idx,
             )
-            self.log("train/nonfinite_skip", 1.0, prog_bar=False, on_step=True, on_epoch=False)
+            self.log(
+                "train/nonfinite_skip",
+                1.0,
+                prog_bar=False,
+                on_step=True,
+                on_epoch=False,
+            )
             return None
         logger_cfg = self.cfg.get("logger") or {}
         wandb_cfg = logger_cfg.get("wandb") or {}
         exclude_log_keys = set(
             str(key) for key in (wandb_cfg.get("train_exclude_log_keys") or [])
         )
-        for k, v in losses.items():
-            if k in exclude_log_keys:
+        for key, value in losses.items():
+            if key in exclude_log_keys:
                 continue
-            self.log(f"train/{k}", v, prog_bar=True, on_step=True, on_epoch=False)
+            self.log(
+                f"train/{key}",
+                value,
+                prog_bar=True,
+                on_step=True,
+                on_epoch=False,
+            )
         return loss
 
     def validation_step(self, batch: dict, batch_idx: int, dataloader_idx: int = 0):
@@ -363,13 +440,13 @@ class RootRefinerLightningModule(pl.LightningModule):
             losses = self._compute_loss(out, batch, target_mask=metric_mask)
             if first_loss is None:
                 first_loss = losses["loss"]
-            for k, v in losses.items():
-                if log_keys is not None and k not in log_keys:
+            for key, value in losses.items():
+                if log_keys is not None and key not in log_keys:
                     continue
                 self.log(
-                    f"val_{suite_name}/{mode}/{k}",
-                    v,
-                    prog_bar=(k == "loss" and mode == "groundtruth_duration"),
+                    f"val_{suite_name}/{mode}/{key}",
+                    value,
+                    prog_bar=(key == "loss" and mode == "groundtruth_duration"),
                     on_step=False,
                     on_epoch=True,
                     sync_dist=True,

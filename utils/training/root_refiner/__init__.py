@@ -26,10 +26,9 @@ from .text_encoder import (
 )
 
 __all__ = [
+    "DATASET_DEFAULTS",
     "FixedRefinerSampleDataset",
     "FrozenStubTextEncoder",
-    "DATASET_DEFAULTS",
-    "masked_mean",
     "PrecomputedT5PooledTextEncoder",
     "RefinerSample",
     "RefinerSampleBuilder",
@@ -41,6 +40,7 @@ __all__ = [
     "build_root_refiner_dataset",
     "collate_fn",
     "copy_refiner_sample",
+    "masked_mean",
     "resolve_dataset_dir",
     "resolve_text_encoder",
     "second_order_diff_l2",

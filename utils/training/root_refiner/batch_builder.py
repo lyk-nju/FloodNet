@@ -1,12 +1,16 @@
+"""RootRefiner dataset, batch, and fixed-sample helpers."""
+
 from __future__ import annotations
 
 import copy
 import random as random_module
-import torch
-
 from pathlib import Path
 from typing import Any
+
+import torch
+
 from torch.utils.data import Dataset
+
 from utils.training.root_refiner.sample_builder import RefinerSampleBuilder
 from utils.training.root_refiner.sample_creator import RefinerSampleCreator
 
@@ -38,7 +42,8 @@ class RootRefinerBatchBuilder:
     ):
         self.n_hist = int(n_hist)
         self.n_path = int(n_path)
-        self.max_frames_value = int(max_frames)
+        self._max_frames = int(max_frames)
+        self.max_frames_value = self._max_frames
         self.min_frames = int(min_frames)
         self.full_plan_ratio = float(full_plan_ratio)
         self.horizon_policy = str(horizon_policy)
@@ -55,7 +60,7 @@ class RootRefinerBatchBuilder:
 
         self.sample_creator = RefinerSampleCreator(
             n_hist=self.n_hist,
-            max_frames=self.max_frames_value,
+            max_frames=self._max_frames,
             min_frames=self.min_frames,
             full_plan_ratio=self.full_plan_ratio,
             horizon_policy=self.horizon_policy,
@@ -70,7 +75,7 @@ class RootRefinerBatchBuilder:
         self.sample_builder = RefinerSampleBuilder(
             n_hist=self.n_hist,
             n_path=self.n_path,
-            max_frames=self.max_frames_value,
+            max_frames=self._max_frames,
             min_frames=self.min_frames,
             sparse_path_point_range=self.sparse_path_point_range,
             seed=seed,
@@ -78,7 +83,7 @@ class RootRefinerBatchBuilder:
 
     @property
     def max_frames(self) -> int:
-        return self.max_frames_value
+        return self._max_frames
 
     def reset_rng(self) -> None:
         self._rng = random_module.Random(self._seed)
@@ -149,17 +154,18 @@ class RootRefinerBatchBuilder:
         text: str,
         index: int,
     ) -> dict[str, Any]:
-        out = dict(sample)
-        out["motion_263"] = motion
-        out["text"] = text
-        out.setdefault("texts", [text])
-        out.setdefault("clip_idx", int(index))
-        out.setdefault("raw_id", out.get("name", str(index)))
-        out.setdefault("name", out.get("raw_id", str(index)))
-        out.setdefault("split_index", int(index))
-        out.setdefault("split_file", out.get("split_file"))
-        out.setdefault("dataset", out.get("dataset"))
-        return out
+        builder_sample = dict(sample)
+        builder_sample["motion_263"] = motion
+        builder_sample["text"] = text
+        builder_sample.setdefault("texts", [text])
+        builder_sample.setdefault("clip_idx", int(index))
+        builder_sample.setdefault("raw_id", builder_sample.get("name", str(index)))
+        builder_sample.setdefault("name", builder_sample.get("raw_id", str(index)))
+        builder_sample.setdefault("split_index", int(index))
+        builder_sample.setdefault("split_file", builder_sample.get("split_file"))
+        builder_sample.setdefault("dataset", builder_sample.get("dataset"))
+        return builder_sample
+
 
 class RootRefinerDataset(Dataset):
     """RootRefiner training adapter over a raw HumanML3D dataset."""
@@ -283,6 +289,7 @@ class RootRefinerDataset(Dataset):
         sample = self.raw_dataset[int(raw_idx)]
         return int(RootRefinerBatchBuilder._motion_of(sample).shape[0])
 
+
 def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     out: dict[str, Any] = {
         "text": [sample["text"] for sample in batch],
@@ -377,18 +384,18 @@ def build_fixed_samples(
         source.reset_rng()
 
     samples: list[dict[str, Any]] = []
-    for out_idx in range(int(num_samples)):
-        src_idx = out_idx % len(source)
+    for sample_idx in range(int(num_samples)):
+        source_idx = sample_idx % len(source)
         if hasattr(source, "get_sample"):
             sample = source.get_sample(
-                src_idx,
-                force_mode=_mode_for_index(mode_policy, out_idx),
+                source_idx,
+                force_mode=_mode_for_index(mode_policy, sample_idx),
                 force_no_path_aug=bool(force_no_path_aug),
                 force_text_idx=force_text_idx,
                 force_anchor_frame=force_anchor_frame,
             )
         else:
-            sample = source[src_idx]
+            sample = source[source_idx]
         samples.append(copy_refiner_sample(sample))
     return samples
 

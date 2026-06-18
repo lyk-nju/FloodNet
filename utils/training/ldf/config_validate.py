@@ -1,11 +1,4 @@
-"""Config consistency validation for the flag-gated 4D→7D traj migration (T_B_10).
-
-The 7D path is controlled by two flags that MUST agree:
-  - data.traj_feat_dim                 (dataset emits 4D or 7D traj_cond)
-  - model.params.traj_encoder_in_dim   (encoder consumes 4D or 7D)
-A mismatch silently feeds 7D data into a 4D encoder (or vice-versa). This module
-fails fast at startup instead.
-"""
+"""LDF training config consistency checks."""
 
 from __future__ import annotations
 
@@ -19,17 +12,16 @@ from utils.training.ldf.self_forcing_config import (
 from utils.training.ldf.t2m_generation_modes import resolve_t2m_generation_modes
 
 
+_WINDOW_POLICIES = {"prefix", "rolling"}
+_SAMPLE_POLICIES = {"variable_history", "fixed_window"}
+
+
 def validate_traj_dim_consistency(cfg) -> int:
-    """Check the two traj-dim flags agree and equal 7. Returns the dim (7).
-
-    The 4D legacy encoder was removed (FrameTrajEncoder is 7D-only), so a 4D
-    config now crashes at model construction — fail fast here with a clear
-    message. Defaults are 7 (matching the model's `traj_in_dim=7` default).
-
-    Raises ValueError on mismatch or any non-7 value.
-    """
+    """Check dataset and model trajectory feature dimensions."""
     data_dim = int(OmegaConf.select(cfg, "data.traj_feat_dim", default=7))
-    model_dim = int(OmegaConf.select(cfg, "model.params.traj_encoder_in_dim", default=7))
+    model_dim = int(
+        OmegaConf.select(cfg, "model.params.traj_encoder_in_dim", default=7)
+    )
     if data_dim != model_dim:
         raise ValueError(
             f"traj dim mismatch: data.traj_feat_dim={data_dim} != "
@@ -43,23 +35,9 @@ def validate_traj_dim_consistency(cfg) -> int:
 
 
 def validate_7d_requires_self_forcing(cfg) -> None:
-    """7D path requires self-forcing — fail fast otherwise. No-op for 4D.
-
-    The two correctness guarantees of the 7D traj path live ONLY inside the
-    self-forcing trainer:
-      - body_aux_loss, which is the SOLE supervision of the new 7D heading
-        channels (computed in SelfForcingTrainer; the regular _step path never
-        computes it), and
-      - the body-window world->local canonicalize (apply_body_window_canonicalize,
-        called only from the SF path) that matches the streaming-inference
-        distribution.
-    So a 7D config with self_forcing.enabled=false would silently train the new
-    heading channels unsupervised on uncanonicalized world-frame traj cond. The
-    in-SF "traj_encoder_in_dim=7 requires body_aux_loss" guard never runs when SF
-    is off, so enforce 7D => self_forcing here (at module construction).
-    """
-    dim = int(OmegaConf.select(cfg, "model.params.traj_encoder_in_dim", default=7))
-    if dim != 7:
+    """Require self-forcing for the 7D trajectory path."""
+    traj_dim = int(OmegaConf.select(cfg, "model.params.traj_encoder_in_dim", default=7))
+    if traj_dim != 7:
         return
     if not self_forcing_enabled(cfg):
         raise ValueError(
@@ -104,7 +82,7 @@ def validate_ldf_training_config(cfg) -> None:
             f"got {formulation!r}."
         )
     policy = str(OmegaConf.select(cfg, "ldf_training.window_policy", default="prefix"))
-    if policy not in {"prefix", "rolling"}:
+    if policy not in _WINDOW_POLICIES:
         raise ValueError(
             "ldf_training.window_policy must be 'prefix' or 'rolling'; "
             f"got {policy!r}."
@@ -150,14 +128,16 @@ def validate_ldf_training_config(cfg) -> None:
             default=chunk_size if policy == "rolling" else 1,
         )
     )
-    horizon_tokens = int(OmegaConf.select(cfg, "ldf_training.horizon_tokens", default=0))
+    horizon_tokens = int(
+        OmegaConf.select(cfg, "ldf_training.horizon_tokens", default=0)
+    )
     sample_policy = str(
         OmegaConf.select(cfg, "ldf_training.sample_policy", default="variable_history")
     )
     anchor_move = bool(
         OmegaConf.select(cfg, "ldf_training.anchor_move_in_rollout", default=False)
     )
-    if sample_policy not in {"variable_history", "fixed_window"}:
+    if sample_policy not in _SAMPLE_POLICIES:
         raise ValueError(
             "ldf_training.sample_policy must be 'variable_history' or "
             f"'fixed_window'; got {sample_policy!r}."
@@ -174,10 +154,20 @@ def validate_ldf_training_config(cfg) -> None:
                 "ldf_training.window_policy='rolling'."
             )
         ws_prefix = "ldf_training.window_sampling"
-        history_min = int(OmegaConf.select(cfg, f"{ws_prefix}.history_tokens_min", default=0))
-        history_max = OmegaConf.select(cfg, f"{ws_prefix}.history_tokens_max", default="auto")
-        horizon_min = int(OmegaConf.select(cfg, f"{ws_prefix}.horizon_tokens_min", default=0))
-        horizon_max = int(OmegaConf.select(cfg, f"{ws_prefix}.horizon_tokens_max", default=0))
+        history_min = int(
+            OmegaConf.select(cfg, f"{ws_prefix}.history_tokens_min", default=0)
+        )
+        history_max = OmegaConf.select(
+            cfg,
+            f"{ws_prefix}.history_tokens_max",
+            default="auto",
+        )
+        horizon_min = int(
+            OmegaConf.select(cfg, f"{ws_prefix}.horizon_tokens_min", default=0)
+        )
+        horizon_max = int(
+            OmegaConf.select(cfg, f"{ws_prefix}.horizon_tokens_max", default=0)
+        )
         stride = self_forcing_stride_tokens(cfg)
         schedule = self_forcing_k_schedule(cfg)
         max_k = 1
@@ -235,7 +225,8 @@ def validate_ldf_training_config(cfg) -> None:
     if policy == "rolling" and context_tokens < min_history_tokens:
         raise ValueError(
             "ldf_training.context_tokens must be >= min_history_tokens; "
-            f"got context_tokens={context_tokens}, min_history_tokens={min_history_tokens}"
+            f"got context_tokens={context_tokens}, "
+            f"min_history_tokens={min_history_tokens}"
         )
     if policy == "rolling" and horizon_tokens < 0:
         raise ValueError(

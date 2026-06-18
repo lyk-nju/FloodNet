@@ -1,6 +1,9 @@
+"""LDF model construction and precomputed text embedding helpers."""
+
 import torch
 
 from omegaconf import OmegaConf
+
 from utils.initialize import instantiate
 
 
@@ -71,3 +74,12 @@ def instantiate_ldf_model(target, params):
             expected_text_dim=getattr(model, "text_dim", 4096),
         )
     return model
+
+
+__all__ = [
+    "expand_precomputed_caption_keys",
+    "install_precomputed_text_embeddings",
+    "instantiate_ldf_model",
+    "load_precomputed_text_embeddings",
+    "prepare_model_params",
+]

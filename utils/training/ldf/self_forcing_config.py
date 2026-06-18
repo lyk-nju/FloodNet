@@ -1,3 +1,5 @@
+"""Self-forcing config accessors and runtime guards."""
+
 from __future__ import annotations
 
 from omegaconf import OmegaConf
@@ -24,11 +26,11 @@ def self_forcing_k_schedule(cfg) -> list[tuple[float, int]]:
         "self_forcing.k_schedule",
         DEFAULT_SELF_FORCING_K_SCHEDULE,
     )
-    out = [(float(p), int(k)) for p, k in schedule]
-    if not out:
+    rows = [(float(progress), int(k_value)) for progress, k_value in schedule]
+    if not rows:
         raise ValueError("self_forcing.k_schedule must not be empty")
-    out.sort(key=lambda x: x[0])
-    return out
+    rows.sort(key=lambda item: item[0])
+    return rows
 
 
 def validate_self_forcing_runtime_config(cfg, *, prediction_type: str) -> None:
@@ -53,18 +55,28 @@ def _select(cfg, key: str, default=None):
     except (AttributeError, TypeError, ValueError):
         pass
 
-    cur = cfg
+    current = cfg
     for part in key.split("."):
-        if isinstance(cur, dict):
-            if part not in cur:
+        if isinstance(current, dict):
+            if part not in current:
                 return default
-            cur = cur[part]
-        elif hasattr(cur, part):
-            cur = getattr(cur, part)
-        elif hasattr(cur, "get"):
-            cur = cur.get(part, default)
-            if cur is default:
+            current = current[part]
+        elif hasattr(current, part):
+            current = getattr(current, part)
+        elif hasattr(current, "get"):
+            current = current.get(part, default)
+            if current is default:
                 return default
         else:
             return default
-    return cur
+    return current
+
+
+__all__ = [
+    "DEFAULT_SELF_FORCING_K_SCHEDULE",
+    "self_forcing_detach_between_steps",
+    "self_forcing_enabled",
+    "self_forcing_k_schedule",
+    "self_forcing_stride_tokens",
+    "validate_self_forcing_runtime_config",
+]

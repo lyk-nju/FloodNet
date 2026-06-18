@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
-from dataclasses import dataclass
 from utils.ldf_condition import LDFCondition
 from utils.traj_batch import encode_traj_batch, get_traj_seq_lens
 
@@ -215,37 +216,43 @@ def prepare_text_context(
     encode_text,
 ):
     if use_text_cond and "text" in batch:
-        text_list = batch["text"]  # List[str] or List[List[str]]
+        text_list = batch["text"]
         if isinstance(text_list[0], list):
             text_end_list = batch["feature_text_end"]
             all_text_context = []
-            for i, (single_text_list, single_text_end_list) in enumerate(
+            for sample_idx, (single_text_list, single_text_end_list) in enumerate(
                 zip(text_list, text_end_list)
             ):
                 sample_dropped = (
-                    text_dropped_flags[i]
+                    text_dropped_flags[sample_idx]
                     if text_dropped_flags is not None
                     else False
                 )
                 if (not training) or (not sample_dropped):
                     single_text_end_list = [0] + [
-                        min(t, seq_len) for t in single_text_end_list
+                        min(end_token, seq_len)
+                        for end_token in single_text_end_list
                     ]
                 else:
                     single_text_list = [""]
                     single_text_end_list = [0, seq_len]
                 single_text_length_list = [
-                    t - b
-                    for t, b in zip(
+                    end_token - begin_token
+                    for end_token, begin_token in zip(
                         single_text_end_list[1:], single_text_end_list[:-1]
                     )
                 ]
                 single_text_context = encode_text(single_text_list, device)
                 single_text_context = [
-                    u.to(param_dtype) for u in single_text_context
+                    item.to(param_dtype) for item in single_text_context
                 ]
-                for u, duration in zip(single_text_context, single_text_length_list):
-                    all_text_context.extend([u for _ in range(duration)])
+                for context_item, duration in zip(
+                    single_text_context,
+                    single_text_length_list,
+                ):
+                    all_text_context.extend(
+                        [context_item for _ in range(duration)]
+                    )
                 all_text_context.extend(
                     [
                         single_text_context[-1]
@@ -255,17 +262,17 @@ def prepare_text_context(
         else:
             if training and text_dropped_flags is not None:
                 all_text_context = [
-                    ("" if text_dropped_flags[i] else u)
-                    for i, u in enumerate(text_list)
+                    ("" if text_dropped_flags[sample_idx] else text)
+                    for sample_idx, text in enumerate(text_list)
                 ]
             else:
                 all_text_context = list(text_list)
             all_text_context = encode_text(all_text_context, device)
-            all_text_context = [u.to(param_dtype) for u in all_text_context]
+            all_text_context = [item.to(param_dtype) for item in all_text_context]
     else:
         all_text_context = [""] * batch["feature"].shape[0]
         all_text_context = encode_text(all_text_context, device)
-        all_text_context = [u.to(param_dtype) for u in all_text_context]
+        all_text_context = [item.to(param_dtype) for item in all_text_context]
     return all_text_context
 
 

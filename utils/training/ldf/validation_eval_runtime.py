@@ -1,3 +1,5 @@
+"""Validation dataloader and metric-runtime helpers for LDF training."""
+
 from __future__ import annotations
 
 from lightning.pytorch.utilities import rank_zero_info
@@ -8,27 +10,32 @@ from utils.initialize import instantiate
 
 
 def build_generation_eval_cfg(cfg):
-    val_cfg = cfg.get("validation", {})
+    validation_cfg = cfg.get("validation", {})
     return {
-        "enabled": bool(val_cfg.get("eval_generation_metrics", True)),
-        "num_runs": int(val_cfg.get("eval_num_runs", 10)),
-        "seg_size": int(val_cfg.get("eval_seg_size", 20)),
-        "forward_ctrl_loss": bool(val_cfg.get("eval_forward_control_loss", True)),
-        "forward_ctrl_window_mode": str(
-            val_cfg.get("eval_forward_control_loss_window_mode", "mean_chunk_windows")
+        "enabled": bool(validation_cfg.get("eval_generation_metrics", True)),
+        "num_runs": int(validation_cfg.get("eval_num_runs", 10)),
+        "seg_size": int(validation_cfg.get("eval_seg_size", 20)),
+        "forward_ctrl_loss": bool(
+            validation_cfg.get("eval_forward_control_loss", True)
         ),
-        "eval_all_captions": bool(val_cfg.get("eval_all_captions", False)),
+        "forward_ctrl_window_mode": str(
+            validation_cfg.get(
+                "eval_forward_control_loss_window_mode",
+                "mean_chunk_windows",
+            )
+        ),
+        "eval_all_captions": bool(validation_cfg.get("eval_all_captions", False)),
     }
 
 
 def t2m_metric_enabled(cfg) -> bool:
-    val_cfg = cfg.get("validation", {})
-    return bool(val_cfg.get("t2m_metric", False))
+    validation_cfg = cfg.get("validation", {})
+    return bool(validation_cfg.get("t2m_metric", False))
 
 
 def validation_repeat_count(cfg) -> int:
-    val_cfg = cfg.get("validation", {})
-    return int(val_cfg.get("val_repeat", 1))
+    validation_cfg = cfg.get("validation", {})
+    return int(validation_cfg.get("val_repeat", 1))
 
 
 def control_loss_train_mode(cfg) -> int:
@@ -73,7 +80,7 @@ def build_probe_loaders(cfg, collate_fn):
         if meta_paths is not None:
             OmegaConf.update(probe_cfg_obj, "data.test_meta_paths", meta_paths)
         probe_dataset = instantiate(test_target, cfg=probe_cfg_obj, split="test")
-        dl_kwargs = dict(
+        dataloader_kwargs = dict(
             num_workers=cfg.data.num_workers,
             prefetch_factor=8 if cfg.data.num_workers > 0 else None,
             persistent_workers=cfg.data.num_workers > 0,
@@ -84,7 +91,11 @@ def build_probe_loaders(cfg, collate_fn):
             shuffle=False,
             drop_last=False,
             collate_fn=collate_fn,
-            **{k: v for k, v in dl_kwargs.items() if v is not None},
+            **{
+                key: value
+                for key, value in dataloader_kwargs.items()
+                if value is not None
+            },
         )
         loaders.append(probe_loader)
         tags.append(probe_tag)
@@ -105,3 +116,16 @@ def resolve_test_probe_tag(module, test_loader_idx: int) -> str:
     if 0 <= test_loader_idx < len(tags):
         return tags[test_loader_idx]
     return f"test_loader_{test_loader_idx}"
+
+
+__all__ = [
+    "build_generation_eval_cfg",
+    "build_probe_loaders",
+    "build_test_probe_tags",
+    "build_val_dataloaders",
+    "control_loss_train_mode",
+    "get_test_probe_tags",
+    "resolve_test_probe_tag",
+    "t2m_metric_enabled",
+    "validation_repeat_count",
+]

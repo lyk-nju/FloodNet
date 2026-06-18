@@ -1,3 +1,5 @@
+"""RootRefiner dataset construction from training config."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -44,7 +46,7 @@ def build_humanml3d_dataset_cfg(
     token_path: str | None = None,
     text_path: str | None = None,
     min_length: int = 1,
-    max_length: int = 10 ** 9,
+    max_length: int = 10**9,
     window_length: int | None = None,
     random_length: int = 0,
     traj_feat_dim: int = 4,
@@ -88,12 +90,12 @@ def build_root_refiner_dataset(
 ) -> RootRefinerDataset:
     validate_refiner_config(cfg)
     data_cfg = _section(cfg, "data")
-    target = data_cfg.get("target", "datasets.humanml3d.HumanML3DDataset")
-    if target != "datasets.humanml3d.HumanML3DDataset":
+    data_target = data_cfg.get("target", "datasets.humanml3d.HumanML3DDataset")
+    if data_target != "datasets.humanml3d.HumanML3DDataset":
         raise ValueError(
             "RootRefiner data.target must be "
             "'datasets.humanml3d.HumanML3DDataset'; "
-            f"got {target!r}."
+            f"got {data_target!r}."
         )
 
     model_cfg = _section(_section(cfg, "model"), "params")
@@ -126,7 +128,8 @@ def build_root_refiner_dataset(
         )
 
     dataset_name = str(data_cfg.get("dataset", "humanml3d"))
-    raw_cfg = build_humanml3d_dataset_cfg(
+    max_length = int(data_cfg.get("max_length", 10**9))
+    raw_dataset_cfg = build_humanml3d_dataset_cfg(
         raw_data_dir=data_cfg["raw_data_dir"],
         dataset=dataset_name,
         split_file=split_file or _default_split_file(data_cfg, split, dataset_name),
@@ -134,17 +137,15 @@ def build_root_refiner_dataset(
         token_path=data_cfg.get("token_path"),
         text_path=data_cfg.get("text_path"),
         min_length=int(data_cfg.get("min_length", 1)),
-        max_length=int(data_cfg.get("max_length", 10 ** 9)),
-        window_length=int(
-            data_cfg.get("window_length", data_cfg.get("max_length", 10 ** 9))
-        ),
+        max_length=max_length,
+        window_length=int(data_cfg.get("window_length", max_length)),
         random_length=int(data_cfg.get("random_length", 0)),
         traj_feat_dim=int(data_cfg.get("traj_feat_dim", 4)),
         smooth_traj_sigma=float(data_cfg.get("smooth_traj_sigma", 0.0)),
         return_text_all=True,
         debug=bool(cfg.get("debug", False)),
     )
-    raw_dataset = HumanML3DDataset(raw_cfg, split=split)
+    raw_dataset = HumanML3DDataset(raw_dataset_cfg, split=split)
     dataset = RootRefinerDataset(
         raw_dataset,
         n_hist=model_cfg["n_hist"],
@@ -165,9 +166,13 @@ def build_root_refiner_dataset(
         seed=seed,
         randomize_caption=randomize_caption,
     )
-    if validation_suite is not None and validation_suite.get("mode_policy") == "sliding":
+    if (
+        validation_suite is not None
+        and validation_suite.get("mode_policy") == "sliding"
+    ):
         dataset.valid_indices = [
-            idx for idx in dataset.valid_indices
+            idx
+            for idx in dataset.valid_indices
             if idx in dataset.sliding_eligible_indices
         ]
     return dataset
@@ -184,11 +189,17 @@ def _dataset_defaults(dataset: str) -> dict[str, str]:
 
 def _default_split_file(data_cfg: Mapping, split: str, dataset: str) -> str:
     if split == "train":
-        return data_cfg.get("train_split_file") or _dataset_defaults(dataset)["split_file"]
+        return data_cfg.get("train_split_file") or _dataset_defaults(dataset)[
+            "split_file"
+        ]
     if split == "val":
-        return data_cfg.get("val_split_file") or _dataset_defaults(dataset)["split_file"]
+        return data_cfg.get("val_split_file") or _dataset_defaults(dataset)[
+            "split_file"
+        ]
     if split == "test":
-        return data_cfg.get("test_split_file") or _dataset_defaults(dataset)["split_file"]
+        return data_cfg.get("test_split_file") or _dataset_defaults(dataset)[
+            "split_file"
+        ]
     return _dataset_defaults(dataset)["split_file"]
 
 

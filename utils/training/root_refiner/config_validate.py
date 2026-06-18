@@ -1,8 +1,4 @@
-"""RootRefiner config consistency checks.
-
-These guards capture experiment contracts that should fail before a run starts,
-instead of silently producing invalid training data or incompatible losses.
-"""
+"""RootRefiner config consistency checks."""
 
 from __future__ import annotations
 
@@ -15,6 +11,18 @@ _ALLOWED_PATH_MODES = {"dense_path", "sparse_path", "goal_point"}
 _ALLOWED_CANONICALIZATION_MODES = {"b_full"}
 _ALLOWED_CANONICALIZATION_ANCHORS = {"first_effective_frame"}
 _LEGACY_LOSS_KEYS = {"speed", "yaw_rate"}
+_LEGACY_DATA_KEYS = {"normalize", "stats_dir", "path_feature_stats_dir"}
+_REQUIRED_DATA_KEYS = {"target", "collate_fn", "train_bs", "val_bs", "num_workers"}
+_LEGACY_MODEL_KEYS = {
+    "min_tokens",
+    "max_tokens",
+    "frames_per_token",
+    "n_layers_token",
+    "decoder_type",
+    "decoder_path_cond_dim",
+    "decoder_token_res_depth",
+    "decoder_frame_res_depth",
+}
 
 
 def _section(cfg: Mapping, key: str) -> Mapping:
@@ -23,12 +31,7 @@ def _section(cfg: Mapping, key: str) -> Mapping:
 
 
 def validate_refiner_config(cfg: Mapping) -> None:
-    """Fail fast on invalid RootRefiner config combinations.
-
-    The function accepts plain dict-like configs because `train_refiner.py`
-    resolves YAML into dictionaries. RootRefiner uses the LDF-style
-    target/params schema and intentionally rejects the old `training` block.
-    """
+    """Fail fast on invalid RootRefiner config combinations."""
     model_block = _section(cfg, "model")
     model = _section(model_block, "params")
     data = _section(cfg, "data")
@@ -48,7 +51,7 @@ def validate_refiner_config(cfg: Mapping) -> None:
         raise ValueError("model.params is required for LDF-style RootRefiner config.")
     if not optimizer.get("target") or not isinstance(optimizer.get("params"), Mapping):
         raise ValueError("optimizer.target and optimizer.params are required.")
-    for key in ("target", "collate_fn", "train_bs", "val_bs", "num_workers"):
+    for key in sorted(_REQUIRED_DATA_KEYS):
         if key not in data:
             raise ValueError(f"data.{key} is required for RootRefiner config.")
 
@@ -56,8 +59,7 @@ def validate_refiner_config(cfg: Mapping) -> None:
         raise ValueError(
             "data.num_token_policy is legacy; use sampling.horizon_policy instead."
         )
-    legacy_data_keys = {"normalize", "stats_dir", "path_feature_stats_dir"}
-    legacy_data_present = sorted(set(data) & legacy_data_keys)
+    legacy_data_present = sorted(set(data) & _LEGACY_DATA_KEYS)
     if legacy_data_present:
         raise ValueError(
             "RootRefiner data config contains legacy normalize/stat key(s) "
@@ -77,17 +79,7 @@ def validate_refiner_config(cfg: Mapping) -> None:
             "RootRefiner frame range invalid: "
             f"min_frames={min_frames}, max_frames={max_frames}."
         )
-    legacy_model_keys = {
-        "min_tokens",
-        "max_tokens",
-        "frames_per_token",
-        "n_layers_token",
-        "decoder_type",
-        "decoder_path_cond_dim",
-        "decoder_token_res_depth",
-        "decoder_frame_res_depth",
-    }
-    legacy_present = sorted(set(model) & legacy_model_keys)
+    legacy_present = sorted(set(model) & _LEGACY_MODEL_KEYS)
     if legacy_present:
         raise ValueError(
             "RootRefiner model.params contains legacy token/decoder key(s) "
@@ -170,11 +162,11 @@ def validate_refiner_config(cfg: Mapping) -> None:
                 f"got {anchor!r}."
             )
     if "full_plan_valid_history_frames" in canonicalization:
-        n_hist = int(canonicalization["full_plan_valid_history_frames"])
-        if n_hist != 1:
+        valid_history_frames = int(canonicalization["full_plan_valid_history_frames"])
+        if valid_history_frames != 1:
             raise ValueError(
                 "canonicalization.full_plan_valid_history_frames must be 1, "
-                f"got {n_hist}."
+                f"got {valid_history_frames}."
             )
 
 

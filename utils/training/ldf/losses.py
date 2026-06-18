@@ -1,3 +1,5 @@
+"""LDF masked loss and trajectory-control helpers."""
+
 from __future__ import annotations
 
 import torch
@@ -6,37 +8,36 @@ import torch.nn.functional as F
 from utils.motion_process import extract_root_trajectory_263_torch
 
 
-# ===========================================================================
-# T_B_06: body aux loss (heading + physical root control) — pure core.
-# Operates on already-recovered poses (no VAE), so it is fully unit-testable.
-# ===========================================================================
-
-
 def masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Mean of `x` over the True/nonzero entries of `mask` (same shape)."""
-    m = mask.to(x.dtype)
-    return (x * m).sum() / m.sum().clamp(min=1.0)
+    mask_float = mask.to(x.dtype)
+    return (x * mask_float).sum() / mask_float.sum().clamp(min=1.0)
 
 
-def masked_smooth_l1(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor,
-                     beta: float = 1.0) -> torch.Tensor:
-    """SmoothL1 between pred/gt, summed over the last (feature) dim if present,
-    then masked-mean over the remaining (frame) dims. `mask` is frame-level."""
+def masked_smooth_l1(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    mask: torch.Tensor,
+    beta: float = 1.0,
+) -> torch.Tensor:
+    """Frame-masked SmoothL1, summing feature channels when present."""
     diff = F.smooth_l1_loss(pred, gt, reduction="none", beta=beta)
     if diff.dim() > mask.dim():
         diff = diff.sum(-1)
     return masked_mean(diff, mask)
 
 
-def last_valid_smooth_l1(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor,
-                         beta: float = 1.0) -> torch.Tensor:
-    """SmoothL1 on the last valid frame of each sample.
-
-    `mask` is expected to be frame-level [B, T]. Samples with no valid frames do
-    not contribute. Feature dimensions are summed before averaging over samples.
-    """
+def last_valid_smooth_l1(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    mask: torch.Tensor,
+    beta: float = 1.0,
+) -> torch.Tensor:
+    """SmoothL1 on the last valid frame of each sample."""
     if mask.dim() != 2:
-        raise ValueError(f"last_valid_smooth_l1 expects a [B,T] mask, got {tuple(mask.shape)}")
+        raise ValueError(
+            f"last_valid_smooth_l1 expects a [B,T] mask, got {tuple(mask.shape)}"
+        )
     valid = mask > 0
     valid_counts = valid.long().sum(dim=1)
     has_valid = valid_counts > 0
@@ -57,19 +58,13 @@ def last_valid_smooth_l1(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tenso
 
 
 def derive_fwd_yaw_delta(xyz: torch.Tensor, yaw: torch.Tensor):
-    """Per-frame forward displacement + yaw change from (xyz, physical yaw).
-
-    Matches utils/motion_process.root_to_traj_feats_7d: fwd_delta = projection of
-    the per-frame xz displacement onto the heading direction; yaw_delta =
-    wrap(yaw[t]-yaw[t-1]); both 0 at the first frame. xyz: [..., T, 3];
-    yaw: [..., T]. Returns (fwd_delta [..., T], yaw_delta [..., T]).
-    """
+    """Per-frame forward displacement and yaw change from root pose."""
     from utils.local_frame import heading_dir_xz, wrap_angle
 
     delta_xz = torch.zeros_like(xyz[..., [0, 2]])
     delta_xz[..., 1:, :] = xyz[..., 1:, :][..., [0, 2]] - xyz[..., :-1, :][..., [0, 2]]
-    fwd_dir = heading_dir_xz(yaw)                       # [..., T, 2]
-    fwd_delta = (delta_xz * fwd_dir).sum(-1)            # [..., T]
+    fwd_dir = heading_dir_xz(yaw)
+    fwd_delta = (delta_xz * fwd_dir).sum(-1)
     yaw_delta = torch.zeros_like(yaw)
     yaw_delta[..., 1:] = wrap_angle(yaw[..., 1:] - yaw[..., :-1])
     return fwd_delta, yaw_delta
@@ -100,81 +95,93 @@ def canonicalize_pose_to_anchor(
     return local_xyz, local_yaw
 
 
-def body_aux_loss_terms(pred_xyz, pred_yaw, gt_xyz, gt_yaw, active_mask,
-                        weights: dict, heading_form: str = "cosine",
-                        sample_loss_mask=None):
+def body_aux_loss_terms(
+    pred_xyz,
+    pred_yaw,
+    gt_xyz,
+    gt_yaw,
+    active_mask,
+    weights: dict,
+    heading_form: str = "cosine",
+    sample_loss_mask=None,
+):
     """Body-aux loss terms over the active frames.
 
     pred_xyz/gt_xyz: [B, T, 3]; pred_yaw/gt_yaw: [B, T] (physical yaw);
     active_mask: [B, T] (bool/float); sample_loss_mask: optional [B] (0 zeroes a
     whole invalid sample, e.g. T_B_05 padding anchor). Returns (total, per_term).
 
-    P1-3 (v1, intentional): fwd_delta / yaw_delta supervise the ACTIVE-WINDOW
-    INTERNAL dynamics — derived (derive_fwd_yaw_delta) from the sliced pred/gt,
+    P1-3 (v1, intentional): fwd_delta / yaw_delta supervise the active-window
+    internal dynamics from the sliced pred/gt,
     NOT a direct per-frame loss vs the dataset 7D channels; the first active
     frame's delta is 0 (no previous frame in the window). To strictly supervise
-    the 7D delta channels, include one pre-active frame when slicing — deferred
+    the 7D delta channels, include one pre-active frame when slicing; deferred
     unless the body speed profile proves off.
     """
     mask = active_mask.to(pred_xyz.dtype)
     if sample_loss_mask is not None:
-        mask = mask * sample_loss_mask.to(mask.dtype).view(-1, *([1] * (mask.dim() - 1)))
+        sample_mask = sample_loss_mask.to(mask.dtype).view(
+            -1,
+            *([1] * (mask.dim() - 1)),
+        )
+        mask = mask * sample_mask
 
-    l_root_xz = masked_smooth_l1(pred_xyz[..., [0, 2]], gt_xyz[..., [0, 2]], mask)
-    l_end_xz = last_valid_smooth_l1(
+    loss_root_xz = masked_smooth_l1(
+        pred_xyz[..., [0, 2]],
+        gt_xyz[..., [0, 2]],
+        mask,
+    )
+    loss_end_xz = last_valid_smooth_l1(
         pred_xyz[..., [0, 2]], gt_xyz[..., [0, 2]], mask
     )
-    l_root_y = masked_smooth_l1(pred_xyz[..., 1:2], gt_xyz[..., 1:2], mask)
+    loss_root_y = masked_smooth_l1(pred_xyz[..., 1:2], gt_xyz[..., 1:2], mask)
 
     pred_h = torch.stack([torch.cos(pred_yaw), torch.sin(pred_yaw)], -1)
     gt_h = torch.stack([torch.cos(gt_yaw), torch.sin(gt_yaw)], -1)
     if heading_form == "cosine":
-        l_heading_raw = 1.0 - (pred_h * gt_h).sum(-1)
+        heading_raw = 1.0 - (pred_h * gt_h).sum(-1)
     else:
-        l_heading_raw = F.smooth_l1_loss(pred_h, gt_h, reduction="none").sum(-1)
-    l_heading = masked_mean(l_heading_raw, mask)
+        heading_raw = F.smooth_l1_loss(pred_h, gt_h, reduction="none").sum(-1)
+    loss_heading = masked_mean(heading_raw, mask)
 
     pred_fwd, pred_yawd = derive_fwd_yaw_delta(pred_xyz, pred_yaw)
     gt_fwd, gt_yawd = derive_fwd_yaw_delta(gt_xyz, gt_yaw)
-    l_fwd = masked_smooth_l1(pred_fwd, gt_fwd, mask)
-    l_yawd = masked_smooth_l1(pred_yawd, gt_yawd, mask)
+    loss_fwd = masked_smooth_l1(pred_fwd, gt_fwd, mask)
+    loss_yawd = masked_smooth_l1(pred_yawd, gt_yawd, mask)
 
     total = (
-        weights["root_xz"] * l_root_xz
-        + weights["root_y"] * l_root_y
-        + weights["heading"] * l_heading
-        + weights["fwd_delta"] * l_fwd
-        + weights["yaw_delta"] * l_yawd
-        + weights.get("end_xz", 0.0) * l_end_xz
+        weights["root_xz"] * loss_root_xz
+        + weights["root_y"] * loss_root_y
+        + weights["heading"] * loss_heading
+        + weights["fwd_delta"] * loss_fwd
+        + weights["yaw_delta"] * loss_yawd
+        + weights.get("end_xz", 0.0) * loss_end_xz
     )
     terms = {
-        "root_xz": l_root_xz, "root_y": l_root_y, "heading": l_heading,
-        "fwd_delta": l_fwd, "yaw_delta": l_yawd, "end_xz": l_end_xz,
+        "root_xz": loss_root_xz,
+        "root_y": loss_root_y,
+        "heading": loss_heading,
+        "fwd_delta": loss_fwd,
+        "yaw_delta": loss_yawd,
+        "end_xz": loss_end_xz,
     }
     return total, terms
 
 
 def compute_body_aux_loss(
     pred_list,
-    gt_traj_7d,                # [B, T_frame, 7] clip-local raw traj_cond_7d (GT)
-    traj_length,               # [B] valid frame count
+    gt_traj_7d,
+    traj_length,
     vae,
     device,
     weights: dict,
     chunk_size_tokens: int | None = None,
     heading_form: str = "cosine",
-    sample_loss_mask=None,     # [B] from T_B_05 (0 = invalid sample)
+    sample_loss_mask=None,
     token_to_frame: int = 4,
     window_start_tokens=None,
 ):
-    """Body aux loss over the active window (design §2.4).
-
-    Decodes each predicted latent ONCE (vae.decode) and recovers (xyz, physical
-    yaw); all five terms + GT reuse that single decode. GT (xyz + heading) is the
-    clip-local raw 7D traj_cond (same frame as the decoded pred). Returns
-    `(loss, term_metrics)` frame-weighted across the batch, or `(None, {})` when
-    no active frames remain.
-    """
+    """Body auxiliary loss over the active window."""
     from utils.local_frame import root_quat_to_physical_yaw
     from utils.motion_process import recover_root_rot_pos
 
@@ -183,52 +190,69 @@ def compute_body_aux_loss(
         k: 0.0
         for k in ("root_xz", "root_y", "heading", "fwd_delta", "yaw_delta", "end_xz")
     }
-    total_n = 0.0
-    for i in range(len(pred_list)):
-        pred_latent = pred_list[i].to(device)
-        t_tok = pred_latent.size(0)
-        if chunk_size_tokens is not None and t_tok > chunk_size_tokens:
+    total_weight = 0.0
+    for sample_idx in range(len(pred_list)):
+        pred_latent = pred_list[sample_idx].to(device)
+        num_tokens = pred_latent.size(0)
+        if chunk_size_tokens is not None and num_tokens > chunk_size_tokens:
             from utils.token_frame import token_start_frame
-            start_tok = t_tok - chunk_size_tokens
-            start_f = token_start_frame(start_tok, token_to_frame)   # P1-2: canonical helper
+
+            start_token = num_tokens - chunk_size_tokens
+            start_frame = token_start_frame(start_token, token_to_frame)
         else:
-            start_f = 0
+            start_frame = 0
 
-        decoded = vae.decode(pred_latent.unsqueeze(0))[0].float()    # [T, 263] — single decode
-        quat, xyz = recover_root_rot_pos(decoded.unsqueeze(0))       # [1,T,4],[1,T,3]
-        yaw = root_quat_to_physical_yaw(quat)                        # [1,T]
+        decoded = vae.decode(pred_latent.unsqueeze(0))[0].float()
+        quat, xyz = recover_root_rot_pos(decoded.unsqueeze(0))
+        yaw = root_quat_to_physical_yaw(quat)
 
-        gt_len = min(int(traj_length[i].item()), gt_traj_7d.shape[1])
-        end_f = min(decoded.size(0), gt_len)
-        if start_f >= end_f:
+        gt_len = min(int(traj_length[sample_idx].item()), gt_traj_7d.shape[1])
+        end_frame = min(decoded.size(0), gt_len)
+        if start_frame >= end_frame:
             continue
-        sl = slice(start_f, end_f)
-        gt7 = gt_traj_7d[i:i + 1, sl, :].to(device=device, dtype=xyz.dtype)
-        gt_xyz = gt7[..., :3]
-        gt_yaw = torch.atan2(gt7[..., 4], gt7[..., 3])
-        pred_xyz = xyz[:, sl, :]
-        pred_yaw = yaw[:, sl]
+        frame_slice = slice(start_frame, end_frame)
+        target_7d = gt_traj_7d[sample_idx:sample_idx + 1, frame_slice, :].to(
+            device=device,
+            dtype=xyz.dtype,
+        )
+        gt_xyz = target_7d[..., :3]
+        gt_yaw = torch.atan2(target_7d[..., 4], target_7d[..., 3])
+        pred_xyz = xyz[:, frame_slice, :]
+        pred_yaw = yaw[:, frame_slice]
         if window_start_tokens is not None:
             from utils.token_frame import token_start_frame
 
             if not torch.is_tensor(window_start_tokens):
-                starts = torch.as_tensor(window_start_tokens, device=device, dtype=torch.long)
+                starts = torch.as_tensor(
+                    window_start_tokens,
+                    device=device,
+                    dtype=torch.long,
+                )
             else:
                 starts = window_start_tokens.to(device=device, dtype=torch.long)
             if starts.ndim == 0:
                 starts = starts.repeat(len(pred_list))
-            anchor_f = token_start_frame(int(starts[i].item()), token_to_frame)
-            if anchor_f >= gt_len:
+            anchor_frame = token_start_frame(
+                int(starts[sample_idx].item()),
+                token_to_frame,
+            )
+            if anchor_frame >= gt_len:
                 raise ValueError(
                     "window_start_tokens must reference a valid GT anchor frame; "
-                    f"sample={i}, start_token={int(starts[i].item())}, "
-                    f"anchor_frame={anchor_f}, traj_length={gt_len}"
+                    f"sample={sample_idx}, "
+                    f"start_token={int(starts[sample_idx].item())}, "
+                    f"anchor_frame={anchor_frame}, traj_length={gt_len}"
                 )
-            anchor7 = gt_traj_7d[i:i + 1, anchor_f:anchor_f + 1, :].to(
-                device=device, dtype=xyz.dtype
+            anchor_7d = gt_traj_7d[
+                sample_idx:sample_idx + 1,
+                anchor_frame:anchor_frame + 1,
+                :,
+            ].to(
+                device=device,
+                dtype=xyz.dtype,
             )
-            anchor_xyz = anchor7[..., :3]
-            anchor_yaw = torch.atan2(anchor7[..., 4], anchor7[..., 3])
+            anchor_xyz = anchor_7d[..., :3]
+            anchor_yaw = torch.atan2(anchor_7d[..., 4], anchor_7d[..., 3])
             pred_xyz, pred_yaw = canonicalize_pose_to_anchor(
                 pred_xyz, pred_yaw, anchor_xyz, anchor_yaw
             )
@@ -236,30 +260,36 @@ def compute_body_aux_loss(
                 gt_xyz, gt_yaw, anchor_xyz, anchor_yaw
             )
 
-        n_frames = end_f - start_f
-        slm_i = None
+        num_frames = end_frame - start_frame
+        sample_mask_i = None
         sample_w = 1.0
         if sample_loss_mask is not None:
-            sample_w = float(sample_loss_mask[i])
-            slm_i = sample_loss_mask[i:i + 1].to(device)
-        active_mask = torch.ones(1, n_frames, device=device, dtype=xyz.dtype)
+            sample_w = float(sample_loss_mask[sample_idx])
+            sample_mask_i = sample_loss_mask[sample_idx:sample_idx + 1].to(device)
+        active_mask = torch.ones(1, num_frames, device=device, dtype=xyz.dtype)
 
         total_i, terms_i = body_aux_loss_terms(
-            pred_xyz, pred_yaw, gt_xyz, gt_yaw, active_mask, weights,
-            heading_form=heading_form, sample_loss_mask=slm_i,
+            pred_xyz,
+            pred_yaw,
+            gt_xyz,
+            gt_yaw,
+            active_mask,
+            weights,
+            heading_form=heading_form,
+            sample_loss_mask=sample_mask_i,
         )
-        n_eff = n_frames * sample_w
-        if n_eff <= 0:
+        effective_frames = num_frames * sample_w
+        if effective_frames <= 0:
             continue
-        weighted_losses.append(total_i * n_eff)
-        for k in term_sums:
-            term_sums[k] += float(terms_i[k].detach()) * n_eff
-        total_n += n_eff
+        weighted_losses.append(total_i * effective_frames)
+        for key in term_sums:
+            term_sums[key] += float(terms_i[key].detach()) * effective_frames
+        total_weight += effective_frames
 
-    if total_n <= 0 or not weighted_losses:
+    if total_weight <= 0 or not weighted_losses:
         return None, {}
-    loss = torch.stack(weighted_losses).sum() / total_n
-    metrics = {k: v / total_n for k, v in term_sums.items()}
+    loss = torch.stack(weighted_losses).sum() / total_weight
+    metrics = {key: value / total_weight for key, value in term_sums.items()}
     return loss, metrics
 
 
@@ -274,8 +304,7 @@ def compute_control_loss_xz(
     chunk_size_tokens: int | None = None,
     token_to_frame: int = 4,
 ):
-    """
-    XZ-plane trajectory control loss. Behaviour is selected by train_mode:
+    """XZ-plane trajectory control loss.
 
       Mode 1 - active window, absolute coords, no detach
       Mode 2 - active window, absolute coords, detach past tokens
@@ -289,51 +318,64 @@ def compute_control_loss_xz(
     relative_disp = train_mode in (5, 6)
     relative_disp_gt_anchor = train_mode == 6
 
-    loss_control = 0.0
-    n_valid = 0.0
-    for i in range(len(pred_list)):
-        pred_latent_full = pred_list[i].to(device)
-        t_tok = pred_latent_full.size(0)
+    control_loss = 0.0
+    valid_count = 0.0
+    for sample_idx in range(len(pred_list)):
+        pred_latent_full = pred_list[sample_idx].to(device)
+        num_tokens = pred_latent_full.size(0)
 
-        if chunk_size_tokens is not None and t_tok > chunk_size_tokens:
+        if chunk_size_tokens is not None and num_tokens > chunk_size_tokens:
             from utils.token_frame import token_start_frame
-            start_tok = t_tok - chunk_size_tokens
-            start_f = token_start_frame(start_tok, token_to_frame)   # P1-2: canonical helper
-            end_f = t_tok * token_to_frame   # legacy: clamped to decoded length below
-        else:
-            start_tok = 0
-            start_f = 0
-            end_f = None
 
-        if detach_past and start_tok > 0:
+            start_token = num_tokens - chunk_size_tokens
+            start_frame = token_start_frame(start_token, token_to_frame)
+            end_frame = num_tokens * token_to_frame
+        else:
+            start_token = 0
+            start_frame = 0
+            end_frame = None
+
+        if detach_past and start_token > 0:
             latent_for_decode = torch.cat(
-                [pred_latent_full[:start_tok].detach(), pred_latent_full[start_tok:]],
+                [
+                    pred_latent_full[:start_token].detach(),
+                    pred_latent_full[start_token:],
+                ],
                 dim=0,
             )
         else:
             latent_for_decode = pred_latent_full
 
         decoded = vae.decode(latent_for_decode.unsqueeze(0))[0].float()
-        l_motion = decoded.size(0)
-        l_gt_total = min(int(traj_length[i].item()), traj.shape[1])
+        pred_frame_count = decoded.size(0)
+        target_frame_count = min(int(traj_length[sample_idx].item()), traj.shape[1])
 
-        if use_active_window and end_f is not None:
-            pred_sl = slice(min(start_f, l_motion), min(end_f, l_motion))
-            gt_sl = slice(min(start_f, l_gt_total), min(end_f, l_gt_total))
+        if use_active_window and end_frame is not None:
+            pred_slice = slice(
+                min(start_frame, pred_frame_count),
+                min(end_frame, pred_frame_count),
+            )
+            target_slice = slice(
+                min(start_frame, target_frame_count),
+                min(end_frame, target_frame_count),
+            )
         else:
-            pred_sl = slice(0, l_motion)
-            gt_sl = slice(0, l_gt_total)
+            pred_slice = slice(0, pred_frame_count)
+            target_slice = slice(0, target_frame_count)
 
-        l_cur = min(pred_sl.stop - pred_sl.start, gt_sl.stop - gt_sl.start)
-        if l_cur <= 0:
+        frame_count = min(
+            pred_slice.stop - pred_slice.start,
+            target_slice.stop - target_slice.start,
+        )
+        if frame_count <= 0:
             continue
 
         pred_traj_full = extract_root_trajectory_263_torch(decoded.unsqueeze(0))
-        pred_traj = pred_traj_full[:, pred_sl, :][:, :l_cur, :]
-        gt_traj = traj[i, gt_sl, :][:l_cur].unsqueeze(0).to(
+        pred_traj = pred_traj_full[:, pred_slice, :][:, :frame_count, :]
+        gt_traj = traj[sample_idx, target_slice, :][:frame_count].unsqueeze(0).to(
             pred_traj.device, dtype=pred_traj.dtype
         )
-        mask = traj_mask[i, gt_sl][:l_cur].unsqueeze(0).to(
+        mask = traj_mask[sample_idx, target_slice][:frame_count].unsqueeze(0).to(
             pred_traj.device, dtype=pred_traj.dtype
         )
 
@@ -351,9 +393,9 @@ def compute_control_loss_xz(
                 gt_xz = gt_xz - gt_xz[:, 0:1, :]
 
         sq_err = ((pred_xz - gt_xz) ** 2).sum(dim=-1)
-        loss_control = loss_control + (mask * sq_err).sum()
-        n_valid += mask.sum().item()
+        control_loss = control_loss + (mask * sq_err).sum()
+        valid_count += mask.sum().item()
 
-    if n_valid <= 0:
+    if valid_count <= 0:
         return None
-    return loss_control / n_valid
+    return control_loss / valid_count

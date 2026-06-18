@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
-from dataclasses import dataclass
 from utils.local_frame import canonicalize_7d
 from utils.motion_process import recover_root_rot_pos, root_to_traj_feats_7d
 from utils.token_frame import (
@@ -26,24 +27,37 @@ def _as_long_1d(value, *, batch_size: int, device, name: str) -> torch.Tensor:
         out = out.expand(batch_size)
     if out.numel() != batch_size:
         raise ValueError(
-            f"{name} must be scalar or length {batch_size}; got shape {tuple(out.shape)}"
+            f"{name} must be scalar or length {batch_size}; "
+            f"got shape {tuple(out.shape)}"
         )
     return out
 
 
 def _frames_for_tokens_tensor(tokens: torch.Tensor) -> torch.Tensor:
     values = [num_frames_for_tokens(int(v.item())) for v in tokens.view(-1)]
-    return torch.as_tensor(values, device=tokens.device, dtype=torch.long).view_as(tokens)
+    return torch.as_tensor(
+        values,
+        device=tokens.device,
+        dtype=torch.long,
+    ).view_as(tokens)
 
 
 def _start_frames_tensor(tokens: torch.Tensor) -> torch.Tensor:
     values = [token_start_frame(int(v.item())) for v in tokens.view(-1)]
-    return torch.as_tensor(values, device=tokens.device, dtype=torch.long).view_as(tokens)
+    return torch.as_tensor(
+        values,
+        device=tokens.device,
+        dtype=torch.long,
+    ).view_as(tokens)
 
 
 def _tokens_for_frames_tensor(frames: torch.Tensor) -> torch.Tensor:
     values = [num_tokens_for_frame_len(int(v.item())) for v in frames.view(-1)]
-    return torch.as_tensor(values, device=frames.device, dtype=torch.long).view_as(frames)
+    return torch.as_tensor(
+        values,
+        device=frames.device,
+        dtype=torch.long,
+    ).view_as(frames)
 
 
 def resolve_history_tokens_max(
@@ -178,81 +192,101 @@ def sample_stream_window_indices(
     horizon_values: list[torch.Tensor] = []
     horizon_cap_values: list[torch.Tensor] = []
     horizon_short_fallback_values: list[torch.Tensor] = []
-    for b in range(batch_size):
-        t_len = int(lengths[b].item())
-        horizon_cap_clip = t_len - chunk_size - rollout_span
+    for batch_idx in range(batch_size):
+        token_count = int(lengths[batch_idx].item())
+        horizon_cap_clip = token_count - chunk_size - rollout_span
         if horizon_cap_clip < horizon_abs_min:
             raise ValueError(
                 "stream window sampling requires a full horizon inside the clip; "
-                f"sample={b}, token_length={t_len}, "
+                f"sample={batch_idx}, token_length={token_count}, "
                 f"horizon_cap_clip={horizon_cap_clip}, "
                 f"horizon_abs_min={horizon_abs_min}"
             )
         short_fallback = horizon_cap_clip < horizon_pref_min
-        h_low = horizon_pref_min if not short_fallback else horizon_abs_min
-        h_hi = min(horizon_tokens_max, horizon_cap_clip)
-        if h_hi < h_low:
+        horizon_low = horizon_pref_min if not short_fallback else horizon_abs_min
+        horizon_high = min(horizon_tokens_max, horizon_cap_clip)
+        if horizon_high < horizon_low:
             raise ValueError(
                 "stream window sampling found no valid horizon range; "
-                f"sample={b}, horizon_low={h_low}, horizon_high={h_hi}, "
+                f"sample={batch_idx}, horizon_low={horizon_low}, "
+                f"horizon_high={horizon_high}, "
                 f"horizon_cap_clip={horizon_cap_clip}"
             )
         if horizon_override is None:
-            h = torch.randint(h_low, h_hi + 1, (1,), device=device)[0]
+            horizon_value = torch.randint(
+                horizon_low,
+                horizon_high + 1,
+                (1,),
+                device=device,
+            )[0]
         else:
-            h = horizon_override[b]
-            h_int = int(h.item())
-            if h_int < h_low or h_int > h_hi:
+            horizon_value = horizon_override[batch_idx]
+            horizon_int = int(horizon_value.item())
+            if horizon_int < horizon_low or horizon_int > horizon_high:
                 raise ValueError(
                     "horizon_tokens must be within the complete per-clip range; "
-                    f"sample={b}, horizon_tokens={h_int}, valid_range="
-                    f"[{h_low}, {h_hi}]"
+                    f"sample={batch_idx}, horizon_tokens={horizon_int}, "
+                    f"valid_range=[{horizon_low}, {horizon_high}]"
                 )
 
-        low_a = history_tokens_min
-        high_a = t_len - chunk_size - rollout_span - int(h.item())
-        if high_a < low_a:
+        active_low = history_tokens_min
+        active_high = (
+            token_count - chunk_size - rollout_span - int(horizon_value.item())
+        )
+        if active_high < active_low:
             raise ValueError(
                 "stream window sampling requires room for active chunk, rollout, "
                 "chosen horizon, and minimum history; "
-                f"sample={b}, token_length={t_len}, low_active_left={low_a}, "
-                f"high_active_left={high_a}, chosen_horizon={int(h.item())}"
+                f"sample={batch_idx}, token_length={token_count}, "
+                f"low_active_left={active_low}, high_active_left={active_high}, "
+                f"chosen_horizon={int(horizon_value.item())}"
             )
 
         if active_override is None:
-            a = torch.randint(low_a, high_a + 1, (1,), device=device)[0]
+            active_value = torch.randint(
+                active_low,
+                active_high + 1,
+                (1,),
+                device=device,
+            )[0]
         else:
-            a = active_override[b]
-            if int(a.item()) < low_a or int(a.item()) > high_a:
+            active_value = active_override[batch_idx]
+            active_int = int(active_value.item())
+            if active_int < active_low or active_int > active_high:
                 raise ValueError(
                     "active_left_tokens must allow full horizon and minimum history; "
-                    f"sample={b}, active_left={int(a.item())}, "
-                    f"valid_range=[{low_a}, {high_a}]"
+                    f"sample={batch_idx}, active_left={active_int}, "
+                    f"valid_range=[{active_low}, {active_high}]"
                 )
 
-        g_hi = min(history_max_eff, int(a.item()))
-        if g_hi < history_tokens_min:
+        history_high = min(history_max_eff, int(active_value.item()))
+        if history_high < history_tokens_min:
             raise ValueError(
                 "stream window sampling found no valid history length; "
-                f"sample={b}, active_left={int(a.item())}, "
+                f"sample={batch_idx}, active_left={int(active_value.item())}, "
                 f"history_tokens_min={history_tokens_min}, "
                 f"history_tokens_max_effective={history_max_eff}"
             )
         if history_override is None:
-            g = torch.randint(history_tokens_min, g_hi + 1, (1,), device=device)[0]
+            history_value = torch.randint(
+                history_tokens_min,
+                history_high + 1,
+                (1,),
+                device=device,
+            )[0]
         else:
-            g = history_override[b]
-            g_int = int(g.item())
-            if g_int < history_tokens_min or g_int > g_hi:
+            history_value = history_override[batch_idx]
+            history_int = int(history_value.item())
+            if history_int < history_tokens_min or history_int > history_high:
                 raise ValueError(
                     "history_tokens must fit before active_left and inside context; "
-                    f"sample={b}, history_tokens={g_int}, valid_range="
-                    f"[{history_tokens_min}, {g_hi}]"
+                    f"sample={batch_idx}, history_tokens={history_int}, "
+                    f"valid_range=[{history_tokens_min}, {history_high}]"
                 )
 
-        active_values.append(a.to(dtype=torch.long))
-        history_values.append(g.to(dtype=torch.long))
-        horizon_values.append(h.to(dtype=torch.long))
+        active_values.append(active_value.to(dtype=torch.long))
+        history_values.append(history_value.to(dtype=torch.long))
+        horizon_values.append(horizon_value.to(dtype=torch.long))
         horizon_cap_values.append(
             torch.as_tensor(horizon_cap_clip, device=device, dtype=torch.long)
         )
@@ -346,7 +380,9 @@ class SampleCreator:
     def _create_batch(self, batch: dict) -> dict:
         token = batch["token"]
         if token.ndim != 3:
-            raise ValueError(f"batch['token'] must be [B,T,D], got {tuple(token.shape)}")
+            raise ValueError(
+                f"batch['token'] must be [B,T,D], got {tuple(token.shape)}"
+            )
         batch_size = int(token.shape[0])
         device = token.device
         token_length = _as_long_1d(
@@ -368,10 +404,14 @@ class SampleCreator:
 
         max_latent_len = int(latent_lengths.max().item())
         feature = token.new_zeros(batch_size, max_latent_len, int(token.shape[-1]))
-        for b in range(batch_size):
-            start = int(starts[b].item())
-            valid = int(latent_lengths[b].item())
-            feature[b, :valid, :] = token[b, start:start + valid, :]
+        for batch_idx in range(batch_size):
+            start_token = int(starts[batch_idx].item())
+            valid_tokens = int(latent_lengths[batch_idx].item())
+            feature[batch_idx, :valid_tokens, :] = token[
+                batch_idx,
+                start_token:start_token + valid_tokens,
+                :,
+            ]
 
         model_batch = batch.copy()
         model_batch.pop("token_mask", None)
@@ -382,10 +422,13 @@ class SampleCreator:
         if "token_mask" in batch:
             token_mask = batch["token_mask"].to(device=device, dtype=torch.float32)
             token_mask_out = token_mask.new_zeros(batch_size, max_latent_len)
-            for b in range(batch_size):
-                start = int(starts[b].item())
-                valid = int(latent_lengths[b].item())
-                token_mask_out[b, :valid] = token_mask[b, start:start + valid]
+            for batch_idx in range(batch_size):
+                start_token = int(starts[batch_idx].item())
+                valid_tokens = int(latent_lengths[batch_idx].item())
+                token_mask_out[batch_idx, :valid_tokens] = token_mask[
+                    batch_idx,
+                    start_token:start_token + valid_tokens,
+                ]
             model_batch["latent_token_mask"] = token_mask_out
         if "token_text_end" in batch:
             model_batch["feature_text_end"] = batch["token_text_end"]
@@ -401,9 +444,13 @@ class SampleCreator:
         if vae is None:
             raise ValueError("stream SampleCreator requires a VAE for online encode")
         if "feature" not in batch:
-            raise ValueError("stream SampleCreator requires raw batch['feature'] motion")
+            raise ValueError(
+                "stream SampleCreator requires raw batch['feature'] motion"
+            )
         if "feature_length" not in batch:
-            raise ValueError("stream SampleCreator requires raw batch['feature_length']")
+            raise ValueError(
+                "stream SampleCreator requires raw batch['feature_length']"
+            )
         raw_feature = batch["feature"]
         if (
             raw_feature.ndim != 3
@@ -425,7 +472,8 @@ class SampleCreator:
         max_raw_frames = int(raw_feature.shape[1])
         if bool((raw_lengths < 0).any()) or bool((raw_lengths > max_raw_frames).any()):
             raise ValueError(
-                "raw_feature_length/feature_length must be within the raw feature tensor frame range "
+                "raw_feature_length/feature_length must be within the raw feature "
+                "tensor frame range "
                 f"[0, {max_raw_frames}]; got {raw_lengths.tolist()}"
             )
 
@@ -449,18 +497,22 @@ class SampleCreator:
         encoded_windows: list[torch.Tensor] = []
         start_frames = sample.global_start_frames.to(device=device)
         frame_lengths = sample.latent_frame_lengths.to(device=device)
-        for b in range(batch_size):
-            start_frame = int(start_frames[b].item())
-            frame_len = int(frame_lengths[b].item())
-            stop_frame = start_frame + frame_len
-            raw_len = int(raw_lengths[b].item())
-            if stop_frame > raw_len:
+        for batch_idx in range(batch_size):
+            start_frame = int(start_frames[batch_idx].item())
+            frame_count = int(frame_lengths[batch_idx].item())
+            stop_frame = start_frame + frame_count
+            raw_frame_count = int(raw_lengths[batch_idx].item())
+            if stop_frame > raw_frame_count:
                 raise ValueError(
                     "online VAE encode window exceeds raw feature length; "
-                    f"sample={b}, start_frame={start_frame}, frame_len={frame_len}, "
-                    f"raw_feature_length={raw_len}"
+                    f"sample={batch_idx}, start_frame={start_frame}, "
+                    f"frame_len={frame_count}, raw_feature_length={raw_frame_count}"
                 )
-            raw_window = raw_feature[b : b + 1, start_frame:stop_frame, :]
+            raw_window = raw_feature[
+                batch_idx:batch_idx + 1,
+                start_frame:stop_frame,
+                :,
+            ]
             with torch.no_grad():
                 encoded = vae.encode(raw_window)
             if encoded.ndim != 3 or encoded.shape[0] != 1:
@@ -468,13 +520,13 @@ class SampleCreator:
                     "online VAE encode must return [1,T,D] for each motion window; "
                     f"got {tuple(encoded.shape)}"
                 )
-            valid = int(latent_lengths[b].item())
-            if int(encoded.shape[1]) != valid:
+            valid_tokens = int(latent_lengths[batch_idx].item())
+            if int(encoded.shape[1]) != valid_tokens:
                 raise ValueError(
                     "online VAE token count mismatch: sampled token count does not "
                     "match VAE encode output; "
-                    f"sample={b}, sampled_tokens={valid}, "
-                    f"encoded_tokens={int(encoded.shape[1])}, frame_len={frame_len}"
+                    f"sample={batch_idx}, sampled_tokens={valid_tokens}, "
+                    f"encoded_tokens={int(encoded.shape[1])}, frame_len={frame_count}"
                 )
             encoded_windows.append(encoded[0])
 
@@ -482,16 +534,18 @@ class SampleCreator:
         if "token" in batch and torch.is_tensor(batch["token"]):
             token = batch["token"]
             if token.ndim != 3:
-                raise ValueError(f"batch['token'] must be [B,T,D], got {tuple(token.shape)}")
+                raise ValueError(
+                    f"batch['token'] must be [B,T,D], got {tuple(token.shape)}"
+                )
             if int(token.shape[-1]) != latent_dim:
                 raise ValueError(
                     "online VAE latent dim mismatch with dataset token dim; "
                     f"encoded_dim={latent_dim}, token_dim={int(token.shape[-1])}"
                 )
         feature = encoded_windows[0].new_zeros(batch_size, max_latent_len, latent_dim)
-        for b, encoded in enumerate(encoded_windows):
-            valid = int(latent_lengths[b].item())
-            feature[b, :valid, :] = encoded.to(
+        for batch_idx, encoded in enumerate(encoded_windows):
+            valid_tokens = int(latent_lengths[batch_idx].item())
+            feature[batch_idx, :valid_tokens, :] = encoded.to(
                 device=device,
                 dtype=feature.dtype,
             )
@@ -500,10 +554,13 @@ class SampleCreator:
         if batch.get("token_mask") is not None:
             token_mask_src = batch["token_mask"].to(device=device, dtype=torch.float32)
             token_mask_out = token_mask_src.new_zeros(batch_size, max_latent_len)
-            for b in range(batch_size):
-                start = int(starts[b].item())
-                valid = int(latent_lengths[b].item())
-                token_mask_out[b, :valid] = token_mask_src[b, start:start + valid]
+            for batch_idx in range(batch_size):
+                start_token = int(starts[batch_idx].item())
+                valid_tokens = int(latent_lengths[batch_idx].item())
+                token_mask_out[batch_idx, :valid_tokens] = token_mask_src[
+                    batch_idx,
+                    start_token:start_token + valid_tokens,
+                ]
 
         traj_part = self._create_local_traj_batch(
             raw_feature_263=raw_feature,
@@ -545,7 +602,9 @@ class SampleCreator:
         out["_window_local_latent_valid_len"] = latent_lengths
         out["_window_local_sample_policy"] = sample.sample_policy
         if stream_sample is not None:
-            out["_window_sampling_active_left_token"] = stream_sample["active_left_tokens"]
+            out["_window_sampling_active_left_token"] = stream_sample[
+                "active_left_tokens"
+            ]
             out["_window_sampling_history_tokens"] = stream_sample["history_tokens"]
             out["_window_sampling_horizon_tokens"] = stream_sample["horizon_tokens"]
             out["_window_sampling_horizon_cap_clip"] = stream_sample["horizon_cap_clip"]
@@ -603,8 +662,13 @@ class SampleCreator:
                 )
             latent_tokens = torch.stack(
                 [
-                    torch.randint(low, int(max_latent[b].item()) + 1, (1,), device=device)[0]
-                    for b in range(batch_size)
+                    torch.randint(
+                        low,
+                        int(max_latent[batch_idx].item()) + 1,
+                        (1,),
+                        device=device,
+                    )[0]
+                    for batch_idx in range(batch_size)
                 ]
             ).to(dtype=torch.long)
         if bool((latent_tokens <= 0).any()):
@@ -612,7 +676,8 @@ class SampleCreator:
         if bool((latent_tokens > max_latent).any()):
             raise ValueError(
                 "prefix-window latent length must fit token_length; "
-                f"latent_tokens={latent_tokens.tolist()}, max_latent={max_latent.tolist()}"
+                f"latent_tokens={latent_tokens.tolist()}, "
+                f"max_latent={max_latent.tolist()}"
             )
         starts = torch.zeros_like(lengths)
         return self._make_sample(
@@ -672,11 +737,11 @@ class SampleCreator:
                 [
                     torch.randint(
                         history_min,
-                        int(history_high[b].item()) + 1,
+                        int(history_high[batch_idx].item()) + 1,
                         (1,),
                         device=device,
                     )[0]
-                    for b in range(batch_size)
+                    for batch_idx in range(batch_size)
                 ]
             ).to(dtype=torch.long)
             stream_sample = sample_stream_window_indices(
@@ -744,11 +809,11 @@ class SampleCreator:
                     [
                         torch.randint(
                             self.min_history_tokens,
-                            int(lengths[b].item()) + 1,
+                            int(lengths[batch_idx].item()) + 1,
                             (1,),
                             device=device,
                         )[0]
-                        for b in range(batch_size)
+                        for batch_idx in range(batch_size)
                     ]
                 ).to(dtype=torch.long)
             else:
@@ -770,8 +835,13 @@ class SampleCreator:
             max_start = (lengths - self.context_tokens).clamp(min=0)
             starts = torch.stack(
                 [
-                    torch.randint(0, int(max_start[b].item()) + 1, (1,), device=device)[0]
-                    for b in range(batch_size)
+                    torch.randint(
+                        0,
+                        int(max_start[batch_idx].item()) + 1,
+                        (1,),
+                        device=device,
+                    )[0]
+                    for batch_idx in range(batch_size)
                 ]
             ).to(dtype=torch.long)
         else:
@@ -883,45 +953,58 @@ class SampleCreator:
         expected_lengths: list[int] = []
         available_lengths: list[int] = []
         traj_windows: list[torch.Tensor] = []
-        for b in range(batch_size):
-            start = int(starts[b].item())
-            count = int(counts[b].item())
-            raw_len = int(raw_lengths[b].item())
-            origin_frame = token_start_frame(start, self.frames_per_token)
-            if origin_frame >= raw_len:
+        for batch_idx in range(batch_size):
+            start_token = int(starts[batch_idx].item())
+            token_count = int(counts[batch_idx].item())
+            raw_frame_count = int(raw_lengths[batch_idx].item())
+            origin_frame = token_start_frame(start_token, self.frames_per_token)
+            if origin_frame >= raw_frame_count:
                 raise ValueError(
                     "window-local trajectory requires a valid origin; "
-                    f"sample={b}, start_token={start}, origin_frame={origin_frame}, "
-                    f"raw_feature_length={raw_len}"
+                    f"sample={batch_idx}, start_token={start_token}, "
+                    f"origin_frame={origin_frame}, "
+                    f"raw_feature_length={raw_frame_count}"
                 )
             if local_prefix:
-                expected_len = num_frames_for_tokens(count, self.frames_per_token)
-                available_stop = min(origin_frame + expected_len, raw_len)
+                expected_len = num_frames_for_tokens(
+                    token_count,
+                    self.frames_per_token,
+                )
+                available_stop = min(origin_frame + expected_len, raw_frame_count)
                 available_len = max(0, available_stop - origin_frame)
-                raw_window = raw_feature_263[b : b + 1, origin_frame:available_stop, :]
+                raw_window = raw_feature_263[
+                    batch_idx:batch_idx + 1,
+                    origin_frame:available_stop,
+                    :,
+                ]
                 if raw_window.shape[1] <= 0:
                     raise ValueError(
                         "window-local trajectory produced an empty raw window; "
-                        f"sample={b}, start_token={start}, expected_len={expected_len}, "
-                        f"raw_feature_length={raw_len}"
+                        f"sample={batch_idx}, start_token={start_token}, "
+                        f"expected_len={expected_len}, "
+                        f"raw_feature_length={raw_frame_count}"
                     )
                 root_quat, root_xyz = recover_root_rot_pos(raw_window)
                 traj7 = root_to_traj_feats_7d(root_quat, root_xyz).squeeze(0)
             else:
                 frame_slice = token_range_to_frame_slice(
-                    start,
-                    count,
+                    start_token,
+                    token_count,
                     self.frames_per_token,
                 )
                 expected_len = int(frame_slice.stop - frame_slice.start)
-                available_stop = min(int(frame_slice.stop), raw_len)
+                available_stop = min(int(frame_slice.stop), raw_frame_count)
                 available_len = max(0, available_stop - int(frame_slice.start))
-                raw_full = raw_feature_263[b : b + 1, :raw_len, :]
+                raw_full = raw_feature_263[
+                    batch_idx:batch_idx + 1,
+                    :raw_frame_count,
+                    :,
+                ]
                 if raw_full.shape[1] <= 0:
                     raise ValueError(
                         "window-local trajectory produced an empty raw window; "
-                        f"sample={b}, frame_slice={frame_slice}, "
-                        f"raw_feature_length={raw_len}"
+                        f"sample={batch_idx}, frame_slice={frame_slice}, "
+                        f"raw_feature_length={raw_frame_count}"
                     )
                 root_quat, root_xyz = recover_root_rot_pos(raw_full)
                 full_traj7 = root_to_traj_feats_7d(root_quat, root_xyz).squeeze(0)
@@ -941,10 +1024,10 @@ class SampleCreator:
         max_expected_len = max(expected_lengths) if expected_lengths else 0
         traj_features = raw_feature_263.new_zeros(batch_size, max_expected_len, 7)
         traj_mask = raw_feature_263.new_zeros(batch_size, max_expected_len)
-        for b, traj7 in enumerate(traj_windows):
-            valid = int(available_lengths[b])
-            traj_features[b, :valid, :] = traj7[:valid]
-            traj_mask[b, :valid] = 1.0
+        for batch_idx, traj7 in enumerate(traj_windows):
+            valid_frames = int(available_lengths[batch_idx])
+            traj_features[batch_idx, :valid_frames, :] = traj7[:valid_frames]
+            traj_mask[batch_idx, :valid_frames] = 1.0
 
         return {
             "traj_features": traj_features,
@@ -988,35 +1071,52 @@ class SampleCreator:
             traj_features = src7.new_zeros(batch_size, max_traj_frames, src7.shape[-1])
             traj_mask = src7.new_zeros(batch_size, max_traj_frames)
             traj_lengths: list[int] = []
-            for b in range(batch_size):
+            for batch_idx in range(batch_size):
                 frames = num_frames_for_tokens(
-                    int(traj_token_lengths[b].item()),
+                    int(traj_token_lengths[batch_idx].item()),
                     self.frames_per_token,
                 )
                 valid_src_frames = (
-                    int(source_lengths[b].item())
+                    int(source_lengths[batch_idx].item())
                     if source_lengths is not None
                     else int(src7.shape[1])
                 )
                 valid_src_frames = max(0, min(valid_src_frames, int(src7.shape[1])))
                 available = min(frames, valid_src_frames)
                 traj_lengths.append(available)
-                traj_features[b, :available, :] = src7[b, :available, :]
+                traj_features[batch_idx, :available, :] = src7[
+                    batch_idx,
+                    :available,
+                    :,
+                ]
                 if src_mask is not None:
                     mask_available = min(available, int(src_mask.shape[1]))
-                    traj_mask[b, :mask_available] = src_mask[b, :mask_available].to(
-                        device=device,
-                        dtype=traj_mask.dtype,
+                    traj_mask[batch_idx, :mask_available] = src_mask[
+                        batch_idx,
+                        :mask_available,
+                    ].to(
+                        device=device, dtype=traj_mask.dtype,
                     )
                 else:
-                    traj_mask[b, :available] = 1.0
+                    traj_mask[batch_idx, :available] = 1.0
             model_batch["traj_features"] = traj_features
             model_batch["traj_cond_7d"] = traj_features
             if src_traj is not None:
-                traj = src_traj.new_zeros(batch_size, max_traj_frames, src_traj.shape[-1])
-                for b in range(batch_size):
-                    available = min(int(traj_lengths[b]), int(src_traj.shape[1]))
-                    traj[b, :available, :] = src_traj[b, :available, :]
+                traj = src_traj.new_zeros(
+                    batch_size,
+                    max_traj_frames,
+                    src_traj.shape[-1],
+                )
+                for batch_idx in range(batch_size):
+                    available = min(
+                        int(traj_lengths[batch_idx]),
+                        int(src_traj.shape[1]),
+                    )
+                    traj[batch_idx, :available, :] = src_traj[
+                        batch_idx,
+                        :available,
+                        :,
+                    ]
                 model_batch["traj"] = traj
             model_batch["traj_mask"] = traj_mask
             model_batch["traj_cond_mask"] = traj_mask
@@ -1039,28 +1139,34 @@ class SampleCreator:
             traj = src_traj.new_zeros(batch_size, max_traj_frames, src_traj.shape[-1])
             traj_mask = src_traj.new_zeros(batch_size, max_traj_frames)
             traj_lengths: list[int] = []
-            for b in range(batch_size):
+            for batch_idx in range(batch_size):
                 frames = num_frames_for_tokens(
-                    int(traj_token_lengths[b].item()),
+                    int(traj_token_lengths[batch_idx].item()),
                     self.frames_per_token,
                 )
                 valid_src_frames = (
-                    int(source_lengths[b].item())
+                    int(source_lengths[batch_idx].item())
                     if source_lengths is not None
                     else int(src_traj.shape[1])
                 )
                 valid_src_frames = max(0, min(valid_src_frames, int(src_traj.shape[1])))
                 available = min(frames, valid_src_frames)
                 traj_lengths.append(available)
-                traj[b, :available, :] = src_traj[b, :available, :]
+                traj[batch_idx, :available, :] = src_traj[
+                    batch_idx,
+                    :available,
+                    :,
+                ]
                 if src_mask is not None:
                     mask_available = min(available, int(src_mask.shape[1]))
-                    traj_mask[b, :mask_available] = src_mask[b, :mask_available].to(
-                        device=device,
-                        dtype=traj_mask.dtype,
+                    traj_mask[batch_idx, :mask_available] = src_mask[
+                        batch_idx,
+                        :mask_available,
+                    ].to(
+                        device=device, dtype=traj_mask.dtype,
                     )
                 else:
-                    traj_mask[b, :available] = 1.0
+                    traj_mask[batch_idx, :available] = 1.0
             model_batch["traj"] = traj
             model_batch["traj_mask"] = traj_mask
             model_batch["traj_length"] = torch.as_tensor(
@@ -1078,7 +1184,6 @@ class SampleCreator:
 
     @staticmethod
     def _copy_trajectory_fields(batch, model_batch) -> None:
-        # T_B_09: prefer world-frame 7D traj cond when present.
         if "traj_cond_7d" in batch:
             model_batch["traj_features"] = batch["traj_cond_7d"]
             model_batch["traj"] = batch.get("traj_cond", batch.get("traj"))
@@ -1121,8 +1226,8 @@ class SampleCreator:
             return
         cropped_text: list[list[str]] = []
         cropped_end: list[list[int]] = []
-        for b, segments in enumerate(text):
-            ends = token_text_end[b]
+        for batch_idx, segments in enumerate(text):
+            ends = token_text_end[batch_idx]
             if torch.is_tensor(ends):
                 ends = [int(v) for v in ends.view(-1).tolist()]
             else:
@@ -1130,7 +1235,7 @@ class SampleCreator:
             if len(segments) != len(ends):
                 raise ValueError(
                     "text/end schedule mismatch for segmented text: "
-                    f"sample={b}, text_segments={len(segments)}, "
+                    f"sample={batch_idx}, text_segments={len(segments)}, "
                     f"endpoints={len(ends)}"
                 )
             prev = 0
@@ -1138,11 +1243,11 @@ class SampleCreator:
                 if int(end) < prev:
                     raise ValueError(
                         "segmented text token endpoints must be monotonic; "
-                        f"sample={b}, endpoints={ends}"
+                        f"sample={batch_idx}, endpoints={ends}"
                     )
                 prev = int(end)
-            window_start = int(starts[b].item())
-            window_end = window_start + int(latent_lengths[b].item())
+            window_start = int(starts[batch_idx].item())
+            window_end = window_start + int(latent_lengths[batch_idx].item())
             prev_end = 0
             sample_text: list[str] = []
             sample_end: list[int] = []
@@ -1158,10 +1263,10 @@ class SampleCreator:
                 sample_end.append(inter_end - window_start)
             if not sample_text:
                 sample_text = [""]
-                sample_end = [int(latent_lengths[b].item())]
-            elif sample_end[-1] < int(latent_lengths[b].item()):
+                sample_end = [int(latent_lengths[batch_idx].item())]
+            elif sample_end[-1] < int(latent_lengths[batch_idx].item()):
                 sample_text.append("")
-                sample_end.append(int(latent_lengths[b].item()))
+                sample_end.append(int(latent_lengths[batch_idx].item()))
             cropped_text.append(sample_text)
             cropped_end.append(sample_end)
         batch["text"] = cropped_text

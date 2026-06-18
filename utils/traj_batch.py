@@ -1,4 +1,9 @@
-"""Trajectory batch utilities for DiffForcing/WanModel trajectory conditioning."""
+"""Trajectory conditioning batch helpers.
+
+This module converts frame-level root trajectory features into causal-VAE token
+windows and masks. The legacy 4D path-heading path is kept for older WanModel
+callers; physical 7D root features live in `utils.motion_process`.
+"""
 
 from __future__ import annotations
 
@@ -18,15 +23,7 @@ _PATH_HEADING_EPS = 1e-8
 
 
 def smooth_root_xz(root_xz: np.ndarray, sigma: float = 2.0) -> np.ndarray:
-    """Gaussian-smooth the xz root trajectory to reduce high-frequency jitter.
-
-    Args:
-        root_xz: (T, 2) array of [x, z] root positions.
-        sigma:   Gaussian sigma in frames. 0.0 disables smoothing (returns copy).
-
-    Returns:
-        Smoothed (T, 2) float32 array.  The original array is not modified.
-    """
+    """Gaussian-smooth root XZ positions; `sigma <= 0` returns a float32 copy."""
     if sigma <= 0.0:
         return root_xz.astype(np.float32)
     from scipy.ndimage import gaussian_filter1d
@@ -37,20 +34,12 @@ def smooth_root_xz(root_xz: np.ndarray, sigma: float = 2.0) -> np.ndarray:
 
 
 def root_to_traj_feats(traj_xyz, eps: float = _PATH_HEADING_EPS):
-    """Convert root xyz to legacy path-heading features [x, z, cos, sin].
-
-    Accepts either:
-      - numpy ndarray (T, 3), returning numpy (T, 4)
-      - torch Tensor (B, T, 3), returning torch (B, T, 4)
-
-    This is path direction, not physical root yaw. The 7D physical-yaw path lives
-    in utils.motion_process.root_to_traj_feats_7d.
-    """
+    """Convert root xyz to legacy path-heading features `[x, z, cos, sin]`."""
     if isinstance(traj_xyz, np.ndarray):
         arr = np.asarray(traj_xyz, dtype=np.float64)
-        t_len = arr.shape[0]
+        num_frames = arr.shape[0]
         x, z = arr[:, 0:1], arr[:, 2:3]
-        if t_len == 1:
+        if num_frames == 1:
             heading = [
                 np.ones((1, 1), dtype=np.float64),
                 np.zeros((1, 1), dtype=np.float64),
@@ -94,28 +83,34 @@ def root_to_traj_feats(traj_xyz, eps: float = _PATH_HEADING_EPS):
 
 
 def frames_to_tokens(feats_frame: torch.Tensor, seq_len: int) -> torch.Tensor:
-    """Group frame-level features into causal-VAE token windows.
-
-    Args:
-        feats_frame: (B, T_frame, C), padded/truncated internally.
-        seq_len:     number of output tokens N.
-    Returns:
-        (B, N, 4, C)
-    """
-    B, T_frame, C = feats_frame.shape
+    """Group frame-level features into causal-VAE token windows `[B, N, 4, C]`."""
+    batch_size, num_input_frames, channels = feats_frame.shape
     total_causal = num_frames_for_tokens(seq_len)
-    if T_frame < total_causal:
-        pad = feats_frame.new_zeros(B, total_causal - T_frame, C)
+    if num_input_frames < total_causal:
+        pad = feats_frame.new_zeros(
+            batch_size,
+            total_causal - num_input_frames,
+            channels,
+        )
         feats_frame = torch.cat([feats_frame, pad], dim=1)
     feats_frame = feats_frame[:, :total_causal, :]
-    tok0 = feats_frame[:, 0:1, :].unsqueeze(2).expand(-1, -1, 4, -1)
+    token0 = (
+        feats_frame[:, 0:1, :]
+        .unsqueeze(2)
+        .expand(-1, -1, FRAMES_PER_TOKEN_DEFAULT, -1)
+    )
     if seq_len > 1:
-        rest = feats_frame[:, 1:, :].reshape(B, seq_len - 1, 4, C)
-        return torch.cat([tok0, rest], dim=1)
-    return tok0
+        rest = feats_frame[:, 1:, :].reshape(
+            batch_size,
+            seq_len - 1,
+            FRAMES_PER_TOKEN_DEFAULT,
+            channels,
+        )
+        return torch.cat([token0, rest], dim=1)
+    return token0
 
 
-def _as_single_start_token(start_token_idx) -> int:
+def _single_start_token(start_token_idx) -> int:
     if torch.is_tensor(start_token_idx):
         start_token_idx = int(start_token_idx.item())
     elif isinstance(start_token_idx, (list, tuple)):
@@ -154,15 +149,9 @@ def frames_to_tokens_range(
     start_token_idx: int | torch.Tensor,
     num_tokens: int,
     *,
-    frames_per_token: int = 4,
+    frames_per_token: int = FRAMES_PER_TOKEN_DEFAULT,
 ) -> torch.Tensor:
-    """Group frame-level features for an arbitrary token range.
-
-    ``frames_to_tokens`` is the causal-prefix helper for ``[0, N)``. For a
-    rolling range ``[S, S + N)`` where ``S > 0``, every local token covers four
-    effective frames. ``feats_frame`` is expected to be window-relative: local
-    frame 0 corresponds to ``token_start_frame(S)``.
-    """
+    """Group window-relative frame features for token range `[start, start + N)`."""
     per_sample_starts = _per_sample_start_tokens(start_token_idx, feats_frame.shape[0])
     if per_sample_starts is not None:
         return torch.cat(
@@ -178,26 +167,30 @@ def frames_to_tokens_range(
             dim=0,
         )
 
-    start_token_idx = _as_single_start_token(start_token_idx)
+    start_token_idx = _single_start_token(start_token_idx)
     if num_tokens <= 0:
-        B, _, C = feats_frame.shape
-        return feats_frame.new_zeros(B, 0, frames_per_token, C)
+        batch_size, _, channels = feats_frame.shape
+        return feats_frame.new_zeros(batch_size, 0, frames_per_token, channels)
     if start_token_idx == 0:
         return frames_to_tokens(feats_frame, num_tokens)
 
-    B, T_frame, C = feats_frame.shape
+    batch_size, num_input_frames, channels = feats_frame.shape
     origin_frame = token_start_frame(start_token_idx, frames_per_token)
     groups = []
     for i in range(num_tokens):
         token_idx = start_token_idx + i
         rel_start = token_start_frame(token_idx, frames_per_token) - origin_frame
         rel_stop = token_end_frame(token_idx, frames_per_token) + 1 - origin_frame
-        if rel_start >= T_frame:
-            chunk = feats_frame.new_zeros(B, 0, C)
+        if rel_start >= num_input_frames:
+            chunk = feats_frame.new_zeros(batch_size, 0, channels)
         else:
-            chunk = feats_frame[:, rel_start:min(rel_stop, T_frame), :]
+            chunk = feats_frame[:, rel_start:min(rel_stop, num_input_frames), :]
         if chunk.shape[1] < frames_per_token:
-            pad = feats_frame.new_zeros(B, frames_per_token - chunk.shape[1], C)
+            pad = feats_frame.new_zeros(
+                batch_size,
+                frames_per_token - chunk.shape[1],
+                channels,
+            )
             chunk = torch.cat([chunk, pad], dim=1)
         groups.append(chunk[:, :frames_per_token, :].unsqueeze(1))
     return torch.cat(groups, dim=1)
@@ -208,7 +201,7 @@ def frames_to_token_mask_range(
     num_tokens: int,
     *,
     start_token_idx: int | torch.Tensor = 0,
-    frames_per_token: int = 4,
+    frames_per_token: int = FRAMES_PER_TOKEN_DEFAULT,
 ) -> torch.Tensor:
     """Aggregate a window-relative frame mask to token mask by OR."""
     grouped = frames_to_tokens_range(
@@ -221,14 +214,17 @@ def frames_to_token_mask_range(
 
 
 def _traj_source(x: dict):
-    """The traj tensor encode_traj_batch would use (source priority)."""
+    """Return the frame-level trajectory source, following encoder priority."""
     for key in ("traj_features", "traj_cond", "traj"):
         if key in x and x[key] is not None:
             return x[key]
     return None
 
 
-def _resolve_traj_start_token(x: dict, explicit: int | torch.Tensor | None = None):
+def _resolve_traj_start_token(
+    x: dict,
+    explicit: int | torch.Tensor | None = None,
+) -> int | torch.Tensor:
     value = x.get("traj_start_token", 0) if explicit is None else explicit
     if torch.is_tensor(value):
         if value.numel() == 1:
@@ -260,6 +256,7 @@ def _copy_token_mask_to_frame_mask(
     *,
     batch_index: int | None = None,
 ) -> None:
+    """Copy token validity into the frame spans covered by each token."""
     origin_frame = token_start_frame(start_token_idx, frames_per_token)
     _, num_tokens = token_mask.shape
     total_frames = frame_mask.shape[-1]
@@ -290,46 +287,57 @@ def _copy_token_mask_to_frame_mask(
 
 def build_traj_frame_mask(
     x: dict,
-    tf: int,
+    num_frames: int,
     device,
     *,
-    frames_per_token: int = 4,
+    frames_per_token: int = FRAMES_PER_TOKEN_DEFAULT,
     traj_start_token: int | None = None,
 ):
-    """Frame-level traj mask [B, tf] (1=valid) from traj_cond_mask/traj_mask, or a
-    token_mask expanded to frame level. Padded/truncated to `tf`. None if neither
-    is present. Single source for the frame-mask derivation (no second copy)."""
+    """Build frame-level trajectory mask `[B, num_frames]`.
+
+    Prefer explicit frame masks (`traj_cond_mask` / `traj_mask`). If unavailable,
+    expand `token_mask` through the causal token/frame layout.
+    """
     cond_mask = x.get("traj_cond_mask", x.get("traj_mask"))
     if cond_mask is not None:
-        mf = cond_mask.to(device=device, dtype=torch.float32)
+        frame_mask = cond_mask.to(device=device, dtype=torch.float32)
     elif x.get("token_mask") is not None:
-        tm = x["token_mask"].to(device=device, dtype=torch.float32)
-        B_tm, _ = tm.shape
-        mf = tm.new_zeros(B_tm, tf)
+        token_mask = x["token_mask"].to(device=device, dtype=torch.float32)
+        batch_size, _ = token_mask.shape
+        frame_mask = token_mask.new_zeros(batch_size, num_frames)
         start_token_idx = _resolve_traj_start_token(x, traj_start_token)
-        per_sample_starts = _per_sample_start_tokens(start_token_idx, B_tm)
+        per_sample_starts = _per_sample_start_tokens(start_token_idx, batch_size)
         if per_sample_starts is None:
-            start_token_idx = _as_single_start_token(start_token_idx)
+            start_token_idx = _single_start_token(start_token_idx)
             _copy_token_mask_to_frame_mask(
-                mf,
-                tm,
+                frame_mask,
+                token_mask,
                 start_token_idx,
                 frames_per_token,
             )
         else:
-            for b, start in enumerate(per_sample_starts):
+            for batch_idx, start in enumerate(per_sample_starts):
                 _copy_token_mask_to_frame_mask(
-                    mf,
-                    tm,
+                    frame_mask,
+                    token_mask,
                     start,
                     frames_per_token,
-                    batch_index=b,
+                    batch_index=batch_idx,
                 )
     else:
         return None
-    if mf.shape[1] < tf:
-        mf = torch.cat([mf, mf.new_zeros(mf.shape[0], tf - mf.shape[1])], dim=1)
-    return mf[:, :tf]
+    if frame_mask.shape[1] < num_frames:
+        frame_mask = torch.cat(
+            [
+                frame_mask,
+                frame_mask.new_zeros(
+                    frame_mask.shape[0],
+                    num_frames - frame_mask.shape[1],
+                ),
+            ],
+            dim=1,
+        )
+    return frame_mask[:, :num_frames]
 
 
 def build_traj_token_mask(
@@ -339,18 +347,18 @@ def build_traj_token_mask(
     *,
     horizon_tokens: int | torch.Tensor | None = None,
     horizon_active_end_token=0,
-    frames_per_token: int = 4,
+    frames_per_token: int = FRAMES_PER_TOKEN_DEFAULT,
     traj_start_token: int | None = None,
 ):
     """Build [B, seq_len] token mask from frame masks and optional horizon."""
-    src = _traj_source(x)
-    if src is None:
+    source = _traj_source(x)
+    if source is None:
         return None
-    tf = src.shape[1]
+    num_source_frames = source.shape[1]
     start_token_idx = _resolve_traj_start_token(x, traj_start_token)
     mask_frame = build_traj_frame_mask(
         x,
-        tf,
+        num_source_frames,
         device,
         frames_per_token=frames_per_token,
         traj_start_token=start_token_idx,
@@ -358,9 +366,14 @@ def build_traj_token_mask(
     if mask_frame is None and horizon_tokens is None:
         return None
     if mask_frame is None:
-        mask_frame = torch.ones(src.shape[0], tf, device=device, dtype=torch.float32)
+        mask_frame = torch.ones(
+            source.shape[0],
+            num_source_frames,
+            device=device,
+            dtype=torch.float32,
+        )
     if horizon_tokens is not None:
-        _apply_horizon_mask_tokens_range(
+        _truncate_frame_mask_to_token_horizon(
             mask_frame,
             horizon_active_end_token,
             horizon_tokens,
@@ -441,7 +454,7 @@ def _length_tensor(value, batch_size, seq_len: int, device):
     return out.clamp(min=0, max=seq_len)
 
 
-def _apply_horizon_mask_tokens_range(
+def _truncate_frame_mask_to_token_horizon(
     mask_frame: torch.Tensor,
     active_end_token,
     horizon_tokens: int | torch.Tensor,
@@ -449,7 +462,7 @@ def _apply_horizon_mask_tokens_range(
     start_token_idx: int | torch.Tensor,
     frames_per_token: int,
 ) -> torch.Tensor:
-    """Zero a window-relative frame mask at global cutoff ``E + H``."""
+    """Zero frame-mask entries at and after the token horizon cutoff."""
     per_sample_starts = _per_sample_start_tokens(start_token_idx, mask_frame.shape[0])
     active_is_batch = torch.is_tensor(active_end_token) and active_end_token.dim() > 0
     horizon_is_batch = torch.is_tensor(horizon_tokens) and horizon_tokens.dim() > 0
@@ -460,14 +473,14 @@ def _apply_horizon_mask_tokens_range(
             else:
                 start = int(start_token_idx)
             per_sample_starts = [start] * mask_frame.shape[0]
-        for b, start in enumerate(per_sample_starts):
+        for batch_idx, start in enumerate(per_sample_starts):
             active_end = (
-                int(active_end_token[b])
+                int(active_end_token[batch_idx])
                 if active_is_batch
                 else int(active_end_token)
             )
             horizon = (
-                int(horizon_tokens[b])
+                int(horizon_tokens[batch_idx])
                 if horizon_is_batch
                 else int(horizon_tokens)
             )
@@ -477,11 +490,11 @@ def _apply_horizon_mask_tokens_range(
                 - origin_frame
             )
             if cutoff <= 0:
-                mask_frame[b, :] = 0
+                mask_frame[batch_idx, :] = 0
             elif cutoff < mask_frame.shape[-1]:
-                mask_frame[b, cutoff:] = 0
+                mask_frame[batch_idx, cutoff:] = 0
         return mask_frame
-    start_token_idx = _as_single_start_token(start_token_idx)
+    start_token_idx = _single_start_token(start_token_idx)
     origin_frame = token_start_frame(start_token_idx, frames_per_token)
     cutoff = (
         token_start_frame(int(active_end_token) + int(horizon_tokens), frames_per_token)
@@ -502,30 +515,11 @@ def encode_traj_batch(
     *,
     horizon_tokens: int | torch.Tensor | None = None,
     horizon_active_end_token: int = 0,
-    frames_per_token: int = 4,
+    frames_per_token: int = FRAMES_PER_TOKEN_DEFAULT,
     return_token_mask: bool = False,
     traj_start_token: int | None = None,
 ):
-    """Build trajectory embedding from a training batch dict.
-
-    Pipeline:
-      traj_features (B,T,7) or traj xyz (B,T,3)
-        -> frame-level mask gate
-        -> frames_to_tokens_range
-        -> TrajectoryEncoder
-        -> token-level mask gate
-
-    Returns:
-      - traj_emb (B, seq_len, traj_out_dim) by default, or None if x has no
-        trajectory fields (or the entire batch's traj mask is zero).
-      - When `return_token_mask=True`, returns (traj_emb, token_mask) where
-        `token_mask` is (B, seq_len) in {0, 1} and is None when there is no
-        traj/horizon mask. The tuple is also returned (with traj_emb=None,
-        token_mask=None) on the no-traj path so callers can unpack uniformly.
-
-    If `horizon_tokens` is provided, frame-level conditioning is zeroed at the
-    token-start cutoff `horizon_active_end_token + horizon_tokens`.
-    """
+    """Encode frame-level trajectory conditioning to token embeddings."""
     if "traj_features" in x and x["traj_features"] is not None:
         feats_frame = x["traj_features"].to(device)
     elif "traj_cond" in x and x["traj_cond"] is not None:
@@ -536,10 +530,10 @@ def encode_traj_batch(
         return (None, None) if return_token_mask else None
 
     start_token_idx = _resolve_traj_start_token(x, traj_start_token)
-    tf = feats_frame.shape[1]
+    num_source_frames = feats_frame.shape[1]
     mask_frame = build_traj_frame_mask(
         x,
-        tf,
+        num_source_frames,
         device,
         frames_per_token=frames_per_token,
         traj_start_token=start_token_idx,
@@ -548,22 +542,24 @@ def encode_traj_batch(
     token_mask_from_frame = None
     if mask_frame is not None or horizon_tokens is not None:
         if mask_frame is None:
-            mask_frame = feats_frame.new_ones(feats_frame.shape[0], tf)
+            mask_frame = feats_frame.new_ones(
+                feats_frame.shape[0],
+                num_source_frames,
+            )
         if horizon_tokens is not None:
-            _apply_horizon_mask_tokens_range(
+            _truncate_frame_mask_to_token_horizon(
                 mask_frame,
                 horizon_active_end_token,
                 horizon_tokens,
                 start_token_idx=start_token_idx,
                 frames_per_token=frames_per_token,
             )
-        if not bool(mask_frame[:, :tf].any()):
+        if not bool(mask_frame[:, :num_source_frames].any()):
             return (None, None) if return_token_mask else None
-        feats_frame = feats_frame * mask_frame[:, :tf].unsqueeze(-1).to(
-            dtype=feats_frame.dtype
-        )
+        visible_mask = mask_frame[:, :num_source_frames].unsqueeze(-1)
+        feats_frame = feats_frame * visible_mask.to(dtype=feats_frame.dtype)
         token_mask_from_frame = frames_to_token_mask_range(
-            mask_frame[:, :tf],
+            mask_frame[:, :num_source_frames],
             seq_len,
             start_token_idx=start_token_idx,
             frames_per_token=frames_per_token,
@@ -571,37 +567,42 @@ def encode_traj_batch(
 
     if feats_frame.shape[1] == seq_len and seq_len > 1:
         raise ValueError(
-            "encode_traj_batch expects frame-level traj input [B, T_frame, C] "
-            f"(T_frame ~= 4*seq_len), got shape[1]={feats_frame.shape[1]} == "
+            "encode_traj_batch expects frame-level traj input [B, num_frames, C] "
+            f"(not token-level input), got shape[1]={feats_frame.shape[1]} == "
             f"seq_len={seq_len}; the token-level parallel path is disabled."
         )
-    feats_4 = frames_to_tokens_range(
+    token_frames = frames_to_tokens_range(
         feats_frame,
         start_token_idx,
         seq_len,
         frames_per_token=frames_per_token,
     )
     if mask_frame is not None:
-        mf_grouped = frames_to_tokens_range(
-            mask_frame[:, :tf].unsqueeze(-1).to(feats_frame.dtype),
+        grouped_frame_mask = frames_to_tokens_range(
+            mask_frame[:, :num_source_frames].unsqueeze(-1).to(feats_frame.dtype),
             start_token_idx,
             seq_len,
             frames_per_token=frames_per_token,
         )
-        frame_mask_4 = mf_grouped.squeeze(-1)
+        frame_mask_4 = grouped_frame_mask.squeeze(-1)
     else:
         frame_mask_4 = None
-    traj_emb = traj_encoder(feats_4, frame_mask=frame_mask_4)
+    traj_emb = traj_encoder(token_frames, frame_mask=frame_mask_4)
 
     combined_token_mask = token_mask_from_frame
     if "token_mask" in x and x["token_mask"] is not None:
-        tm = x["token_mask"].to(device=device, dtype=torch.float32)
-        if tm.shape[1] < seq_len:
-            pad = tm.new_zeros(tm.shape[0], seq_len - tm.shape[1])
-            tm = torch.cat([tm, pad], dim=1)
-        tm = tm[:, :seq_len]
+        explicit_token_mask = x["token_mask"].to(device=device, dtype=torch.float32)
+        if explicit_token_mask.shape[1] < seq_len:
+            pad = explicit_token_mask.new_zeros(
+                explicit_token_mask.shape[0],
+                seq_len - explicit_token_mask.shape[1],
+            )
+            explicit_token_mask = torch.cat([explicit_token_mask, pad], dim=1)
+        explicit_token_mask = explicit_token_mask[:, :seq_len]
         combined_token_mask = (
-            tm if combined_token_mask is None else (combined_token_mask * tm)
+            explicit_token_mask
+            if combined_token_mask is None
+            else (combined_token_mask * explicit_token_mask)
         )
 
     if combined_token_mask is not None:
@@ -621,11 +622,7 @@ def build_traj_emb(
     traj_drop_out: float,
     training_dropout: bool,
 ) -> torch.Tensor | None:
-    """Build legacy trajectory embedding for WanModel.forward(traj_emb=...).
-
-    Returns None when trajectory is absent or dropped out.
-    Prefers traj_features, then falls back to traj xyz converted on the fly.
-    """
+    """Build legacy trajectory embedding for WanModel.forward(traj_emb=...)."""
     if not use_traj_cond or traj_encoder is None:
         return None
     if training_dropout and np.random.rand() <= traj_drop_out:
@@ -633,11 +630,14 @@ def build_traj_emb(
 
     def align_temporal(feats: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
         if feats.shape[1] != seq_len:
-            t_frames = feats.shape[1]
+            num_input_frames = feats.shape[1]
             indices = torch.zeros(seq_len, dtype=torch.long, device=feats.device)
             indices[0] = 0
-            for k in range(1, seq_len):
-                indices[k] = min(token_end_frame(k), t_frames - 1)
+            for token_idx in range(1, seq_len):
+                indices[token_idx] = min(
+                    token_end_frame(token_idx),
+                    num_input_frames - 1,
+                )
             feats = feats[:, indices, :]
         if mask is not None:
             m = mask.to(device=device, dtype=torch.float32)
