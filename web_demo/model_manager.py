@@ -95,8 +95,6 @@ class ModelManager(WebRuntime):
         self.current_text = ""
         self.is_generating = False
         self.generation_worker = GenerationWorker(self._generation_loop)
-        self.generation_thread = None
-        self.should_stop = False
         self.reset_pending = False  # True while waiting for thread to stop before reset
         self.generation_state = GenerationState.IDLE
         
@@ -284,8 +282,7 @@ class ModelManager(WebRuntime):
             print(f"Model initialized with history length: {self.history_length}, denoise steps: {self.denoise_steps}")
             
             # Start generation thread
-            self.should_stop = False
-            self.generation_thread = self._generation_worker().start()
+            self._generation_worker().start()
             self.is_generating = True
             self.generation_state = GenerationState.RUNNING
     
@@ -1118,8 +1115,8 @@ class ModelManager(WebRuntime):
     
     def pause_generation(self):
         """Pause generation (keeps all state)"""
-        self.should_stop = True
-        if self.generation_thread and not self._generation_worker().stop(timeout=5.0):
+        worker = self._generation_worker()
+        if worker.is_running and not worker.stop(timeout=5.0):
             print("Warning: generation thread did not stop within timeout; model state may be unsafe")
             self.generation_state = GenerationState.ERROR
             return False
@@ -1135,8 +1132,7 @@ class ModelManager(WebRuntime):
             return
         
         # Restart generation thread with existing state
-        self.should_stop = False
-        self.generation_thread = self._generation_worker().start()
+        self._generation_worker().start()
         self.is_generating = True
         self.generation_state = GenerationState.RUNNING
         print("Generation resumed")
@@ -1158,14 +1154,11 @@ class ModelManager(WebRuntime):
             if not self.pause_generation():
                 self.generation_state = GenerationState.ERROR
                 return False
-        if self.generation_thread is not None and self.generation_thread.is_alive():
+        worker = self._generation_worker()
+        if worker.is_running:
             self.reset_pending = True
             print("Reset pending — waiting for generation thread to finish...")
-            for _ in range(20):  # up to 10s more (20 × 0.5s)
-                self.generation_thread.join(timeout=0.5)
-                if not self.generation_thread.is_alive():
-                    break
-            if self.generation_thread.is_alive():
+            if not worker.stop(timeout=10.0):
                 print("Reset failed: generation thread still running after 15s timeout")
                 self.reset_pending = False
                 self.generation_state = GenerationState.ERROR
@@ -1229,9 +1222,7 @@ class ModelManager(WebRuntime):
         total_gen_time = 0
         
         with torch.no_grad():
-            while not self.should_stop and not (
-                stop_event is not None and stop_event.is_set()
-            ):
+            while not (stop_event is not None and stop_event.is_set()):
                 # Check if buffer needs more frames
                 if self.frame_buffer.needs_generation():
                     try:

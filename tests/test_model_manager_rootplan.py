@@ -419,7 +419,6 @@ def test_reset_clears_model_manager_and_stream_generator_route_state():
     mgr._generated_frame_count = 7
     mgr._absolute_commit_index = 3
     mgr.is_generating = False
-    mgr.generation_thread = None
     mgr.reset_pending = False
     mgr.smoothing_alpha = 1.0
     mgr.denoise_steps = 10
