@@ -134,10 +134,12 @@ def load_root_refiner_modules(root_cfg: dict):
         raise ValueError("traj_mask.root_refiner.enabled=true requires ckpt")
     print(f"Loading RootRefiner modules: config={refiner_config}, ckpt={ckpt_path}")
 
-    from train_refiner import _load_cfg, resolve_cfg_interpolations
+    from omegaconf import OmegaConf
+
+    from utils.initialize import load_config
     from utils.training.root_refiner.lightning_module import RootRefinerLightningModule
 
-    cfg = resolve_cfg_interpolations(_load_cfg(refiner_config))
+    cfg = OmegaConf.to_container(load_config(refiner_config).config, resolve=True)
     reject_normalized_root_refiner_config(cfg)
     module = RootRefinerLightningModule(cfg)
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)

@@ -54,6 +54,24 @@ def test_train_refiner_rejects_legacy_dataset_target(tmp_path):
                 "max_frames": 29,
             },
         },
+        "optimizer": {
+            "target": "AdamW",
+            "params": {"lr": 1.0e-4, "weight_decay": 0.01},
+        },
+        "canonicalization": {
+            "mode": "b_full",
+            "anchor": "first_effective_frame",
+            "full_plan_valid_history_frames": 1,
+        },
+        "loss_weights": {
+            "pace": 1.0,
+            "frame_pace": 0.1,
+            "xyz": 5.0,
+            "heading": 1.0,
+            "fwd_delta": 0.5,
+            "yaw_delta": 0.5,
+            "smoothness": 0.0,
+        },
         "sampling": {
             "full_plan_ratio": 1.0,
             "horizon_policy": "random",
@@ -66,6 +84,9 @@ def test_train_refiner_rejects_legacy_dataset_target(tmp_path):
         "data": {
             "target": "datasets." "humanml3d" "_refiner.HumanML3D" "RefinerDataset",
             "collate_fn": "datasets." "humanml3d" "_refiner.collate_fn",
+            "train_bs": 4,
+            "val_bs": 4,
+            "num_workers": 0,
             "raw_data_dir": str(tmp_path),
             "dataset": "humanml3d",
             "train_split_file": "train.txt",

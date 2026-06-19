@@ -583,7 +583,7 @@ def _write_root_refiner_sample_artifacts(
     path_mode = str(sample.get("path_mode", "dense_path"))
     offset_frame = _to_int(sample.get("offset_start_frames"), default=0)
     anchor_frame = _to_int(sample.get("anchor_frame"), default=0)
-    gt_slice_start = anchor_frame
+    gt_slice_start = anchor_frame + 1
     gt_slice_end = gt_slice_start + int(_as_cpu_tensor(gt_mask).bool().sum().item())
     anchor_world_xz, anchor_world_yaw = _sample_anchor_world(sample)
     metadata = build_root_refiner_sample_metadata(
@@ -1166,13 +1166,13 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
-    from train_refiner import resolve_cfg_interpolations
+    from omegaconf import OmegaConf
 
-    from train_refiner import _load_cfg
-    cfg = _load_cfg(args.config)
+    from utils.initialize import load_config
+
     # A-P0-1: resolve ${data.raw_data_dir} etc. (the model cfg comes from the
     # ckpt's saved hparams, which train_refiner already resolved).
-    cfg = resolve_cfg_interpolations(cfg)
+    cfg = OmegaConf.to_container(load_config(args.config).config, resolve=True)
 
     model, text_encoder, ckpt_cfg = _load_model_from_ckpt(args.ckpt, args.device)
     validate_ckpt_eval_config_compatible(ckpt_cfg, cfg)

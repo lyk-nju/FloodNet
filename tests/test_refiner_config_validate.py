@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import pytest
-import yaml
 
 from pathlib import Path
+from omegaconf import OmegaConf
+from utils.initialize import load_config
 from utils.training.root_refiner.config_validate import validate_refiner_config
 
 
@@ -13,9 +14,10 @@ _CFG_DIR = Path(__file__).resolve().parent.parent / "configs"
 
 
 def _load(name: str) -> dict:
-    from train_refiner import _load_cfg
-
-    return _load_cfg(str(_CFG_DIR / name))
+    return OmegaConf.to_container(
+        load_config(str(_CFG_DIR / name)).config,
+        resolve=True,
+    )
 
 
 def _minimal_cfg() -> dict:

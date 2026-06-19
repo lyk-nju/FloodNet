@@ -8,6 +8,8 @@ from __future__ import annotations
 import yaml
 
 from pathlib import Path
+from omegaconf import OmegaConf
+from utils.initialize import load_config
 
 _CFG_DIR = Path(__file__).resolve().parent.parent / "configs"
 CFG_PATH = _CFG_DIR / "root_refiner.yaml"
@@ -71,13 +73,13 @@ def test_sampling_path_condition_block_present_in_both_configs():
 
 def test_A_P0_1_train_config_interpolation_resolves():
     """A-P0-1: ${data.raw_data_dir} in root_refiner_train.yaml must resolve to a
-    real (no '${') path via resolve_cfg_interpolations (train uses yaml.safe_load
-    which would otherwise pass the literal to the text encoder)."""
-    from train_refiner import resolve_cfg_interpolations
-
+    real (no '${') path via the shared project config loader."""
     raw = _load(TRAIN_CFG_PATH)
     assert "${" in raw["text_encoder"]["precomputed_text_emb_path"]   # literal pre-resolve
-    resolved = resolve_cfg_interpolations(raw)
+    resolved = OmegaConf.to_container(
+        load_config(str(TRAIN_CFG_PATH)).config,
+        resolve=True,
+    )
     path = resolved["text_encoder"]["precomputed_text_emb_path"]
     assert "${" not in path
     assert path.startswith(resolved["data"]["raw_data_dir"])

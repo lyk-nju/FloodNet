@@ -804,12 +804,17 @@ def main():
     if args.root_refiner_config or args.root_refiner_ckpt:
         if not (args.root_refiner_config and args.root_refiner_ckpt):
             p.error("--root_refiner_config and --root_refiner_ckpt must be provided together")
-        from train_refiner import _load_cfg, resolve_cfg_interpolations
+        from omegaconf import OmegaConf
+
+        from utils.initialize import load_config
         from utils.inference.stream_generator import StreamGenerator
         from utils.training.root_refiner.lightning_module import RootRefinerLightningModule
 
         print("Loading RootRefiner modules ...")
-        root_cfg = resolve_cfg_interpolations(_load_cfg(args.root_refiner_config))
+        root_cfg = OmegaConf.to_container(
+            load_config(args.root_refiner_config).config,
+            resolve=True,
+        )
         root_module = RootRefinerLightningModule(root_cfg)
         ckpt = torch.load(args.root_refiner_ckpt, map_location="cpu", weights_only=False)
         state_dict = ckpt.get("state_dict", ckpt)
