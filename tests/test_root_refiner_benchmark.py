@@ -39,6 +39,7 @@ from eval.root_refiner.adapters import (
     DURATION_PRED,
     ROOT_REFINER_ARTIFACT_NAMES,
 )
+from eval.root_refiner.metrics import _lateral_component
 from models.root_refiner import RootRefiner
 from utils.training.root_refiner.text_encoder import FrozenStubTextEncoder
 
@@ -100,6 +101,20 @@ def test_masked_frames_excluded_from_metrics():
     mask[:3] = True
     m = compute_sample_metrics(pred, gt, mask)
     assert m["xyz_ADE"] < 1e-6   # masked-out errors don't count
+
+
+def test_lateral_component_is_perpendicular_to_heading():
+    forward_xyz = torch.zeros(4, 3)
+    forward_xyz[:, 0] = torch.arange(4, dtype=torch.float32)
+    sideways_xyz = torch.zeros(4, 3)
+    sideways_xyz[:, 2] = torch.arange(4, dtype=torch.float32)
+    yaw = torch.zeros(4)
+
+    forward_lateral = _lateral_component(forward_xyz, yaw)
+    sideways_lateral = _lateral_component(sideways_xyz, yaw)
+
+    assert torch.allclose(forward_lateral, torch.zeros(3))
+    assert torch.allclose(sideways_lateral, torch.ones(3))
 
 
 def test_empty_valid_returns_nan_metrics():
@@ -436,7 +451,7 @@ def test_root_refiner_artifacts_use_physical_path_and_real_anchor(tmp_path):
     expected_anchor_yaw = float(raw_sample["anchor_yaw_world"].item())
     np.testing.assert_allclose(metadata["anchor_world_xz"], expected_anchor_xz)
     assert abs(metadata["anchor_world_yaw"] - expected_anchor_yaw) < 1e-6
-    assert metadata["gt_slice"] == {"start": 5, "end": 5 + int(raw_sample["target_mask"].sum())}
+    assert metadata["gt_slice"] == {"start": 6, "end": 6 + int(raw_sample["target_mask"].sum())}
 
     rootplan = json.loads(
         (

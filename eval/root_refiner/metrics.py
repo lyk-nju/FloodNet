@@ -23,7 +23,7 @@ def _lateral_component(xyz: Tensor, yaw: Tensor) -> Tensor:
         return xyz.new_zeros(0)
     delta_xz = xyz[1:, [0, 2]] - xyz[:-1, [0, 2]]
     yaw_prev = yaw[:-1]
-    perp = torch.stack([torch.cos(yaw_prev), -torch.sin(yaw_prev)], dim=-1)
+    perp = torch.stack([-torch.sin(yaw_prev), torch.cos(yaw_prev)], dim=-1)
     return (delta_xz * perp).sum(-1).abs()
 
 
