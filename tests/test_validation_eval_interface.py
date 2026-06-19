@@ -64,6 +64,25 @@ def test_train_ldf_does_not_import_eval_package():
     assert "import eval." not in train_source
 
 
+def test_ldf_lightning_module_export_and_train_alias_match():
+    from train_ldf import CustomLightningModule
+    from utils.training.ldf.lightning_module import LDFLightningModule
+
+    assert CustomLightningModule is LDFLightningModule
+
+
+def test_ldf_lightning_module_method_names_are_clear():
+    from utils.training.ldf.lightning_module import LDFLightningModule
+
+    assert "_log_step" in LDFLightningModule.__dict__
+    assert "_log_step_metrics" not in LDFLightningModule.__dict__
+    assert "load_checkpoint" in LDFLightningModule.__dict__
+    assert "on_load_checkpoint" in LDFLightningModule.__dict__
+    assert "finish_validation_epoch" in LDFLightningModule.__dict__
+    assert "on_validation_epoch_end" in LDFLightningModule.__dict__
+    assert "on_train_batch_end" not in LDFLightningModule.__dict__
+
+
 def test_t2m_metric_enabled_is_validation_scoped():
     from utils.training.ldf.validation_eval_runtime import t2m_metric_enabled
 

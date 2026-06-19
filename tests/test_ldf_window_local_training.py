@@ -1071,7 +1071,7 @@ def test_self_forcing_step_logs_window_local_metrics(monkeypatch):
         optimizers=lambda: optimizer,
         lr_schedulers=lambda: None,
         manual_backward=lambda loss: loss.backward(),
-        _log_step_metrics=lambda *args, **kwargs: captured.update(kwargs),
+        _log_step=lambda *args, **kwargs: captured.update(kwargs),
     )
     trainer = SelfForcingTrainer.__new__(SelfForcingTrainer)
     trainer._module = module
@@ -1265,7 +1265,7 @@ def test_ldf_training_default_rolling_smoke_with_real_tiny_model(tmp_path, monke
         optimizers=lambda: optimizer,
         lr_schedulers=lambda: None,
         manual_backward=lambda loss: loss.backward(),
-        _log_step_metrics=lambda *args, **kwargs: None,
+        _log_step=lambda *args, **kwargs: None,
     )
     trainer = SelfForcingTrainer(module)
 
@@ -1380,7 +1380,7 @@ def test_ldf_training_rolling_motion_aux_smoke_with_real_tiny_model(tmp_path, mo
         optimizers=lambda: optimizer,
         lr_schedulers=lambda: None,
         manual_backward=lambda loss: loss.backward(),
-        _log_step_metrics=lambda *args, **kwargs: None,
+        _log_step=lambda *args, **kwargs: None,
     )
     trainer = SelfForcingTrainer(module)
 
@@ -1498,7 +1498,7 @@ def test_ldf_training_rolling_online_encode_motion_aux_smoke_with_real_tiny_mode
         optimizers=lambda: optimizer,
         lr_schedulers=lambda: None,
         manual_backward=lambda loss: loss.backward(),
-        _log_step_metrics=lambda *args, **kwargs: None,
+        _log_step=lambda *args, **kwargs: None,
     )
     trainer = SelfForcingTrainer(module)
 

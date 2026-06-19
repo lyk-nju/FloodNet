@@ -2,7 +2,7 @@
 
 Encapsulates the K-step scheduled rollout, manual optimization, cross-rank
 DDP consensus, and checkpoint auto-to-manual progress mirroring that were
-previously spread across CustomLightningModule and main().
+previously spread across the LDF Lightning module and main().
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ from utils.training.ldf.validation_eval_runtime import control_loss_train_mode
 from utils.training.module_step import compute_step_semantics
 
 if TYPE_CHECKING:
-    from train_ldf import CustomLightningModule
+    from utils.training.ldf.lightning_module import LDFLightningModule
 
 
 @dataclass(frozen=True)
@@ -112,7 +112,7 @@ def shifted_local_time_steps(
 class SelfForcingTrainer:
     """Run self-forcing rollout, loss, backward, and optimizer step."""
 
-    def __init__(self, module: CustomLightningModule):
+    def __init__(self, module: LDFLightningModule):
         self._module = module
         self._preconditions_checked = False
         self._last_replace_diff: float | None = None
@@ -284,7 +284,7 @@ class SelfForcingTrainer:
             loss_dict["control"] = step_control_loss.detach()
         if lr_scheduler is not None:
             runtime_metrics["lr_next"] = float(optimizer.param_groups[0]["lr"])
-        self._module._log_step_metrics(
+        self._module._log_step(
             loss_dict,
             optimizer,
             net_start_time,
