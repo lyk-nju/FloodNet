@@ -172,6 +172,18 @@ def test_shipped_ldf_training_config_valid():
     validate_ldf_training_config(cfg)
 
 
+def test_ldf_training_accepts_full_precomputed_latent_policy():
+    cfg = OmegaConf.create({
+        "model": {"params": {"chunk_size": 5}},
+        "ldf_training": {
+            "formulation": "windowed",
+            "window_policy": "full",
+        },
+    })
+
+    validate_ldf_training_config(cfg)
+
+
 def test_ldf_training_rejects_unknown_t2m_generation_mode():
     cfg = OmegaConf.create({
         "validation": {

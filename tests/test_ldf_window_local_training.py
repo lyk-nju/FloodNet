@@ -5,6 +5,7 @@ import pytest
 import utils.training.ldf.self_forcing as sf_mod
 
 from types import SimpleNamespace
+from omegaconf import OmegaConf
 from unittest.mock import MagicMock
 from utils.token_frame import (
     num_frames_for_tokens,
@@ -17,6 +18,7 @@ from utils.local_frame import canonicalize_7d
 from utils.motion_process import recover_root_rot_pos, root_to_traj_feats_7d
 from utils.training.ldf.self_forcing import SelfForcingTrainer
 from utils.training.ldf.self_forcing import _collect_window_local_metrics
+from utils.training.ldf.lightning_module import LDFLightningModule
 from utils.training.ldf.model_factory import install_precomputed_text_embeddings
 from utils.training.ldf.sample_creator import SampleCreator
 
@@ -901,6 +903,21 @@ def test_training_step_prefix_passes_rollout_min_prefix_tokens(
 
     assert float(out.item()) == 3.0
     assert captured["min_prefix_tokens"] == expected_min_prefix_tokens
+
+
+def test_lightning_full_policy_builds_full_sample_creator():
+    module = LDFLightningModule.__new__(LDFLightningModule)
+    module.cfg = OmegaConf.create({
+        "ldf_training": {
+            "window_policy": "full",
+        },
+    })
+    module.model = SimpleNamespace(chunk_size=5)
+
+    creator = module.build_prefix_sample_creator(min_prefix_tokens=5)
+
+    assert creator.window_policy == "full"
+    assert creator.min_prefix_tokens is None
 
 
 def test_training_step_passes_force_start_zero_to_window_local_builder(monkeypatch):

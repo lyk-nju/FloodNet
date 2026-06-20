@@ -116,6 +116,49 @@ def test_sample_creator_prefix_does_not_expose_legacy_token_mask_to_traj_path():
     assert torch.allclose(out["latent_token_mask"], torch.ones(1, 5))
 
 
+def test_sample_creator_full_policy_preserves_precomputed_latents_and_traj():
+    token = torch.arange(2 * 6 * 4, dtype=torch.float32).view(2, 6, 4)
+    traj_frames = num_frames_for_tokens(6)
+    traj7 = torch.arange(2 * traj_frames * 7, dtype=torch.float32).view(
+        2,
+        traj_frames,
+        7,
+    )
+    token_mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 1, 1],
+            [1, 1, 1, 1, 0, 0],
+        ],
+        dtype=torch.float32,
+    )
+    traj_mask = torch.ones(2, traj_frames)
+    batch = {
+        "token": token,
+        "token_length": torch.tensor([6, 4]),
+        "token_mask": token_mask,
+        "token_text_end": torch.tensor([6, 4]),
+        "traj_cond_7d": traj7,
+        "traj_cond": torch.zeros(2, traj_frames, 3),
+        "traj_length": torch.tensor([traj_frames, num_frames_for_tokens(4)]),
+        "traj_cond_mask": traj_mask,
+    }
+
+    out = SampleCreator(window_policy="full").create(batch)
+
+    assert torch.equal(out["feature"], token)
+    assert torch.equal(out["feature_length"], batch["token_length"])
+    assert torch.equal(out["token"], token)
+    assert torch.equal(out["token_length"], batch["token_length"])
+    assert torch.equal(out["feature_text_end"], batch["token_text_end"])
+    assert torch.equal(out["token_mask"], token_mask)
+    assert torch.equal(out["traj_features"], traj7)
+    assert torch.equal(out["traj_length"], batch["traj_length"])
+    assert torch.equal(out["traj_mask"], traj_mask)
+    assert "_window_local_sample_policy" not in out
+    assert "latent_token_mask" not in out
+    assert "traj_num_tokens" not in out
+
+
 def test_sample_creator_prefix_window_does_not_cap_active_right_by_context_tokens():
     token = torch.arange(10 * 4, dtype=torch.float32).view(1, 10, 4)
     traj_frames = num_frames_for_tokens(10)

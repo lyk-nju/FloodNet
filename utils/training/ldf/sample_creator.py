@@ -396,9 +396,12 @@ class SampleCreator:
             name="token_length",
         )
 
+        if self.window_policy == "full":
+            return self._create_full_batch(batch, token, token_length)
         if self.window_policy != "prefix":
             raise ValueError(
-                "non-stream LDF batch creation only supports window_policy='prefix'; "
+                "non-stream LDF batch creation only supports "
+                "window_policy='prefix' or 'full'; "
                 f"got {self.window_policy!r}"
             )
         sample = self._sample_prefix_window(token_length, batch_size, device)
@@ -442,6 +445,23 @@ class SampleCreator:
         model_batch["_window_local_latent_start_token"] = torch.zeros_like(starts)
         model_batch["_window_local_latent_valid_len"] = latent_lengths
         model_batch["_window_local_sample_policy"] = sample.sample_policy
+        return model_batch
+
+    def _create_full_batch(
+        self,
+        batch: dict,
+        token: torch.Tensor,
+        token_length: torch.Tensor,
+    ) -> dict:
+        """Use the dataset's precomputed latent sequence without window cropping."""
+        model_batch = batch.copy()
+        model_batch["feature"] = token
+        model_batch["feature_length"] = token_length
+        model_batch["token"] = token
+        model_batch["token_length"] = token_length
+        if "token_text_end" in batch:
+            model_batch["feature_text_end"] = batch["token_text_end"]
+        self._copy_trajectory_fields(batch, model_batch)
         return model_batch
 
     def _create_online_batch(self, batch: dict, *, vae) -> dict:

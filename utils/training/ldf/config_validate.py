@@ -12,7 +12,7 @@ from utils.training.ldf.self_forcing_config import (
 from utils.training.ldf.t2m_generation_modes import resolve_t2m_generation_modes
 
 
-_WINDOW_POLICIES = {"prefix", "rolling"}
+_WINDOW_POLICIES = {"prefix", "rolling", "full"}
 _SAMPLE_POLICIES = {"variable_history", "fixed_window"}
 
 
@@ -52,9 +52,9 @@ def validate_7d_requires_self_forcing(cfg) -> None:
 def validate_ldf_training_config(cfg) -> None:
     """Validate the windowed LDF training contract.
 
-    The new mainline has no separate full-sequence/full-latent training task.
-    ``ldf_training.window_policy`` selects prefix or rolling window sampling,
-    while runtime files may still use "stream" in their names.
+    ``ldf_training.window_policy`` selects precomputed full latent, prefix, or
+    rolling window sampling, while runtime files may still use "stream" in
+    their names.
     """
     resolve_t2m_generation_modes(cfg)
     if "stream_training" in cfg:
@@ -84,30 +84,31 @@ def validate_ldf_training_config(cfg) -> None:
     policy = str(OmegaConf.select(cfg, "ldf_training.window_policy", default="prefix"))
     if policy not in _WINDOW_POLICIES:
         raise ValueError(
-            "ldf_training.window_policy must be 'prefix' or 'rolling'; "
+            "ldf_training.window_policy must be 'prefix', 'rolling', or 'full'; "
             f"got {policy!r}."
         )
     chunk_size = int(OmegaConf.select(cfg, "model.params.chunk_size", default=5))
     window_sampling_enabled = bool(
         OmegaConf.select(cfg, "ldf_training.window_sampling.enabled", default=False)
     )
-    if policy == "prefix":
+    if policy in {"prefix", "full"}:
+        policy_label = "prefix" if policy == "prefix" else "full"
         if "context_tokens" in ldf_cfg:
             raise ValueError(
-                "ldf_training.context_tokens is not used for prefix training; "
-                "prefix active right is sampled from [1, token_length]."
+                f"ldf_training.context_tokens is not used for {policy_label} "
+                "training; active right is sampled from [1, token_length]."
             )
         if "horizon_tokens" in ldf_cfg:
             raise ValueError(
-                "ldf_training.horizon_tokens is not used for prefix training; "
-                "prefix trajectory condition always extends to token_length."
+                f"ldf_training.horizon_tokens is not used for {policy_label} "
+                "training; trajectory condition always extends to token_length."
             )
         if "window_sampling" in ldf_cfg:
             raise ValueError(
                 "ldf_training.window_sampling is only used for rolling training; "
-                "prefix active right is sampled from [1, token_length]."
+                "active right is sampled from [1, token_length]."
             )
-        if "min_history_tokens" in ldf_cfg:
+        if policy == "prefix" and "min_history_tokens" in ldf_cfg:
             raise ValueError(
                 "ldf_training.min_history_tokens is not used for prefix training; "
                 "prefix active right is sampled from [1, token_length]."

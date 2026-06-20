@@ -77,6 +77,14 @@ class LDFLightningModule(BasicLightningModule):
         *,
         min_prefix_tokens: int | None = None,
     ) -> SampleCreator:
+        window_policy = str(
+            OmegaConf.select(self.cfg, "ldf_training.window_policy", default="prefix")
+        )
+        if window_policy == "full":
+            return SampleCreator(
+                window_policy="full",
+                chunk_size=getattr(self.model, "chunk_size", None),
+            )
         return SampleCreator(
             window_policy="prefix",
             sample_policy=str(
