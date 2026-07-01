@@ -64,6 +64,12 @@ For every rollout step, including non-final steps:
 Invalid commit indices should be skipped consistently with the current
 replacement path.
 
+Initial implementation assumes `model.chunk_size == 1`, matching the current
+stream commit path. If `chunk_size > 1` is supported later, commit records must
+store a token span (`commit_start`, `commit_end`) and frame masks must use
+`token_range_to_frame_slice(commit_start, chunk_size)` instead of a single-token
+slice.
+
 ## Prefix Assembly
 
 The decode prefix source depends on `_window_local_body_aux_mode`.
@@ -71,19 +77,28 @@ The decode prefix source depends on `_window_local_body_aux_mode`.
 For `full_prefix_splice`:
 
 - `model_batch["feature"]` is window-local, not a full prefix.
-- Start from the original full `batch["token"]` detached clone.
+- Start from the original `batch["token"]` only as a detached source tensor.
 - Replace `global_commit_idx = _window_global_start_token + local_commit_idx`.
   Do not use `_window_local_latent_start_token` for this; local and global start
   metadata diverge between precomputed slicing and online encoding.
-- Decode the assembled full prefix.
+- For each sample, assemble a decode prefix ending at
+  `decode_end_token = max(valid global_commit_idx for that sample) + 1`.
+- Use `batch["token"][b, :decode_end_token].detach().clone()` and replace the
+  committed global token indices inside that prefix with gradient-carrying
+  `pred_token` values.
+- Do not append or decode GT future tokens after `decode_end_token`.
 - Build one loss frame mask per commit record in full/global frame coordinates.
 
 For `local_decode`:
 
 - `model_batch["feature"]` is the local prefix produced by online encoding.
-- Start from `model_batch["feature"]` detached clone.
+- Start from `model_batch["feature"]` only as a detached source tensor.
 - Replace `local_commit_idx`.
-- Decode the assembled local prefix.
+- For each sample, assemble a local decode prefix ending at
+  `decode_end_token = max(valid local_commit_idx for that sample) + 1`.
+- Use `model_batch["feature"][b, :decode_end_token].detach().clone()` and
+  replace local commit indices inside that prefix.
+- Do not append or decode local future tokens after `decode_end_token`.
 - Build one loss frame mask per commit record in local frame coordinates.
 
 Only the K committed tokens carry gradients in the assembled decode latent.
@@ -104,6 +119,20 @@ all commit masks into one union mask before loss computation, because that would
 change the reduction from step mean to frame mean. Each mask should include only
 that commit token's frame range; it should not include earlier history frames or
 uncommitted future frames.
+
+Decoded-frame to GT-frame alignment must be explicit. For each decoded sample,
+decoded frame `t` corresponds to GT frame:
+
+```text
+gt_t = token_start_frame(window_start_token) + t
+```
+
+For `full_prefix_splice`, `window_start_token = 0` because the decoded prefix
+starts at global token 0. For `local_decode`, `window_start_token` is the global
+token start of the local decoded prefix, normally `_window_global_start_token`.
+The helper must use this offset when slicing `gt_traj_7d`; otherwise local
+decoded frame 0 would be compared against GT frame 0 instead of the local
+window's first global frame.
 
 ## Loss Reduction
 
@@ -139,6 +168,12 @@ end_xz: 0.0
 committed tokens, not each commit token's endpoint. A later variant may add
 `per_commit_end_xz`.
 
+These are conservative diagnostic weights, not an exact reproduction of the
+old final-step body-aux objective. For the cleanest comparison against the old
+objective, run a follow-up ablation that inherits the existing
+`body_aux_loss.weights`, while keeping `end_xz: 0.0` unless
+`per_commit_end_xz` is implemented.
+
 ## Loss Interaction
 
 When the new mode is enabled, commit 7D body aux replaces the existing final-step
@@ -150,6 +185,12 @@ token and keeps the diagnostic variable isolated.
 When `replace_final_body_aux=true`, do not fall back to the old final-step body
 aux if the commit loss is `None`. Returning only the final diffusion loss in
 that edge case keeps the diagnostic comparison clean.
+
+This edge case must be monitored. Log `body_aux/commit_valid_count`; if it is
+0, also log that commit body aux was skipped. In strict/debug mode, raise an
+error when `replace_final_body_aux=true` and no valid commit loss is produced.
+In non-strict mode, allow final diffusion loss only for that batch, but do not
+silently re-enable the old final-step body aux.
 
 When the new mode is disabled, existing self-forcing and body-aux behavior must
 remain unchanged.
@@ -165,6 +206,7 @@ multistep_commit_body_aux:
   replace_final_body_aux: true
   include_final_step: true
   reduction: step_mean
+  strict_valid_commits: false
   weight: 1.0
   weights:
     root_xz: 1.0
@@ -208,9 +250,17 @@ Add focused tests for:
   indices, not `model_batch["feature"]`.
 - `full_prefix_splice` computes global commit indices from
   `_window_global_start_token`, not `_window_local_latent_start_token`.
+- `full_prefix_splice` assembles and decodes only up to
+  `max(global_commit_idx) + 1`; it must not include GT future suffix tokens.
 - `local_decode` uses local `model_batch["feature"]` and local commit indices.
+- `local_decode` assembles and decodes only up to
+  `max(local_commit_idx) + 1`.
+- Local decoded frames are compared to GT frames using the local prefix's global
+  `window_start_token` offset.
 - Each per-record commit-frame mask covers only
   `token_range_to_frame_slice(idx, 1)` for that committed token.
+- `chunk_size > 1` either raises `NotImplementedError` in this initial mode or
+  is handled with an explicit commit span mask.
 - Prefix assembly returns sample indices so decoded-list positions map back to
   the correct original batch rows.
 - Scalar `_window_global_start_token` metadata expands to batch size before
@@ -225,6 +275,7 @@ Add focused tests for:
 ## Experiment Plan
 
 1. K=3, `model.params.traj_dropout=0.0`, single decode, commit-token 7D body aux.
-2. K=3, per-step decode comparison.
-3. K=5, `model.params.traj_dropout=0.0`, single decode.
-4. Consider full BPTT or no-detach only after the diagnostic results are clear.
+2. K=3, same setup but inherit old `body_aux_loss.weights`, with `end_xz: 0.0`.
+3. K=3, per-step decode comparison.
+4. K=5, `model.params.traj_dropout=0.0`, single decode.
+5. Consider full BPTT or no-detach only after the diagnostic results are clear.

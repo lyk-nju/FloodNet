@@ -4,7 +4,7 @@
 
 **Goal:** Add an optional diagnostic self-forcing mode where every rollout step's committed token receives direct 7D body/root supervision, while history replacement remains detached.
 
-**Architecture:** Keep rollout orchestration in `utils/training/self_forcing.py`, add one decoded-prefix commit-mask helper in `utils/training/control_loss.py`, and gate the behavior behind `multistep_commit_body_aux.enabled`. The rollout stores gradient-bearing commit tokens from `pred_x0_latent_list`, writes detached replacements from `x0_latent_list`, assembles one decode prefix per sample, decodes once, computes one 7D body/root loss per committed rollout token, and averages over valid committed steps.
+**Architecture:** Keep rollout orchestration in `utils/training/self_forcing.py`, add one decoded-prefix commit-mask helper in `utils/training/control_loss.py`, and gate the behavior behind `multistep_commit_body_aux.enabled`. The rollout stores gradient-bearing commit tokens from `pred_x0_latent_list`, writes detached replacements from `x0_latent_list`, assembles one decode prefix per sample ending at the latest committed token, decodes once, computes one 7D body/root loss per committed rollout token, and averages over valid committed steps.
 
 **Tech Stack:** Python, PyTorch, Lightning manual optimization, existing causal VAE token/frame helpers in `utils.token_frame`, existing 7D body-aux primitives in `utils.training.control_loss`.
 
@@ -13,10 +13,10 @@
 ## File Structure
 
 - Modify `configs/ldf.yaml`: add disabled-by-default `multistep_commit_body_aux` config block with `include_final_step`, `reduction: step_mean`, local `weight`, and conservative 7D weights.
-- Modify `utils/training/control_loss.py`: add `compute_body_aux_loss_on_commit_masks()` that accepts decoded prefixes plus one frame mask per commit record, derives 7D body terms over complete decoded prefixes, and reduces by step mean.
-- Modify `utils/training/self_forcing.py`: add a commit record dataclass, collect records during rollout when the new mode is enabled, assemble decode prefixes using full-prefix or local-prefix coordinates, compute commit body aux, and replace final-step body aux when configured.
-- Modify `tests/test_body_aux_loss.py`: add focused tests for step-mean reduction and full-prefix delta derivation.
-- Create `tests/test_multistep_commit_body_aux.py`: add rollout and integration tests for gradient-enabled non-final forwards, source tensor split, replacement detach, full/local prefix assembly, sample-index mapping, and final-body-aux replacement semantics.
+- Modify `utils/training/control_loss.py`: add `compute_body_aux_loss_on_commit_masks()` that accepts decoded prefixes plus one frame mask per commit record, derives 7D body terms over complete decoded prefixes, applies decoded-frame to GT-frame offsets, and reduces by step mean.
+- Modify `utils/training/self_forcing.py`: add a commit record dataclass, collect records during rollout when the new mode is enabled, reject `chunk_size > 1` for the first implementation, assemble decode prefixes using full-prefix or local-prefix coordinates without future GT suffix, compute commit body aux, log valid commit counts, and replace final-step body aux when configured.
+- Modify `tests/test_body_aux_loss.py`: add focused tests for step-mean reduction, full-prefix delta derivation, and local GT frame offset.
+- Create `tests/test_multistep_commit_body_aux.py`: add rollout and integration tests for gradient-enabled non-final forwards, source tensor split, replacement detach, chunk-size guard, full/local prefix-only assembly, sample-index mapping, valid-commit logging, and final-body-aux replacement semantics.
 
 ---
 
@@ -36,6 +36,7 @@ multistep_commit_body_aux:
     replace_final_body_aux: true
     include_final_step: true
     reduction: step_mean
+    strict_valid_commits: false
     weight: 1.0
     weights:
         root_xz: 1.0
@@ -60,6 +61,7 @@ assert node.decode_mode == "single"
 assert node.replace_final_body_aux is True
 assert node.include_final_step is True
 assert node.reduction == "step_mean"
+assert node.strict_valid_commits is False
 assert float(node.weight) == 1.0
 assert float(node.weights.end_xz) == 0.0
 print("ok")
@@ -174,6 +176,50 @@ def test_commit_body_aux_delta_uses_full_decoded_prefix(monkeypatch):
 
     assert loss is not None
     assert terms["fwd_delta"] > 0.0
+
+
+def test_commit_body_aux_uses_window_start_token_for_gt_offset(monkeypatch):
+    import utils.training.control_loss as cl
+
+    def fake_recover_root_rot_pos(decoded):
+        b, t, _ = decoded.shape
+        quat = decoded.new_zeros(b, t, 4)
+        quat[..., 0] = 1.0
+        xyz = decoded[..., :3]
+        return quat, xyz
+
+    monkeypatch.setattr(cl, "recover_root_rot_pos", fake_recover_root_rot_pos)
+
+    decoded = [torch.zeros(1, 263)]
+    gt = torch.zeros(1, 12, 7)
+    gt[..., 3] = 1.0
+    gt[0, 8, 0] = 1.0
+    commit_masks = torch.ones(1, 1)
+    weights = {
+        "root_xz": 1.0,
+        "root_y": 0.0,
+        "heading": 0.0,
+        "fwd_delta": 0.0,
+        "yaw_delta": 0.0,
+        "end_xz": 0.0,
+    }
+
+    loss, terms = cl.compute_body_aux_loss_on_commit_masks(
+        decoded,
+        gt,
+        torch.tensor([12]),
+        commit_masks,
+        torch.tensor([0]),
+        torch.tensor([0]),
+        torch.device("cpu"),
+        weights,
+        heading_form="cosine",
+        window_start_tokens=torch.tensor([2]),
+    )
+
+    assert loss is not None
+    assert torch.isclose(loss, torch.tensor(0.5))
+    assert abs(terms["root_xz"] - 0.5) < 1e-6
 ```
 
 - [ ] **Step 2: Run the tests and verify they fail**
@@ -181,7 +227,7 @@ def test_commit_body_aux_delta_uses_full_decoded_prefix(monkeypatch):
 Run:
 
 ```bash
-/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests/test_body_aux_loss.py::test_commit_body_aux_uses_step_mean_not_frame_mean tests/test_body_aux_loss.py::test_commit_body_aux_delta_uses_full_decoded_prefix -q
+/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests/test_body_aux_loss.py::test_commit_body_aux_uses_step_mean_not_frame_mean tests/test_body_aux_loss.py::test_commit_body_aux_delta_uses_full_decoded_prefix tests/test_body_aux_loss.py::test_commit_body_aux_uses_window_start_token_for_gt_offset -q
 ```
 
 Expected: fails with `AttributeError: module 'utils.training.control_loss' has no attribute 'compute_body_aux_loss_on_commit_masks'`.
@@ -253,14 +299,20 @@ def compute_body_aux_loss_on_commit_masks(
     traj_length = traj_length.view(-1)
 
     starts = None
-    if window_start_tokens is not None:
-        if not torch.is_tensor(window_start_tokens):
-            starts = torch.as_tensor(window_start_tokens, device=device, dtype=torch.long)
-        else:
-            starts = window_start_tokens.to(device=device, dtype=torch.long)
-        starts = starts.view(-1)
-        if starts.numel() == 1 and len(decoded_list) > 1:
-            starts = starts.expand(len(decoded_list))
+    if window_start_tokens is None:
+        starts = torch.zeros(len(decoded_list), device=device, dtype=torch.long)
+    elif not torch.is_tensor(window_start_tokens):
+        starts = torch.as_tensor(window_start_tokens, device=device, dtype=torch.long)
+    else:
+        starts = window_start_tokens.to(device=device, dtype=torch.long)
+    starts = starts.view(-1)
+    if starts.numel() == 1 and len(decoded_list) > 1:
+        starts = starts.expand(len(decoded_list))
+    if starts.numel() != len(decoded_list):
+        raise ValueError(
+            "window_start_tokens must provide one GT offset per decoded prefix; "
+            f"got {starts.numel()} starts for {len(decoded_list)} decoded prefixes"
+        )
 
     decoded_cache = []
     for decoded_pos, decoded in enumerate(decoded_list):
@@ -269,36 +321,42 @@ def compute_body_aux_loss_on_commit_masks(
         quat, xyz = recover_root_rot_pos(decoded.unsqueeze(0))
         yaw = root_quat_to_physical_yaw(quat)
         gt_len = min(int(traj_length[orig_i].item()), gt_traj_7d.shape[1])
-        end_f = min(decoded.shape[0], gt_len, commit_frame_masks.shape[1])
+        window_start_token = int(starts[decoded_pos].item())
+        gt_start_f = token_start_frame(window_start_token, token_to_frame)
+        if gt_start_f >= gt_len:
+            raise ValueError(
+                "window_start_tokens must reference a valid GT start frame; "
+                f"sample={orig_i}, start_token={window_start_token}, "
+                f"start_frame={gt_start_f}, traj_length={gt_len}"
+            )
+        end_f = min(
+            decoded.shape[0],
+            gt_len - gt_start_f,
+            commit_frame_masks.shape[1],
+        )
         if end_f <= 0:
             decoded_cache.append(None)
             continue
-        gt7 = gt_traj_7d[orig_i : orig_i + 1, :end_f, :].to(
+        gt7 = gt_traj_7d[
+            orig_i : orig_i + 1, gt_start_f : gt_start_f + end_f, :
+        ].to(
             device=device, dtype=xyz.dtype
         )
         gt_xyz = gt7[..., :3]
         gt_yaw = torch.atan2(gt7[..., 4], gt7[..., 3])
         pred_xyz = xyz[:, :end_f, :]
         pred_yaw = yaw[:, :end_f]
-        if starts is not None:
-            anchor_f = token_start_frame(int(starts[decoded_pos].item()), token_to_frame)
-            if anchor_f >= gt_len:
-                raise ValueError(
-                    "window_start_tokens must reference a valid GT anchor frame; "
-                    f"sample={orig_i}, start_token={int(starts[decoded_pos].item())}, "
-                    f"anchor_frame={anchor_f}, traj_length={gt_len}"
-                )
-            anchor7 = gt_traj_7d[orig_i : orig_i + 1, anchor_f : anchor_f + 1, :].to(
-                device=device, dtype=xyz.dtype
-            )
-            anchor_xyz = anchor7[..., :3]
-            anchor_yaw = torch.atan2(anchor7[..., 4], anchor7[..., 3])
-            pred_xyz, pred_yaw = canonicalize_pose_to_anchor(
-                pred_xyz, pred_yaw, anchor_xyz, anchor_yaw
-            )
-            gt_xyz, gt_yaw = canonicalize_pose_to_anchor(
-                gt_xyz, gt_yaw, anchor_xyz, anchor_yaw
-            )
+        anchor7 = gt_traj_7d[
+            orig_i : orig_i + 1, gt_start_f : gt_start_f + 1, :
+        ].to(device=device, dtype=xyz.dtype)
+        anchor_xyz = anchor7[..., :3]
+        anchor_yaw = torch.atan2(anchor7[..., 4], anchor7[..., 3])
+        pred_xyz, pred_yaw = canonicalize_pose_to_anchor(
+            pred_xyz, pred_yaw, anchor_xyz, anchor_yaw
+        )
+        gt_xyz, gt_yaw = canonicalize_pose_to_anchor(
+            gt_xyz, gt_yaw, anchor_xyz, anchor_yaw
+        )
         decoded_cache.append((orig_i, end_f, pred_xyz, pred_yaw, gt_xyz, gt_yaw))
 
     losses = []
@@ -343,6 +401,7 @@ def compute_body_aux_loss_on_commit_masks(
     loss = torch.stack(losses).mean()
     denom = float(len(losses))
     metrics = {key: value / denom for key, value in term_sums.items()}
+    metrics["valid_count"] = denom
     return loss, metrics
 ```
 
@@ -386,7 +445,11 @@ import torch
 from utils.training.self_forcing import RolloutPlan, SelfForcingTrainer
 
 
-def _cfg(commit_enabled: bool, disable_replace: bool = True):
+def _cfg(
+    commit_enabled: bool,
+    disable_replace: bool = True,
+    strict_valid_commits: bool = False,
+):
     def get(key, default=None):
         values = {
             "anchor_canonicalize": {"enabled": False},
@@ -399,6 +462,7 @@ def _cfg(commit_enabled: bool, disable_replace: bool = True):
                 "replace_final_body_aux": True,
                 "include_final_step": True,
                 "reduction": "step_mean",
+                "strict_valid_commits": strict_valid_commits,
                 "weight": 1.0,
                 "weights": {
                     "root_xz": 1.0,
@@ -414,13 +478,19 @@ def _cfg(commit_enabled: bool, disable_replace: bool = True):
     return SimpleNamespace(get=get)
 
 
-def _trainer(commit_enabled: bool, k: int = 3, disable_replace: bool = True):
+def _trainer(
+    commit_enabled: bool,
+    k: int = 3,
+    disable_replace: bool = True,
+    chunk_size: int = 1,
+    strict_valid_commits: bool = False,
+):
     batch = 1
     seq_len = 5
     hidden = 4
     feature = torch.zeros(batch, seq_len, hidden)
     model = MagicMock(name="model")
-    model.chunk_size = 1
+    model.chunk_size = chunk_size
     model.self_forcing_stride_tokens = 1
     model.self_forcing_k_schedule = [(0.0, k)]
     model._decide_text_dropout.return_value = torch.zeros(batch, dtype=torch.bool)
@@ -443,7 +513,10 @@ def _trainer(commit_enabled: bool, k: int = 3, disable_replace: bool = True):
         }
 
     model._forward_single_window.side_effect = forward
-    module = SimpleNamespace(model=model, cfg=_cfg(commit_enabled, disable_replace))
+    module = SimpleNamespace(
+        model=model,
+        cfg=_cfg(commit_enabled, disable_replace, strict_valid_commits),
+    )
     trainer = SelfForcingTrainer.__new__(SelfForcingTrainer)
     trainer._module = module
     trainer._last_replace_diff = None
@@ -497,6 +570,17 @@ def test_replacement_uses_detached_x0_latent_list_not_pred_x0():
 
     assert torch.equal(seen_features[1][0, 0], torch.full((4,), 2.0))
     assert not seen_features[1].requires_grad
+
+
+def test_commit_aux_rejects_chunk_size_greater_than_one_for_first_version():
+    trainer, model_batch, _, _ = _trainer(commit_enabled=True, k=2, chunk_size=2)
+
+    try:
+        trainer._run_rollout(model_batch, progress=1.0)
+    except NotImplementedError as exc:
+        assert "chunk_size == 1" in str(exc)
+    else:
+        raise AssertionError("expected chunk_size > 1 to be rejected")
 ```
 
 - [ ] **Step 2: Run tests and verify failure**
@@ -507,7 +591,7 @@ Run:
 /home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests/test_multistep_commit_body_aux.py -q
 ```
 
-Expected: commit-aux tests fail because `_last_commit_token_records` does not exist and non-final steps remain `no_grad`.
+Expected: commit-aux tests fail because `_last_commit_token_records` does not exist, non-final steps remain `no_grad`, and the chunk-size guard does not exist.
 
 - [ ] **Step 3: Add commit record dataclass and config helpers**
 
@@ -540,6 +624,12 @@ In `_run_rollout()`, initialize before the loop:
 ```python
         commit_cfg = self._commit_body_aux_cfg()
         commit_aux_enabled = bool(commit_cfg.get("enabled", False))
+        if commit_aux_enabled and int(model.chunk_size) != 1:
+            raise NotImplementedError(
+                "multistep_commit_body_aux initial implementation requires "
+                "model.chunk_size == 1; add commit span records before enabling "
+                "chunk_size > 1"
+            )
         include_final_commit = bool(commit_cfg.get("include_final_step", True))
         commit_records: list[CommitTokenRecord] = []
         global_starts = model_batch.get("_window_global_start_token")
@@ -660,7 +750,7 @@ git commit -m "feat: collect multistep commit tokens"
 Append to `tests/test_multistep_commit_body_aux.py`:
 
 ```python
-def test_full_prefix_splice_assembly_uses_global_commit_indices():
+def test_full_prefix_splice_assembly_decodes_only_to_global_commit_prefix():
     from utils.token_frame import token_range_to_frame_slice
 
     trainer, _, _, _ = _trainer(commit_enabled=True, k=1)
@@ -691,12 +781,13 @@ def test_full_prefix_splice_assembly_uses_global_commit_indices():
         trainer._assemble_commit_decode_inputs(batch, model_batch)
     )
 
+    assert decoded_latents[0].shape[0] == 4
     assert torch.equal(decoded_latents[0][3], record)
     assert decoded_latents[0][3].requires_grad
     assert not decoded_latents[0][2].requires_grad
     assert commit_positions.tolist() == [0]
     assert sample_indices.tolist() == [0]
-    assert window_starts.tolist() == [2]
+    assert window_starts.tolist() == [0]
     sl = token_range_to_frame_slice(3, 1)
     assert commit_masks.shape[0] == 1
     assert commit_masks[0, sl.start:sl.stop].sum().item() == 4
@@ -704,7 +795,7 @@ def test_full_prefix_splice_assembly_uses_global_commit_indices():
     assert commit_masks[0, sl.stop:].sum().item() == 0
 
 
-def test_local_decode_assembly_uses_local_commit_indices():
+def test_local_decode_assembly_decodes_only_to_local_commit_prefix():
     from utils.token_frame import token_range_to_frame_slice
 
     trainer, _, _, _ = _trainer(commit_enabled=True, k=1)
@@ -735,19 +826,20 @@ def test_local_decode_assembly_uses_local_commit_indices():
         trainer._assemble_commit_decode_inputs(batch, model_batch)
     )
 
+    assert decoded_latents[0].shape[0] == 2
     assert torch.equal(decoded_latents[0][1], record)
     assert decoded_latents[0][1].requires_grad
     assert not decoded_latents[0][0].requires_grad
     assert commit_positions.tolist() == [0]
     assert sample_indices.tolist() == [0]
-    assert window_starts is None
+    assert window_starts.tolist() == [5]
     sl = token_range_to_frame_slice(1, 1)
     assert commit_masks[0, sl.start:sl.stop].sum().item() == 4
     assert commit_masks[0, :sl.start].sum().item() == 0
     assert commit_masks[0, sl.stop:].sum().item() == 0
 
 
-def test_prefix_assembly_preserves_sample_indices_and_expands_scalar_starts():
+def test_local_prefix_assembly_preserves_sample_indices_and_expands_scalar_starts():
     trainer, _, _, _ = _trainer(commit_enabled=True, k=1)
     batch = {
         "token": torch.zeros(3, 6, 2),
@@ -756,7 +848,7 @@ def test_prefix_assembly_preserves_sample_indices_and_expands_scalar_starts():
         "traj_length": torch.tensor([24, 24, 24]),
     }
     model_batch = {
-        "_window_local_body_aux_mode": "full_prefix_splice",
+        "_window_local_body_aux_mode": "local_decode",
         "_window_global_start_token": torch.tensor([2]),
         "feature": torch.zeros(3, 4, 2),
         "feature_length": torch.tensor([4, 4, 4]),
@@ -777,6 +869,38 @@ def test_prefix_assembly_preserves_sample_indices_and_expands_scalar_starts():
     assert commit_positions.tolist() == [0]
     assert sample_indices.tolist() == [2]
     assert window_starts.tolist() == [2]
+
+
+def test_prefix_assembly_does_not_include_future_gt_suffix():
+    trainer, _, _, _ = _trainer(commit_enabled=True, k=1)
+    batch = {
+        "token": torch.zeros(1, 10, 2),
+        "token_length": torch.tensor([10]),
+        "traj_cond_7d": torch.zeros(1, 40, 7),
+        "traj_length": torch.tensor([40]),
+    }
+    batch["token"][0, 4:, :] = 99.0
+    model_batch = {
+        "_window_local_body_aux_mode": "full_prefix_splice",
+        "_window_global_start_token": torch.tensor([2]),
+        "feature": torch.zeros(1, 4, 2),
+        "feature_length": torch.tensor([4]),
+    }
+    trainer._last_commit_token_records = [
+        SimpleNamespace(
+            batch_idx=0,
+            local_commit_idx=1,
+            global_commit_idx=3,
+            pred_token=torch.ones(2, requires_grad=True),
+        )
+    ]
+
+    decoded_latents, _, _, _, _ = trainer._assemble_commit_decode_inputs(
+        batch, model_batch
+    )
+
+    assert decoded_latents[0].shape[0] == 4
+    assert not torch.any(decoded_latents[0] == 99.0)
 ```
 
 - [ ] **Step 2: Run tests and verify failure**
@@ -784,7 +908,7 @@ def test_prefix_assembly_preserves_sample_indices_and_expands_scalar_starts():
 Run:
 
 ```bash
-/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests/test_multistep_commit_body_aux.py::test_full_prefix_splice_assembly_uses_global_commit_indices tests/test_multistep_commit_body_aux.py::test_local_decode_assembly_uses_local_commit_indices tests/test_multistep_commit_body_aux.py::test_prefix_assembly_preserves_sample_indices_and_expands_scalar_starts -q
+/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests/test_multistep_commit_body_aux.py::test_full_prefix_splice_assembly_decodes_only_to_global_commit_prefix tests/test_multistep_commit_body_aux.py::test_local_decode_assembly_decodes_only_to_local_commit_prefix tests/test_multistep_commit_body_aux.py::test_local_prefix_assembly_preserves_sample_indices_and_expands_scalar_starts tests/test_multistep_commit_body_aux.py::test_prefix_assembly_does_not_include_future_gt_suffix -q
 ```
 
 Expected: fails because `_assemble_commit_decode_inputs` is not defined.
@@ -819,18 +943,6 @@ Add method inside `SelfForcingTrainer`:
             source = model_batch["feature"]
             lengths = model_batch["feature_length"]
             use_global = False
-            window_starts = None
-        elif mode == "full_prefix_splice":
-            source = batch["token"]
-            lengths = batch.get("token_length")
-            if lengths is None:
-                lengths = torch.full(
-                    (source.shape[0],),
-                    source.shape[1],
-                    device=source.device,
-                    dtype=torch.long,
-                )
-            use_global = True
             starts = model_batch.get(
                 "_window_global_start_token", batch.get("_window_global_start_token")
             )
@@ -842,6 +954,18 @@ Add method inside `SelfForcingTrainer`:
             if starts.numel() == 1 and source.shape[0] > 1:
                 starts = starts.expand(source.shape[0])
             window_starts = starts
+        elif mode == "full_prefix_splice":
+            source = batch["token"]
+            lengths = batch.get("token_length")
+            if lengths is None:
+                lengths = torch.full(
+                    (source.shape[0],),
+                    source.shape[1],
+                    device=source.device,
+                    dtype=torch.long,
+                )
+            use_global = True
+            window_starts = torch.zeros(source.shape[0], device=device, dtype=torch.long)
         else:
             raise ValueError(f"Unsupported _window_local_body_aux_mode={mode!r}")
 
@@ -858,19 +982,35 @@ Add method inside `SelfForcingTrainer`:
         for record in records:
             records_by_sample.setdefault(int(record.batch_idx), []).append(record)
 
-        sample_indices_list = sorted(records_by_sample)
+        def record_commit_idx(record):
+            return int(record.global_commit_idx if use_global else record.local_commit_idx)
+
+        sample_indices_list = []
         decoded_latents = []
         max_frames = 0
-        for batch_idx in sample_indices_list:
+        for batch_idx in sorted(records_by_sample):
+            max_commit_idx = max(record_commit_idx(r) for r in records_by_sample[batch_idx])
+            decode_end_token = max_commit_idx + 1
             token_len = int(lengths[batch_idx].item())
-            decoded_latents.append(source[batch_idx, :token_len, :].detach().clone())
-            max_frames = max(max_frames, token_range_to_frame_slice(0, token_len).stop)
+            decode_end_token = min(decode_end_token, token_len)
+            if decode_end_token <= 0:
+                continue
+            sample_indices_list.append(batch_idx)
+            decoded_latents.append(
+                source[batch_idx, :decode_end_token, :].detach().clone()
+            )
+            max_frames = max(
+                max_frames,
+                token_range_to_frame_slice(0, decode_end_token).stop,
+            )
 
         sample_pos = {batch_idx: pos for pos, batch_idx in enumerate(sample_indices_list)}
         commit_masks = []
         commit_positions = []
         for record in records:
             batch_idx = int(record.batch_idx)
+            if batch_idx not in sample_pos:
+                continue
             decoded_pos = sample_pos[batch_idx]
             token_idx = int(record.global_commit_idx if use_global else record.local_commit_idx)
             write_idx = token_idx if use_global else int(record.local_commit_idx)
@@ -915,10 +1055,10 @@ Add method inside `SelfForcingTrainer`:
 Run:
 
 ```bash
-/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests/test_multistep_commit_body_aux.py::test_full_prefix_splice_assembly_uses_global_commit_indices tests/test_multistep_commit_body_aux.py::test_local_decode_assembly_uses_local_commit_indices tests/test_multistep_commit_body_aux.py::test_prefix_assembly_preserves_sample_indices_and_expands_scalar_starts -q
+/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests/test_multistep_commit_body_aux.py::test_full_prefix_splice_assembly_decodes_only_to_global_commit_prefix tests/test_multistep_commit_body_aux.py::test_local_decode_assembly_decodes_only_to_local_commit_prefix tests/test_multistep_commit_body_aux.py::test_local_prefix_assembly_preserves_sample_indices_and_expands_scalar_starts tests/test_multistep_commit_body_aux.py::test_prefix_assembly_does_not_include_future_gt_suffix -q
 ```
 
-Expected: all three tests pass.
+Expected: all four prefix assembly tests pass.
 
 - [ ] **Step 5: Commit**
 
@@ -992,6 +1132,7 @@ def test_commit_aux_replaces_final_body_aux(monkeypatch):
     assert torch.isclose(total, torch.tensor(4.5))
     assert torch.isclose(diff, torch.tensor(2.0))
     assert torch.isclose(control, torch.tensor(0.5))
+    assert trainer._last_commit_body_aux_valid_count == 1
 
 
 def test_commit_aux_none_does_not_fallback_to_final_body_aux(monkeypatch):
@@ -1026,6 +1167,42 @@ def test_commit_aux_none_does_not_fallback_to_final_body_aux(monkeypatch):
     assert torch.isclose(total, torch.tensor(2.0))
     assert torch.isclose(diff, torch.tensor(2.0))
     assert control is None
+    assert trainer._last_commit_body_aux_valid_count == 0
+
+
+def test_commit_aux_none_raises_in_strict_mode(monkeypatch):
+    trainer, _, _, _ = _trainer(
+        commit_enabled=True, k=1, strict_valid_commits=True
+    )
+    trainer._module.device = torch.device("cpu")
+    trainer._module.vae = MagicMock()
+    trainer._module.cfg.model = SimpleNamespace(params={"control_loss_weight": 5.0})
+    trainer._last_commit_token_records = []
+    final_step_result = {
+        "loss": torch.tensor(2.0, requires_grad=True),
+        "pred_x0_latent_list": [torch.ones(1, 4, requires_grad=True)],
+    }
+    batch = {
+        "token": torch.zeros(1, 1, 4),
+        "token_length": torch.tensor([1]),
+        "traj_cond_7d": torch.zeros(1, 1, 7),
+        "traj_length": torch.tensor([1]),
+    }
+    model_batch = {
+        "feature": torch.zeros(1, 1, 4),
+        "feature_length": torch.tensor([1]),
+    }
+    monkeypatch.setattr(
+        "utils.training.self_forcing._compute_body_aux_loss",
+        MagicMock(side_effect=AssertionError("must not fallback")),
+    )
+
+    try:
+        trainer._compute_losses(final_step_result, batch, model_batch)
+    except RuntimeError as exc:
+        assert "no valid commit body aux loss" in str(exc)
+    else:
+        raise AssertionError("expected strict mode to reject missing commit loss")
 ```
 
 - [ ] **Step 2: Run tests and verify failure**
@@ -1033,7 +1210,7 @@ def test_commit_aux_none_does_not_fallback_to_final_body_aux(monkeypatch):
 Run:
 
 ```bash
-/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests/test_multistep_commit_body_aux.py::test_commit_aux_replaces_final_body_aux tests/test_multistep_commit_body_aux.py::test_commit_aux_none_does_not_fallback_to_final_body_aux -q
+/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests/test_multistep_commit_body_aux.py::test_commit_aux_replaces_final_body_aux tests/test_multistep_commit_body_aux.py::test_commit_aux_none_does_not_fallback_to_final_body_aux tests/test_multistep_commit_body_aux.py::test_commit_aux_none_raises_in_strict_mode -q
 ```
 
 Expected: fails because `_compute_losses()` does not accept `model_batch` and commit aux is not integrated.
@@ -1066,6 +1243,7 @@ Add inside `SelfForcingTrainer`:
 
 ```python
     def _compute_commit_body_aux_loss(self, batch: dict, model_batch: dict):
+        self._last_commit_body_aux_valid_count = 0
         cfg = self._commit_body_aux_cfg()
         if not bool(cfg.get("enabled", False)):
             return None, {}
@@ -1088,6 +1266,7 @@ Add inside `SelfForcingTrainer`:
         ) = self._assemble_commit_decode_inputs(batch, model_batch)
         if not decoded_latents or commit_frame_masks is None:
             return None, {}
+        candidate_commit_count = int(commit_frame_masks.shape[0])
         decoded = self._decode_commit_latents(decoded_latents)
         ba_cfg = self._module.cfg.get("body_aux_loss", {}) or {}
         weights = {
@@ -1109,7 +1288,10 @@ Add inside `SelfForcingTrainer`:
             window_start_tokens=window_starts,
         )
         if loss is None:
+            self._last_commit_body_aux_valid_count = 0
             return None, {}
+        valid_count = int(float(terms.get("valid_count", candidate_commit_count)))
+        self._last_commit_body_aux_valid_count = valid_count
         return loss * float(cfg.get("weight", 1.0)), terms
 ```
 
@@ -1134,11 +1316,16 @@ At the top after `control_weight`, add:
         commit_enabled = bool(commit_cfg.get("enabled", False))
         replace_final = bool(commit_cfg.get("replace_final_body_aux", True))
         if control_weight > 0.0 and commit_enabled:
-            step_control_loss, self._last_body_aux_terms = (
-                self._compute_commit_body_aux_loss(batch, model_batch)
+            step_control_loss, commit_terms = self._compute_commit_body_aux_loss(
+                batch, model_batch
             )
+            self._last_body_aux_terms = commit_terms
             if step_control_loss is not None:
                 total_loss = total_loss + control_weight * step_control_loss
+            elif bool(commit_cfg.get("strict_valid_commits", False)):
+                raise RuntimeError(
+                    "multistep_commit_body_aux produced no valid commit body aux loss"
+                )
             if replace_final:
                 return total_loss, step_diff_loss, step_control_loss
 ```
@@ -1150,6 +1337,18 @@ Keep the existing final-step body aux logic below this for disabled mode or
         total_loss, step_diff_loss, step_control_loss = self._compute_losses(
             final_step_result, batch, model_batch
         )
+```
+
+Also add commit-validity metrics before logging:
+
+```python
+        commit_valid_count = getattr(self, "_last_commit_body_aux_valid_count", None)
+        if commit_valid_count is not None:
+            runtime_metrics["body_aux/commit_valid_count"] = float(commit_valid_count)
+            runtime_metrics["body_aux/commit_loss_skipped"] = (
+                1.0 if int(commit_valid_count) == 0 else 0.0
+            )
+            self._last_commit_body_aux_valid_count = None
 ```
 
 - [ ] **Step 6: Run loss integration tests**
@@ -1215,7 +1414,7 @@ git diff --stat
 
 Expected: only intended files changed, plus any pre-existing unstaged user edits that were already present before implementation.
 
-- [ ] **Step 4: Document first diagnostic run overrides**
+- [ ] **Step 4: Document diagnostic run overrides**
 
 Use these overrides for the first experiment:
 
@@ -1231,6 +1430,31 @@ multistep_commit_body_aux:
 ```
 
 Expected: K=3, no trajectory-condition dropout, single-decode step-mean commit body aux replaces old final-step body aux.
+
+For the clean comparison against the old objective, also run a second K=3
+ablation that inherits the previous body-aux weights while keeping `end_xz`
+disabled:
+
+```yaml
+model:
+  params:
+    self_forcing_k_schedule:
+      - [0.0, 3]
+    traj_dropout: 0.0
+multistep_commit_body_aux:
+  enabled: true
+  weight: 1.0
+  weights:
+    root_xz: 2.0
+    root_y: 0.1
+    heading: 0.5
+    fwd_delta: 0.1
+    yaw_delta: 0.1
+    end_xz: 0.0
+```
+
+Expected: the second run changes only the commit body-aux term strength, not
+the step-mean/prefix-only training semantics.
 
 - [ ] **Step 5: Final commit if verification-only fixes were needed**
 
