@@ -15,7 +15,10 @@ from metrics.traj import (
     _stable_eval_seed,
 )
 from utils.traj_batch import root_to_traj_feats
+from eval.ldf.stream_generation import run_stream_generate_step_sample
 from utils.training import ckpt_step_info
+from utils.training.ldf.t2m_generation import run_t2m_generation_mode
+from utils.training.ldf.t2m_generation_modes import T2M_STREAM_GENERATE_STEP
 from utils.training.ldf.validation_conditioning import prepare_ldf_eval_model_batch
 from utils.training.ldf.validation_eval_runtime import (
     build_generation_eval_cfg,
@@ -138,6 +141,56 @@ def _gather_payloads(local_payloads):
     return local_payloads
 
 
+def _batch_text(model_batch: dict, batch_size: int):
+    text = model_batch.get("output_text", model_batch.get("text", [""] * batch_size))
+    if isinstance(text, list) and text and isinstance(text[0], list):
+        text = [" ////////// ".join(map(str, item)) for item in text]
+    return text
+
+
+def _run_validation_generation_mode(
+    model,
+    model_batch,
+    generation_mode: str,
+    *,
+    vae=None,
+    sample_batch=None,
+    device=None,
+    stream_history_length: int = 30,
+    stream_traj_horizon_tokens: int | None = 20,
+    stream_token_dt: float = 0.20,
+    stream_frames_per_token: int = 4,
+    num_denoise_steps=None,
+) -> dict:
+    if generation_mode != T2M_STREAM_GENERATE_STEP:
+        return run_t2m_generation_mode(
+            model,
+            model_batch,
+            generation_mode,
+            num_denoise_steps=num_denoise_steps,
+        )
+    if vae is None or sample_batch is None or device is None:
+        raise ValueError(
+            "stream_generate_step validation requires vae, sample_batch, and device."
+        )
+    stream_output = run_stream_generate_step_sample(
+        model=model,
+        vae=vae,
+        sample_batch=sample_batch,
+        device=device,
+        history_length=int(stream_history_length),
+        num_denoise_steps=num_denoise_steps,
+        traj_horizon_tokens=stream_traj_horizon_tokens,
+        token_dt=float(stream_token_dt),
+        frames_per_token=int(stream_frames_per_token),
+    )
+    return {
+        "generated": [stream_output["latent_stream"]],
+        "decoded_feature": [stream_output["decoded_feature"]],
+        "text": _batch_text(model_batch, 1),
+    }
+
+
 def run_validation_generation_eval(module, batch, batch_idx=None, test_loader_idx=0):
     # Fix seed for reproducible test generation, but save/restore the training RNG so
     # that training noise stays i.i.d. when the training loop resumes after validation.
@@ -149,6 +202,8 @@ def run_validation_generation_eval(module, batch, batch_idx=None, test_loader_id
     eval_cfg = build_generation_eval_cfg(module.cfg)
     eval_num_runs = max(eval_cfg["num_runs"], 1)
     eval_seg_size = eval_cfg["seg_size"]
+    condition_mode = eval_cfg["condition_mode"]
+    generation_mode = eval_cfg["generation_mode"]
     do_eval_metrics = eval_cfg["enabled"] and "traj" in batch and "traj_mask" in batch
     generation_num_runs = eval_num_runs if do_eval_metrics else 1
     probe_tag = resolve_test_probe_tag(module, test_loader_idx)
@@ -185,7 +240,12 @@ def run_validation_generation_eval(module, batch, batch_idx=None, test_loader_id
                         train_mode=control_loss_train_mode(module.cfg),
                         chunk_size_tokens=getattr(module.model, "chunk_size", None),
                         window_mode=eval_cfg["forward_ctrl_window_mode"],
-                        model_batch_builder=prepare_ldf_eval_model_batch,
+                        model_batch_builder=lambda sample_batch, device, model=None: prepare_ldf_eval_model_batch(
+                            sample_batch,
+                            device,
+                            model=model,
+                            condition_mode=condition_mode,
+                        ),
                     )
                 except Exception as e:
                     rank_zero_info(
@@ -228,10 +288,25 @@ def run_validation_generation_eval(module, batch, batch_idx=None, test_loader_id
                             _cap_batch,
                             module.device,
                             model=module.model,
+                            condition_mode=condition_mode,
                         )
                         if _debug and run_idx == 0 and _cap_idx == 0 and sample_idx == 0:
                             _dump_eval_debug(module, model_batch, sample_seed, step_tag)
-                        output = module.model.generate(model_batch)
+                        output = _run_validation_generation_mode(
+                            module.model,
+                            model_batch,
+                            generation_mode,
+                            vae=module.vae,
+                            sample_batch=_cap_batch,
+                            device=module.device,
+                            stream_history_length=eval_cfg["stream_history_length"],
+                            stream_traj_horizon_tokens=eval_cfg[
+                                "stream_traj_horizon_tokens"
+                            ],
+                            stream_token_dt=eval_cfg["stream_token_dt"],
+                            stream_frames_per_token=eval_cfg["stream_frames_per_token"],
+                            num_denoise_steps=eval_cfg["num_denoise_steps"],
+                        )
                     if _debug and run_idx == 0 and _cap_idx == 0 and sample_idx == 0:
                         _post_sd = _hash_sd(module.model.state_dict())
                         _post_ema = _hash_ema(module.ema)
@@ -243,9 +318,15 @@ def run_validation_generation_eval(module, batch, batch_idx=None, test_loader_id
                             )
 
                     single_generated = output["generated"][0]
-                    decoded_single_generated = module.vae.decode(
-                        single_generated[None, :].to(module.device)
-                    )[0].float().detach()
+                    decoded_features = output.get("decoded_feature")
+                    if decoded_features is not None:
+                        decoded_single_generated = (
+                            decoded_features[0].float().to(module.device).detach()
+                        )
+                    else:
+                        decoded_single_generated = module.vae.decode(
+                            single_generated[None, :].to(module.device)
+                        )[0].float().detach()
 
                     if run_idx == 0 and _cap_idx == 0:
                         sample_text = output["text"][0]
@@ -307,6 +388,18 @@ def run_validation_generation_eval(module, batch, batch_idx=None, test_loader_id
                     "num_runs": eval_num_runs,
                     "num_captions": len(_all_captions),
                     "probe_tag": probe_tag,
+                    "condition_mode": condition_mode,
+                    "generation_mode": generation_mode,
+                    "stream_history_length": (
+                        eval_cfg["stream_history_length"]
+                        if generation_mode == T2M_STREAM_GENERATE_STEP
+                        else None
+                    ),
+                    "stream_traj_horizon_tokens": (
+                        eval_cfg["stream_traj_horizon_tokens"]
+                        if generation_mode == T2M_STREAM_GENERATE_STEP
+                        else None
+                    ),
                     "text": sample_text,
                     "text_all": _all_captions,
                 }

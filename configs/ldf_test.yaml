@@ -44,7 +44,12 @@ validation:
     val_repeat: 1
     t2m_metric: true
     t2m_generation_modes:
-        - generate
+        - stream_generate_step
+    eval_generation_mode: stream_generate_step
+    eval_stream_history_length: 30
+    eval_stream_traj_horizon_tokens: 20
+    eval_stream_token_dt: 0.20
+    eval_stream_frames_per_token: 4
     eval_generation_metrics: true
     eval_num_runs: 5
     eval_seg_size: 20

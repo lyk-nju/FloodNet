@@ -32,13 +32,18 @@ from utils.training.ldf.model_step import run_model_step
 from utils.training.ldf.t2m_generation import run_t2m_generation_mode
 from utils.training.ldf.t2m_generation_modes import (
     T2M_GENERATE,
+    T2M_STREAM_GENERATE_STEP,
     resolve_t2m_generation_modes,
 )
 from utils.training.ldf.validation_conditioning import (
     build_windowed_metric_ground_truth as _build_windowed_metric_ground_truth,
     prepare_ldf_eval_model_batch,
 )
-from utils.training.ldf.validation_generation import run_validation_generation_eval
+from utils.training.ldf.validation_eval_runtime import build_generation_eval_cfg
+from utils.training.ldf.validation_generation import (
+    _run_validation_generation_mode,
+    run_validation_generation_eval,
+)
 from utils.training.ldf.validation_summary import process_validation_generation_results
 
 
@@ -419,10 +424,50 @@ class LDFLightningModule(BasicLightningModule):
         try:
             with self.ema.average_parameters([p for p in self.model.parameters() if p.requires_grad]):
                 model_batch = prepare_ldf_eval_model_batch(batch, self.device, model=self.model)
-                outputs = {
-                    mode: run_t2m_generation_mode(self.model, model_batch, mode)
-                    for mode in self.t2m_generation_modes
-                }
+                eval_cfg = build_generation_eval_cfg(self.cfg)
+                outputs = {}
+                for mode in self.t2m_generation_modes:
+                    if mode != T2M_STREAM_GENERATE_STEP:
+                        outputs[mode] = run_t2m_generation_mode(
+                            self.model,
+                            model_batch,
+                            mode,
+                            num_denoise_steps=eval_cfg["num_denoise_steps"],
+                        )
+                        continue
+                    generated = []
+                    decoded_feature = []
+                    text = []
+                    for sample_idx in range(len(batch["name"])):
+                        sample_batch = _slice_single_sample_batch(batch, sample_idx)
+                        sample_model_batch = prepare_ldf_eval_model_batch(
+                            sample_batch,
+                            self.device,
+                            model=self.model,
+                        )
+                        sample_output = _run_validation_generation_mode(
+                            self.model,
+                            sample_model_batch,
+                            mode,
+                            vae=self.vae,
+                            sample_batch=sample_batch,
+                            device=self.device,
+                            stream_history_length=eval_cfg["stream_history_length"],
+                            stream_traj_horizon_tokens=eval_cfg[
+                                "stream_traj_horizon_tokens"
+                            ],
+                            stream_token_dt=eval_cfg["stream_token_dt"],
+                            stream_frames_per_token=eval_cfg["stream_frames_per_token"],
+                            num_denoise_steps=eval_cfg["num_denoise_steps"],
+                        )
+                        generated.append(sample_output["generated"][0])
+                        decoded_feature.append(sample_output["decoded_feature"][0])
+                        text.append(sample_output["text"][0])
+                    outputs[mode] = {
+                        "generated": generated,
+                        "decoded_feature": decoded_feature,
+                        "text": text,
+                    }
         finally:
             torch.random.set_rng_state(cpu_state)
             if cuda_state is not None:
@@ -437,14 +482,18 @@ class LDFLightningModule(BasicLightningModule):
         for mode, output in outputs.items():
             metric = self.t2m_metrics[mode]
             generated = output["generated"]
+            decoded_generated = output.get("decoded_feature")
             for i in range(len(generated)):
                 ##############################
                 # decode generated motion
                 ##############################
                 single_generated = generated[i]
-                decoded_single_generated = self.vae.decode(
-                    single_generated[None, :].to(self.device)
-                )[0]
+                if decoded_generated is not None:
+                    decoded_single_generated = decoded_generated[i].to(self.device)
+                else:
+                    decoded_single_generated = self.vae.decode(
+                        single_generated[None, :].to(self.device)
+                    )[0]
                 decoded_single_generated = decoded_single_generated.float().to(self.device)
                 ##############################
                 # decode ground truth

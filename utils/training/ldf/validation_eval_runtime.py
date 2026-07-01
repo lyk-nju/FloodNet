@@ -7,6 +7,17 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
 from utils.initialize import instantiate
+from utils.training.ldf.t2m_generation_modes import T2M_GENERATION_MODES
+
+
+def _resolve_eval_generation_mode(validation_cfg) -> str:
+    mode = str(validation_cfg.get("eval_generation_mode", "stream_generate_step"))
+    if mode not in T2M_GENERATION_MODES:
+        raise ValueError(
+            "validation.eval_generation_mode must be one of "
+            f"{T2M_GENERATION_MODES}; got {mode!r}."
+        )
+    return mode
 
 
 def build_generation_eval_cfg(cfg):
@@ -25,6 +36,21 @@ def build_generation_eval_cfg(cfg):
             )
         ),
         "eval_all_captions": bool(validation_cfg.get("eval_all_captions", False)),
+        "condition_mode": str(
+            validation_cfg.get("eval_condition_mode", "clip_start_local")
+        ),
+        "generation_mode": _resolve_eval_generation_mode(validation_cfg),
+        "stream_history_length": int(
+            validation_cfg.get("eval_stream_history_length", 30)
+        ),
+        "stream_traj_horizon_tokens": int(
+            validation_cfg.get("eval_stream_traj_horizon_tokens", 20)
+        ),
+        "stream_token_dt": float(validation_cfg.get("eval_stream_token_dt", 0.20)),
+        "stream_frames_per_token": int(
+            validation_cfg.get("eval_stream_frames_per_token", 4)
+        ),
+        "num_denoise_steps": validation_cfg.get("eval_num_denoise_steps", None),
     }
 
 

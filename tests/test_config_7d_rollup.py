@@ -54,7 +54,10 @@ def test_all_new_sections_present_and_readable():
     assert "motion_aux_loss" not in cfg.ldf_training
     assert "t2m_metric" not in cfg
     assert cfg.validation.t2m_metric is True
-    assert list(cfg.validation.t2m_generation_modes) == ["generate"]
+    assert list(cfg.validation.t2m_generation_modes) == ["stream_generate_step"]
+    assert cfg.validation.eval_generation_mode == "stream_generate_step"
+    assert cfg.validation.eval_stream_history_length == 30
+    assert cfg.validation.eval_stream_traj_horizon_tokens == 20
     assert "val_repeat" not in cfg
     assert cfg.validation.val_repeat == 1
     # T_B_05 is now a hard default in the self-forcing path; only ablations

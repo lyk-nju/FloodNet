@@ -58,14 +58,18 @@ from metrics.traj import (
     _to_device,
 )
 from utils.training.ldf.validation_conditioning import (
+    EVAL_CONDITION_CLIP_START_LOCAL,
+    EVAL_CONDITION_LEGACY_RAW,
     build_windowed_metric_ground_truth,
     prepare_ldf_eval_model_batch,
 )
 from utils.training.ldf.t2m_generation import run_t2m_generation_mode
+from eval.ldf.stream_generation import run_stream_generate_step_sample
 from utils.initialize import get_function, instantiate, load_config
 from utils.motion_process import extract_root_trajectory_263_torch
 from utils.training.ldf.t2m_generation_modes import (
     T2M_GENERATE,
+    T2M_STREAM_GENERATE_STEP,
     resolve_t2m_generation_modes,
 )
 from utils.training.ldf.model_factory import instantiate_ldf_model
@@ -146,6 +150,23 @@ def parse_args():
                         help="Optional probe label used in output path / summaries, e.g. train or test.")
     parser.add_argument("--meta_paths", nargs="+", default=None,
                         help="Override cfg.data.test_meta_paths for this evaluation run.")
+    parser.add_argument(
+        "--condition_mode",
+        type=str,
+        default=None,
+        choices=[
+            EVAL_CONDITION_CLIP_START_LOCAL,
+            EVAL_CONDITION_LEGACY_RAW,
+            "clip_start",
+            "local",
+            "raw_legacy",
+            "raw",
+        ],
+        help=(
+            "LDF eval condition prepare mode. Defaults to "
+            "validation.eval_condition_mode or clip_start_local."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -169,6 +190,66 @@ def _infer_meta_tag(meta_paths) -> str:
     if stem.endswith("_min"):
         stem = stem[:-4]
     return stem or "meta"
+
+
+def _resolve_eval_t2m_generation_modes(cfg):
+    """Resolve modes from an OmegaConf config or the project Config wrapper."""
+    return resolve_t2m_generation_modes(getattr(cfg, "config", cfg))
+
+
+def _batch_text(model_batch: Dict, batch_size: int) -> List[str]:
+    text = model_batch.get("output_text", model_batch.get("text", [""] * batch_size))
+    if isinstance(text, list) and text and isinstance(text[0], list):
+        text = [" ////////// ".join(map(str, item)) for item in text]
+    return list(text)
+
+
+def _run_t2m_generation_for_mode(
+    *,
+    model,
+    vae,
+    batch,
+    model_batch,
+    mode: str,
+    device,
+    val_cfg,
+    condition_mode: str,
+) -> Dict:
+    if mode != T2M_STREAM_GENERATE_STEP:
+        return run_t2m_generation_mode(model, model_batch, mode)
+
+    generated = []
+    decoded_feature = []
+    text = []
+    for sample_idx in range(len(batch["name"])):
+        sample_batch = _slice_single_sample_batch(batch, sample_idx)
+        sample_model_batch = prepare_ldf_eval_model_batch(
+            sample_batch,
+            device,
+            model=model,
+            condition_mode=condition_mode,
+        )
+        stream_output = run_stream_generate_step_sample(
+            model=model,
+            vae=vae,
+            sample_batch=sample_batch,
+            device=device,
+            history_length=int(val_cfg.get("eval_stream_history_length", 30)),
+            num_denoise_steps=val_cfg.get("eval_num_denoise_steps", None),
+            traj_horizon_tokens=int(
+                val_cfg.get("eval_stream_traj_horizon_tokens", 20)
+            ),
+            token_dt=float(val_cfg.get("eval_stream_token_dt", 0.20)),
+            frames_per_token=int(val_cfg.get("eval_stream_frames_per_token", 4)),
+        )
+        generated.append(stream_output["latent_stream"])
+        decoded_feature.append(stream_output["decoded_feature"])
+        text.extend(_batch_text(sample_model_batch, 1))
+    return {
+        "generated": generated,
+        "decoded_feature": decoded_feature,
+        "text": text,
+    }
 
 
 def _remove_traj_fields(batch: Dict) -> Dict:
@@ -430,6 +511,9 @@ def main():
     control_mode = control_loss_train_mode(cfg.config)
     val_cfg = cfg.get("validation", {})
     fwd_ctrl_window_mode = str(val_cfg.get("eval_forward_control_loss_window_mode", "mean_chunk_windows"))
+    condition_mode = args.condition_mode or str(
+        val_cfg.get("eval_condition_mode", EVAL_CONDITION_CLIP_START_LOCAL)
+    )
 
     collate_fn = get_function(cfg.data.collate_fn) if cfg.data.get("collate_fn") else None
 
@@ -449,7 +533,7 @@ def main():
         )
 
     # ── Val dataset (T2M FID, only when run_t2m) ──────────────────────────────
-    t2m_generation_modes = resolve_t2m_generation_modes(cfg)
+    t2m_generation_modes = _resolve_eval_t2m_generation_modes(cfg)
     if run_t2m:
         t2m_metrics_by_mode = {
             mode: T2MMetrics(cfg.metrics.t2m).to(device)
@@ -477,6 +561,7 @@ def main():
     if not args.skip_test_pass:
         print(f"[eval] test samples (video + traj): {len(test_dataset)}")
     print(f"[eval] num_runs   : {args.num_runs}")
+    print(f"[eval] condition_mode: {condition_mode}")
     if args.forward_control_loss:
         print(
             f"[eval] forward_control_loss: ON  "
@@ -540,7 +625,12 @@ def main():
                         train_mode=control_mode,
                         chunk_size_tokens=chunk_size_tokens,
                         window_mode=fwd_ctrl_window_mode,
-                        model_batch_builder=prepare_ldf_eval_model_batch,
+                        model_batch_builder=lambda sample_batch, device, model=None: prepare_ldf_eval_model_batch(
+                            sample_batch,
+                            device,
+                            model=model,
+                            condition_mode=condition_mode,
+                        ),
                     )
                 except Exception as e:
                     print(f"[fwd_ctrl_loss] sample={sample_name} deterministic eval failed: {e}")
@@ -549,7 +639,12 @@ def main():
                 _set_seed(_stable_eval_seed(args.seed, probe_tag, sample_name, run_idx))
 
                 with torch.no_grad():
-                    model_batch = prepare_ldf_eval_model_batch(sample_batch, device, model=model)
+                    model_batch = prepare_ldf_eval_model_batch(
+                        sample_batch,
+                        device,
+                        model=model,
+                        condition_mode=condition_mode,
+                    )
                     output = model.generate(model_batch)
 
                 single_generated = output["generated"][0].detach()
@@ -612,6 +707,7 @@ def main():
                                 _remove_traj_fields(sample_batch),
                                 device,
                                 model=model,
+                                condition_mode=condition_mode,
                             )
                             out_no = model.generate(mb_no_traj)
                         abl_single = out_no["generated"][0].detach()
@@ -773,19 +869,41 @@ def main():
             batch = _to_device(batch, device)
 
             with torch.no_grad():
-                model_batch = prepare_ldf_eval_model_batch(batch, device, model=model)
+                model_batch = prepare_ldf_eval_model_batch(
+                    batch,
+                    device,
+                    model=model,
+                    condition_mode=condition_mode,
+                )
                 outputs_by_mode = {
-                    mode: run_t2m_generation_mode(model, model_batch, mode)
+                    mode: _run_t2m_generation_for_mode(
+                        model=model,
+                        vae=vae,
+                        batch=batch,
+                        model_batch=model_batch,
+                        mode=mode,
+                        device=device,
+                        val_cfg=val_cfg,
+                        condition_mode=condition_mode,
+                    )
                     for mode in t2m_generation_modes
                 }
 
             for mode, output in outputs_by_mode.items():
                 t2m_metrics = t2m_metrics_by_mode[mode]
                 generated = output["generated"]
+                decoded_generated_all = output.get("decoded_feature")
 
                 for i in range(len(generated)):
                     single_generated = generated[i].detach()
-                    decoded_generated = vae.decode(single_generated[None, :].to(device))[0].float().detach().to(device)
+                    if decoded_generated_all is not None:
+                        decoded_generated = (
+                            decoded_generated_all[i].float().detach().to(device)
+                        )
+                    else:
+                        decoded_generated = vae.decode(
+                            single_generated[None, :].to(device)
+                        )[0].float().detach().to(device)
 
                     gt_ref, gt_ref_len = _select_t2m_reference(
                         batch,
@@ -841,7 +959,7 @@ def main():
     # ══════════════════════════════════════════════════════════════════════════
     # Aggregate & save
     # ══════════════════════════════════════════════════════════════════════════
-    final_metrics: Dict = {}
+    final_metrics: Dict = {"eval/condition_mode": condition_mode}
     final_metrics.update(t2m_results)
 
     valid_traj = [r for r in traj_records if "ade" in r and r["ade"] == r["ade"]]
@@ -981,6 +1099,7 @@ def main():
     # Aggregate summary at the end
     output_dict["summary"] = final_metrics
     output_dict["probe_tag"] = probe_tag
+    output_dict["condition_mode"] = condition_mode
 
     metrics_path = out_root / "metrics.json"
     metrics_path.write_text(json.dumps(output_dict, indent=2))

@@ -9,7 +9,13 @@ from omegaconf import OmegaConf
 
 T2M_GENERATE = "generate"
 T2M_STREAM_GENERATE = "stream_generate"
-T2M_GENERATION_MODES = (T2M_GENERATE, T2M_STREAM_GENERATE)
+T2M_STREAM_GENERATE_STEP = "stream_generate_step"
+T2M_GENERATION_MODES = (
+    T2M_GENERATE,
+    T2M_STREAM_GENERATE,
+    T2M_STREAM_GENERATE_STEP,
+)
+T2M_BOTH_GENERATION_MODES = (T2M_GENERATE, T2M_STREAM_GENERATE)
 
 
 def _normalize_mode(value) -> str:
@@ -37,8 +43,8 @@ def resolve_t2m_generation_modes(cfg) -> tuple[str, ...]:
 
     Defaults to ``("generate",)`` to preserve the old full-sequence T2M
     validation path. Use ``validation.t2m_generation_modes`` to opt into
-    ``stream_generate`` or both modes. ``validation.t2m_generation_mode=both`` is
-    accepted as a convenience alias.
+    stream modes. ``validation.t2m_generation_mode=both`` is accepted as a
+    convenience alias for ``generate`` and ``stream_generate``.
     """
     modes_value = OmegaConf.select(cfg, "validation.t2m_generation_modes", default=None)
     mode_value = OmegaConf.select(cfg, "validation.t2m_generation_mode", default=None)
@@ -55,7 +61,7 @@ def resolve_t2m_generation_modes(cfg) -> tuple[str, ...]:
     for raw in raw_modes:
         mode = _normalize_mode(raw)
         if mode == "both":
-            expanded = list(T2M_GENERATION_MODES)
+            expanded = list(T2M_BOTH_GENERATION_MODES)
         else:
             expanded = [mode]
         for item in expanded:
@@ -72,6 +78,7 @@ def resolve_t2m_generation_modes(cfg) -> tuple[str, ...]:
 __all__ = [
     "T2M_GENERATE",
     "T2M_STREAM_GENERATE",
+    "T2M_STREAM_GENERATE_STEP",
     "T2M_GENERATION_MODES",
     "resolve_t2m_generation_modes",
 ]

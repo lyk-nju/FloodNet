@@ -10,6 +10,17 @@ from utils.token_frame import token_range_to_frame_slice
 from utils.training.ldf.conditioning import prepare_generate_condition
 from utils.training.ldf.sample_creator import SampleCreator
 
+EVAL_CONDITION_CLIP_START_LOCAL = "clip_start_local"
+EVAL_CONDITION_LEGACY_RAW = "legacy_raw"
+_EVAL_CONDITION_ALIASES = {
+    EVAL_CONDITION_CLIP_START_LOCAL: EVAL_CONDITION_CLIP_START_LOCAL,
+    "clip_start": EVAL_CONDITION_CLIP_START_LOCAL,
+    "local": EVAL_CONDITION_CLIP_START_LOCAL,
+    EVAL_CONDITION_LEGACY_RAW: EVAL_CONDITION_LEGACY_RAW,
+    "raw_legacy": EVAL_CONDITION_LEGACY_RAW,
+    "raw": EVAL_CONDITION_LEGACY_RAW,
+}
+
 
 def _as_tensor(value, *, device=None, dtype=torch.float32) -> torch.Tensor:
     if torch.is_tensor(value):
@@ -91,21 +102,82 @@ def _canonicalize_7d_clip_start(traj_7d) -> torch.Tensor:
     return canonicalize_7d(traj, anchor_xz, anchor_yaw)
 
 
-def prepare_ldf_eval_model_batch(batch: dict, device, model=None) -> dict:
-    """Prepare an LDF validation/eval batch with clip-start-local 7D control."""
+def _normalize_eval_condition_mode(condition_mode: str | None) -> str:
+    if condition_mode is None:
+        return EVAL_CONDITION_CLIP_START_LOCAL
+    key = str(condition_mode).strip().lower()
+    if key in _EVAL_CONDITION_ALIASES:
+        return _EVAL_CONDITION_ALIASES[key]
+    valid = ", ".join(sorted(_EVAL_CONDITION_ALIASES))
+    raise ValueError(
+        f"Unknown LDF eval condition_mode={condition_mode!r}; expected one of: {valid}"
+    )
+
+
+def _prepare_legacy_raw_model_batch(batch: dict) -> dict:
+    """Reproduce ecabef3 eval's raw prepare_model_input() contract."""
+    model_batch = batch.copy()
+    model_batch["feature"] = batch["token"]
+    model_batch["feature_length"] = batch["token_length"]
+    if "token_text_end" in batch:
+        model_batch["feature_text_end"] = batch["token_text_end"]
+
+    if "traj_cond_7d" in batch:
+        model_batch["traj_features"] = batch["traj_cond_7d"]
+        model_batch["traj"] = batch.get("traj_cond", batch.get("traj"))
+        model_batch["traj_length"] = batch["traj_length"]
+        model_batch["traj_mask"] = batch.get(
+            "traj_cond_mask",
+            batch.get("traj_mask", batch.get("traj_loss_mask")),
+        )
+        if "token_mask" in batch:
+            model_batch["token_mask"] = batch["token_mask"]
+        return model_batch
+
+    if "traj_cond" in batch:
+        model_batch["traj"] = batch["traj_cond"]
+        model_batch["traj_length"] = batch["traj_length"]
+        model_batch["traj_mask"] = batch.get(
+            "traj_cond_mask",
+            batch.get("traj_mask", batch.get("traj_loss_mask")),
+        )
+        model_batch.pop("traj_features", None)
+    elif "traj" in batch:
+        model_batch["traj"] = batch["traj"]
+        model_batch["traj_length"] = batch["traj_length"]
+        model_batch["traj_mask"] = batch["traj_mask"]
+        if "traj_features" in batch:
+            model_batch["traj_features"] = batch["traj_features"]
+    if "token_mask" in batch:
+        model_batch["token_mask"] = batch["token_mask"]
+    return model_batch
+
+
+def prepare_ldf_eval_model_batch(
+    batch: dict,
+    device,
+    model=None,
+    *,
+    condition_mode: str | None = None,
+) -> dict:
+    """Prepare an LDF validation/eval batch for the requested condition mode."""
     if "token_length" not in batch:
         raise ValueError("prepare_ldf_eval_model_batch requires batch['token_length']")
-    model_batch = SampleCreator(
-        window_policy="prefix",
-        sample_policy="fixed_window",
-        end_tokens=batch["token_length"],
-    ).create(batch)
-    if _has_7d_traj(model_batch):
-        source = model_batch.get("traj_features", model_batch.get("traj_cond_7d"))
-        canon = _canonicalize_7d_clip_start(source)
-        model_batch["traj_features"] = canon
-        if "traj_cond_7d" in model_batch:
-            model_batch["traj_cond_7d"] = canon
+    mode = _normalize_eval_condition_mode(condition_mode)
+    if mode == EVAL_CONDITION_LEGACY_RAW:
+        model_batch = _prepare_legacy_raw_model_batch(batch)
+    else:
+        model_batch = SampleCreator(
+            window_policy="prefix",
+            sample_policy="fixed_window",
+            end_tokens=batch["token_length"],
+        ).create(batch)
+        if _has_7d_traj(model_batch):
+            source = model_batch.get("traj_features", model_batch.get("traj_cond_7d"))
+            canon = _canonicalize_7d_clip_start(source)
+            model_batch["traj_features"] = canon
+            if "traj_cond_7d" in model_batch:
+                model_batch["traj_cond_7d"] = canon
     model_batch = _to_device(model_batch, device)
     if model is not None:
         model_batch["ldf_condition"] = prepare_generate_condition(
@@ -117,6 +189,8 @@ def prepare_ldf_eval_model_batch(batch: dict, device, model=None) -> dict:
 
 
 __all__ = [
+    "EVAL_CONDITION_CLIP_START_LOCAL",
+    "EVAL_CONDITION_LEGACY_RAW",
     "build_windowed_metric_ground_truth",
     "prepare_ldf_eval_model_batch",
 ]

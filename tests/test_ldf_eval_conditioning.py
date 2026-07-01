@@ -12,6 +12,7 @@ from eval.ldf.conditioning import (
 from utils.training.ldf.validation_conditioning import (
     prepare_ldf_eval_model_batch,
 )
+from utils.training.ldf.validation_eval_runtime import build_generation_eval_cfg
 from metrics.traj import _compute_deterministic_fwd_ctrl_loss_sample
 from utils.token_frame import num_frames_for_tokens
 
@@ -125,6 +126,58 @@ def test_prepare_ldf_eval_model_batch_prefix_window_uses_full_future_traj(monkey
     assert model_batch["traj_features_length"].tolist() == [traj_tokens]
     assert model_batch["traj_features"].shape[1] == traj_frames
     assert model_batch["ldf_condition"] == {"prepared": True}
+
+
+def test_prepare_ldf_eval_model_batch_legacy_raw_preserves_ecabef3_condition():
+    batch = _make_7d_batch()
+
+    model_batch = prepare_ldf_eval_model_batch(
+        batch,
+        torch.device("cpu"),
+        condition_mode="legacy_raw",
+    )
+
+    assert torch.equal(model_batch["feature"], batch["token"])
+    assert torch.equal(model_batch["feature_length"], batch["token_length"])
+    assert torch.equal(model_batch["traj_features"], batch["traj_cond_7d"])
+    assert torch.equal(model_batch["traj"], batch["traj_cond"])
+    assert torch.equal(model_batch["traj_mask"], batch["traj_cond_mask"])
+    assert torch.equal(model_batch["traj_length"], batch["traj_length"])
+    assert "traj_num_tokens" not in model_batch
+    assert "traj_start_token" not in model_batch
+
+
+def test_build_generation_eval_cfg_passes_eval_condition_mode():
+    cfg = {"validation": {"eval_condition_mode": "legacy_raw"}}
+
+    eval_cfg = build_generation_eval_cfg(cfg)
+
+    assert eval_cfg["condition_mode"] == "legacy_raw"
+
+
+def test_build_generation_eval_cfg_defaults_to_stream_generate_step_and_allows_generate():
+    default_cfg = {"validation": {}}
+    offline_cfg = {"validation": {"eval_generation_mode": "generate"}}
+    stream_cfg = {
+        "validation": {
+            "eval_generation_mode": "stream_generate_step",
+            "eval_stream_history_length": 12,
+            "eval_stream_traj_horizon_tokens": 9,
+            "eval_stream_token_dt": 0.25,
+            "eval_stream_frames_per_token": 5,
+            "eval_num_denoise_steps": 4,
+        }
+    }
+
+    assert build_generation_eval_cfg(default_cfg)["generation_mode"] == "stream_generate_step"
+    assert build_generation_eval_cfg(offline_cfg)["generation_mode"] == "generate"
+    eval_cfg = build_generation_eval_cfg(stream_cfg)
+    assert eval_cfg["generation_mode"] == "stream_generate_step"
+    assert eval_cfg["stream_history_length"] == 12
+    assert eval_cfg["stream_traj_horizon_tokens"] == 9
+    assert eval_cfg["stream_token_dt"] == 0.25
+    assert eval_cfg["stream_frames_per_token"] == 5
+    assert eval_cfg["num_denoise_steps"] == 4
 
 
 def test_build_gt_rootplan_from_batch_uses_first_frame_anchor():
