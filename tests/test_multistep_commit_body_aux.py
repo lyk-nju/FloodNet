@@ -8,34 +8,55 @@ import torch
 from utils.training.self_forcing import RolloutPlan, SelfForcingTrainer
 
 
+_BODY_AUX_WEIGHTS = {
+    "root_xz": 2.0,
+    "root_y": 0.1,
+    "heading": 0.5,
+    "fwd_delta": 0.1,
+    "yaw_delta": 0.1,
+    "end_xz": 1.0,
+}
+
+_STALE_COMMIT_WEIGHTS = {
+    "root_xz": 99.0,
+    "root_y": 99.0,
+    "heading": 99.0,
+    "fwd_delta": 99.0,
+    "yaw_delta": 99.0,
+    "end_xz": 99.0,
+}
+
+
 def _cfg(
     commit_enabled: bool,
     disable_replace: bool = True,
     strict_valid_commits: bool = False,
+    legacy_commit_overrides: bool = False,
 ):
+    commit_cfg = {
+        "enabled": commit_enabled,
+        "decode_mode": "single",
+        "replace_final_body_aux": True,
+        "include_final_step": True,
+        "reduction": "step_mean",
+        "strict_valid_commits": strict_valid_commits,
+    }
+    if legacy_commit_overrides:
+        commit_cfg["weight"] = 7.0
+        commit_cfg["weights"] = _STALE_COMMIT_WEIGHTS
+
     def get(key, default=None):
         values = {
             "anchor_canonicalize": {"enabled": False},
+            "body_aux_loss": {
+                "enabled": True,
+                "heading_form": "cosine",
+                "weights": _BODY_AUX_WEIGHTS,
+            },
             "history_corruption": {},
             "horizon_sim": {"enabled": False},
             "self_forcing_disable_replace": disable_replace,
-            "multistep_commit_body_aux": {
-                "enabled": commit_enabled,
-                "decode_mode": "single",
-                "replace_final_body_aux": True,
-                "include_final_step": True,
-                "reduction": "step_mean",
-                "strict_valid_commits": strict_valid_commits,
-                "weight": 1.0,
-                "weights": {
-                    "root_xz": 1.0,
-                    "root_y": 0.0,
-                    "heading": 0.2,
-                    "fwd_delta": 0.05,
-                    "yaw_delta": 0.05,
-                    "end_xz": 0.0,
-                },
-            },
+            "multistep_commit_body_aux": commit_cfg,
         }
         return values.get(key, default)
 
@@ -48,6 +69,7 @@ def _trainer(
     disable_replace: bool = True,
     chunk_size: int = 1,
     strict_valid_commits: bool = False,
+    legacy_commit_overrides: bool = False,
 ):
     batch = 1
     seq_len = 5
@@ -79,7 +101,12 @@ def _trainer(
     model._forward_single_window.side_effect = forward
     module = SimpleNamespace(
         model=model,
-        cfg=_cfg(commit_enabled, disable_replace, strict_valid_commits),
+        cfg=_cfg(
+            commit_enabled,
+            disable_replace,
+            strict_valid_commits,
+            legacy_commit_overrides,
+        ),
     )
     trainer = SelfForcingTrainer.__new__(SelfForcingTrainer)
     trainer._module = module
@@ -363,6 +390,61 @@ def test_commit_aux_replaces_final_body_aux(monkeypatch):
     assert torch.isclose(diff, torch.tensor(2.0))
     assert torch.isclose(control, torch.tensor(0.5))
     assert trainer._last_commit_body_aux_valid_count == 1
+
+
+def test_commit_aux_uses_body_aux_weights_and_ignores_multistep_overrides(monkeypatch):
+    trainer, _, _, _ = _trainer(
+        commit_enabled=True, k=1, legacy_commit_overrides=True
+    )
+    trainer._module.device = torch.device("cpu")
+    trainer._module.vae = MagicMock()
+    trainer._module.cfg.model = SimpleNamespace(params={"control_loss_weight": 5.0})
+    trainer._last_commit_token_records = [
+        SimpleNamespace(
+            batch_idx=0,
+            local_commit_idx=0,
+            global_commit_idx=0,
+            pred_token=torch.ones(4, requires_grad=True),
+        )
+    ]
+    final_step_result = {
+        "loss": torch.tensor(2.0, requires_grad=True),
+        "pred_x0_latent_list": [torch.ones(1, 4, requires_grad=True)],
+    }
+    batch = {
+        "token": torch.zeros(1, 1, 4),
+        "token_length": torch.tensor([1]),
+        "traj_cond_7d": torch.zeros(1, 1, 7),
+        "traj_length": torch.tensor([1]),
+        "_window_local_body_aux_mode": "full_prefix_splice",
+        "_window_global_start_token": torch.tensor([0]),
+    }
+    model_batch = {
+        "feature": torch.zeros(1, 1, 4),
+        "feature_length": torch.tensor([1]),
+        "_window_local_body_aux_mode": "full_prefix_splice",
+        "_window_global_start_token": torch.tensor([0]),
+    }
+    captured = {}
+
+    def fake_commit_helper(*args, **kwargs):
+        captured["weights"] = args[7]
+        return torch.tensor(0.5), {"valid_count": 1.0}
+
+    monkeypatch.setattr(
+        "utils.training.self_forcing.compute_body_aux_loss_on_commit_masks",
+        MagicMock(side_effect=fake_commit_helper),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_decode_commit_latents",
+        MagicMock(return_value=[torch.zeros(1, 263)]),
+    )
+
+    total, _, _ = trainer._compute_losses(final_step_result, batch, model_batch)
+
+    assert captured["weights"] == _BODY_AUX_WEIGHTS
+    assert torch.isclose(total, torch.tensor(4.5))
 
 
 def test_commit_aux_none_does_not_fallback_to_final_body_aux(monkeypatch):

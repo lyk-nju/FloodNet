@@ -935,7 +935,6 @@ class SelfForcingTrainer:
         weights = {
             **_DEFAULT_BODY_AUX_WEIGHTS,
             **(ba_cfg.get("weights", {}) or {}),
-            **(cfg.get("weights", {}) or {}),
         }
         loss, terms = compute_body_aux_loss_on_commit_masks(
             decoded,
@@ -955,7 +954,7 @@ class SelfForcingTrainer:
             return None, {}
         valid_count = int(float(terms.get("valid_count", candidate_commit_count)))
         self._last_commit_body_aux_valid_count = valid_count
-        return loss * float(cfg.get("weight", 1.0)), terms
+        return loss, terms
 
     def _compute_losses(self, final_step_result: dict, batch: dict, model_batch: dict):
         """Compute total loss for the supervised final step, including the

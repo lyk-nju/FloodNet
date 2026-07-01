@@ -12,7 +12,7 @@
 
 ## File Structure
 
-- Modify `configs/ldf.yaml`: add disabled-by-default `multistep_commit_body_aux` config block with `include_final_step`, `reduction: step_mean`, local `weight`, and conservative 7D weights.
+- Modify `configs/ldf.yaml`: add disabled-by-default `multistep_commit_body_aux` config block with `include_final_step` and `reduction: step_mean`. Commit body aux reuses `body_aux_loss.weights` and global `control_loss_weight`.
 - Modify `utils/training/control_loss.py`: add `compute_body_aux_loss_on_commit_masks()` that accepts decoded prefixes plus one frame mask per commit record, derives 7D body terms over complete decoded prefixes, applies decoded-frame to GT-frame offsets, and reduces by step mean.
 - Modify `utils/training/self_forcing.py`: add a commit record dataclass, collect records during rollout when the new mode is enabled, reject `chunk_size > 1` for the first implementation, assemble decode prefixes using full-prefix or local-prefix coordinates without future GT suffix, compute commit body aux, log valid commit counts, and replace final-step body aux when configured.
 - Modify `tests/test_body_aux_loss.py`: add focused tests for step-mean reduction, full-prefix delta derivation, and local GT frame offset.
@@ -37,14 +37,6 @@ multistep_commit_body_aux:
     include_final_step: true
     reduction: step_mean
     strict_valid_commits: false
-    weight: 1.0
-    weights:
-        root_xz: 1.0
-        root_y: 0.0
-        heading: 0.2
-        fwd_delta: 0.05
-        yaw_delta: 0.05
-        end_xz: 0.0
 ```
 
 - [ ] **Step 2: Verify YAML parses**
@@ -62,8 +54,8 @@ assert node.replace_final_body_aux is True
 assert node.include_final_step is True
 assert node.reduction == "step_mean"
 assert node.strict_valid_commits is False
-assert float(node.weight) == 1.0
-assert float(node.weights.end_xz) == 0.0
+assert "weight" not in node
+assert "weights" not in node
 print("ok")
 PY
 ```
@@ -1272,7 +1264,6 @@ Add inside `SelfForcingTrainer`:
         weights = {
             **_DEFAULT_BODY_AUX_WEIGHTS,
             **(ba_cfg.get("weights", {}) or {}),
-            **(cfg.get("weights", {}) or {}),
         }
         loss, terms = compute_body_aux_loss_on_commit_masks(
             decoded,
@@ -1292,7 +1283,7 @@ Add inside `SelfForcingTrainer`:
             return None, {}
         valid_count = int(float(terms.get("valid_count", candidate_commit_count)))
         self._last_commit_body_aux_valid_count = valid_count
-        return loss * float(cfg.get("weight", 1.0)), terms
+        return loss, terms
 ```
 
 - [ ] **Step 5: Change `_compute_losses()` signature and no-fallback logic**
@@ -1426,35 +1417,13 @@ model:
     traj_dropout: 0.0
 multistep_commit_body_aux:
   enabled: true
-  weight: 1.0
 ```
 
 Expected: K=3, no trajectory-condition dropout, single-decode step-mean commit body aux replaces old final-step body aux.
 
-For the clean comparison against the old objective, also run a second K=3
-ablation that inherits the previous body-aux weights while keeping `end_xz`
-disabled:
-
-```yaml
-model:
-  params:
-    self_forcing_k_schedule:
-      - [0.0, 3]
-    traj_dropout: 0.0
-multistep_commit_body_aux:
-  enabled: true
-  weight: 1.0
-  weights:
-    root_xz: 2.0
-    root_y: 0.1
-    heading: 0.5
-    fwd_delta: 0.1
-    yaw_delta: 0.1
-    end_xz: 0.0
-```
-
-Expected: the second run changes only the commit body-aux term strength, not
-the step-mean/prefix-only training semantics.
+The commit body-aux term scale is controlled by `model.params.control_loss_weight`
+and `body_aux_loss.weights`. Do not add `multistep_commit_body_aux.weight` or
+`multistep_commit_body_aux.weights` for this diagnostic.
 
 - [ ] **Step 5: Final commit if verification-only fixes were needed**
 

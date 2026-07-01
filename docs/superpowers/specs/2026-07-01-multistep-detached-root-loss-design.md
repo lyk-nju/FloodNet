@@ -13,13 +13,12 @@ The new mode should train:
 
 ```text
 L = final_diffusion_loss
-  + control_loss_weight * multistep_commit_body_aux.weight
-    * mean_{valid committed rollout steps}(L_commit_step)
+  + control_loss_weight * mean_{valid committed rollout steps}(L_commit_step)
 ```
 
 where each `L_commit_step` is computed only on the frame range covered by that
-step's committed token. The local `weight` lets the diagnostic term be tuned
-without changing the run's global `control_loss_weight`.
+step's committed token. The auxiliary term reuses the run's global
+`control_loss_weight`.
 
 ## Non-Goals
 
@@ -152,27 +151,30 @@ not the first diagnostic target.
 
 ## 7D Body-Aux Weights
 
-The first diagnostic mode uses conservative commit-loss weights:
+The commit loss uses the existing `body_aux_loss.weights` configuration. There
+is no separate `multistep_commit_body_aux.weight` multiplier and no separate
+`multistep_commit_body_aux.weights` override block. This keeps the comparison
+against the old final-step body-aux objective clean: only the supervised rollout
+steps change, not the body-aux term scale.
+
+For example, with the current main config:
 
 ```yaml
-root_xz: 1.0
-root_y: 0.0
-heading: 0.2
-fwd_delta: 0.05
-yaw_delta: 0.05
-end_xz: 0.0
+body_aux_loss:
+  weights:
+    root_xz: 2.0
+    root_y: 0.1
+    heading: 0.5
+    fwd_delta: 0.1
+    yaw_delta: 0.1
+    end_xz: 1.0
 ```
 
-`end_xz` is disabled because the current implementation's
-`last_valid_smooth_l1()` would only supervise the final valid frame across all
-committed tokens, not each commit token's endpoint. A later variant may add
-`per_commit_end_xz`.
-
-These are conservative diagnostic weights, not an exact reproduction of the
-old final-step body-aux objective. For the cleanest comparison against the old
-objective, run a follow-up ablation that inherits the existing
-`body_aux_loss.weights`, while keeping `end_xz: 0.0` unless
-`per_commit_end_xz` is implemented.
+`end_xz` now participates per commit record under the step-mean reduction: each
+valid `L_commit_step_s` applies the existing endpoint term to that step's
+committed-token frame mask. If this is too strong for a diagnostic run, adjust
+`body_aux_loss.weights.end_xz` for that run; do not add a second multistep-only
+weight block.
 
 ## Loss Interaction
 
@@ -207,14 +209,6 @@ multistep_commit_body_aux:
   include_final_step: true
   reduction: step_mean
   strict_valid_commits: false
-  weight: 1.0
-  weights:
-    root_xz: 1.0
-    root_y: 0.0
-    heading: 0.2
-    fwd_delta: 0.05
-    yaw_delta: 0.05
-    end_xz: 0.0
 ```
 
 `decode_mode: single` is the initial implementation. `decode_mode: per_step`
@@ -275,7 +269,6 @@ Add focused tests for:
 ## Experiment Plan
 
 1. K=3, `model.params.traj_dropout=0.0`, single decode, commit-token 7D body aux.
-2. K=3, same setup but inherit old `body_aux_loss.weights`, with `end_xz: 0.0`.
-3. K=3, per-step decode comparison.
-4. K=5, `model.params.traj_dropout=0.0`, single decode.
-5. Consider full BPTT or no-detach only after the diagnostic results are clear.
+2. K=3, per-step decode comparison.
+3. K=5, `model.params.traj_dropout=0.0`, single decode.
+4. Consider full BPTT or no-detach only after the diagnostic results are clear.
