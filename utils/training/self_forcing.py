@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from utils.token_frame import token_range_to_frame_slice
 from utils.training.body_canonicalize import apply_body_window_canonicalize
 from utils.training.history_corruption import (
     apply_history_corruption,
@@ -744,6 +745,147 @@ class SelfForcingTrainer:
             )
         self._last_commit_token_records = commit_records
         return final_step_result, plan.effective_k
+
+    def _assemble_commit_decode_inputs(self, batch: dict, model_batch: dict):
+        records = getattr(self, "_last_commit_token_records", [])
+        if not records:
+            return [], None, None, None, None
+
+        mode = str(
+            model_batch.get(
+                "_window_local_body_aux_mode",
+                batch.get("_window_local_body_aux_mode", "full_prefix_splice"),
+            )
+        )
+        device = (
+            self._module.device
+            if hasattr(self._module, "device")
+            else records[0].pred_token.device
+        )
+
+        if mode == "local_decode":
+            source = model_batch["feature"]
+            lengths = model_batch["feature_length"]
+            use_global = False
+            starts = model_batch.get(
+                "_window_global_start_token", batch.get("_window_global_start_token")
+            )
+            if starts is None:
+                starts = torch.zeros(
+                    source.shape[0], device=source.device, dtype=torch.long
+                )
+            elif not torch.is_tensor(starts):
+                starts = torch.as_tensor(starts, device=source.device, dtype=torch.long)
+            starts = starts.to(device=device, dtype=torch.long).view(-1)
+            if starts.numel() == 1 and source.shape[0] > 1:
+                starts = starts.expand(source.shape[0])
+            window_starts = starts
+        elif mode == "full_prefix_splice":
+            source = batch["token"]
+            lengths = batch.get("token_length")
+            if lengths is None:
+                lengths = torch.full(
+                    (source.shape[0],),
+                    source.shape[1],
+                    device=source.device,
+                    dtype=torch.long,
+                )
+            use_global = True
+            window_starts = torch.zeros(
+                source.shape[0], device=device, dtype=torch.long
+            )
+        else:
+            raise ValueError(f"Unsupported _window_local_body_aux_mode={mode!r}")
+
+        source = source.to(device)
+        if not torch.is_tensor(lengths):
+            lengths = torch.as_tensor(lengths, device=device, dtype=torch.long)
+        else:
+            lengths = lengths.to(device=device, dtype=torch.long)
+        lengths = lengths.view(-1)
+        if lengths.numel() == 1 and source.shape[0] > 1:
+            lengths = lengths.expand(source.shape[0])
+
+        records_by_sample: dict[int, list] = {}
+        for record in records:
+            records_by_sample.setdefault(int(record.batch_idx), []).append(record)
+
+        def record_commit_idx(record):
+            return int(record.global_commit_idx if use_global else record.local_commit_idx)
+
+        sample_indices_list = []
+        decoded_latents = []
+        max_frames = 0
+        for batch_idx in sorted(records_by_sample):
+            if batch_idx < 0 or batch_idx >= source.shape[0]:
+                continue
+            max_commit_idx = max(
+                record_commit_idx(record) for record in records_by_sample[batch_idx]
+            )
+            decode_end_token = max_commit_idx + 1
+            token_len = int(lengths[batch_idx].item())
+            decode_end_token = min(decode_end_token, token_len)
+            if decode_end_token <= 0:
+                continue
+            sample_indices_list.append(batch_idx)
+            decoded_latents.append(
+                source[batch_idx, :decode_end_token, :].detach().clone()
+            )
+            max_frames = max(
+                max_frames,
+                token_range_to_frame_slice(0, decode_end_token).stop,
+            )
+
+        sample_pos = {
+            batch_idx: pos for pos, batch_idx in enumerate(sample_indices_list)
+        }
+        commit_masks = []
+        commit_positions = []
+        for record in records:
+            batch_idx = int(record.batch_idx)
+            if batch_idx not in sample_pos:
+                continue
+            decoded_pos = sample_pos[batch_idx]
+            token_idx = int(
+                record.global_commit_idx if use_global else record.local_commit_idx
+            )
+            write_idx = token_idx if use_global else int(record.local_commit_idx)
+            if token_idx < 0 or write_idx < 0:
+                continue
+            if write_idx >= decoded_latents[decoded_pos].shape[0]:
+                continue
+
+            decoded_latents[decoded_pos][write_idx] = record.pred_token.to(
+                device=device, dtype=decoded_latents[decoded_pos].dtype
+            )
+            mask = source.new_zeros(max_frames)
+            sl = token_range_to_frame_slice(token_idx, 1)
+            if sl.start < max_frames:
+                mask[sl.start:min(sl.stop, max_frames)] = 1.0
+            if mask.sum().item() <= 0:
+                continue
+            commit_masks.append(mask)
+            commit_positions.append(decoded_pos)
+
+        sample_indices = torch.as_tensor(
+            sample_indices_list, device=device, dtype=torch.long
+        )
+        if window_starts is not None:
+            window_starts = window_starts[sample_indices]
+        if not commit_masks:
+            return decoded_latents, None, None, sample_indices, window_starts
+
+        commit_frame_masks = torch.stack(commit_masks, dim=0)
+        commit_sample_positions = torch.as_tensor(
+            commit_positions, device=device, dtype=torch.long
+        )
+        return (
+            decoded_latents,
+            commit_frame_masks,
+            commit_sample_positions,
+            sample_indices,
+            window_starts,
+        )
 
     def _compute_losses(self, final_step_result: dict, batch: dict):
         """Compute total loss for the supervised final step, including the

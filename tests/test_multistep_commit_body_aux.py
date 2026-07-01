@@ -145,3 +145,164 @@ def test_commit_aux_rejects_chunk_size_greater_than_one_for_first_version():
         assert "chunk_size == 1" in str(exc)
     else:
         raise AssertionError("expected chunk_size > 1 to be rejected")
+
+
+def test_full_prefix_splice_assembly_decodes_only_to_global_commit_prefix():
+    from utils.token_frame import token_range_to_frame_slice
+
+    trainer, _, _, _ = _trainer(commit_enabled=True, k=1)
+    batch = {
+        "token": torch.zeros(1, 6, 2),
+        "token_length": torch.tensor([6]),
+        "traj_cond_7d": torch.zeros(1, 24, 7),
+        "traj_length": torch.tensor([24]),
+    }
+    model_batch = {
+        "_window_local_body_aux_mode": "full_prefix_splice",
+        "_window_global_start_token": torch.tensor([2]),
+        "_window_local_latent_start_token": torch.tensor([99]),
+        "feature": torch.zeros(1, 4, 2),
+        "feature_length": torch.tensor([4]),
+    }
+    record = torch.ones(2, requires_grad=True)
+    trainer._last_commit_token_records = [
+        SimpleNamespace(
+            batch_idx=0,
+            local_commit_idx=1,
+            global_commit_idx=3,
+            pred_token=record,
+        )
+    ]
+
+    decoded_latents, commit_masks, commit_positions, sample_indices, window_starts = (
+        trainer._assemble_commit_decode_inputs(batch, model_batch)
+    )
+
+    assert decoded_latents[0].shape[0] == 4
+    assert torch.equal(decoded_latents[0][3], record)
+    assert decoded_latents[0][3].requires_grad
+    decoded_latents[0][2].sum().backward(retain_graph=True)
+    assert record.grad is None or torch.equal(record.grad, torch.zeros_like(record))
+    record.grad = None
+    decoded_latents[0][3].sum().backward(retain_graph=True)
+    assert torch.equal(record.grad, torch.ones_like(record))
+    assert commit_positions.tolist() == [0]
+    assert sample_indices.tolist() == [0]
+    assert window_starts.tolist() == [0]
+    sl = token_range_to_frame_slice(3, 1)
+    assert commit_masks.shape[0] == 1
+    assert commit_masks[0, sl.start:sl.stop].sum().item() == 4
+    assert commit_masks[0, :sl.start].sum().item() == 0
+    assert commit_masks[0, sl.stop:].sum().item() == 0
+
+
+def test_local_decode_assembly_decodes_only_to_local_commit_prefix():
+    from utils.token_frame import token_range_to_frame_slice
+
+    trainer, _, _, _ = _trainer(commit_enabled=True, k=1)
+    batch = {
+        "token": torch.zeros(1, 6, 2),
+        "token_length": torch.tensor([6]),
+        "traj_cond_7d": torch.zeros(1, 24, 7),
+        "traj_length": torch.tensor([24]),
+    }
+    model_batch = {
+        "_window_local_body_aux_mode": "local_decode",
+        "_window_global_start_token": torch.tensor([5]),
+        "_window_local_latent_start_token": torch.tensor([0]),
+        "feature": torch.zeros(1, 4, 2),
+        "feature_length": torch.tensor([4]),
+    }
+    record = torch.ones(2, requires_grad=True)
+    trainer._last_commit_token_records = [
+        SimpleNamespace(
+            batch_idx=0,
+            local_commit_idx=1,
+            global_commit_idx=6,
+            pred_token=record,
+        )
+    ]
+
+    decoded_latents, commit_masks, commit_positions, sample_indices, window_starts = (
+        trainer._assemble_commit_decode_inputs(batch, model_batch)
+    )
+
+    assert decoded_latents[0].shape[0] == 2
+    assert torch.equal(decoded_latents[0][1], record)
+    assert decoded_latents[0][1].requires_grad
+    decoded_latents[0][0].sum().backward(retain_graph=True)
+    assert record.grad is None or torch.equal(record.grad, torch.zeros_like(record))
+    record.grad = None
+    decoded_latents[0][1].sum().backward(retain_graph=True)
+    assert torch.equal(record.grad, torch.ones_like(record))
+    assert commit_positions.tolist() == [0]
+    assert sample_indices.tolist() == [0]
+    assert window_starts.tolist() == [5]
+    sl = token_range_to_frame_slice(1, 1)
+    assert commit_masks[0, sl.start:sl.stop].sum().item() == 4
+    assert commit_masks[0, :sl.start].sum().item() == 0
+    assert commit_masks[0, sl.stop:].sum().item() == 0
+
+
+def test_local_prefix_assembly_preserves_sample_indices_and_expands_scalar_starts():
+    trainer, _, _, _ = _trainer(commit_enabled=True, k=1)
+    batch = {
+        "token": torch.zeros(3, 6, 2),
+        "token_length": torch.tensor([6, 6, 6]),
+        "traj_cond_7d": torch.zeros(3, 24, 7),
+        "traj_length": torch.tensor([24, 24, 24]),
+    }
+    model_batch = {
+        "_window_local_body_aux_mode": "local_decode",
+        "_window_global_start_token": torch.tensor([2]),
+        "feature": torch.zeros(3, 4, 2),
+        "feature_length": torch.tensor([4, 4, 4]),
+    }
+    trainer._last_commit_token_records = [
+        SimpleNamespace(
+            batch_idx=2,
+            local_commit_idx=1,
+            global_commit_idx=3,
+            pred_token=torch.ones(2, requires_grad=True),
+        )
+    ]
+
+    _, _, commit_positions, sample_indices, window_starts = (
+        trainer._assemble_commit_decode_inputs(batch, model_batch)
+    )
+
+    assert commit_positions.tolist() == [0]
+    assert sample_indices.tolist() == [2]
+    assert window_starts.tolist() == [2]
+
+
+def test_prefix_assembly_does_not_include_future_gt_suffix():
+    trainer, _, _, _ = _trainer(commit_enabled=True, k=1)
+    batch = {
+        "token": torch.zeros(1, 10, 2),
+        "token_length": torch.tensor([10]),
+        "traj_cond_7d": torch.zeros(1, 40, 7),
+        "traj_length": torch.tensor([40]),
+    }
+    batch["token"][0, 4:, :] = 99.0
+    model_batch = {
+        "_window_local_body_aux_mode": "full_prefix_splice",
+        "_window_global_start_token": torch.tensor([2]),
+        "feature": torch.zeros(1, 4, 2),
+        "feature_length": torch.tensor([4]),
+    }
+    trainer._last_commit_token_records = [
+        SimpleNamespace(
+            batch_idx=0,
+            local_commit_idx=1,
+            global_commit_idx=3,
+            pred_token=torch.ones(2, requires_grad=True),
+        )
+    ]
+
+    decoded_latents, _, _, _, _ = trainer._assemble_commit_decode_inputs(
+        batch, model_batch
+    )
+
+    assert decoded_latents[0].shape[0] == 4
+    assert not torch.any(decoded_latents[0] == 99.0)
