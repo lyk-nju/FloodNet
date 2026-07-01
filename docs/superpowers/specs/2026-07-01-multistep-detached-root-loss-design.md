@@ -13,11 +13,13 @@ The new mode should train:
 
 ```text
 L = final_diffusion_loss
-  + control_loss_weight * commit_7d_body_aux_loss
+  + control_loss_weight * multistep_commit_body_aux.weight
+    * commit_7d_body_aux_loss
 ```
 
 where `commit_7d_body_aux_loss` is computed only on frames covered by the K
-newly committed rollout tokens.
+newly committed rollout tokens. The local `weight` lets the diagnostic term be
+tuned without changing the run's global `control_loss_weight`.
 
 ## Non-Goals
 
@@ -70,7 +72,9 @@ For `full_prefix_splice`:
 
 - `model_batch["feature"]` is window-local, not a full prefix.
 - Start from the original full `batch["token"]` detached clone.
-- Replace `global_commit_idx = window_global_start + local_commit_idx`.
+- Replace `global_commit_idx = _window_global_start_token + local_commit_idx`.
+  Do not use `_window_local_latent_start_token` for this; local and global start
+  metadata diverge between precomputed slicing and online encoding.
 - Decode the assembled full prefix.
 - Build the loss frame mask in full/global frame coordinates.
 
@@ -97,6 +101,18 @@ decoded prefix so the first committed frame can see the preceding frame.
 
 The mask should include every committed token's frame range. It should not
 include earlier history frames or uncommitted future frames.
+
+## Loss Reduction
+
+`commit_7d_body_aux_loss` is reduced as a masked mean over all valid frames
+covered by the committed rollout tokens. It must not be a raw sum over rollout
+steps, because then K=5 would naturally produce a larger auxiliary loss than
+K=3.
+
+This default is frame-level mean over the union of committed-token frame ranges,
+matching the existing body-aux masked-frame semantics. A per-step mean variant
+may be added later for ablation, but the first diagnostic should keep the loss
+scale roughly comparable across K values.
 
 ## 7D Body-Aux Weights
 
@@ -134,6 +150,7 @@ multistep_commit_body_aux:
   enabled: false
   decode_mode: single
   replace_final_body_aux: true
+  weight: 1.0
   weights:
     root_xz: 1.0
     root_y: 0.0
@@ -145,6 +162,12 @@ multistep_commit_body_aux:
 
 `decode_mode: single` is the initial implementation. `decode_mode: per_step`
 is reserved for the stricter K-decode comparison.
+
+## Runtime Cost
+
+Single decode avoids K VAE decodes, but this mode still keeps K gradient-enabled
+LDF forward graphs. K=3 should be the first diagnostic setting. K=5 may require
+smaller batch size or additional memory checks.
 
 ## Expected Gradient Path
 
@@ -168,9 +191,13 @@ Add focused tests for:
 - Replacement tokens are sourced from detached `x0_latent_list`.
 - `full_prefix_splice` uses original full `batch["token"]` and global commit
   indices, not `model_batch["feature"]`.
+- `full_prefix_splice` computes global commit indices from
+  `_window_global_start_token`, not `_window_local_latent_start_token`.
 - `local_decode` uses local `model_batch["feature"]` and local commit indices.
 - The commit-frame mask covers only `token_range_to_frame_slice(idx, 1)` for
   committed tokens.
+- The commit body-aux reduction is a frame-level masked mean and does not scale
+  linearly with K.
 - Enabling the new mode replaces final-step body aux rather than adding a second
   body-aux loss.
 
