@@ -191,6 +191,26 @@ def _run_validation_generation_mode(
     }
 
 
+def _extract_target_traj_xz(sample_batch: dict, feat_len: int):
+    if "traj_features" in sample_batch:
+        cond = sample_batch["traj_features"][0]
+        if torch.is_tensor(cond):
+            cond = cond.detach().cpu().numpy()
+        cond = np.asarray(cond)
+        if cond.ndim == 2 and cond.shape[1] >= 7:
+            return cond[:feat_len, [0, 2]].astype(np.float32)
+        if cond.ndim == 2 and cond.shape[1] >= 2:
+            return cond[:feat_len, :2].astype(np.float32)
+    if "traj" in sample_batch:
+        traj = sample_batch["traj"][0]
+        if torch.is_tensor(traj):
+            traj = traj.detach().cpu().numpy()
+        traj = np.asarray(traj)[:feat_len]
+        if traj.ndim == 2 and traj.shape[1] >= 3:
+            return root_to_traj_feats(traj)[:, :2].astype(np.float32)
+    return None
+
+
 def run_validation_generation_eval(module, batch, batch_idx=None, test_loader_idx=0):
     # Fix seed for reproducible test generation, but save/restore the training RNG so
     # that training noise stays i.i.d. when the training loop resumes after validation.
@@ -345,20 +365,7 @@ def run_validation_generation_eval(module, batch, batch_idx=None, test_loader_id
                             )
 
                         feat_len = int(decoded_single_generated.shape[0])
-                        if "traj_features" in sample_batch:
-                            cond = sample_batch["traj_features"][0]
-                            if torch.is_tensor(cond):
-                                cond = cond.detach().cpu().numpy()
-                            cond = np.asarray(cond)
-                            if cond.ndim == 2 and cond.shape[1] >= 2:
-                                traj_xz = cond[:feat_len, :2].astype(np.float32)
-                        if traj_xz is None and "traj" in sample_batch:
-                            traj = sample_batch["traj"][0]
-                            if torch.is_tensor(traj):
-                                traj = traj.detach().cpu().numpy()
-                            traj = np.asarray(traj)[:feat_len]
-                            if traj.ndim == 2 and traj.shape[1] >= 3:
-                                traj_xz = root_to_traj_feats(traj)[:, :2].astype(np.float32)
+                        traj_xz = _extract_target_traj_xz(sample_batch, feat_len)
                         if "traj_mask" in sample_batch:
                             traj_mask_i = sample_batch["traj_mask"][0]
                             if torch.is_tensor(traj_mask_i):

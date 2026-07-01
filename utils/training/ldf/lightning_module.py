@@ -10,6 +10,7 @@ from lightning.pytorch.utilities import rank_zero_info
 from omegaconf import OmegaConf
 from torch_ema import ExponentialMovingAverage
 
+from metrics.traj import _slice_single_sample_batch
 from metrics.t2m import T2MMetrics
 from utils.initialize import check_state_dict, instantiate
 from utils.training import ckpt_step_info
@@ -423,8 +424,14 @@ class LDFLightningModule(BasicLightningModule):
         cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         try:
             with self.ema.average_parameters([p for p in self.model.parameters() if p.requires_grad]):
-                model_batch = prepare_ldf_eval_model_batch(batch, self.device, model=self.model)
                 eval_cfg = build_generation_eval_cfg(self.cfg)
+                condition_mode = eval_cfg["condition_mode"]
+                model_batch = prepare_ldf_eval_model_batch(
+                    batch,
+                    self.device,
+                    model=self.model,
+                    condition_mode=condition_mode,
+                )
                 outputs = {}
                 for mode in self.t2m_generation_modes:
                     if mode != T2M_STREAM_GENERATE_STEP:
@@ -444,6 +451,7 @@ class LDFLightningModule(BasicLightningModule):
                             sample_batch,
                             self.device,
                             model=self.model,
+                            condition_mode=condition_mode,
                         )
                         sample_output = _run_validation_generation_mode(
                             self.model,

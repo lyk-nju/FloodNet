@@ -1,6 +1,7 @@
 import pytest
 import torch
 from omegaconf import OmegaConf
+from contextlib import contextmanager
 
 from utils.training.ldf.t2m_generation import run_t2m_generation_mode
 from utils.training.ldf.t2m_generation_modes import resolve_t2m_generation_modes
@@ -236,3 +237,131 @@ def test_validation_generation_mode_uses_stream_generate_step_payload(monkeypatc
     assert out["text"] == ["turn left"]
     assert torch.equal(out["generated"][0], torch.tensor([[1.0], [2.0]]))
     assert torch.equal(out["decoded_feature"][0], torch.tensor([[10.0], [20.0]]))
+
+
+def test_t2m_update_metrics_passes_eval_condition_mode(monkeypatch):
+    import utils.training.ldf.lightning_module as lightning_module
+    from utils.training.ldf.lightning_module import LDFLightningModule
+
+    condition_modes = []
+
+    def fake_prepare_model_batch(batch, device, model=None, condition_mode=None):
+        condition_modes.append(condition_mode)
+        batch_size = len(batch["name"])
+        return {
+            "feature": torch.zeros(batch_size, 2, 1),
+            "feature_length": torch.tensor([2] * batch_size),
+            "text": list(batch["text"]),
+        }
+
+    def fake_stream_step_mode(
+        model,
+        model_batch,
+        generation_mode,
+        *,
+        vae,
+        sample_batch,
+        device,
+        stream_history_length,
+        stream_traj_horizon_tokens,
+        stream_token_dt,
+        stream_frames_per_token,
+        num_denoise_steps,
+    ):
+        return {
+            "generated": [torch.zeros(2, 1)],
+            "decoded_feature": [torch.zeros(5, 263)],
+            "text": ["walk"],
+        }
+
+    monkeypatch.setattr(
+        lightning_module,
+        "prepare_ldf_eval_model_batch",
+        fake_prepare_model_batch,
+    )
+    monkeypatch.setattr(
+        lightning_module,
+        "_run_validation_generation_mode",
+        fake_stream_step_mode,
+    )
+    monkeypatch.setattr(
+        lightning_module,
+        "_build_windowed_metric_ground_truth",
+        lambda batch, model_batch: (
+            torch.zeros(1, 2, 1),
+            torch.tensor([2]),
+            torch.zeros(1, 5, 263),
+            torch.tensor([5]),
+        ),
+    )
+
+    class FakeEMA:
+        @contextmanager
+        def average_parameters(self, params):
+            yield
+
+    class FakeModel:
+        def parameters(self):
+            return []
+
+    class FakeVAE:
+        def decode(self, latent):
+            return torch.zeros(latent.shape[0], 5, 263)
+
+    class FakeMetric:
+        def __init__(self):
+            self.updates = []
+
+        def update(self, **kwargs):
+            self.updates.append(kwargs)
+
+    module = LDFLightningModule.__new__(LDFLightningModule)
+    torch.nn.Module.__init__(module)
+    module.t2m_enabled = True
+    module.t2m_generation_modes = ("stream_generate_step",)
+    module.t2m_metrics = {"stream_generate_step": FakeMetric()}
+    module.cfg = OmegaConf.create({
+        "validation": {
+            "eval_condition_mode": "legacy_raw",
+            "eval_generation_mode": "stream_generate_step",
+        },
+        "metrics": {"t2m": {"fid_target": "original"}},
+    })
+    module.ema = FakeEMA()
+    module.model = FakeModel()
+    module.vae = FakeVAE()
+    monkeypatch.setattr(
+        LDFLightningModule,
+        "device",
+        property(lambda self: torch.device("cpu")),
+        raising=False,
+    )
+    batch = {
+        "name": ["000021"],
+        "text": ["walk"],
+        "text_tokens": [["walk/VERB"]],
+    }
+
+    module.update_metrics(batch)
+
+    assert condition_modes == ["legacy_raw", "legacy_raw"]
+
+
+def test_validation_artifact_extracts_xz_from_7d_traj_features():
+    from utils.training.ldf.validation_generation import _extract_target_traj_xz
+
+    sample_batch = {
+        "traj_features": torch.tensor(
+            [[
+                [1.0, 100.0, 2.0, 1.0, 0.0, 0.1, 0.0],
+                [3.0, 200.0, 4.0, 0.0, 1.0, 0.1, 0.2],
+            ]]
+        ),
+    }
+
+    traj_xz = _extract_target_traj_xz(sample_batch, feat_len=2)
+
+    assert torch.equal(
+        torch.from_numpy(traj_xz),
+        torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+    )
