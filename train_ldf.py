@@ -33,8 +33,9 @@ from torch_ema import ExponentialMovingAverage
 
 from metrics.t2m import T2MMetrics
 from eval.ldf.conditioning import prepare_ldf_eval_model_batch
-from eval.eval_runner import run_validation_generation_eval
+from eval.eval_runner import run_ldf_generation_mode, run_validation_generation_eval
 from eval.eval_summary import process_validation_generation_results
+from metrics.traj import _slice_single_sample_batch
 from utils.initialize import (
     check_state_dict,
     get_function,
@@ -48,6 +49,7 @@ from utils.training import (
     prepare_model_input,
     build_probe_loaders,
     build_val_dataloaders,
+    build_generation_eval_cfg,
     compute_control_loss_xz,
     ckpt_step_info,
     resolve_sf_runtime,
@@ -427,20 +429,67 @@ class CustomLightningModule(BasicLightningModule):
     def update_metrics(self, batch):
         if not self.t2m_enabled or self.t2m_metrics is None:
             return
-        # Save/restore CUDA RNG — model.generate() consumes random state via
+        eval_cfg = build_generation_eval_cfg(self.cfg)
+        generation_mode = str(
+            self.cfg.get("validation", {}).get(
+                "t2m_generation_mode",
+                eval_cfg["generation_mode"],
+            )
+        )
+        # Save/restore CUDA RNG — generation consumes random state via
         # torch.randn() for latent init, which would otherwise shift the noise
         # used in subsequent training steps.
         cpu_state = torch.random.get_rng_state()
         cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         try:
             with self.ema.average_parameters([p for p in self.model.parameters() if p.requires_grad]):
-                model_batch = prepare_ldf_eval_model_batch(batch, self.device, model=self.model)
-                output = self.model.generate(model_batch)
+                decoded_generated = None
+                if generation_mode == "stream_generate_step":
+                    generated = []
+                    decoded_generated = []
+                    for sample_idx in range(len(batch["name"])):
+                        sample_batch = _slice_single_sample_batch(batch, sample_idx)
+                        model_batch = prepare_ldf_eval_model_batch(
+                            sample_batch,
+                            self.device,
+                            model=self.model,
+                        )
+                        output = run_ldf_generation_mode(
+                            self.model,
+                            model_batch,
+                            generation_mode,
+                            vae=self.vae,
+                            sample_batch=sample_batch,
+                            device=self.device,
+                            stream_history_length=eval_cfg["stream_history_length"],
+                            stream_traj_horizon_tokens=eval_cfg[
+                                "stream_traj_horizon_tokens"
+                            ],
+                            stream_token_dt=eval_cfg["stream_token_dt"],
+                            stream_frames_per_token=eval_cfg[
+                                "stream_frames_per_token"
+                            ],
+                            num_denoise_steps=eval_cfg["num_denoise_steps"],
+                        )
+                        generated.append(output["generated"][0])
+                        decoded_generated.append(output["decoded_feature"][0])
+                else:
+                    model_batch = prepare_ldf_eval_model_batch(
+                        batch,
+                        self.device,
+                        model=self.model,
+                    )
+                    output = run_ldf_generation_mode(
+                        self.model,
+                        model_batch,
+                        generation_mode,
+                        num_denoise_steps=eval_cfg["num_denoise_steps"],
+                    )
+                    generated = output["generated"]
         finally:
             torch.random.set_rng_state(cpu_state)
             if cuda_state is not None:
                 torch.cuda.set_rng_state_all(cuda_state)
-        generated = output["generated"]
         ground_truth_token = batch["token"]
         gt_token_length = batch["token_length"]
         ground_truth_feature = batch["feature"]
@@ -451,10 +500,13 @@ class CustomLightningModule(BasicLightningModule):
             # decode generated motion
             ##############################
             single_generated = generated[i]
-            decoded_single_generated = self.vae.decode(
-                single_generated[None, :].to(self.device)
-            )[0]
-            decoded_single_generated = decoded_single_generated.float().to(self.device)
+            if decoded_generated is not None:
+                decoded_single_generated = decoded_generated[i].float().to(self.device)
+            else:
+                decoded_single_generated = self.vae.decode(
+                    single_generated[None, :].to(self.device)
+                )[0]
+                decoded_single_generated = decoded_single_generated.float().to(self.device)
             ##############################
             # decode ground truth
             ##############################
@@ -720,16 +772,16 @@ def main():
     # train or validate
     ##############################
     if cfg.train:
-        # if cfg.resume_ckpt:
-        #     rank_zero_info(
-        #         f"[eval-on-resume] running test on resume ckpt: {cfg.resume_ckpt}"
-        #     )
-        #     trainer.test(
-        #         model,
-        #         dataloaders=test_probe_loaders,
-        #         ckpt_path=cfg.resume_ckpt,
-        #         weights_only=False,
-        #     )
+        if cfg.resume_ckpt:
+            rank_zero_info(
+                f"[eval-on-resume] running test on resume ckpt: {cfg.resume_ckpt}"
+            )
+            trainer.test(
+                model,
+                dataloaders=test_probe_loaders,
+                ckpt_path=cfg.resume_ckpt,
+                weights_only=False,
+            )
         trainer.fit(
             model,
             train_dataloader,

@@ -17,7 +17,17 @@ try:
         _slice_single_sample_batch,
         _stable_eval_seed,
     )
-    from FloodNet.eval.ldf.conditioning import prepare_ldf_eval_model_batch
+    from FloodNet.eval.ldf.conditioning import (
+        LdfEvalStreamConditioner,
+        prepare_ldf_eval_model_batch,
+    )
+    from FloodNet.utils.motion_process import StreamJointRecovery263
+    from FloodNet.utils.stream_rollout import (
+        StreamTextRolloutController,
+        build_stream_step_model_input,
+        build_stream_suffix_conditioning,
+        clip_traj_input_to_horizon,
+    )
     from FloodNet.utils.traj_batch import root_to_traj_feats
     from FloodNet.utils.training import (
         build_generation_eval_cfg,
@@ -36,7 +46,14 @@ except ImportError:  # pragma: no cover - script entrypoints use top-level impor
         _slice_single_sample_batch,
         _stable_eval_seed,
     )
-    from eval.ldf.conditioning import prepare_ldf_eval_model_batch
+    from eval.ldf.conditioning import LdfEvalStreamConditioner, prepare_ldf_eval_model_batch
+    from utils.motion_process import StreamJointRecovery263
+    from utils.stream_rollout import (
+        StreamTextRolloutController,
+        build_stream_step_model_input,
+        build_stream_suffix_conditioning,
+        clip_traj_input_to_horizon,
+    )
     from utils.traj_batch import root_to_traj_feats
     from utils.training import (
         build_generation_eval_cfg,
@@ -192,16 +209,186 @@ def _batch_text(model_batch: dict, batch_size: int):
     return text
 
 
+def _first_int(value, default: int) -> int:
+    if value is None:
+        return int(default)
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return int(default)
+        return int(value.reshape(-1)[0].detach().cpu().item())
+    arr = np.asarray(value)
+    if arr.size == 0:
+        return int(default)
+    return int(arr.reshape(-1)[0])
+
+
+def _vae_clear_cache(vae) -> None:
+    if hasattr(vae, "clear_cache"):
+        vae.clear_cache()
+
+
 @torch.no_grad()
-def _run_validation_generation_mode(model, model_batch: dict, generation_mode: str) -> dict:
+def _run_stream_generate_step_single(
+    *,
+    model,
+    vae,
+    sample_batch: dict,
+    device,
+    history_length: int,
+    num_denoise_steps=None,
+    traj_horizon_tokens: int | None = None,
+    token_dt: float = 0.20,
+    frames_per_token: int = 4,
+) -> dict:
+    total_tokens = _first_int(sample_batch.get("token_length"), 0)
+    total_frames = _first_int(sample_batch.get("feature_length"), total_tokens * 4)
+    if total_tokens <= 0:
+        empty_latent = torch.zeros((0, int(getattr(model, "input_dim", 0))), dtype=torch.float32)
+        empty_feature = torch.zeros((0, 263), dtype=torch.float32)
+        return {
+            "generated": [empty_latent],
+            "decoded_feature": [empty_feature],
+            "text": _batch_text(sample_batch, 1),
+        }
+
+    if num_denoise_steps is None:
+        num_denoise_steps = int(getattr(model, "noise_steps"))
+
+    model.init_generated(
+        int(history_length),
+        batch_size=1,
+        num_denoise_steps=num_denoise_steps,
+    )
+    _vae_clear_cache(vae)
+
+    text_rollout = StreamTextRolloutController.from_sample_batch(sample_batch)
+    stream_conditioner = (
+        LdfEvalStreamConditioner(
+            sample_batch,
+            history_length=int(history_length),
+            traj_horizon_tokens=int(traj_horizon_tokens or 0),
+            token_dt=float(token_dt),
+            frames_per_token=int(frames_per_token),
+            device=device,
+        )
+        if sample_batch.get("traj_cond_7d") is not None
+        else None
+    )
+    stream_recovery = (
+        StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
+        if stream_conditioner is not None
+        else None
+    )
+
+    first_chunk = True
+    latent_tokens = []
+    decoded_chunks = []
+    try:
+        for commit_index in range(total_tokens):
+            current_text = text_rollout.get_text_for_commit_index(commit_index)
+            if stream_conditioner is not None:
+                local_commit_index = int(getattr(model, "commit_index", commit_index))
+                chunk_size = int(getattr(model, "chunk_size", 1))
+                traj_input = stream_conditioner.build_step_payload(
+                    local_commit_index=local_commit_index,
+                    absolute_commit_index=commit_index,
+                    chunk_size=chunk_size,
+                )
+            else:
+                traj_input = build_stream_suffix_conditioning(
+                    sample_batch,
+                    commit_index,
+                )
+                if traj_horizon_tokens is not None and traj_horizon_tokens > 0:
+                    traj_input = clip_traj_input_to_horizon(
+                        traj_input,
+                        int(traj_horizon_tokens),
+                    )
+            step_payload = build_stream_step_model_input(
+                current_text,
+                traj_input=traj_input,
+            )
+            output = model.stream_generate_step(
+                step_payload,
+                first_chunk=first_chunk,
+            )
+            latent_token = output["generated"][0].detach().cpu()
+            decoded_chunk = vae.stream_decode(
+                output["generated"][0][None, :],
+                first_chunk=first_chunk,
+            )[0].float().detach().cpu()
+            first_chunk = False
+
+            latent_tokens.append(latent_token)
+            decoded_chunks.append(decoded_chunk)
+            if stream_conditioner is not None and stream_recovery is not None:
+                stream_conditioner.append_decoded(
+                    decoded_chunk,
+                    commit_idx=commit_index + 1,
+                    recovery=stream_recovery,
+                )
+    finally:
+        _vae_clear_cache(vae)
+
+    latent_stream = (
+        torch.cat(latent_tokens, dim=0)
+        if latent_tokens
+        else torch.zeros((0, int(getattr(model, "input_dim", 0))), dtype=torch.float32)
+    )
+    decoded_feature = (
+        torch.cat(decoded_chunks, dim=0)[:total_frames]
+        if decoded_chunks
+        else torch.zeros((0, 263), dtype=torch.float32)
+    )
+    return {
+        "generated": [latent_stream],
+        "decoded_feature": [decoded_feature],
+        "text": _batch_text(sample_batch, 1),
+    }
+
+
+@torch.no_grad()
+def _run_validation_generation_mode(
+    model,
+    model_batch: dict,
+    generation_mode: str,
+    *,
+    vae=None,
+    sample_batch: dict | None = None,
+    device=None,
+    stream_history_length: int = 30,
+    stream_traj_horizon_tokens: int | None = 20,
+    stream_token_dt: float = 0.20,
+    stream_frames_per_token: int = 4,
+    num_denoise_steps=None,
+) -> dict:
     if generation_mode == "generate":
-        return model.generate(model_batch)
+        return model.generate(model_batch, num_denoise_steps=num_denoise_steps)
+    if generation_mode == "stream_generate_step":
+        if vae is None or sample_batch is None or device is None:
+            raise ValueError(
+                "stream_generate_step validation requires vae, sample_batch, and device."
+            )
+        return _run_stream_generate_step_single(
+            model=model,
+            vae=vae,
+            sample_batch=sample_batch,
+            device=device,
+            history_length=stream_history_length,
+            num_denoise_steps=num_denoise_steps,
+            traj_horizon_tokens=stream_traj_horizon_tokens,
+            token_dt=stream_token_dt,
+            frames_per_token=stream_frames_per_token,
+        )
     if generation_mode != "stream_generate":
         raise ValueError(f"unknown validation generation mode: {generation_mode!r}")
 
     batch_size = _batch_size_from_model_batch(model_batch)
     chunks = [[] for _ in range(batch_size)]
-    for step_output in model.stream_generate(model_batch):
+    for step_output in model.stream_generate(
+        model_batch,
+        num_denoise_steps=num_denoise_steps,
+    ):
         step_generated = step_output.get("generated", [])
         for idx in range(min(batch_size, len(step_generated))):
             chunk = step_generated[idx]
@@ -220,6 +407,9 @@ def _run_validation_generation_mode(model, model_batch: dict, generation_mode: s
         "generated": generated,
         "text": _batch_text(model_batch, batch_size),
     }
+
+
+run_ldf_generation_mode = _run_validation_generation_mode
 
 
 def run_validation_generation_eval(module, batch, batch_idx=None, test_loader_idx=0):
@@ -320,6 +510,18 @@ def run_validation_generation_eval(module, batch, batch_idx=None, test_loader_id
                             module.model,
                             model_batch,
                             generation_mode,
+                            vae=module.vae,
+                            sample_batch=_cap_batch,
+                            device=module.device,
+                            stream_history_length=eval_cfg["stream_history_length"],
+                            stream_traj_horizon_tokens=eval_cfg[
+                                "stream_traj_horizon_tokens"
+                            ],
+                            stream_token_dt=eval_cfg["stream_token_dt"],
+                            stream_frames_per_token=eval_cfg[
+                                "stream_frames_per_token"
+                            ],
+                            num_denoise_steps=eval_cfg["num_denoise_steps"],
                         )
                     if _debug and run_idx == 0 and _cap_idx == 0 and sample_idx == 0:
                         _post_sd = _hash_sd(module.model.state_dict())
@@ -332,9 +534,14 @@ def run_validation_generation_eval(module, batch, batch_idx=None, test_loader_id
                             )
 
                     single_generated = output["generated"][0]
-                    decoded_single_generated = module.vae.decode(
-                        single_generated[None, :].to(module.device)
-                    )[0].float().detach()
+                    if output.get("decoded_feature") is not None:
+                        decoded_single_generated = output["decoded_feature"][0].to(
+                            module.device
+                        ).float().detach()
+                    else:
+                        decoded_single_generated = module.vae.decode(
+                            single_generated[None, :].to(module.device)
+                        )[0].float().detach()
 
                     if run_idx == 0 and _cap_idx == 0:
                         sample_text = output["text"][0]

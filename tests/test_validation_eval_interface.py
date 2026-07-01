@@ -47,7 +47,7 @@ def test_validation_eval_uses_validation_function_names():
     assert callable(process_validation_generation_results)
 
 
-def test_generation_eval_defaults_to_stream_generate_and_allows_generate():
+def test_generation_eval_defaults_to_stream_generate_step_and_allows_generate():
     from utils.training.validation_eval_runtime import build_generation_eval_cfg
 
     default_cfg = OmegaConf.create({"validation": {}})
@@ -55,7 +55,7 @@ def test_generation_eval_defaults_to_stream_generate_and_allows_generate():
         {"validation": {"eval_generation_mode": "generate"}}
     )
 
-    assert build_generation_eval_cfg(default_cfg)["generation_mode"] == "stream_generate"
+    assert build_generation_eval_cfg(default_cfg)["generation_mode"] == "stream_generate_step"
     assert build_generation_eval_cfg(offline_cfg)["generation_mode"] == "generate"
 
 
@@ -99,6 +99,79 @@ def test_validation_generation_mode_uses_stream_generate_when_configured():
     assert not model.generate_called
     assert out["text"] == ["stream"]
     assert torch.equal(out["generated"][0], torch.tensor([[1.0], [2.0]]))
+
+
+def test_validation_generation_mode_uses_stream_generate_step_when_configured():
+    from eval.eval_runner import _run_validation_generation_mode
+    import torch
+
+    class FakeModel:
+        input_dim = 1
+        noise_steps = 1
+        chunk_size = 1
+
+        def __init__(self):
+            self.generate_called = False
+            self.stream_generate_step_calls = 0
+
+        def generate(self, model_batch, num_denoise_steps=None):
+            self.generate_called = True
+            return {
+                "generated": [torch.tensor([[99.0]])],
+                "text": ["offline"],
+            }
+
+        def init_generated(self, history_length, batch_size=1, num_denoise_steps=None):
+            self.history_length = history_length
+            self.batch_size = batch_size
+
+        def stream_generate_step(self, step_input, first_chunk=True):
+            self.stream_generate_step_calls += 1
+            return {
+                "generated": torch.tensor(
+                    [[[float(self.stream_generate_step_calls)]]]
+                )
+            }
+
+    class FakeVAE:
+        def __init__(self):
+            self.clear_count = 0
+
+        def clear_cache(self):
+            self.clear_count += 1
+
+        def stream_decode(self, latent, first_chunk=True):
+            return torch.full((1, 1, 263), float(latent.reshape(-1)[0]))
+
+    model = FakeModel()
+    vae = FakeVAE()
+    sample_batch = {
+        "feature": torch.zeros(1, 2, 1),
+        "feature_length": torch.tensor([2]),
+        "token_length": torch.tensor([2]),
+        "text": ["walk"],
+    }
+    model_batch = {
+        "feature": torch.zeros(1, 2, 1),
+        "feature_length": torch.tensor([2]),
+        "text": ["walk"],
+    }
+
+    out = _run_validation_generation_mode(
+        model,
+        model_batch,
+        "stream_generate_step",
+        vae=vae,
+        sample_batch=sample_batch,
+        device=torch.device("cpu"),
+        stream_history_length=2,
+        stream_traj_horizon_tokens=0,
+    )
+
+    assert model.stream_generate_step_calls == 2
+    assert not model.generate_called
+    assert torch.equal(out["generated"][0], torch.tensor([[1.0], [2.0]]))
+    assert out["decoded_feature"][0].shape == (2, 263)
 
 
 def test_t2m_metric_enabled_is_validation_scoped():
