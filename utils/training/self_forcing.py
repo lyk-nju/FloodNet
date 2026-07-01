@@ -38,6 +38,14 @@ class RolloutPlan:
     phase_offset: torch.Tensor       # (B,) float32
 
 
+@dataclass(frozen=True)
+class CommitTokenRecord:
+    batch_idx: int
+    local_commit_idx: int
+    global_commit_idx: int
+    pred_token: torch.Tensor
+
+
 def shifted_local_time_steps(
     local_end_indices: torch.Tensor,
     *,
@@ -86,6 +94,12 @@ class SelfForcingTrainer:
         self._preconditions_checked = False
         self._last_replace_diff: float | None = None
         self._grad_clip_val: float | None = None  # resolved lazily
+
+    def _commit_body_aux_cfg(self) -> dict:
+        return self._module.cfg.get("multistep_commit_body_aux", {}) or {}
+
+    def _commit_body_aux_enabled(self) -> bool:
+        return bool(self._commit_body_aux_cfg().get("enabled", False))
 
     # ------------------------------------------------------------------
     # Public API
@@ -584,6 +598,32 @@ class SelfForcingTrainer:
             corruption_applied = True
         self._last_corruption_applied = float(corruption_applied)
 
+        commit_cfg = self._commit_body_aux_cfg()
+        commit_aux_enabled = bool(commit_cfg.get("enabled", False))
+        if commit_aux_enabled and int(model.chunk_size) != 1:
+            raise NotImplementedError(
+                "multistep_commit_body_aux initial implementation requires "
+                "model.chunk_size == 1; add commit span records before enabling "
+                "chunk_size > 1"
+            )
+        include_final_commit = bool(commit_cfg.get("include_final_step", True))
+        commit_records: list[CommitTokenRecord] = []
+        global_starts = model_batch.get("_window_global_start_token")
+        if global_starts is None:
+            global_starts = torch.zeros(feature.shape[0], device=device, dtype=torch.long)
+        elif not torch.is_tensor(global_starts):
+            global_starts = torch.as_tensor(global_starts, device=device, dtype=torch.long)
+        else:
+            global_starts = global_starts.to(device=device, dtype=torch.long)
+        global_starts = global_starts.view(-1)
+        if global_starts.numel() == 1 and feature.shape[0] > 1:
+            global_starts = global_starts.expand(feature.shape[0])
+        if global_starts.numel() != feature.shape[0]:
+            raise ValueError(
+                "_window_global_start_token must provide one value per sample; "
+                f"got {global_starts.numel()} for batch size {feature.shape[0]}"
+            )
+
         final_step_result = None
         window_start_tokens = model_batch.get("_window_local_latent_start_token")
         stride_tokens = int(getattr(model, "self_forcing_stride_tokens", 1))
@@ -613,21 +653,7 @@ class SelfForcingTrainer:
                     )
                 )
             is_final_step = step_idx == plan.effective_k - 1
-            if is_final_step:
-                final_step_result = model._forward_single_window(
-                    model_batch,
-                    current_feature,
-                    time_steps,
-                    all_text_context,
-                    traj_emb,
-                    traj_seq_lens,
-                    traj_dropped,
-                    enable_scheduled_sampling=False,
-                    traj_token_mask=traj_token_mask,
-                )
-                break
-
-            with torch.no_grad():
+            if is_final_step or commit_aux_enabled:
                 rollout_result = model._forward_single_window(
                     model_batch,
                     current_feature,
@@ -639,6 +665,45 @@ class SelfForcingTrainer:
                     enable_scheduled_sampling=False,
                     traj_token_mask=traj_token_mask,
                 )
+                if is_final_step:
+                    final_step_result = rollout_result
+            else:
+                with torch.no_grad():
+                    rollout_result = model._forward_single_window(
+                        model_batch,
+                        current_feature,
+                        time_steps,
+                        all_text_context,
+                        traj_emb,
+                        traj_seq_lens,
+                        traj_dropped,
+                        enable_scheduled_sampling=False,
+                        traj_token_mask=traj_token_mask,
+                    )
+
+            should_record_commit = commit_aux_enabled and (
+                include_final_commit or not is_final_step
+            )
+            if should_record_commit:
+                pred_list = rollout_result.get("pred_x0_latent_list")
+                if pred_list is not None:
+                    for b in range(feature.shape[0]):
+                        local_idx = int(end_indices[b].item()) - int(model.chunk_size)
+                        if local_idx < 0:
+                            continue
+                        pred_seq = pred_list[b]
+                        if pred_seq is None or local_idx >= pred_seq.shape[0]:
+                            continue
+                        commit_records.append(
+                            CommitTokenRecord(
+                                batch_idx=b,
+                                local_commit_idx=local_idx,
+                                global_commit_idx=int(global_starts[b].item()) + local_idx,
+                                pred_token=pred_seq[local_idx],
+                            )
+                        )
+            if is_final_step:
+                break
 
             disable_replace = bool(
                 self._module.cfg.get("self_forcing_disable_replace", False)
@@ -677,6 +742,7 @@ class SelfForcingTrainer:
                 f"self-forcing expected at least one supervised step, "
                 f"got effective_k={plan.effective_k}"
             )
+        self._last_commit_token_records = commit_records
         return final_step_result, plan.effective_k
 
     def _compute_losses(self, final_step_result: dict, batch: dict):
