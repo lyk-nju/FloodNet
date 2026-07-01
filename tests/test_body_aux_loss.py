@@ -244,3 +244,142 @@ def test_compute_body_aux_loss_uses_global_active_frame_slice_after_prefix_splic
     assert loss is not None
     assert abs(float(loss)) < 1e-6
     assert abs(float(terms["root_xz"])) < 1e-6
+
+
+def test_commit_body_aux_uses_step_mean_not_frame_mean(monkeypatch):
+    import utils.training.control_loss as cl
+
+    def fake_recover_root_rot_pos(decoded):
+        b, t, _ = decoded.shape
+        quat = decoded.new_zeros(b, t, 4)
+        quat[..., 0] = 1.0
+        xyz = decoded[..., :3]
+        return quat, xyz
+
+    monkeypatch.setattr(
+        cl, "recover_root_rot_pos", fake_recover_root_rot_pos, raising=False
+    )
+
+    decoded = [torch.zeros(5, 263)]
+    gt = torch.zeros(1, 5, 7)
+    gt[..., 3] = 1.0
+    gt[0, 0, 0] = 1.0
+    commit_masks = torch.zeros(2, 5)
+    commit_masks[0, 0] = 1.0        # one-frame commit, SmoothL1(1)=0.5
+    commit_masks[1, 1:5] = 1.0      # four-frame commit, zero loss
+    weights = {
+        "root_xz": 1.0,
+        "root_y": 0.0,
+        "heading": 0.0,
+        "fwd_delta": 0.0,
+        "yaw_delta": 0.0,
+        "end_xz": 0.0,
+    }
+
+    loss, terms = cl.compute_body_aux_loss_on_commit_masks(
+        decoded,
+        gt,
+        torch.tensor([5]),
+        commit_masks,
+        torch.tensor([0, 0]),
+        torch.tensor([0]),
+        torch.device("cpu"),
+        weights,
+        heading_form="cosine",
+    )
+
+    assert loss is not None
+    assert torch.isclose(loss, torch.tensor(0.25))
+    assert abs(terms["root_xz"] - 0.25) < 1e-6
+
+
+def test_commit_body_aux_delta_uses_full_decoded_prefix(monkeypatch):
+    import utils.training.control_loss as cl
+
+    def fake_recover_root_rot_pos(decoded):
+        b, t, _ = decoded.shape
+        quat = decoded.new_zeros(b, t, 4)
+        quat[..., 0] = 1.0
+        xyz = decoded[..., :3]
+        return quat, xyz
+
+    monkeypatch.setattr(
+        cl, "recover_root_rot_pos", fake_recover_root_rot_pos, raising=False
+    )
+
+    decoded = [torch.zeros(4, 263)]
+    decoded[0][1, 2] = 1.0
+    gt = torch.zeros(1, 4, 7)
+    gt[..., 3] = 1.0
+    commit_masks = torch.zeros(1, 4)
+    commit_masks[0, 1] = 1.0
+    weights = {
+        "root_xz": 0.0,
+        "root_y": 0.0,
+        "heading": 0.0,
+        "fwd_delta": 1.0,
+        "yaw_delta": 0.0,
+        "end_xz": 0.0,
+    }
+
+    loss, terms = cl.compute_body_aux_loss_on_commit_masks(
+        decoded,
+        gt,
+        torch.tensor([4]),
+        commit_masks,
+        torch.tensor([0]),
+        torch.tensor([0]),
+        torch.device("cpu"),
+        weights,
+        heading_form="cosine",
+    )
+
+    assert loss is not None
+    assert terms["fwd_delta"] > 0.0
+
+
+def test_commit_body_aux_uses_window_start_token_for_gt_offset(monkeypatch):
+    import utils.training.control_loss as cl
+    from utils.token_frame import token_start_frame
+
+    def fake_recover_root_rot_pos(decoded):
+        b, t, _ = decoded.shape
+        quat = decoded.new_zeros(b, t, 4)
+        quat[..., 0] = 1.0
+        xyz = decoded[..., :3]
+        return quat, xyz
+
+    monkeypatch.setattr(
+        cl, "recover_root_rot_pos", fake_recover_root_rot_pos, raising=False
+    )
+
+    decoded = [torch.zeros(1, 263)]
+    gt = torch.zeros(1, 12, 7)
+    gt[..., 3] = 1.0
+    gt[0, token_start_frame(2), 0] = 1.0
+    commit_masks = torch.ones(1, 1)
+    weights = {
+        "root_xz": 1.0,
+        "root_y": 0.0,
+        "heading": 0.0,
+        "fwd_delta": 0.0,
+        "yaw_delta": 0.0,
+        "end_xz": 0.0,
+    }
+
+    loss, terms = cl.compute_body_aux_loss_on_commit_masks(
+        decoded,
+        gt,
+        torch.tensor([12]),
+        commit_masks,
+        torch.tensor([0]),
+        torch.tensor([0]),
+        torch.device("cpu"),
+        weights,
+        heading_form="cosine",
+        window_start_tokens=torch.tensor([2]),
+    )
+
+    assert loss is not None
+    assert torch.isclose(loss, torch.tensor(0.5))
+    assert abs(terms["root_xz"] - 0.5) < 1e-6

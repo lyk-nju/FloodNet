@@ -4,9 +4,9 @@ import torch
 import torch.nn.functional as F
 
 try:
-    from ..motion_process import extract_root_trajectory_263_torch
+    from ..motion_process import extract_root_trajectory_263_torch, recover_root_rot_pos
 except ImportError:  # pragma: no cover - script entrypoints use top-level imports
-    from utils.motion_process import extract_root_trajectory_263_torch
+    from utils.motion_process import extract_root_trajectory_263_torch, recover_root_rot_pos
 
 
 # ===========================================================================
@@ -263,6 +263,182 @@ def compute_body_aux_loss(
         return None, {}
     loss = torch.stack(weighted_losses).sum() / total_n
     metrics = {k: v / total_n for k, v in term_sums.items()}
+    return loss, metrics
+
+
+def compute_body_aux_loss_on_commit_masks(
+    decoded_list,
+    gt_traj_7d,
+    traj_length,
+    commit_frame_masks,
+    commit_sample_positions,
+    sample_indices,
+    device,
+    weights: dict,
+    heading_form: str = "cosine",
+    sample_loss_mask=None,
+    window_start_tokens=None,
+    token_to_frame: int = 4,
+):
+    """Compute 7D body aux as a mean over committed rollout steps.
+
+    `commit_frame_masks` has one row per commit record. Deltas are derived over
+    the complete decoded prefix before a single commit mask selects frames.
+    """
+    from utils.local_frame import root_quat_to_physical_yaw
+    from utils.token_frame import token_start_frame
+
+    if not torch.is_tensor(commit_frame_masks):
+        commit_frame_masks = torch.as_tensor(
+            commit_frame_masks, device=device, dtype=torch.float32
+        )
+    else:
+        commit_frame_masks = commit_frame_masks.to(device=device, dtype=torch.float32)
+    if commit_frame_masks.ndim != 2:
+        raise ValueError(
+            f"commit_frame_masks must be [R,T], got {tuple(commit_frame_masks.shape)}"
+        )
+
+    if not torch.is_tensor(commit_sample_positions):
+        commit_sample_positions = torch.as_tensor(
+            commit_sample_positions, device=device, dtype=torch.long
+        )
+    else:
+        commit_sample_positions = commit_sample_positions.to(
+            device=device, dtype=torch.long
+        )
+    commit_sample_positions = commit_sample_positions.view(-1)
+    if commit_sample_positions.numel() != commit_frame_masks.shape[0]:
+        raise ValueError(
+            "commit_sample_positions must have one entry per commit mask; "
+            f"got {commit_sample_positions.numel()} for {commit_frame_masks.shape[0]}"
+        )
+
+    if not torch.is_tensor(sample_indices):
+        sample_indices = torch.as_tensor(sample_indices, device=device, dtype=torch.long)
+    else:
+        sample_indices = sample_indices.to(device=device, dtype=torch.long)
+    sample_indices = sample_indices.view(-1)
+    if sample_indices.numel() != len(decoded_list):
+        raise ValueError(
+            "sample_indices must map each decoded prefix to an original batch row; "
+            f"got {sample_indices.numel()} for {len(decoded_list)} decoded prefixes"
+        )
+
+    if not torch.is_tensor(traj_length):
+        traj_length = torch.as_tensor(traj_length, device=device, dtype=torch.long)
+    else:
+        traj_length = traj_length.to(device=device, dtype=torch.long)
+    traj_length = traj_length.view(-1)
+
+    if window_start_tokens is None:
+        starts = torch.zeros(len(decoded_list), device=device, dtype=torch.long)
+    elif not torch.is_tensor(window_start_tokens):
+        starts = torch.as_tensor(window_start_tokens, device=device, dtype=torch.long)
+    else:
+        starts = window_start_tokens.to(device=device, dtype=torch.long)
+    starts = starts.view(-1)
+    if starts.numel() == 1 and len(decoded_list) > 1:
+        starts = starts.expand(len(decoded_list))
+    if starts.numel() != len(decoded_list):
+        raise ValueError(
+            "window_start_tokens must provide one GT offset per decoded prefix; "
+            f"got {starts.numel()} starts for {len(decoded_list)} decoded prefixes"
+        )
+
+    decoded_cache = []
+    for decoded_pos, decoded in enumerate(decoded_list):
+        orig_i = int(sample_indices[decoded_pos].item())
+        decoded = decoded.to(device=device).float()
+        quat, xyz = recover_root_rot_pos(decoded.unsqueeze(0))
+        yaw = root_quat_to_physical_yaw(quat)
+        gt_len = min(int(traj_length[orig_i].item()), gt_traj_7d.shape[1])
+        window_start_token = int(starts[decoded_pos].item())
+        gt_start_f = token_start_frame(window_start_token, token_to_frame)
+        if gt_start_f >= gt_len:
+            raise ValueError(
+                "window_start_tokens must reference a valid GT start frame; "
+                f"sample={orig_i}, start_token={window_start_token}, "
+                f"start_frame={gt_start_f}, traj_length={gt_len}"
+            )
+        end_f = min(
+            decoded.shape[0],
+            gt_len - gt_start_f,
+            commit_frame_masks.shape[1],
+        )
+        if end_f <= 0:
+            decoded_cache.append(None)
+            continue
+
+        gt7 = gt_traj_7d[
+            orig_i:orig_i + 1,
+            gt_start_f:gt_start_f + end_f,
+            :,
+        ].to(device=device, dtype=xyz.dtype)
+        gt_xyz = gt7[..., :3]
+        gt_yaw = torch.atan2(gt7[..., 4], gt7[..., 3])
+        pred_xyz = xyz[:, :end_f, :]
+        pred_yaw = yaw[:, :end_f]
+
+        anchor7 = gt_traj_7d[
+            orig_i:orig_i + 1,
+            gt_start_f:gt_start_f + 1,
+            :,
+        ].to(device=device, dtype=xyz.dtype)
+        anchor_xyz = anchor7[..., :3]
+        anchor_yaw = torch.atan2(anchor7[..., 4], anchor7[..., 3])
+        pred_xyz, pred_yaw = canonicalize_pose_to_anchor(
+            pred_xyz, pred_yaw, anchor_xyz, anchor_yaw
+        )
+        gt_xyz, gt_yaw = canonicalize_pose_to_anchor(
+            gt_xyz, gt_yaw, anchor_xyz, anchor_yaw
+        )
+        decoded_cache.append((orig_i, end_f, pred_xyz, pred_yaw, gt_xyz, gt_yaw))
+
+    losses = []
+    term_sums = {
+        k: 0.0
+        for k in ("root_xz", "root_y", "heading", "fwd_delta", "yaw_delta", "end_xz")
+    }
+    for record_idx in range(commit_frame_masks.shape[0]):
+        decoded_pos = int(commit_sample_positions[record_idx].item())
+        if decoded_pos < 0 or decoded_pos >= len(decoded_cache):
+            continue
+        cached = decoded_cache[decoded_pos]
+        if cached is None:
+            continue
+        orig_i, end_f, pred_xyz, pred_yaw, gt_xyz, gt_yaw = cached
+        mask_i = commit_frame_masks[record_idx:record_idx + 1, :end_f].to(
+            device=device, dtype=pred_xyz.dtype
+        )
+        if mask_i.sum().item() <= 0:
+            continue
+        slm_i = None
+        if sample_loss_mask is not None:
+            if float(sample_loss_mask[orig_i]) <= 0:
+                continue
+            slm_i = sample_loss_mask[orig_i:orig_i + 1].to(device)
+
+        total_i, terms_i = body_aux_loss_terms(
+            pred_xyz,
+            pred_yaw,
+            gt_xyz,
+            gt_yaw,
+            mask_i,
+            weights,
+            heading_form=heading_form,
+            sample_loss_mask=slm_i,
+        )
+        losses.append(total_i)
+        for key in term_sums:
+            term_sums[key] += float(terms_i[key].detach())
+
+    if not losses:
+        return None, {}
+    loss = torch.stack(losses).mean()
+    denom = float(len(losses))
+    metrics = {key: value / denom for key, value in term_sums.items()}
+    metrics["valid_count"] = denom
     return loss, metrics
 
 
