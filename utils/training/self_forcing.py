@@ -23,7 +23,11 @@ from utils.training.validation_eval_runtime import control_loss_train_mode
 from utils.training.horizon_sched import sample_random_horizon_tokens
 from lightning.pytorch.utilities import rank_zero_info
 
-from .control_loss import compute_body_aux_loss, compute_control_loss_xz
+from .control_loss import (
+    compute_body_aux_loss,
+    compute_body_aux_loss_on_commit_masks,
+    compute_control_loss_xz,
+)
 from .model_batch import prepare_model_input
 from .window_local import build_window_local_model_batch
 from .module_step import compute_step_semantics
@@ -254,8 +258,15 @@ class SelfForcingTrainer:
             )
             self._last_replace_diff = None
         total_loss, step_diff_loss, step_control_loss = self._compute_losses(
-            final_step_result, batch
+            final_step_result, batch, model_batch
         )
+        commit_valid_count = getattr(self, "_last_commit_body_aux_valid_count", None)
+        if commit_valid_count is not None:
+            runtime_metrics["body_aux/commit_valid_count"] = float(commit_valid_count)
+            runtime_metrics["body_aux/commit_loss_skipped"] = (
+                1.0 if int(commit_valid_count) == 0 else 0.0
+            )
+            self._last_commit_body_aux_valid_count = None
 
         module.manual_backward(total_loss)
         trainable = [p for p in module.model.parameters() if p.requires_grad]
@@ -887,7 +898,66 @@ class SelfForcingTrainer:
             window_starts,
         )
 
-    def _compute_losses(self, final_step_result: dict, batch: dict):
+    def _decode_commit_latents(self, decoded_latents: list[torch.Tensor]):
+        return [
+            self._module.vae.decode(latent.unsqueeze(0))[0].float()
+            for latent in decoded_latents
+        ]
+
+    def _compute_commit_body_aux_loss(self, batch: dict, model_batch: dict):
+        self._last_commit_body_aux_valid_count = 0
+        cfg = self._commit_body_aux_cfg()
+        if not bool(cfg.get("enabled", False)):
+            return None, {}
+        if str(cfg.get("decode_mode", "single")) != "single":
+            raise NotImplementedError(
+                "multistep_commit_body_aux.decode_mode currently supports only 'single'"
+            )
+        if str(cfg.get("reduction", "step_mean")) != "step_mean":
+            raise NotImplementedError(
+                "multistep_commit_body_aux.reduction currently supports only 'step_mean'"
+            )
+        if "traj_cond_7d" not in batch:
+            return None, {}
+
+        (
+            decoded_latents,
+            commit_frame_masks,
+            commit_sample_positions,
+            sample_indices,
+            window_starts,
+        ) = self._assemble_commit_decode_inputs(batch, model_batch)
+        if not decoded_latents or commit_frame_masks is None:
+            return None, {}
+        candidate_commit_count = int(commit_frame_masks.shape[0])
+        decoded = self._decode_commit_latents(decoded_latents)
+        ba_cfg = self._module.cfg.get("body_aux_loss", {}) or {}
+        weights = {
+            **_DEFAULT_BODY_AUX_WEIGHTS,
+            **(ba_cfg.get("weights", {}) or {}),
+            **(cfg.get("weights", {}) or {}),
+        }
+        loss, terms = compute_body_aux_loss_on_commit_masks(
+            decoded,
+            batch["traj_cond_7d"],
+            batch["traj_length"],
+            commit_frame_masks,
+            commit_sample_positions,
+            sample_indices,
+            self._module.device,
+            weights,
+            heading_form=ba_cfg.get("heading_form", "cosine"),
+            sample_loss_mask=getattr(self, "_last_sample_loss_mask", None),
+            window_start_tokens=window_starts,
+        )
+        if loss is None:
+            self._last_commit_body_aux_valid_count = 0
+            return None, {}
+        valid_count = int(float(terms.get("valid_count", candidate_commit_count)))
+        self._last_commit_body_aux_valid_count = valid_count
+        return loss * float(cfg.get("weight", 1.0)), terms
+
+    def _compute_losses(self, final_step_result: dict, batch: dict, model_batch: dict):
         """Compute total loss for the supervised final step, including the
         optional trajectory control loss."""
         step_diff_loss = final_step_result["loss"]
@@ -896,6 +966,23 @@ class SelfForcingTrainer:
         control_weight = float(
             self._module.cfg.model.params.get("control_loss_weight", 1.0)
         )
+        commit_cfg = self._commit_body_aux_cfg()
+        commit_enabled = bool(commit_cfg.get("enabled", False))
+        replace_final = bool(commit_cfg.get("replace_final_body_aux", True))
+        if control_weight > 0.0 and commit_enabled:
+            step_control_loss, commit_terms = self._compute_commit_body_aux_loss(
+                batch, model_batch
+            )
+            self._last_body_aux_terms = commit_terms
+            if step_control_loss is not None:
+                total_loss = total_loss + control_weight * step_control_loss
+            elif bool(commit_cfg.get("strict_valid_commits", False)):
+                raise RuntimeError(
+                    "multistep_commit_body_aux produced no valid commit body aux loss"
+                )
+            if replace_final:
+                return total_loss, step_diff_loss, step_control_loss
+
         # T_B_06: in 7D mode with body_aux_loss enabled, the body aux loss (5
         # terms incl. heading) replaces the legacy xz-only control loss. The 4D
         # path keeps using compute_control_loss_xz (gate below).

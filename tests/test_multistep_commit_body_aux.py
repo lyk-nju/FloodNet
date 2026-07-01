@@ -306,3 +306,130 @@ def test_prefix_assembly_does_not_include_future_gt_suffix():
 
     assert decoded_latents[0].shape[0] == 4
     assert not torch.any(decoded_latents[0] == 99.0)
+
+
+def test_commit_aux_replaces_final_body_aux(monkeypatch):
+    trainer, _, _, _ = _trainer(commit_enabled=True, k=1)
+    trainer._module.device = torch.device("cpu")
+    trainer._module.vae = MagicMock()
+    trainer._module.cfg.model = SimpleNamespace(params={"control_loss_weight": 5.0})
+    trainer._last_commit_token_records = [
+        SimpleNamespace(
+            batch_idx=0,
+            local_commit_idx=0,
+            global_commit_idx=0,
+            pred_token=torch.ones(4, requires_grad=True),
+        )
+    ]
+    final_step_result = {
+        "loss": torch.tensor(2.0, requires_grad=True),
+        "pred_x0_latent_list": [torch.ones(1, 4, requires_grad=True)],
+    }
+    batch = {
+        "token": torch.zeros(1, 1, 4),
+        "token_length": torch.tensor([1]),
+        "traj_cond_7d": torch.zeros(1, 1, 7),
+        "traj_length": torch.tensor([1]),
+        "_window_local_body_aux_mode": "full_prefix_splice",
+        "_window_global_start_token": torch.tensor([0]),
+    }
+    model_batch = {
+        "feature": torch.zeros(1, 1, 4),
+        "feature_length": torch.tensor([1]),
+        "_window_local_body_aux_mode": "full_prefix_splice",
+        "_window_global_start_token": torch.tensor([0]),
+    }
+    monkeypatch.setattr(
+        "utils.training.self_forcing._compute_body_aux_loss",
+        MagicMock(side_effect=AssertionError("final body aux should be skipped")),
+    )
+    monkeypatch.setattr(
+        "utils.training.self_forcing.compute_body_aux_loss_on_commit_masks",
+        MagicMock(return_value=(torch.tensor(0.5), {"root_xz": 0.5})),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_decode_commit_latents",
+        MagicMock(return_value=[torch.zeros(1, 263)]),
+        raising=False,
+    )
+
+    total, diff, control = trainer._compute_losses(
+        final_step_result, batch, model_batch
+    )
+
+    assert torch.isclose(total, torch.tensor(4.5))
+    assert torch.isclose(diff, torch.tensor(2.0))
+    assert torch.isclose(control, torch.tensor(0.5))
+    assert trainer._last_commit_body_aux_valid_count == 1
+
+
+def test_commit_aux_none_does_not_fallback_to_final_body_aux(monkeypatch):
+    trainer, _, _, _ = _trainer(commit_enabled=True, k=1)
+    trainer._module.device = torch.device("cpu")
+    trainer._module.vae = MagicMock()
+    trainer._module.cfg.model = SimpleNamespace(params={"control_loss_weight": 5.0})
+    trainer._last_commit_token_records = []
+    final_step_result = {
+        "loss": torch.tensor(2.0, requires_grad=True),
+        "pred_x0_latent_list": [torch.ones(1, 4, requires_grad=True)],
+    }
+    batch = {
+        "token": torch.zeros(1, 1, 4),
+        "token_length": torch.tensor([1]),
+        "traj_cond_7d": torch.zeros(1, 1, 7),
+        "traj_length": torch.tensor([1]),
+    }
+    model_batch = {
+        "feature": torch.zeros(1, 1, 4),
+        "feature_length": torch.tensor([1]),
+    }
+    monkeypatch.setattr(
+        "utils.training.self_forcing._compute_body_aux_loss",
+        MagicMock(side_effect=AssertionError("must not fallback")),
+    )
+
+    total, diff, control = trainer._compute_losses(
+        final_step_result, batch, model_batch
+    )
+
+    assert torch.isclose(total, torch.tensor(2.0))
+    assert torch.isclose(diff, torch.tensor(2.0))
+    assert control is None
+    assert trainer._last_commit_body_aux_valid_count == 0
+
+
+def test_commit_aux_none_raises_in_strict_mode(monkeypatch):
+    trainer, _, _, _ = _trainer(
+        commit_enabled=True, k=1, strict_valid_commits=True
+    )
+    trainer._module.device = torch.device("cpu")
+    trainer._module.vae = MagicMock()
+    trainer._module.cfg.model = SimpleNamespace(params={"control_loss_weight": 5.0})
+    trainer._last_commit_token_records = []
+    final_step_result = {
+        "loss": torch.tensor(2.0, requires_grad=True),
+        "pred_x0_latent_list": [torch.ones(1, 4, requires_grad=True)],
+    }
+    batch = {
+        "token": torch.zeros(1, 1, 4),
+        "token_length": torch.tensor([1]),
+        "traj_cond_7d": torch.zeros(1, 1, 7),
+        "traj_length": torch.tensor([1]),
+    }
+    model_batch = {
+        "feature": torch.zeros(1, 1, 4),
+        "feature_length": torch.tensor([1]),
+    }
+    monkeypatch.setattr(
+        "utils.training.self_forcing._compute_body_aux_loss",
+        MagicMock(side_effect=AssertionError("must not fallback")),
+    )
+
+    try:
+        trainer._compute_losses(final_step_result, batch, model_batch)
+    except RuntimeError as exc:
+        assert "no valid commit body aux loss" in str(exc)
+    else:
+        raise AssertionError("expected strict mode to reject missing commit loss")
