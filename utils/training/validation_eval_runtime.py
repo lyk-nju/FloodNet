@@ -1,6 +1,21 @@
 from __future__ import annotations
 
 
+GENERATION_MODE_GENERATE = "generate"
+GENERATION_MODE_STREAM_GENERATE = "stream_generate"
+GENERATION_MODES = (GENERATION_MODE_GENERATE, GENERATION_MODE_STREAM_GENERATE)
+
+
+def _resolve_eval_generation_mode(val_cfg) -> str:
+    mode = str(val_cfg.get("eval_generation_mode", GENERATION_MODE_STREAM_GENERATE))
+    if mode not in GENERATION_MODES:
+        raise ValueError(
+            "validation.eval_generation_mode must be one of "
+            f"{GENERATION_MODES}; got {mode!r}."
+        )
+    return mode
+
+
 def build_generation_eval_cfg(cfg):
     val_cfg = cfg.get("validation", {})
     return {
@@ -12,6 +27,7 @@ def build_generation_eval_cfg(cfg):
             val_cfg.get("eval_forward_control_loss_window_mode", "mean_chunk_windows")
         ),
         "eval_all_captions": bool(val_cfg.get("eval_all_captions", False)),
+        "generation_mode": _resolve_eval_generation_mode(val_cfg),
     }
 
 

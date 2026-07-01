@@ -159,6 +159,69 @@ def _gather_payloads(local_payloads):
     return local_payloads
 
 
+def _batch_size_from_model_batch(model_batch: dict) -> int:
+    if "feature_length" in model_batch:
+        return int(len(model_batch["feature_length"]))
+    if "token_length" in model_batch:
+        return int(len(model_batch["token_length"]))
+    if "feature" in model_batch:
+        return int(model_batch["feature"].shape[0])
+    return int(len(model_batch.get("text", [])))
+
+
+def _lengths_from_model_batch(model_batch: dict, batch_size: int):
+    lengths = model_batch.get("feature_length", model_batch.get("token_length"))
+    if lengths is None:
+        return [None] * batch_size
+    if torch.is_tensor(lengths):
+        return [int(v.item()) for v in lengths.reshape(-1)[:batch_size]]
+    return [int(v) for v in list(lengths)[:batch_size]]
+
+
+def _empty_generated_like(model_batch: dict) -> torch.Tensor:
+    feature = model_batch.get("feature")
+    if torch.is_tensor(feature):
+        return feature.new_zeros((0, int(feature.shape[-1])))
+    return torch.zeros(0, 0)
+
+
+def _batch_text(model_batch: dict, batch_size: int):
+    text = model_batch.get("output_text", model_batch.get("text", [""] * batch_size))
+    if isinstance(text, list) and text and isinstance(text[0], list):
+        text = [" ////////// ".join(map(str, item)) for item in text]
+    return text
+
+
+@torch.no_grad()
+def _run_validation_generation_mode(model, model_batch: dict, generation_mode: str) -> dict:
+    if generation_mode == "generate":
+        return model.generate(model_batch)
+    if generation_mode != "stream_generate":
+        raise ValueError(f"unknown validation generation mode: {generation_mode!r}")
+
+    batch_size = _batch_size_from_model_batch(model_batch)
+    chunks = [[] for _ in range(batch_size)]
+    for step_output in model.stream_generate(model_batch):
+        step_generated = step_output.get("generated", [])
+        for idx in range(min(batch_size, len(step_generated))):
+            chunk = step_generated[idx]
+            if chunk is not None and int(chunk.shape[0]) > 0:
+                chunks[idx].append(chunk)
+
+    lengths = _lengths_from_model_batch(model_batch, batch_size)
+    empty = _empty_generated_like(model_batch)
+    generated = []
+    for idx in range(batch_size):
+        sample = torch.cat(chunks[idx], dim=0) if chunks[idx] else empty
+        if lengths[idx] is not None:
+            sample = sample[: lengths[idx]]
+        generated.append(sample)
+    return {
+        "generated": generated,
+        "text": _batch_text(model_batch, batch_size),
+    }
+
+
 def run_validation_generation_eval(module, batch, batch_idx=None, test_loader_idx=0):
     # Fix seed for reproducible test generation, but save/restore the training RNG so
     # that training noise stays i.i.d. when the training loop resumes after validation.
@@ -170,6 +233,7 @@ def run_validation_generation_eval(module, batch, batch_idx=None, test_loader_id
     eval_cfg = build_generation_eval_cfg(module.cfg)
     eval_num_runs = max(eval_cfg["num_runs"], 1)
     eval_seg_size = eval_cfg["seg_size"]
+    generation_mode = eval_cfg["generation_mode"]
     do_eval_metrics = eval_cfg["enabled"] and "traj" in batch and "traj_mask" in batch
     generation_num_runs = eval_num_runs if do_eval_metrics else 1
     probe_tag = resolve_test_probe_tag(module, test_loader_idx)
@@ -252,7 +316,11 @@ def run_validation_generation_eval(module, batch, batch_idx=None, test_loader_id
                         )
                         if _debug and run_idx == 0 and _cap_idx == 0 and sample_idx == 0:
                             _dump_eval_debug(module, model_batch, sample_seed, step_tag)
-                        output = module.model.generate(model_batch)
+                        output = _run_validation_generation_mode(
+                            module.model,
+                            model_batch,
+                            generation_mode,
+                        )
                     if _debug and run_idx == 0 and _cap_idx == 0 and sample_idx == 0:
                         _post_sd = _hash_sd(module.model.state_dict())
                         _post_ema = _hash_ema(module.ema)
@@ -328,6 +396,7 @@ def run_validation_generation_eval(module, batch, batch_idx=None, test_loader_id
                     "num_runs": eval_num_runs,
                     "num_captions": len(_all_captions),
                     "probe_tag": probe_tag,
+                    "generation_mode": generation_mode,
                     "text": sample_text,
                     "text_all": _all_captions,
                 }
