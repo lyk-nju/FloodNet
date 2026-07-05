@@ -212,6 +212,7 @@ def _run_validation_generation_mode(
         "generated": [stream_output["latent_stream"]],
         "decoded_feature": [stream_output["decoded_feature"]],
         "text": _batch_text(model_batch, 1),
+        "stream_best_of_k": stream_output.get("stream_best_of_k", {}),
     }
 
 

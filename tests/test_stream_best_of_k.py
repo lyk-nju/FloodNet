@@ -433,6 +433,23 @@ class _SerialCandidateVAE:
         return out
 
 
+class _BufferedProposalModel(_StatefulModel):
+    input_dim = 4
+    chunk_size = 1
+
+    def __init__(self):
+        super().__init__()
+        self.generated = torch.zeros(1, self.input_dim, 4, 1, 1)
+        self.commit_index = 1
+        self.batch_size = 1
+
+    def stream_generate_step(self, step_payload, first_chunk=True, condition=None):
+        idx = int(self.commit_index)
+        latent = self.generated[:, :, idx, 0, 0].unsqueeze(1)
+        self.commit_index += 1
+        return {"generated": latent}
+
+
 def _decoded_feature_x_as_root_xz(decoded_chunk, previous_decoded_chunks=None):
     return torch.stack(
         [
@@ -673,3 +690,45 @@ def test_serial_selector_forces_candidate0_when_any_frame_range_differs(monkeypa
     assert candidate1["target_xz_frame_range_matches_candidate0"] is False
     assert candidate1["decoded_chunk_length_matches_candidate0"] is False
     assert candidate1["frame_range_matches_candidate0"] is False
+
+
+def test_extra_candidates_resample_ready_to_commit_latent(monkeypatch):
+    from eval.ldf import stream_best_of_k
+    from eval.ldf.stream_best_of_k import StreamBestOfKConfig, run_best_of_k_step
+
+    monkeypatch.setattr(
+        stream_best_of_k,
+        "decoded_chunk_root_xz",
+        _decoded_feature_x_as_root_xz,
+    )
+    torch.manual_seed(123)
+    model = _BufferedProposalModel()
+    vae = _SerialCandidateVAE()
+    sample_batch = {
+        "traj_cond_7d": torch.zeros(1, 8, 7, dtype=torch.float32),
+    }
+    sample_batch["traj_cond_7d"][0, :, 3] = 1.0
+
+    step_output, record = run_best_of_k_step(
+        model=model,
+        vae=vae,
+        stream=_OneStepStream(),
+        stream_conditioner=None,
+        step_payload={"text": "walk"},
+        sample_batch=sample_batch,
+        first_chunk=False,
+        device=torch.device("cpu"),
+        local_commit_index=1,
+        generated_frames=4,
+        previous_decoded_chunks=[],
+        chunk_frame_ends=[4],
+        frames_per_token=4,
+        cfg=StreamBestOfKConfig.from_values(k=2, force_candidate0=True),
+        steps_since_switch=10**9,
+    )
+
+    candidate0, candidate1 = record["candidate_scores"]
+    assert candidate0["latent_max_abs_diff_from_candidate0"] == 0.0
+    assert candidate1["latent_max_abs_diff_from_candidate0"] > 0.0
+    assert torch.allclose(step_output.clean_committed_latent, torch.zeros(1, 4))
+    assert torch.allclose(model.generated[0, :, 1, 0, 0], torch.zeros(4))

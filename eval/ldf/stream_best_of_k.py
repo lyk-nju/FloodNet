@@ -107,6 +107,16 @@ def _seed_extra_candidate(
         torch.cuda.manual_seed_all(seed)
 
 
+def _randomize_extra_candidate_proposal_noise(model: Any, local_commit_index: int) -> None:
+    generated = getattr(model, "generated", None)
+    if not torch.is_tensor(generated):
+        return
+    start = max(0, int(local_commit_index))
+    if start >= int(generated.shape[2]):
+        return
+    generated[:, :, start:, ...] = torch.randn_like(generated[:, :, start:, ...])
+
+
 def _score_step_output(
     *,
     candidate_idx: int,
@@ -207,6 +217,10 @@ def run_best_of_k_step(
             )
             if int(candidate_idx) > 0:
                 _seed_extra_candidate(base_seed, local_commit_index, candidate_idx)
+                _randomize_extra_candidate_proposal_noise(
+                    model,
+                    local_commit_index=local_commit_index,
+                )
             step_output = run_one_stream_step(
                 model=model,
                 vae=vae,
@@ -245,12 +259,20 @@ def run_best_of_k_step(
             score_debugs.append(debug)
 
         candidate0_output = candidates[0].step_output
+        candidate0_latent = candidate0_output.clean_committed_latent.float()
         candidate0_commit_range = tuple(candidate0_output.commit_frame_range)
         candidate0_decoded_range = tuple(candidate0_output.decoded_chunk_frame_range)
         candidate0_target_range = tuple(candidate0_output.target_xz_frame_range)
         candidate0_length = int(candidate0_output.decoded_chunk.shape[0])
         for candidate, debug in zip(candidates, score_debugs):
             output = candidate.step_output
+            candidate_latent = output.clean_committed_latent.float()
+            if tuple(candidate_latent.shape) == tuple(candidate0_latent.shape):
+                latent_diff = float(
+                    (candidate_latent - candidate0_latent).abs().max().item()
+                )
+            else:
+                latent_diff = float("nan")
             commit_matches = tuple(output.commit_frame_range) == candidate0_commit_range
             decoded_matches = tuple(output.decoded_chunk_frame_range) == candidate0_decoded_range
             target_matches = tuple(output.target_xz_frame_range) == candidate0_target_range
@@ -266,6 +288,7 @@ def run_best_of_k_step(
             debug["target_xz_frame_range_matches_candidate0"] = bool(target_matches)
             debug["decoded_chunk_length_matches_candidate0"] = bool(length_matches)
             debug["frame_range_matches_candidate0"] = bool(aggregate_matches)
+            debug["latent_max_abs_diff_from_candidate0"] = latent_diff
             if not aggregate_matches:
                 force_candidate0 = True
 

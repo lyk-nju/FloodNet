@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import torch
 from omegaconf import OmegaConf
 
 from utils.training.ldf.validation_eval_runtime import build_val_dataloaders
@@ -119,6 +120,38 @@ def test_stream_generate_step_accepts_stream_best_of_k_selector_config_kwargs():
     assert cfg.cont_tol == 0.07
     assert cfg.force_candidate0 is True
     assert cfg.switch_cooldown_steps == 2
+
+
+def test_validation_stream_generation_preserves_best_of_k_summary(monkeypatch):
+    from utils.training.ldf import validation_generation
+    from utils.training.ldf.t2m_generation_modes import T2M_STREAM_GENERATE_STEP
+
+    expected_summary = {"k": 5, "switch_count": 2, "step_count": 46}
+
+    def _fake_stream_generate_step_sample(**kwargs):
+        return {
+            "latent_stream": torch.zeros(1, 4),
+            "decoded_feature": torch.zeros(4, 263),
+            "stream_best_of_k": expected_summary,
+        }
+
+    monkeypatch.setattr(
+        validation_generation,
+        "run_stream_generate_step_sample",
+        _fake_stream_generate_step_sample,
+    )
+
+    output = validation_generation._run_validation_generation_mode(
+        model=object(),
+        model_batch={"text": ["walk"]},
+        generation_mode=T2M_STREAM_GENERATE_STEP,
+        vae=object(),
+        sample_batch={"name": ["sample"]},
+        device=torch.device("cpu"),
+        stream_best_of_k=5,
+    )
+
+    assert output["stream_best_of_k"] is expected_summary
 
 
 def test_training_package_no_longer_exports_async_eval_helpers():
