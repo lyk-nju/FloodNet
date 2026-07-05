@@ -140,7 +140,10 @@ def choose_candidate(
     if not scores:
         raise ValueError("choose_candidate requires at least one candidate score")
 
-    candidate0 = scores[0]
+    candidate0 = next((score for score in scores if int(score.index) == 0), None)
+    if candidate0 is None:
+        raise ValueError("choose_candidate requires a score with index 0")
+
     if bool(cfg.force_candidate0):
         return _decision(candidate0, candidate0, cfg, "force_candidate0")
     if (
@@ -154,7 +157,9 @@ def choose_candidate(
     required_gain = max(float(cfg.abs_margin), float(cfg.rel_margin) * track0)
     best = candidate0
     best_track = track0
-    for score in scores[1:]:
+    for score in scores:
+        if int(score.index) == 0:
+            continue
         track = score.track(cfg)
         continuity = score.continuity(cfg)
         if track < track0 - required_gain and continuity <= cont0 + float(cfg.cont_tol):
