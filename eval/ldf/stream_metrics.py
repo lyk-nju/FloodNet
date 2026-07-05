@@ -511,6 +511,12 @@ def _run_stream_eval(
                 stream_metric["stream_best_of_k_total_elapsed_sec"] = float(
                     best_of_k_info.get("total_elapsed_sec", 0.0)
                 )
+                stream_metric["stream_best_of_k_switch_count"] = float(
+                    best_of_k_info.get("switch_count", 0)
+                )
+                stream_metric["stream_best_of_k_step_count"] = float(
+                    best_of_k_info.get("step_count", 0)
+                )
                 if best_of_k_debug:
                     stream_metric["stream_best_of_k_records"] = best_of_k_info.get(
                         "records",
@@ -605,6 +611,14 @@ def _run_stream_eval(
             sample_record["stream_best_of_k_total_elapsed_sec"] = _average_scalar_metric(
                 stream_runs,
                 "stream_best_of_k_total_elapsed_sec",
+            )
+            sample_record["stream_best_of_k_switch_count"] = _average_scalar_metric(
+                stream_runs,
+                "stream_best_of_k_switch_count",
+            )
+            sample_record["stream_best_of_k_step_count"] = _average_scalar_metric(
+                stream_runs,
+                "stream_best_of_k_step_count",
             )
         if compute_offline_baseline:
             sample_record["stream_offline_feature_l2_mean"] = _average_scalar_metric(stream_runs, "stream_offline_feature_l2_mean")

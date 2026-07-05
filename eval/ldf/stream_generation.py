@@ -864,7 +864,27 @@ def run_stream_generate_step_sample(
                 else best_of_k_switch_cooldown_steps
             ),
             "total_elapsed_sec": float(best_of_k_total_elapsed_sec),
-            "records": best_of_k_records,
+            "switch_count": (
+                int(
+                    sum(
+                        1
+                        for item in best_of_k_records
+                        if int(item.get("selected_idx", 0)) != 0
+                    )
+                )
+                if best_of_k_cfg is not None
+                else 0
+            ),
+            "step_count": (
+                int(len(best_of_k_records))
+                if best_of_k_cfg is not None
+                else 0
+            ),
+            "records": (
+                best_of_k_records
+                if best_of_k_cfg is not None and bool(best_of_k_cfg.debug)
+                else []
+            ),
         },
     }
 

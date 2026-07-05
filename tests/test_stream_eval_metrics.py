@@ -458,6 +458,8 @@ def test_stream_best_of_k_force_candidate0_does_not_batch_mutate_state(monkeypat
     assert model.batch_size == 1
     assert model.commit_index == 1
     assert stream_out["stream_best_of_k"]["k"] == 3
+    assert stream_out["stream_best_of_k"]["step_count"] == 1
+    assert stream_out["stream_best_of_k"]["switch_count"] == 0
     assert stream_out["stream_best_of_k"]["records"][0]["selected_idx"] == 0
     assert stream_out["latent_stream"].shape[0] == 1
 
@@ -507,9 +509,61 @@ def test_stream_best_of_k_switches_to_candidate1_and_appends_once(monkeypatch):
     )
 
     assert stream_out["stream_best_of_k"]["records"][0]["selected_idx"] == 1
+    assert stream_out["stream_best_of_k"]["step_count"] == 1
+    assert stream_out["stream_best_of_k"]["switch_count"] == 1
     assert stream_out["latent_stream"].shape[0] == 1
     assert torch.allclose(stream_out["latent_stream"], torch.tensor([[0.25] * 4]))
     assert model.commit_index == 1
+
+
+def test_stream_best_of_k_debug_false_keeps_summary_without_records(monkeypatch):
+    from eval.ldf import stream_best_of_k
+
+    monkeypatch.setattr(
+        stream_best_of_k,
+        "decoded_chunk_root_xz",
+        _decoded_feature_x_as_root_xz,
+    )
+    traj7 = torch.zeros(1, 1, 7, dtype=torch.float32)
+    traj7[0, :, 0] = 0.25
+    traj7[0, :, 3] = 1.0
+    sample_batch = {
+        "name": ["sample"],
+        "dataset": ["HumanML3D"],
+        "text": ["walk"],
+        "token": torch.zeros(1, 1, 4, dtype=torch.float32),
+        "token_length": torch.tensor([1], dtype=torch.long),
+        "feature_length": torch.tensor([1], dtype=torch.long),
+        "traj_cond_7d": traj7,
+        "traj_cond": traj7[..., :3].clone(),
+        "traj": traj7[..., :3].clone(),
+        "traj_length": torch.tensor([1], dtype=torch.long),
+        "traj_cond_mask": torch.ones(1, 1, dtype=torch.float32),
+        "traj_mask": torch.ones(1, 1, dtype=torch.float32),
+        "token_mask": torch.ones(1, 1, dtype=torch.float32),
+    }
+    model = _FakeBestOfKStepModel([2.0, 0.25])
+
+    stream_out = run_stream_generate_step_sample(
+        model=model,
+        vae=_FakeBestOfKVAE(),
+        sample_batch=sample_batch,
+        device=torch.device("cpu"),
+        history_length=2,
+        num_denoise_steps=1,
+        traj_horizon_tokens=1,
+        frames_per_token=1,
+        best_of_k=2,
+        best_of_k_rel_margin=0.0,
+        best_of_k_abs_margin=0.0,
+        best_of_k_cont_tol=1.0,
+        best_of_k_debug=False,
+    )
+
+    best_of_k = stream_out["stream_best_of_k"]
+    assert best_of_k["records"] == []
+    assert best_of_k["step_count"] == 1
+    assert best_of_k["switch_count"] == 1
 
 
 def test_ldf_stream_generate_step_uses_direct_7d_payload_when_available():

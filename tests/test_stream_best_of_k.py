@@ -368,6 +368,8 @@ def test_best_of_k_disabled_skips_config_validation_and_selector(monkeypatch):
     assert stream_out["stream_best_of_k"]["enabled"] is False
     assert stream_out["stream_best_of_k"]["k"] == 1
     assert stream_out["stream_best_of_k"]["score"] == "bad"
+    assert stream_out["stream_best_of_k"]["switch_count"] == 0
+    assert stream_out["stream_best_of_k"]["step_count"] == 0
     assert stream_out["stream_best_of_k"]["records"] == []
 
 
@@ -536,6 +538,39 @@ def test_serial_selector_records_same_frame_range_for_all_candidates():
         (0, 4),
     ]
     assert step_output.commit_frame_range == (0, 4)
+
+
+def test_selector_debug_record_contains_commit_and_target_ranges():
+    from eval.ldf.stream_best_of_k import StreamBestOfKConfig, run_best_of_k_step
+
+    model = _OneStepModel()
+    vae = _OneStepVAE()
+    cfg = StreamBestOfKConfig(k=2, force_candidate0=True, debug=True)
+    sample_batch = {"traj_cond_7d": torch.zeros(1, 4, 7, dtype=torch.float32)}
+    sample_batch["traj_cond_7d"][0, :, 3] = 1.0
+    _, record = run_best_of_k_step(
+        model=model,
+        vae=vae,
+        stream=_OneStepStream(),
+        stream_conditioner=None,
+        step_payload={"text": "walk"},
+        sample_batch=sample_batch,
+        first_chunk=True,
+        device=torch.device("cpu"),
+        local_commit_index=0,
+        generated_frames=0,
+        previous_decoded_chunks=[],
+        chunk_frame_ends=[],
+        frames_per_token=4,
+        cfg=cfg,
+        steps_since_switch=100,
+    )
+    first_score = record["candidate_scores"][0]
+    assert first_score["commit_token_range"] == [0, 1]
+    assert first_score["commit_frame_range"] == [0, 4]
+    assert first_score["decoded_chunk_frame_range"] == [0, 4]
+    assert first_score["target_xz_frame_range"] == [0, 4]
+    assert "switch_reason" in record
 
 
 def test_serial_selector_switches_to_better_candidate1_and_restores_post_state(monkeypatch):
