@@ -285,3 +285,71 @@ def test_step_output_records_explicit_ranges():
     assert output.commit_token_range == (2, 3)
     assert output.commit_frame_range == (8, 12)
     assert output.debug["ready_to_commit_token"] == 2
+
+
+def test_best_of_k_disabled_uses_original_single_step_path(monkeypatch):
+    import eval.ldf.stream_generation as stream_generation
+
+    called = {"selector": 0}
+
+    def _selector_should_not_run(**kwargs):
+        called["selector"] += 1
+        raise AssertionError("best_of_k <= 1 must bypass selector")
+
+    monkeypatch.setattr(stream_generation, "run_best_of_k_step", _selector_should_not_run, raising=False)
+
+    assert stream_generation._should_use_best_of_k(1) is False
+    assert stream_generation._should_use_best_of_k(0) is False
+    assert called["selector"] == 0
+
+
+class _OneStepModel(_StatefulModel):
+    input_dim = 4
+    chunk_size = 1
+
+    def stream_generate_step(self, step_payload, first_chunk=True, condition=None):
+        self.commit_index += 1
+        latent = torch.full((1, 1, self.input_dim), float(self.commit_index))
+        return {"generated": latent}
+
+
+class _OneStepVAE:
+    def __init__(self):
+        self.model = _StatefulVAEModel()
+        self.calls = []
+
+    def stream_decode(self, latent, first_chunk=True):
+        self.calls.append((latent.detach().clone(), bool(first_chunk)))
+        frames = torch.zeros(1, 4, 263, dtype=torch.float32)
+        frames[:, :, 0] = latent[:, :, 0].view(1, 1)
+        return frames
+
+
+class _OneStepStream:
+    def build_ldf_condition_provider(self, step_payload, first_chunk=True, device=None):
+        return lambda **kwargs: None
+
+
+def test_run_one_stream_step_returns_clean_commit_ranges():
+    from eval.ldf.stream_step import run_one_stream_step
+
+    model = _OneStepModel()
+    vae = _OneStepVAE()
+    output = run_one_stream_step(
+        model=model,
+        vae=vae,
+        stream=_OneStepStream(),
+        step_payload={"text": "walk"},
+        first_chunk=True,
+        device=torch.device("cpu"),
+        local_commit_index=0,
+        generated_frames=0,
+        frames_per_token=4,
+    )
+
+    assert output.clean_committed_latent.shape == (1, 4)
+    assert output.decoded_chunk.shape == (4, 263)
+    assert output.commit_token_range == (0, 1)
+    assert output.commit_frame_range == (0, 4)
+    assert output.decoded_chunk_frame_range == (0, 4)
+    assert output.debug["ready_to_commit_token"] == 0

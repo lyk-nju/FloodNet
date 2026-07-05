@@ -10,6 +10,7 @@ from typing import Dict, List, Optional
 import torch
 
 from eval.ldf.conditioning import LdfEvalStreamConditioner
+from eval.ldf.stream_step import run_one_stream_step
 from metrics.stream import decode_stream_chunks
 from utils.inference.stream_generator import StreamGenerator
 from utils.motion_process import (
@@ -76,7 +77,7 @@ class StreamBestOfKConfig:
 
     @property
     def enabled(self) -> bool:
-        return int(self.k) > 1
+        return _should_use_best_of_k(self.k)
 
 
 class StreamTextRolloutController:
@@ -114,6 +115,10 @@ def _to_python_int(value) -> int:
     if torch.is_tensor(value):
         return int(value.item())
     return int(value)
+
+
+def _should_use_best_of_k(best_of_k: int) -> bool:
+    return int(best_of_k) > 1
 
 
 def _sample_traj7(sample_batch: Dict) -> torch.Tensor:
@@ -759,18 +764,18 @@ def run_stream_generate_step_sample(
                 best_of_k_records.append(record)
                 best_of_k_total_elapsed_sec += float(record["elapsed_sec"])
             else:
-                condition_provider = stream.build_ldf_condition_provider(
-                    step_payload,
-                    first_chunk=first_chunk,
-                    device=device,
-                )
-                output = model.stream_generate_step(
-                    step_payload,
-                    first_chunk=first_chunk,
-                    condition=condition_provider,
-                )
-                latent_token = output["generated"][0].detach().cpu()
                 if root_replace_feedback:
+                    condition_provider = stream.build_ldf_condition_provider(
+                        step_payload,
+                        first_chunk=first_chunk,
+                        device=device,
+                    )
+                    output = model.stream_generate_step(
+                        step_payload,
+                        first_chunk=first_chunk,
+                        condition=condition_provider,
+                    )
+                    latent_token = output["generated"][0].detach().cpu()
                     decoded_chunk_raw = _decode_raw_chunk_preserving_feedback_cache(
                         vae,
                         latent_token,
@@ -778,9 +783,19 @@ def run_stream_generate_step_sample(
                         device=device,
                     )
                 else:
-                    decoded_chunk_raw = vae.stream_decode(
-                        output["generated"][0][None, :], first_chunk=first_chunk
-                    )[0].float().detach().cpu()
+                    step_output = run_one_stream_step(
+                        model=model,
+                        vae=vae,
+                        stream=stream,
+                        step_payload=step_payload,
+                        first_chunk=first_chunk,
+                        device=device,
+                        local_commit_index=local_commit_index,
+                        generated_frames=generated_frames,
+                        frames_per_token=frames_per_token,
+                    )
+                    latent_token = step_output.clean_committed_latent
+                    decoded_chunk_raw = step_output.decoded_chunk
             chunk_start_frame = int(generated_frames)
             if root_replace_feedback:
                 decoded_chunk = _replace_chunk_root_from_condition(
