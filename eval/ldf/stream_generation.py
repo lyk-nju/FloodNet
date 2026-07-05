@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import copy
 import time
-from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import torch
 
 from eval.ldf.conditioning import LdfEvalStreamConditioner
+from eval.ldf.stream_best_of_k import StreamBestOfKConfig, run_best_of_k_step
 from eval.ldf.stream_step import run_one_stream_step
 from metrics.stream import decode_stream_chunks
 from utils.inference.stream_generator import StreamGenerator
@@ -20,64 +20,6 @@ from utils.motion_process import (
 )
 from utils.token_frame import num_tokens_for_frame_len
 from utils.training.ldf.validation_conditioning import prepare_ldf_eval_model_batch
-
-
-@dataclass(frozen=True)
-class StreamBestOfKConfig:
-    k: int = 1
-    score: str = "xz"
-    xz_weight: float = 1.0
-    fde_weight: float = 1.0
-    cont_weight: float = 0.0
-    vel_weight: float = 0.5
-    rel_margin: float = 0.10
-    abs_margin: float = 0.03
-    cont_tol: float = 0.03
-    force_candidate0: bool = False
-    switch_cooldown_steps: int = 0
-    debug: bool = False
-
-    @classmethod
-    def from_values(
-        cls,
-        *,
-        k: int = 1,
-        score: str = "xz",
-        xz_weight: float = 1.0,
-        fde_weight: float = 1.0,
-        cont_weight: float = 0.0,
-        vel_weight: float = 0.5,
-        rel_margin: float = 0.10,
-        abs_margin: float = 0.03,
-        cont_tol: float = 0.03,
-        force_candidate0: bool = False,
-        switch_cooldown_steps: int = 0,
-        debug: bool = False,
-    ) -> "StreamBestOfKConfig":
-        out = cls(
-            k=max(1, int(k)),
-            score=str(score),
-            xz_weight=float(xz_weight),
-            fde_weight=float(fde_weight),
-            cont_weight=float(cont_weight),
-            vel_weight=float(vel_weight),
-            rel_margin=float(rel_margin),
-            abs_margin=float(abs_margin),
-            cont_tol=float(cont_tol),
-            force_candidate0=bool(force_candidate0),
-            switch_cooldown_steps=int(switch_cooldown_steps),
-            debug=bool(debug),
-        )
-        if out.score != "xz":
-            raise ValueError(
-                "Only eval_stream_best_of_k_score='xz' is implemented; "
-                f"got {out.score!r}."
-            )
-        return out
-
-    @property
-    def enabled(self) -> bool:
-        return _should_use_best_of_k(self.k)
 
 
 class StreamTextRolloutController:
@@ -727,6 +669,7 @@ def run_stream_generate_step_sample(
     generated_frames = 0
     best_of_k_records: list[dict] = []
     best_of_k_total_elapsed_sec = 0.0
+    steps_since_switch = 10**9
 
     try:
         for commit_index in range(step_count):
@@ -747,10 +690,11 @@ def run_stream_generate_step_sample(
             )
             if use_best_of_k:
                 assert best_of_k_cfg is not None
-                proposal = _stream_generate_step_best_of_k(
+                step_output, record = run_best_of_k_step(
                     model=model,
                     vae=vae,
                     stream=stream,
+                    stream_conditioner=stream_conditioner,
                     step_payload=step_payload,
                     sample_batch=sample_batch,
                     first_chunk=first_chunk,
@@ -758,15 +702,21 @@ def run_stream_generate_step_sample(
                     local_commit_index=local_commit_index,
                     generated_frames=generated_frames,
                     previous_decoded_chunks=decoded_chunks,
+                    chunk_frame_ends=chunk_frame_ends,
+                    frames_per_token=int(frames_per_token),
                     cfg=best_of_k_cfg,
+                    steps_since_switch=steps_since_switch,
                 )
-                latent_token = proposal["latent_token"]
-                decoded_chunk_raw = proposal["decoded_chunk"]
-                record = proposal["record"]
+                latent_token = step_output.clean_committed_latent
+                decoded_chunk_raw = step_output.decoded_chunk
                 record["commit_index"] = int(commit_index)
                 record["local_commit_index"] = int(local_commit_index)
                 best_of_k_records.append(record)
-                best_of_k_total_elapsed_sec += float(record["elapsed_sec"])
+                if int(record["selected_idx"]) == 0:
+                    steps_since_switch += 1
+                else:
+                    steps_since_switch = 0
+                best_of_k_total_elapsed_sec += float(record.get("elapsed_sec", 0.0))
             else:
                 if root_replace_feedback:
                     condition_provider = stream.build_ldf_condition_provider(
@@ -866,7 +816,7 @@ def run_stream_generate_step_sample(
         "root_feedback_xz_blend_alpha": float(root_feedback_xz_blend_alpha),
         "stream_best_of_k": {
             "enabled": bool(use_best_of_k),
-            "k": int(best_of_k_cfg.k) if best_of_k_cfg is not None else int(best_of_k),
+            "k": int(best_of_k_cfg.k) if best_of_k_cfg is not None else max(1, int(best_of_k)),
             "score": str(best_of_k_cfg.score) if best_of_k_cfg is not None else best_of_k_score,
             "xz_weight": (
                 float(best_of_k_cfg.xz_weight)

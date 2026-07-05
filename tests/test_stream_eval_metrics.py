@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from eval.ldf.stream_metrics import _resolve_run_name, _save_sample_outputs
+from metrics.traj import _compute_tail_fde_metrics
 from metrics.stream import compute_root_path_yaw_error, summarize_stream_records
 from eval.runtime.metrics import (
     build_plan_metrics,
@@ -21,6 +22,10 @@ from eval.runtime.metrics import (
     estimate_body_yaw,
 )
 from eval.ldf.stream_metrics import run_stream_generate_step_sample
+from eval.ldf.stream_generation import (
+    _replace_chunk_root_from_condition,
+)
+from utils.motion_process import recover_root_rot_pos
 
 
 def test_compute_yaw_error_wraps_angles():
@@ -216,6 +221,9 @@ class _FakeStepModel:
         self.commit_index += 1
         return {"generated": [torch.zeros(1, self.input_dim)]}
 
+    def preprocess(self, x):
+        return x.permute(0, 2, 1).unsqueeze(-1).unsqueeze(-1)
+
 
 class _FakeRollingStepModel(_FakeStepModel):
     def stream_generate_step(self, step_input, first_chunk=True, condition=None):
@@ -235,6 +243,207 @@ class _FakeStepVAE:
 
     def stream_decode(self, latent, first_chunk=True):
         return torch.zeros(1, 1, 263)
+
+
+class _FakeCausalStepVAE(_FakeStepVAE):
+    def stream_decode(self, latent, first_chunk=True):
+        frames = 1 if first_chunk else 4
+        return torch.zeros(1, frames, 263)
+
+
+class _FakeFeedbackStepModel(_FakeStepModel):
+    def init_generated(
+        self,
+        history_length,
+        batch_size,
+        num_denoise_steps,
+        traj_buffer=None,
+    ):
+        super().init_generated(
+            history_length,
+            batch_size,
+            num_denoise_steps,
+            traj_buffer=traj_buffer,
+        )
+        self.generated = torch.zeros(
+            batch_size,
+            self.input_dim,
+            history_length * 2 + 4,
+            1,
+            1,
+        )
+
+    def stream_generate_step(self, step_input, first_chunk=True, condition=None):
+        self.payloads.append(dict(step_input))
+        value = float(self.commit_index + 1)
+        self.commit_index += 1
+        return {"generated": [torch.full((1, self.input_dim), value)]}
+
+
+class _FakeFeedbackVAE(_FakeCausalStepVAE):
+    def __init__(self):
+        self.encode_prefixes = []
+        self.stream_encode_chunks = []
+        self.stream_decode_calls = []
+
+    def encode(self, x):
+        self.encode_prefixes.append(x.detach().clone())
+        raise AssertionError("feedback should use stream_encode instead of full-prefix encode")
+
+    def stream_encode(self, x, first_chunk=True):
+        self.stream_encode_chunks.append((x.detach().clone(), bool(first_chunk)))
+        value = 100.0 + float(len(self.stream_encode_chunks))
+        return torch.full((1, 1, 4), value, dtype=x.dtype, device=x.device)
+
+    def stream_decode(self, latent, first_chunk=True):
+        self.stream_decode_calls.append((latent.detach().clone(), bool(first_chunk)))
+        return super().stream_decode(latent, first_chunk=first_chunk)
+
+
+class _FakeBestOfKStepModel(_FakeStepModel):
+    def __init__(self, candidate_values):
+        super().__init__()
+        self.candidate_values = list(candidate_values)
+        self.current_step = 0
+
+    def init_generated(
+        self,
+        history_length,
+        batch_size,
+        num_denoise_steps,
+        traj_buffer=None,
+    ):
+        super().init_generated(
+            history_length,
+            batch_size,
+            num_denoise_steps,
+            traj_buffer=traj_buffer,
+        )
+        self.seq_len = int(history_length)
+        self.current_step = 0
+        self.generated = torch.zeros(
+            batch_size,
+            self.input_dim,
+            history_length * 2 + 2,
+            1,
+            1,
+        )
+
+    def stream_generate_step(self, step_input, first_chunk=True, condition=None):
+        self.payloads.append(dict(step_input))
+        values = torch.as_tensor(
+            self.candidate_values[: self.batch_size],
+            dtype=torch.float32,
+        )
+        latent = values.view(self.batch_size, 1, 1).expand(
+            self.batch_size,
+            1,
+            self.input_dim,
+        )
+        self.generated[
+            : self.batch_size,
+            :,
+            self.commit_index,
+            0,
+            0,
+        ] = values.view(self.batch_size, 1)
+        self.commit_index += 1
+        return {"generated": latent}
+
+
+class _FakeBestOfKVAE(_FakeStepVAE):
+    def __init__(self):
+        self.decode_calls = []
+
+    def stream_decode(self, latent, first_chunk=True):
+        self.decode_calls.append((latent.detach().clone(), bool(first_chunk)))
+        value = latent[:, 0, 0].to(dtype=torch.float32)
+        out = torch.zeros(latent.shape[0], 1, 263, dtype=torch.float32)
+        out[:, 0, 0] = value
+        return out
+
+
+def _fake_recover_root_rot_pos_from_feature_x(features):
+    root_xyz = torch.zeros(
+        features.shape[0],
+        features.shape[1],
+        3,
+        dtype=features.dtype,
+        device=features.device,
+    )
+    root_xyz[..., 0] = features[..., 0]
+    return torch.zeros_like(features[..., 0]), root_xyz
+
+
+def test_tail_fde_metrics_can_score_delayed_endpoint_arrival():
+    pred_xz = torch.tensor(
+        [[0.0, 0.0], [1.0, 0.0], [5.0, 0.0], [2.0, 0.0]],
+        dtype=torch.float32,
+    )
+    gt_xz = torch.tensor(
+        [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]],
+        dtype=torch.float32,
+    )
+    mask = torch.ones(3, dtype=torch.float32)
+
+    metrics = _compute_tail_fde_metrics(
+        pred_xz,
+        gt_xz,
+        mask,
+        tail_fde_frames=2,
+    )
+
+    assert metrics["fde_plus_extra"] == 0.0
+    assert metrics["fde_tail_min_extra"] == 0.0
+    assert metrics["fde_plus_extra_frame"] == 3
+    assert metrics["fde_tail_min_extra_frame"] == 3
+
+
+def test_stream_best_of_k_force_candidate0_does_not_batch_mutate_state(monkeypatch):
+    monkeypatch.setattr(
+        "eval.ldf.stream_generation.recover_root_rot_pos",
+        _fake_recover_root_rot_pos_from_feature_x,
+    )
+    traj7 = torch.zeros(1, 1, 7, dtype=torch.float32)
+    traj7[0, :, 3] = 1.0
+    sample_batch = {
+        "name": ["sample"],
+        "dataset": ["HumanML3D"],
+        "text": ["walk"],
+        "token": torch.zeros(1, 1, 4, dtype=torch.float32),
+        "token_length": torch.tensor([1], dtype=torch.long),
+        "feature_length": torch.tensor([1], dtype=torch.long),
+        "traj_cond_7d": traj7,
+        "traj_cond": traj7[..., :3].clone(),
+        "traj": traj7[..., :3].clone(),
+        "traj_length": torch.tensor([1], dtype=torch.long),
+        "traj_cond_mask": torch.ones(1, 1, dtype=torch.float32),
+        "traj_mask": torch.ones(1, 1, dtype=torch.float32),
+        "token_mask": torch.ones(1, 1, dtype=torch.float32),
+    }
+    model = _FakeBestOfKStepModel([2.0, 0.25, 1.0])
+    vae = _FakeBestOfKVAE()
+
+    stream_out = run_stream_generate_step_sample(
+        model=model,
+        vae=vae,
+        sample_batch=sample_batch,
+        device=torch.device("cpu"),
+        history_length=2,
+        num_denoise_steps=1,
+        traj_horizon_tokens=1,
+        frames_per_token=1,
+        best_of_k=3,
+        best_of_k_force_candidate0=True,
+        best_of_k_debug=True,
+    )
+
+    assert len(model.payloads) == 3
+    assert model.batch_size == 1
+    assert model.commit_index == 1
+    assert stream_out["stream_best_of_k"]["k"] == 3
+    assert stream_out["stream_best_of_k"]["records"][0]["selected_idx"] == 0
+    assert stream_out["latent_stream"].shape[0] == 1
 
 
 def test_ldf_stream_generate_step_uses_direct_7d_payload_when_available():
@@ -273,6 +482,123 @@ def test_ldf_stream_generate_step_uses_direct_7d_payload_when_available():
     assert all("traj_cond_frame_mask" in payload for payload in model.payloads)
     assert all("traj_features" not in payload for payload in model.payloads)
     assert all("traj" not in payload for payload in model.payloads)
+
+
+def test_ldf_stream_generate_step_can_roll_past_original_length():
+    traj7 = torch.zeros(1, 5, 7, dtype=torch.float32)
+    traj7[0, :, 2] = torch.arange(5, dtype=torch.float32)
+    traj7[0, :, 3] = 1.0
+    sample_batch = {
+        "name": ["sample"],
+        "dataset": ["HumanML3D"],
+        "text": ["walk"],
+        "token": torch.zeros(1, 2, 4, dtype=torch.float32),
+        "token_length": torch.tensor([2], dtype=torch.long),
+        "feature_length": torch.tensor([5], dtype=torch.long),
+        "traj_cond_7d": traj7,
+        "traj_cond": traj7[..., :3].clone(),
+        "traj": traj7[..., :3].clone(),
+        "traj_length": torch.tensor([5], dtype=torch.long),
+        "traj_cond_mask": torch.ones(1, 5, dtype=torch.float32),
+        "traj_mask": torch.ones(1, 5, dtype=torch.float32),
+        "token_mask": torch.ones(1, 2, dtype=torch.float32),
+    }
+    model = _FakeStepModel()
+
+    stream_out = run_stream_generate_step_sample(
+        model=model,
+        vae=_FakeCausalStepVAE(),
+        sample_batch=sample_batch,
+        device=torch.device("cpu"),
+        history_length=2,
+        num_denoise_steps=1,
+        traj_horizon_tokens=1,
+        extra_frames=8,
+    )
+
+    assert len(model.payloads) == 4
+    assert stream_out["decoded_feature"].shape[0] == 13
+    assert stream_out["original_total_frames"] == 5
+    assert stream_out["target_total_frames"] == 13
+    assert stream_out["extra_frames"] == 8
+
+
+def test_root_feedback_can_blend_generated_and_condition_xz():
+    traj7 = torch.zeros(1, 5, 7, dtype=torch.float32)
+    traj7[0, :, 2] = torch.arange(5, dtype=torch.float32)
+    traj7[0, :, 3] = 1.0
+    sample_batch = {"traj_cond_7d": traj7}
+    previous = _replace_chunk_root_from_condition(
+        torch.zeros(1, 263, dtype=torch.float32),
+        sample_batch,
+        start_frame=0,
+        xz_blend_alpha=0.5,
+    )
+    raw_chunk = torch.zeros(4, 263, dtype=torch.float32)
+
+    corrected = _replace_chunk_root_from_condition(
+        raw_chunk,
+        sample_batch,
+        start_frame=1,
+        previous_decoded_chunks=[previous],
+        xz_blend_alpha=0.5,
+    )
+
+    _, root_xyz = recover_root_rot_pos(torch.cat([previous, corrected]).unsqueeze(0))
+    assert torch.allclose(
+        root_xyz[0, :, 2],
+        torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0]),
+        atol=1e-5,
+    )
+
+
+def test_ldf_stream_generate_step_feedback_reencodes_corrected_root_history():
+    traj7 = torch.zeros(1, 5, 7, dtype=torch.float32)
+    traj7[0, :, 2] = torch.arange(5, dtype=torch.float32)
+    traj7[0, :, 3] = 1.0
+    sample_batch = {
+        "name": ["sample"],
+        "dataset": ["HumanML3D"],
+        "text": ["walk"],
+        "token": torch.zeros(1, 2, 4, dtype=torch.float32),
+        "token_length": torch.tensor([2], dtype=torch.long),
+        "feature_length": torch.tensor([5], dtype=torch.long),
+        "traj_cond_7d": traj7,
+        "traj_cond": traj7[..., :3].clone(),
+        "traj": traj7[..., :3].clone(),
+        "traj_length": torch.tensor([5], dtype=torch.long),
+        "traj_cond_mask": torch.ones(1, 5, dtype=torch.float32),
+        "traj_mask": torch.ones(1, 5, dtype=torch.float32),
+        "token_mask": torch.ones(1, 2, dtype=torch.float32),
+    }
+    model = _FakeFeedbackStepModel()
+    vae = _FakeFeedbackVAE()
+
+    stream_out = run_stream_generate_step_sample(
+        model=model,
+        vae=vae,
+        sample_batch=sample_batch,
+        device=torch.device("cpu"),
+        history_length=2,
+        num_denoise_steps=1,
+        traj_horizon_tokens=1,
+        root_replace_feedback=True,
+    )
+
+    assert vae.encode_prefixes == []
+    assert len(vae.stream_encode_chunks) == 2
+    assert vae.stream_encode_chunks[0][0].shape[1] == 1
+    assert vae.stream_encode_chunks[0][1] is True
+    assert vae.stream_encode_chunks[1][0].shape[1] == 4
+    assert vae.stream_encode_chunks[1][1] is False
+    assert len(vae.stream_decode_calls) == 4
+    assert torch.allclose(model.generated[0, :, 0, 0, 0], torch.full((4,), 101.0))
+    assert torch.allclose(model.generated[0, :, 1, 0, 0], torch.full((4,), 102.0))
+    assert torch.allclose(
+        stream_out["latent_stream"],
+        torch.tensor([[101.0] * 4, [102.0] * 4]),
+    )
+    assert stream_out["root_replace_feedback"] is True
 
 
 def test_ldf_stream_generate_step_separates_local_and_absolute_commit_after_roll():

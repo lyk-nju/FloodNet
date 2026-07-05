@@ -421,3 +421,75 @@ def test_run_one_stream_step_returns_clean_commit_ranges():
     assert output.commit_frame_range == (0, 4)
     assert output.decoded_chunk_frame_range == (0, 4)
     assert output.debug["ready_to_commit_token"] == 0
+
+
+def test_serial_selector_force_candidate0_restores_candidate0_state():
+    from eval.ldf.stream_best_of_k import StreamBestOfKConfig, run_best_of_k_step
+
+    model = _OneStepModel()
+    model.commit_index = 0
+    vae = _OneStepVAE()
+    sample_batch = {
+        "traj_cond_7d": torch.zeros(1, 4, 7, dtype=torch.float32),
+    }
+    sample_batch["traj_cond_7d"][0, :, 3] = 1.0
+
+    step_output, record = run_best_of_k_step(
+        model=model,
+        vae=vae,
+        stream=_OneStepStream(),
+        stream_conditioner=None,
+        step_payload={"text": "walk"},
+        sample_batch=sample_batch,
+        first_chunk=True,
+        device=torch.device("cpu"),
+        local_commit_index=0,
+        generated_frames=0,
+        previous_decoded_chunks=[],
+        chunk_frame_ends=[],
+        frames_per_token=4,
+        cfg=StreamBestOfKConfig.from_values(k=3, force_candidate0=True),
+        steps_since_switch=10**9,
+    )
+
+    assert step_output.commit_frame_range == (0, 4)
+    assert record["selected_idx"] == 0
+    assert record["switch_reason"] == "force_candidate0"
+    assert model.commit_index == 1
+    assert len(record["candidate_scores"]) == 3
+
+
+def test_serial_selector_records_same_frame_range_for_all_candidates():
+    from eval.ldf.stream_best_of_k import StreamBestOfKConfig, run_best_of_k_step
+
+    model = _OneStepModel()
+    model.commit_index = 0
+    vae = _OneStepVAE()
+    sample_batch = {
+        "traj_cond_7d": torch.zeros(1, 4, 7, dtype=torch.float32),
+    }
+    sample_batch["traj_cond_7d"][0, :, 3] = 1.0
+
+    step_output, record = run_best_of_k_step(
+        model=model,
+        vae=vae,
+        stream=_OneStepStream(),
+        stream_conditioner=None,
+        step_payload={"text": "walk"},
+        sample_batch=sample_batch,
+        first_chunk=True,
+        device=torch.device("cpu"),
+        local_commit_index=0,
+        generated_frames=0,
+        previous_decoded_chunks=[],
+        chunk_frame_ends=[],
+        frames_per_token=4,
+        cfg=StreamBestOfKConfig.from_values(k=2, force_candidate0=True),
+        steps_since_switch=10**9,
+    )
+
+    assert [tuple(item["commit_frame_range"]) for item in record["candidate_scores"]] == [
+        (0, 4),
+        (0, 4),
+    ]
+    assert step_output.commit_frame_range == (0, 4)
