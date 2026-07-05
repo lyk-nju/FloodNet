@@ -81,7 +81,8 @@ This is not a training change and must not alter checkpoint structure.
 - model trajectory buffers such as `_traj_buf`
 - VAE stream decode cache: `_conv_num`, `_conv_idx`, `_feat_map`
 - stream conditioner timeline/root plan state when present
-- decoded chunk list and latent token list used by eval
+- decoded chunk list and latent token list if the implementation chooses to
+  include eval buffers in the snapshot
 - `first_chunk`
 - `generated_frames`
 - `chunk_frame_ends`
