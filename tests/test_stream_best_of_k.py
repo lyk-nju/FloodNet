@@ -296,11 +296,79 @@ def test_best_of_k_disabled_uses_original_single_step_path(monkeypatch):
         called["selector"] += 1
         raise AssertionError("best_of_k <= 1 must bypass selector")
 
-    monkeypatch.setattr(stream_generation, "run_best_of_k_step", _selector_should_not_run, raising=False)
+    monkeypatch.setattr(stream_generation, "_stream_generate_step_best_of_k", _selector_should_not_run)
 
     assert stream_generation._should_use_best_of_k(1) is False
     assert stream_generation._should_use_best_of_k(0) is False
+    assert stream_generation._should_use_best_of_k(2) is True
     assert called["selector"] == 0
+
+
+class _BypassModel:
+    input_dim = 4
+    noise_steps = 1
+    chunk_size = 1
+    seq_len = 2
+    use_text_cond = True
+    param_dtype = torch.float32
+
+    def __init__(self):
+        self.batch_size = 1
+        self.commit_index = 0
+        self.text_condition_list = [[]]
+
+    def init_generated(self, history_length, batch_size, num_denoise_steps, traj_buffer=None):
+        self.batch_size = int(batch_size)
+        self.commit_index = 0
+        self.text_condition_list = [[] for _ in range(batch_size)]
+
+    def encode_text_with_cache(self, text_list, device):
+        return [torch.zeros(1, 1, device=device) for _ in text_list]
+
+    def stream_generate_step(self, step_payload, first_chunk=True, condition=None):
+        self.commit_index += 1
+        latent = torch.full((1, 1, self.input_dim), float(self.commit_index))
+        return {"generated": latent}
+
+
+class _BypassVAE:
+    def clear_cache(self):
+        pass
+
+    def stream_decode(self, latent, first_chunk=True):
+        return torch.zeros(1, 4, 263, dtype=torch.float32)
+
+
+def test_best_of_k_disabled_skips_config_validation_and_selector(monkeypatch):
+    import eval.ldf.stream_generation as stream_generation
+
+    def _selector_should_not_run(**kwargs):
+        raise AssertionError("best_of_k <= 1 must bypass selector")
+
+    sample_batch = {
+        "name": ["sample"],
+        "dataset": ["HumanML3D"],
+        "text": ["walk"],
+        "token_length": torch.tensor([1], dtype=torch.long),
+        "feature_length": torch.tensor([4], dtype=torch.long),
+    }
+
+    monkeypatch.setattr(stream_generation, "_stream_generate_step_best_of_k", _selector_should_not_run)
+    stream_out = stream_generation.run_stream_generate_step_sample(
+        model=_BypassModel(),
+        vae=_BypassVAE(),
+        sample_batch=sample_batch,
+        device=torch.device("cpu"),
+        history_length=2,
+        num_denoise_steps=1,
+        best_of_k=1,
+        best_of_k_score="bad",
+    )
+
+    assert stream_out["stream_best_of_k"]["enabled"] is False
+    assert stream_out["stream_best_of_k"]["k"] == 1
+    assert stream_out["stream_best_of_k"]["score"] == "bad"
+    assert stream_out["stream_best_of_k"]["records"] == []
 
 
 class _OneStepModel(_StatefulModel):

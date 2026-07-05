@@ -647,27 +647,30 @@ def run_stream_generate_step_sample(
     best_of_k_switch_cooldown_steps: int = 0,
     best_of_k_debug: bool = False,
 ):
-    best_of_k_cfg = StreamBestOfKConfig.from_values(
-        k=best_of_k,
-        score=best_of_k_score,
-        xz_weight=best_of_k_xz_weight,
-        fde_weight=best_of_k_fde_weight,
-        cont_weight=best_of_k_cont_weight,
-        vel_weight=best_of_k_vel_weight,
-        rel_margin=best_of_k_rel_margin,
-        abs_margin=best_of_k_abs_margin,
-        cont_tol=best_of_k_cont_tol,
-        force_candidate0=best_of_k_force_candidate0,
-        switch_cooldown_steps=best_of_k_switch_cooldown_steps,
-        debug=best_of_k_debug,
-    )
-    if best_of_k_cfg.enabled and root_replace_feedback:
+    use_best_of_k = _should_use_best_of_k(best_of_k)
+    best_of_k_cfg: Optional[StreamBestOfKConfig] = None
+    if use_best_of_k:
+        best_of_k_cfg = StreamBestOfKConfig.from_values(
+            k=best_of_k,
+            score=best_of_k_score,
+            xz_weight=best_of_k_xz_weight,
+            fde_weight=best_of_k_fde_weight,
+            cont_weight=best_of_k_cont_weight,
+            vel_weight=best_of_k_vel_weight,
+            rel_margin=best_of_k_rel_margin,
+            abs_margin=best_of_k_abs_margin,
+            cont_tol=best_of_k_cont_tol,
+            force_candidate0=best_of_k_force_candidate0,
+            switch_cooldown_steps=best_of_k_switch_cooldown_steps,
+            debug=best_of_k_debug,
+        )
+    if use_best_of_k and root_replace_feedback:
         raise ValueError(
             "best-of-K candidate selection commits the selected latent directly "
             "and cannot be combined with root replacement feedback in this "
             "minimal eval path."
         )
-    if best_of_k_cfg.enabled and sample_batch.get("traj_cond_7d") is None:
+    if use_best_of_k and sample_batch.get("traj_cond_7d") is None:
         raise ValueError(
             "best-of-K xz candidate selection requires sample_batch['traj_cond_7d']."
         )
@@ -742,7 +745,8 @@ def run_stream_generate_step_sample(
                 current_text,
                 traj_input=traj_input,
             )
-            if best_of_k_cfg.enabled:
+            if use_best_of_k:
+                assert best_of_k_cfg is not None
                 proposal = _stream_generate_step_best_of_k(
                     model=model,
                     vae=vae,
@@ -861,18 +865,54 @@ def run_stream_generate_step_sample(
         "root_replace_feedback": bool(root_replace_feedback),
         "root_feedback_xz_blend_alpha": float(root_feedback_xz_blend_alpha),
         "stream_best_of_k": {
-            "enabled": bool(best_of_k_cfg.enabled),
-            "k": int(best_of_k_cfg.k),
-            "score": str(best_of_k_cfg.score),
-            "xz_weight": float(best_of_k_cfg.xz_weight),
-            "fde_weight": float(best_of_k_cfg.fde_weight),
-            "cont_weight": float(best_of_k_cfg.cont_weight),
-            "vel_weight": float(best_of_k_cfg.vel_weight),
-            "rel_margin": float(best_of_k_cfg.rel_margin),
-            "abs_margin": float(best_of_k_cfg.abs_margin),
-            "cont_tol": float(best_of_k_cfg.cont_tol),
-            "force_candidate0": bool(best_of_k_cfg.force_candidate0),
-            "switch_cooldown_steps": int(best_of_k_cfg.switch_cooldown_steps),
+            "enabled": bool(use_best_of_k),
+            "k": int(best_of_k_cfg.k) if best_of_k_cfg is not None else int(best_of_k),
+            "score": str(best_of_k_cfg.score) if best_of_k_cfg is not None else best_of_k_score,
+            "xz_weight": (
+                float(best_of_k_cfg.xz_weight)
+                if best_of_k_cfg is not None
+                else best_of_k_xz_weight
+            ),
+            "fde_weight": (
+                float(best_of_k_cfg.fde_weight)
+                if best_of_k_cfg is not None
+                else best_of_k_fde_weight
+            ),
+            "cont_weight": (
+                float(best_of_k_cfg.cont_weight)
+                if best_of_k_cfg is not None
+                else best_of_k_cont_weight
+            ),
+            "vel_weight": (
+                float(best_of_k_cfg.vel_weight)
+                if best_of_k_cfg is not None
+                else best_of_k_vel_weight
+            ),
+            "rel_margin": (
+                float(best_of_k_cfg.rel_margin)
+                if best_of_k_cfg is not None
+                else best_of_k_rel_margin
+            ),
+            "abs_margin": (
+                float(best_of_k_cfg.abs_margin)
+                if best_of_k_cfg is not None
+                else best_of_k_abs_margin
+            ),
+            "cont_tol": (
+                float(best_of_k_cfg.cont_tol)
+                if best_of_k_cfg is not None
+                else best_of_k_cont_tol
+            ),
+            "force_candidate0": (
+                bool(best_of_k_cfg.force_candidate0)
+                if best_of_k_cfg is not None
+                else best_of_k_force_candidate0
+            ),
+            "switch_cooldown_steps": (
+                int(best_of_k_cfg.switch_cooldown_steps)
+                if best_of_k_cfg is not None
+                else best_of_k_switch_cooldown_steps
+            ),
             "total_elapsed_sec": float(best_of_k_total_elapsed_sec),
             "records": best_of_k_records,
         },
