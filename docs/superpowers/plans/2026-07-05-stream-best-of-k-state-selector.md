@@ -14,13 +14,19 @@
 
 - Create `eval/ldf/stream_state.py`
   - Owns `StepOutput`, `CandidateState`, `StreamRuntimeSnapshot`, RNG capture/restore, deep clone helpers, and model/VAE/conditioner state restore.
+- Create `eval/ldf/stream_step.py`
+  - Owns the extracted one-step K=1 runtime helper. This helper must be moved
+    from the existing `stream_generation.py` K=1 branch, not rewritten from
+    memory.
 - Create `eval/ldf/stream_scoring.py`
   - Owns `ConservativeGateConfig`, score dataclasses, root XZ/continuity scoring, and conservative switch decision.
 - Create `eval/ldf/stream_best_of_k.py`
   - Owns `StreamBestOfKConfig`, serial candidate generation, force-candidate0 mode, and selected-state restore.
 - Modify `eval/ldf/stream_generation.py`
   - Remove the old batch latent argmin helpers from the public path.
-  - Preserve K=1 branch exactly.
+  - Preserve K=1 behavior and bypass semantics exactly.
+  - Use `eval.ldf.stream_step.run_one_stream_step` for the ordinary one-step
+    path.
   - Call `run_best_of_k_step` only when `best_of_k > 1`.
 - Modify `utils/training/ldf/validation_eval_runtime.py`
   - Add the new selector config defaults.
@@ -37,6 +43,34 @@
   - Extend config default/override coverage.
 - Modify `tests/test_stream_eval_metrics.py`
   - Update or replace the old batch-argmin test so it matches state-fork semantics.
+
+---
+
+## Implementation Hard Constraints
+
+- The one-step helper must be extracted from the current K=1 code in
+  `run_stream_generate_step_sample`; candidate0 must not be a rewritten
+  approximation.
+- `best_of_k <= 1` must bypass selector/fork/restore/scoring completely.
+- `run_best_of_k_step` must receive the actual mutable stream conditioner used
+  by the runtime, or the implementation must prove through tests that no
+  conditioner state mutates. Do not pass `stream_conditioner=None` for the real
+  LDF eval path.
+- Eval-local variables are not restored by snapshot magic. The outer loop must
+  update `generated_frames`, `first_chunk`, `chunk_frame_ends`, `decoded_chunks`,
+  and `latent_tokens` exactly once from the selected `StepOutput`.
+- XZ extraction must reuse or wrap existing project root-XZ helpers. Do not
+  hardcode 7D `[0, 2]` in the selector unless a test confirms that it matches
+  the current eval/control-loss coordinate contract.
+- Extra candidate RNG must depend on candidate index and stream step
+  (`local_commit_index`) or on a hash of the captured base RNG state. Candidate0
+  must use the unmodified base RNG.
+- Every candidate for a step must have the same commit token/frame range as
+  candidate0. Mismatches should be recorded and rejected; if any mismatch makes
+  scoring unsafe, keep candidate0.
+- `xz_weight` and `cont_weight` are accepted only for backward compatibility in
+  conservative-gate mode. They should not affect selection until an explicit
+  weighted-argmin mode exists.
 
 ---
 
@@ -223,12 +257,15 @@ from __future__ import annotations
 
 import torch
 
+from utils.motion_process import recover_root_rot_pos
+
 from eval.ldf.stream_scoring import (
     ConservativeGateConfig,
     CandidateScore,
     choose_candidate,
     compute_chunk_xz_score,
     compute_continuity_score,
+    target_xz_slice,
 )
 
 
@@ -336,6 +373,17 @@ def test_continuity_score_uses_position_and_velocity_jump():
 
     assert torch.isclose(torch.tensor(pos_jump), torch.tensor(0.2), atol=1e-6)
     assert torch.isclose(torch.tensor(vel_jump), torch.tensor(0.3), atol=1e-6)
+
+
+def test_target_xz_slice_matches_current_7d_eval_contract():
+    traj7 = torch.zeros(1, 3, 7, dtype=torch.float32)
+    traj7[0, :, 0] = torch.tensor([1.0, 2.0, 3.0])
+    traj7[0, :, 2] = torch.tensor([4.0, 5.0, 6.0])
+    traj7[0, :, 3] = 1.0
+
+    out = target_xz_slice({"traj_cond_7d": traj7}, (1, 3))
+
+    assert torch.allclose(out, torch.tensor([[2.0, 5.0], [3.0, 6.0]]))
 ```
 
 - [ ] **Step 2: Run scoring tests and verify they fail**
@@ -358,6 +406,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+
+from utils.motion_process import recover_root_rot_pos
 
 
 @dataclass(frozen=True)
@@ -418,6 +468,48 @@ def compute_continuity_score(previous_xz: torch.Tensor | None, candidate_xz: tor
     cand_vel = cand[1] - cand[0]
     vel_jump = float(torch.linalg.norm(cand_vel - prev_vel).item())
     return pos_jump, vel_jump
+
+
+def _sample_traj7(sample_batch: dict) -> torch.Tensor:
+    traj7 = sample_batch.get("traj_cond_7d")
+    if traj7 is None:
+        raise ValueError("best-of-K xz scoring requires sample_batch['traj_cond_7d']")
+    value = traj7[0] if torch.is_tensor(traj7) and traj7.ndim == 3 else traj7
+    if not torch.is_tensor(value):
+        value = torch.as_tensor(value, dtype=torch.float32)
+    return value.float()
+
+
+def target_xz_slice(sample_batch: dict, frame_range: tuple[int, int]) -> torch.Tensor:
+    # Moved from the existing stream_generation target-XZ scoring helper. This
+    # preserves the current 7D eval contract: root XZ is stored in columns 0 and 2.
+    target = _sample_traj7(sample_batch)
+    start, end = int(frame_range[0]), int(frame_range[1])
+    if target.shape[0] < end:
+        pad = target[-1:].expand(end - target.shape[0], -1)
+        target = torch.cat([target, pad], dim=0)
+    return target[start:end, [0, 2]].float().cpu()
+
+
+def decoded_chunk_root_xz(
+    decoded_chunk: torch.Tensor,
+    previous_decoded_chunks: list[torch.Tensor],
+) -> torch.Tensor:
+    # Moved from the existing stream_generation decoded-root helper so predicted
+    # XZ stays in the same recovered-root coordinate frame as current stream eval.
+    chunks = list(previous_decoded_chunks or []) + [decoded_chunk]
+    full = torch.cat(chunks, dim=0)
+    _, root_xyz = recover_root_rot_pos(full.unsqueeze(0))
+    start = int(full.shape[0] - decoded_chunk.shape[0])
+    return root_xyz[0, start:start + decoded_chunk.shape[0], [0, 2]].float().cpu()
+
+
+def previous_root_xz(previous_decoded_chunks: list[torch.Tensor]) -> torch.Tensor | None:
+    if not previous_decoded_chunks:
+        return None
+    full = torch.cat(previous_decoded_chunks, dim=0)
+    _, root_xyz = recover_root_rot_pos(full.unsqueeze(0))
+    return root_xyz[0, :, [0, 2]].float().cpu()
 
 
 def choose_candidate(
@@ -811,9 +903,10 @@ git commit -m "feat: add stream runtime state snapshots"
 
 ---
 
-### Task 4: One-Step Runtime Wrapper and K=1 Bypass
+### Task 4: Extract Shared One-Step Runtime Helper and Preserve K=1 Bypass
 
 **Files:**
+- Create: `eval/ldf/stream_step.py`
 - Create: `eval/ldf/stream_best_of_k.py`
 - Modify: `eval/ldf/stream_generation.py`
 - Modify: `tests/test_stream_best_of_k.py`
@@ -873,7 +966,7 @@ class _OneStepStream:
 
 
 def test_run_one_stream_step_returns_clean_commit_ranges():
-    from eval.ldf.stream_best_of_k import run_one_stream_step
+    from eval.ldf.stream_step import run_one_stream_step
 
     model = _OneStepModel()
     vae = _OneStepVAE()
@@ -905,41 +998,22 @@ Run:
 /home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests/test_stream_best_of_k.py::test_best_of_k_disabled_uses_original_single_step_path tests/test_stream_best_of_k.py::test_run_one_stream_step_returns_clean_commit_ranges -q
 ```
 
-Expected: FAIL because `_should_use_best_of_k` and `eval.ldf.stream_best_of_k` do not exist.
+Expected: FAIL because `_should_use_best_of_k` and `eval.ldf.stream_step` do not exist.
 
-- [ ] **Step 4: Implement one-step wrapper**
+- [ ] **Step 4: Extract one-step helper from the existing K=1 branch**
 
-Create the initial `eval/ldf/stream_best_of_k.py`:
+Create `eval/ldf/stream_step.py` by moving the existing one-step body from
+`run_stream_generate_step_sample` into this helper. Do not rewrite this logic
+from memory; copy the current K=1 branch and adapt only the inputs/return value.
 
 ```python
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 import torch
 
 from eval.ldf.stream_state import StepOutput
-
-
-@dataclass(frozen=True)
-class StreamBestOfKConfig:
-    k: int = 1
-    score: str = "xz"
-    xz_weight: float = 1.0
-    fde_weight: float = 1.0
-    cont_weight: float = 0.0
-    vel_weight: float = 0.5
-    rel_margin: float = 0.10
-    abs_margin: float = 0.03
-    cont_tol: float = 0.03
-    force_candidate0: bool = False
-    switch_cooldown_steps: int = 0
-    debug: bool = False
-
-    @property
-    def enabled(self) -> bool:
-        return int(self.k) > 1
 
 
 def run_one_stream_step(
@@ -954,6 +1028,9 @@ def run_one_stream_step(
     generated_frames: int,
     frames_per_token: int,
 ) -> StepOutput:
+    # This helper is the extracted K=1 one-step path from
+    # run_stream_generate_step_sample. Keep the ordinary K=1 branch and
+    # best-of-K candidate0 using this same helper.
     condition_provider = stream.build_ldf_condition_provider(
         step_payload,
         first_chunk=first_chunk,
@@ -991,7 +1068,35 @@ def run_one_stream_step(
     )
 ```
 
-- [ ] **Step 5: Add bypass helper to stream generation**
+- [ ] **Step 5: Add config dataclass and bypass helper**
+
+Create the initial `eval/ldf/stream_best_of_k.py`:
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class StreamBestOfKConfig:
+    k: int = 1
+    score: str = "xz"
+    xz_weight: float = 1.0
+    fde_weight: float = 1.0
+    cont_weight: float = 0.0
+    vel_weight: float = 0.5
+    rel_margin: float = 0.10
+    abs_margin: float = 0.03
+    cont_tol: float = 0.03
+    force_candidate0: bool = False
+    switch_cooldown_steps: int = 0
+    debug: bool = False
+
+    @property
+    def enabled(self) -> bool:
+        return int(self.k) > 1
+```
 
 In `eval/ldf/stream_generation.py`, add:
 
@@ -1000,7 +1105,9 @@ def _should_use_best_of_k(best_of_k: int) -> bool:
     return int(best_of_k) > 1
 ```
 
-Do not change the K=1 branch behavior in this task.
+Update the ordinary K=1 branch to call `run_one_stream_step` instead of keeping
+an inline duplicate. Production `best_of_k <= 1` must still bypass selector
+logic entirely.
 
 - [ ] **Step 6: Run tests**
 
@@ -1017,7 +1124,7 @@ Expected: PASS for new state/scoring/one-step tests.
 Run:
 
 ```bash
-git add eval/ldf/stream_best_of_k.py eval/ldf/stream_generation.py tests/test_stream_best_of_k.py
+git add eval/ldf/stream_step.py eval/ldf/stream_best_of_k.py eval/ldf/stream_generation.py tests/test_stream_best_of_k.py
 git commit -m "feat: add stream best-of-k one-step wrapper"
 ```
 
@@ -1052,6 +1159,7 @@ def test_serial_selector_force_candidate0_restores_candidate0_state(monkeypatch)
         model=model,
         vae=vae,
         stream=stream,
+        stream_conditioner=None,
         step_payload={"text": "walk"},
         sample_batch=sample_batch,
         first_chunk=True,
@@ -1088,6 +1196,7 @@ def test_serial_selector_records_same_frame_range_for_all_candidates():
         model=model,
         vae=vae,
         stream=stream,
+        stream_conditioner=None,
         step_payload={"text": "walk"},
         sample_batch=sample_batch,
         first_chunk=True,
@@ -1118,11 +1227,16 @@ Expected: FAIL because `run_best_of_k_step` is not implemented.
 
 - [ ] **Step 3: Implement serial selector**
 
-In `eval/ldf/stream_best_of_k.py`, add helper functions and `run_best_of_k_step`:
+In `eval/ldf/stream_best_of_k.py`, add helper functions and `run_best_of_k_step`.
+Before writing new XZ extraction logic, move the existing root-XZ helpers from
+`eval/ldf/stream_generation.py` into `eval/ldf/stream_scoring.py` and import
+them here. This preserves the current coordinate contract instead of
+hardcoding a new one.
 
 ```python
 import random
 import numpy as np
+import torch
 
 from eval.ldf.stream_scoring import (
     CandidateScore,
@@ -1130,43 +1244,25 @@ from eval.ldf.stream_scoring import (
     choose_candidate,
     compute_chunk_xz_score,
     compute_continuity_score,
+    decoded_chunk_root_xz,
+    previous_root_xz,
+    target_xz_slice,
 )
 from eval.ldf.stream_state import (
     CandidateState,
+    StepOutput,
     capture_runtime_snapshot,
     restore_runtime_snapshot,
 )
-from utils.motion_process import recover_root_rot_pos
+from eval.ldf.stream_step import run_one_stream_step
 
 
-def _target_xz_slice(sample_batch: dict, frame_range: tuple[int, int]) -> torch.Tensor:
-    traj = sample_batch["traj_cond_7d"]
-    if traj.ndim == 3:
-        traj = traj[0]
-    start, end = frame_range
-    if int(traj.shape[0]) < end:
-        pad = traj[-1:].expand(end - int(traj.shape[0]), -1)
-        traj = torch.cat([traj, pad], dim=0)
-    return traj[start:end, [0, 2]].float().cpu()
-
-
-def _decoded_root_xz(decoded_chunk: torch.Tensor, previous_decoded_chunks: list[torch.Tensor]) -> torch.Tensor:
-    full = torch.cat(list(previous_decoded_chunks) + [decoded_chunk], dim=0)
-    _, root_xyz = recover_root_rot_pos(full.unsqueeze(0))
-    start = int(full.shape[0] - decoded_chunk.shape[0])
-    return root_xyz[0, start:start + decoded_chunk.shape[0], [0, 2]].float().cpu()
-
-
-def _previous_root_xz(previous_decoded_chunks: list[torch.Tensor]) -> torch.Tensor | None:
-    if not previous_decoded_chunks:
-        return None
-    full = torch.cat(previous_decoded_chunks, dim=0)
-    _, root_xyz = recover_root_rot_pos(full.unsqueeze(0))
-    return root_xyz[0, :, [0, 2]].float().cpu()
-
-
-def _seed_extra_candidate(base_seed: int, candidate_idx: int) -> None:
-    seed = int(base_seed) + int(candidate_idx) * 1000003
+def _seed_extra_candidate(base_seed: int, local_commit_index: int, candidate_idx: int) -> None:
+    seed = (
+        int(base_seed)
+        + int(local_commit_index) * 9176
+        + int(candidate_idx) * 1000003
+    )
     random.seed(seed)
     np.random.seed(seed % (2**32))
     torch.manual_seed(seed)
@@ -1182,10 +1278,10 @@ def _score_step_output(
     previous_decoded_chunks: list[torch.Tensor],
     cfg: StreamBestOfKConfig,
 ) -> tuple[CandidateScore, dict]:
-    pred_xz = _decoded_root_xz(step_output.decoded_chunk, previous_decoded_chunks)
-    target_xz = _target_xz_slice(sample_batch, step_output.target_xz_frame_range)
+    pred_xz = decoded_chunk_root_xz(step_output.decoded_chunk, previous_decoded_chunks)
+    target_xz = target_xz_slice(sample_batch, step_output.target_xz_frame_range)
     xz_ade, xz_fde = compute_chunk_xz_score(pred_xz, target_xz)
-    pos_cont, vel_cont = compute_continuity_score(_previous_root_xz(previous_decoded_chunks), pred_xz)
+    pos_cont, vel_cont = compute_continuity_score(previous_root_xz(previous_decoded_chunks), pred_xz)
     score = CandidateScore(
         index=int(candidate_idx),
         xz_ade=float(xz_ade),
@@ -1203,6 +1299,7 @@ def _score_step_output(
         "commit_frame_range": list(step_output.commit_frame_range),
         "decoded_chunk_frame_range": list(step_output.decoded_chunk_frame_range),
         "target_xz_frame_range": list(step_output.target_xz_frame_range),
+        "frame_range_matches_candidate0": True,
     }
 
 
@@ -1211,6 +1308,7 @@ def run_best_of_k_step(
     model,
     vae,
     stream,
+    stream_conditioner,
     step_payload: dict,
     sample_batch: dict,
     first_chunk: bool,
@@ -1226,7 +1324,7 @@ def run_best_of_k_step(
     base_snapshot = capture_runtime_snapshot(
         model=model,
         vae=vae,
-        stream_conditioner=None,
+        stream_conditioner=stream_conditioner,
         first_chunk=first_chunk,
         generated_frames=generated_frames,
         chunk_frame_ends=chunk_frame_ends,
@@ -1237,9 +1335,14 @@ def run_best_of_k_step(
     score_records: list[dict] = []
 
     for candidate_idx in range(int(cfg.k)):
-        restore_runtime_snapshot(model=model, vae=vae, stream_conditioner=None, snapshot=base_snapshot)
+        restore_runtime_snapshot(
+            model=model,
+            vae=vae,
+            stream_conditioner=stream_conditioner,
+            snapshot=base_snapshot,
+        )
         if candidate_idx > 0:
-            _seed_extra_candidate(base_seed, candidate_idx)
+            _seed_extra_candidate(base_seed, local_commit_index, candidate_idx)
         step_output = run_one_stream_step(
             model=model,
             vae=vae,
@@ -1254,7 +1357,7 @@ def run_best_of_k_step(
         post_snapshot = capture_runtime_snapshot(
             model=model,
             vae=vae,
-            stream_conditioner=None,
+            stream_conditioner=stream_conditioner,
             first_chunk=False,
             generated_frames=generated_frames + int(step_output.decoded_chunk.shape[0]),
             chunk_frame_ends=chunk_frame_ends + [step_output.commit_frame_range[1]],
@@ -1270,6 +1373,12 @@ def run_best_of_k_step(
         score_objects.append(score_obj)
         score_records.append(score_record)
 
+    candidate0_range = candidates[0].step_output.commit_frame_range
+    range_mismatch = any(
+        candidate.step_output.commit_frame_range != candidate0_range
+        for candidate in candidates
+    )
+
     gate_cfg = ConservativeGateConfig(
         fde_weight=float(cfg.fde_weight),
         vel_weight=float(cfg.vel_weight),
@@ -1279,9 +1388,28 @@ def run_best_of_k_step(
         force_candidate0=bool(cfg.force_candidate0),
         switch_cooldown_steps=int(cfg.switch_cooldown_steps),
     )
+    if range_mismatch:
+        gate_cfg = ConservativeGateConfig(
+            fde_weight=float(cfg.fde_weight),
+            vel_weight=float(cfg.vel_weight),
+            rel_margin=float(cfg.rel_margin),
+            abs_margin=float(cfg.abs_margin),
+            cont_tol=float(cfg.cont_tol),
+            force_candidate0=True,
+            switch_cooldown_steps=int(cfg.switch_cooldown_steps),
+        )
+        for record in score_records:
+            record["frame_range_matches_candidate0"] = (
+                tuple(record["commit_frame_range"]) == tuple(candidate0_range)
+            )
     decision = choose_candidate(score_objects, gate_cfg, steps_since_switch=steps_since_switch)
     selected = candidates[int(decision.selected_index)]
-    restore_runtime_snapshot(model=model, vae=vae, stream_conditioner=None, snapshot=selected.snapshot)
+    restore_runtime_snapshot(
+        model=model,
+        vae=vae,
+        stream_conditioner=stream_conditioner,
+        snapshot=selected.snapshot,
+    )
     record = {
         "selected_idx": int(decision.selected_index),
         "switch_reason": decision.reason,
@@ -1309,6 +1437,7 @@ if _should_use_best_of_k(best_of_k_cfg.k):
         model=model,
         vae=vae,
         stream=stream,
+        stream_conditioner=stream_conditioner,
         step_payload=step_payload,
         sample_batch=sample_batch,
         first_chunk=first_chunk,
@@ -1329,21 +1458,19 @@ if _should_use_best_of_k(best_of_k_cfg.k):
     else:
         steps_since_switch = 0
 else:
-    condition_provider = stream.build_ldf_condition_provider(
-        step_payload,
+    step_output = run_one_stream_step(
+        model=model,
+        vae=vae,
+        stream=stream,
+        step_payload=step_payload,
         first_chunk=first_chunk,
         device=device,
+        local_commit_index=local_commit_index,
+        generated_frames=generated_frames,
+        frames_per_token=int(frames_per_token),
     )
-    output = model.stream_generate_step(
-        step_payload,
-        first_chunk=first_chunk,
-        condition=condition_provider,
-    )
-    latent_token = output["generated"][0].detach().cpu()
-    decoded_chunk_raw = vae.stream_decode(
-        output["generated"][0][None, :],
-        first_chunk=first_chunk,
-    )[0].float().detach().cpu()
+    latent_token = step_output.clean_committed_latent
+    decoded_chunk_raw = step_output.decoded_chunk
 ```
 
 Initialize `steps_since_switch = 10**9` before the rollout loop.
@@ -1408,6 +1535,7 @@ def test_selector_debug_record_contains_commit_and_target_ranges():
         model=model,
         vae=vae,
         stream=_OneStepStream(),
+        stream_conditioner=None,
         step_payload={"text": "walk"},
         sample_batch=sample_batch,
         first_chunk=True,
@@ -1499,7 +1627,7 @@ Expected: PASS.
 Run:
 
 ```bash
-/home/yuankai/.conda/envs/flooddiffusion/bin/python -m py_compile eval/ldf/stream_state.py eval/ldf/stream_scoring.py eval/ldf/stream_best_of_k.py eval/ldf/stream_generation.py eval/ldf/stream_metrics.py utils/training/ldf/validation_eval_runtime.py utils/training/ldf/validation_generation.py tools/sweep_stream_step_cfg.py
+/home/yuankai/.conda/envs/flooddiffusion/bin/python -m py_compile eval/ldf/stream_state.py eval/ldf/stream_scoring.py eval/ldf/stream_step.py eval/ldf/stream_best_of_k.py eval/ldf/stream_generation.py eval/ldf/stream_metrics.py utils/training/ldf/validation_eval_runtime.py utils/training/ldf/validation_generation.py tools/sweep_stream_step_cfg.py
 ```
 
 Expected: exit code 0.

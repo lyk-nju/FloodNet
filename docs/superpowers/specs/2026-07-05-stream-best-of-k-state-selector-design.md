@@ -37,13 +37,25 @@ This is not a training change and must not alter checkpoint structure.
 7. Candidate 0 must use the unmodified base RNG state. Candidates 1..K-1 may use
    perturbed RNG states. If candidate 0 is selected, the post-step RNG state must
    match the original K=1 path.
+8. Candidate 0 must share the same extracted one-step helper as the original
+   K=1 runtime path. Do not reimplement an approximate copy of the one-step
+   logic from memory.
+9. Candidate frame ranges must match candidate 0. If a candidate returns a
+   different committed token/frame range for the same step, the selector must
+   reject that candidate or fall back to candidate 0.
 
 ## Proposed File Structure
 
 - `eval/ldf/stream_generation.py`
   - Keep the public `run_stream_generate_step_sample` entrypoint.
-  - Preserve the existing K=1 path exactly.
+  - Preserve existing K=1 behavior and bypass semantics exactly.
+  - Call the shared one-step helper for ordinary stream steps.
   - Delegate only `best_of_k > 1` to the new selector.
+
+- `eval/ldf/stream_step.py`
+  - Own the extracted one-step K=1 runtime helper.
+  - Candidate 0, proposal candidates, and the production K=1 branch should share
+    this helper as much as possible.
 
 - `eval/ldf/stream_state.py`
   - Define `StreamRuntimeSnapshot`, `CandidateState`, and `StepOutput`.
@@ -112,9 +124,19 @@ There are two valid implementation choices:
 The first implementation should choose one of these strategies explicitly and
 test that selected chunks are not double-appended.
 
+Snapshot fields for eval-local state such as `first_chunk`, `generated_frames`,
+and `chunk_frame_ends` do not automatically update the outer Python locals.
+The selector must either return selected local state explicitly or the outer loop
+must update those locals exactly once from the selected `StepOutput`.
+
 ## Step Output Contract
 
-The one-step runtime wrapper should return a `StepOutput` with:
+The one-step runtime wrapper should be extracted from the existing K=1 one-step
+code path, not reimplemented independently. Candidate 0 and proposal candidates
+should use this helper as much as possible; production `best_of_k <= 1` still
+bypasses selector logic.
+
+The helper should return a `StepOutput` with:
 
 - `clean_committed_latent`
 - `decoded_chunk`
@@ -144,7 +166,9 @@ For every stream step with `K > 1`:
      post-step snapshot.
 3. Candidates 1..K-1:
    - Restore `base_snapshot`.
-   - Perturb RNG/sampling state so the proposal differs from candidate 0.
+   - Perturb RNG/sampling state so the proposal differs from candidate 0. The
+     perturbation must depend on candidate index and stream step, or be derived
+     from a hash of the captured base RNG state.
    - Run the same one-step path.
    - Record the same fields and full post-step snapshot.
 4. Score candidates.
@@ -186,6 +210,13 @@ adjust margins before interpreting results.
 `cont_weight` is not used by the conservative gate in v1. It is accepted only
 for backward compatibility with the existing config surface and should not
 affect selection unless a future explicit weighted-argmin mode is added.
+Likewise, `xz_weight` is accepted for backward compatibility in conservative
+gate mode unless an explicit weighted-argmin mode is added later.
+
+Target XZ and predicted XZ extraction must reuse existing stream eval or control
+loss coordinate helpers when available. Do not hardcode 7D indices or coordinate
+frames unless verified by existing code/tests. Candidate `pred_xz` and
+`target_xz` must be in the same world/canonical frame before scoring.
 
 ## Debug Records
 
