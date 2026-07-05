@@ -148,6 +148,31 @@ def _batch_text(model_batch: dict, batch_size: int):
     return text
 
 
+def _summarize_stream_best_of_k(records: list[dict]) -> dict:
+    records = [item for item in records if isinstance(item, dict) and item]
+    if not records:
+        return {}
+
+    def _mean_field(field: str) -> float:
+        values = []
+        for item in records:
+            value = item.get(field)
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if value == value:
+                values.append(value)
+        return float(np.mean(values)) if values else float("nan")
+
+    return {
+        "stream_best_of_k": _mean_field("k"),
+        "stream_best_of_k_switch_count": _mean_field("switch_count"),
+        "stream_best_of_k_step_count": _mean_field("step_count"),
+        "stream_best_of_k_total_elapsed_sec": _mean_field("total_elapsed_sec"),
+    }
+
+
 def _run_validation_generation_mode(
     model,
     model_batch,
@@ -270,6 +295,7 @@ def run_validation_generation_eval(module, batch, batch_idx=None, test_loader_id
             _all_cap_ctrl = []
             _all_flat_traj = []
             _all_flat_ctrl = []
+            _stream_best_of_k_records = []
             fwd_stat = None
 
             if "feature_text_end" in sample_batch:
@@ -383,6 +409,10 @@ def run_validation_generation_eval(module, batch, batch_idx=None, test_loader_id
                             ],
                             num_denoise_steps=eval_cfg["num_denoise_steps"],
                         )
+                        if generation_mode == T2M_STREAM_GENERATE_STEP:
+                            _stream_best_of_k_records.append(
+                                output.get("stream_best_of_k", {})
+                            )
                     if _debug and run_idx == 0 and _cap_idx == 0 and sample_idx == 0:
                         _post_sd = _hash_sd(module.model.state_dict())
                         _post_ema = _hash_ema(module.ema)
@@ -466,6 +496,9 @@ def run_validation_generation_eval(module, batch, batch_idx=None, test_loader_id
                     "text": sample_text,
                     "text_all": _all_captions,
                 }
+                record.update(
+                    _summarize_stream_best_of_k(_stream_best_of_k_records)
+                )
                 # Aggregate per-caption metrics: for each scalar field,
                 # store caption-mean and cross-caption mean/std.
                 _scalar_fields = (

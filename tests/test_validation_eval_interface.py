@@ -154,6 +154,24 @@ def test_validation_stream_generation_preserves_best_of_k_summary(monkeypatch):
     assert output["stream_best_of_k"] is expected_summary
 
 
+def test_validation_summarizes_stream_best_of_k_records():
+    from utils.training.ldf.validation_generation import _summarize_stream_best_of_k
+
+    summary = _summarize_stream_best_of_k(
+        [
+            {"k": 5, "switch_count": 2, "step_count": 40, "total_elapsed_sec": 10.0},
+            {"k": 5, "switch_count": 4, "step_count": 44, "total_elapsed_sec": 12.0},
+        ]
+    )
+
+    assert summary == {
+        "stream_best_of_k": 5.0,
+        "stream_best_of_k_switch_count": 3.0,
+        "stream_best_of_k_step_count": 42.0,
+        "stream_best_of_k_total_elapsed_sec": 11.0,
+    }
+
+
 def test_training_package_no_longer_exports_async_eval_helpers():
     import utils.training as training
 
