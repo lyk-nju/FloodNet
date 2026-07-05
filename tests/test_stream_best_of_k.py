@@ -296,7 +296,7 @@ def test_best_of_k_disabled_uses_original_single_step_path(monkeypatch):
         called["selector"] += 1
         raise AssertionError("best_of_k <= 1 must bypass selector")
 
-    monkeypatch.setattr(stream_generation, "_stream_generate_step_best_of_k", _selector_should_not_run)
+    monkeypatch.setattr(stream_generation, "run_best_of_k_step", _selector_should_not_run)
 
     assert stream_generation._should_use_best_of_k(1) is False
     assert stream_generation._should_use_best_of_k(0) is False
@@ -353,7 +353,7 @@ def test_best_of_k_disabled_skips_config_validation_and_selector(monkeypatch):
         "feature_length": torch.tensor([4], dtype=torch.long),
     }
 
-    monkeypatch.setattr(stream_generation, "_stream_generate_step_best_of_k", _selector_should_not_run)
+    monkeypatch.setattr(stream_generation, "run_best_of_k_step", _selector_should_not_run)
     stream_out = stream_generation.run_stream_generate_step_sample(
         model=_BypassModel(),
         vae=_BypassVAE(),
@@ -396,6 +396,49 @@ class _OneStepVAE:
 class _OneStepStream:
     def build_ldf_condition_provider(self, step_payload, first_chunk=True, device=None):
         return lambda **kwargs: None
+
+
+class _SerialCandidateModel(_StatefulModel):
+    input_dim = 4
+    chunk_size = 1
+
+    def __init__(self, values):
+        super().__init__()
+        self.values = [float(value) for value in values]
+        self.next_value_idx = 0
+        self.generated = torch.zeros(1, self.input_dim, 3, 1, 1)
+        self.commit_index = 0
+
+    def stream_generate_step(self, step_payload, first_chunk=True, condition=None):
+        value = self.values[self.next_value_idx]
+        self.next_value_idx += 1
+        self.generated[0, :, self.commit_index, 0, 0] = value
+        self.commit_index += 1
+        return {"generated": torch.full((1, 1, self.input_dim), value)}
+
+
+class _SerialCandidateVAE:
+    def __init__(self, lengths=None):
+        self.model = _StatefulVAEModel()
+        self.lengths = lengths or {}
+
+    def stream_decode(self, latent, first_chunk=True):
+        value = float(latent[0, 0, 0].item())
+        frames = int(self.lengths.get(value, 4))
+        self.model._conv_num = int(round(value * 100.0))
+        out = torch.zeros(1, frames, 263, dtype=torch.float32)
+        out[:, :, 0] = value
+        return out
+
+
+def _decoded_feature_x_as_root_xz(decoded_chunk, previous_decoded_chunks=None):
+    return torch.stack(
+        [
+            decoded_chunk[:, 0].float().cpu(),
+            torch.zeros(int(decoded_chunk.shape[0]), dtype=torch.float32),
+        ],
+        dim=-1,
+    )
 
 
 def test_run_one_stream_step_returns_clean_commit_ranges():
@@ -493,3 +536,105 @@ def test_serial_selector_records_same_frame_range_for_all_candidates():
         (0, 4),
     ]
     assert step_output.commit_frame_range == (0, 4)
+
+
+def test_serial_selector_switches_to_better_candidate1_and_restores_post_state(monkeypatch):
+    from eval.ldf import stream_best_of_k
+    from eval.ldf.stream_best_of_k import StreamBestOfKConfig, run_best_of_k_step
+
+    monkeypatch.setattr(
+        stream_best_of_k,
+        "decoded_chunk_root_xz",
+        _decoded_feature_x_as_root_xz,
+    )
+    model = _SerialCandidateModel([2.0, 0.25])
+    vae = _SerialCandidateVAE()
+    sample_batch = {
+        "traj_cond_7d": torch.zeros(1, 4, 7, dtype=torch.float32),
+    }
+    sample_batch["traj_cond_7d"][0, :, 0] = 0.25
+    sample_batch["traj_cond_7d"][0, :, 3] = 1.0
+
+    step_output, record = run_best_of_k_step(
+        model=model,
+        vae=vae,
+        stream=_OneStepStream(),
+        stream_conditioner=None,
+        step_payload={"text": "walk"},
+        sample_batch=sample_batch,
+        first_chunk=True,
+        device=torch.device("cpu"),
+        local_commit_index=0,
+        generated_frames=0,
+        previous_decoded_chunks=[],
+        chunk_frame_ends=[],
+        frames_per_token=4,
+        cfg=StreamBestOfKConfig.from_values(
+            k=2,
+            rel_margin=0.0,
+            abs_margin=0.0,
+            cont_tol=1.0,
+        ),
+        steps_since_switch=10**9,
+    )
+
+    assert record["selected_idx"] == 1
+    assert record["switch_reason"] == "switch_improved_continuous"
+    assert torch.allclose(
+        step_output.clean_committed_latent,
+        torch.full((1, 4), 0.25),
+    )
+    assert model.commit_index == 1
+    assert torch.allclose(model.generated[0, :, 0, 0, 0], torch.full((4,), 0.25))
+    assert vae.model._conv_num == 25
+
+
+def test_serial_selector_forces_candidate0_when_any_frame_range_differs(monkeypatch):
+    from eval.ldf import stream_best_of_k
+    from eval.ldf.stream_best_of_k import StreamBestOfKConfig, run_best_of_k_step
+
+    monkeypatch.setattr(
+        stream_best_of_k,
+        "decoded_chunk_root_xz",
+        _decoded_feature_x_as_root_xz,
+    )
+    model = _SerialCandidateModel([2.0, 0.25])
+    vae = _SerialCandidateVAE(lengths={0.25: 5})
+    sample_batch = {
+        "traj_cond_7d": torch.zeros(1, 5, 7, dtype=torch.float32),
+    }
+    sample_batch["traj_cond_7d"][0, :, 0] = 0.25
+    sample_batch["traj_cond_7d"][0, :, 3] = 1.0
+
+    step_output, record = run_best_of_k_step(
+        model=model,
+        vae=vae,
+        stream=_OneStepStream(),
+        stream_conditioner=None,
+        step_payload={"text": "walk"},
+        sample_batch=sample_batch,
+        first_chunk=True,
+        device=torch.device("cpu"),
+        local_commit_index=0,
+        generated_frames=0,
+        previous_decoded_chunks=[],
+        chunk_frame_ends=[],
+        frames_per_token=4,
+        cfg=StreamBestOfKConfig.from_values(
+            k=2,
+            rel_margin=0.0,
+            abs_margin=0.0,
+            cont_tol=1.0,
+        ),
+        steps_since_switch=10**9,
+    )
+
+    candidate1 = record["candidate_scores"][1]
+    assert record["selected_idx"] == 0
+    assert record["switch_reason"] == "force_candidate0"
+    assert step_output.decoded_chunk.shape[0] == 4
+    assert candidate1["commit_frame_range_matches_candidate0"] is True
+    assert candidate1["decoded_chunk_frame_range_matches_candidate0"] is False
+    assert candidate1["target_xz_frame_range_matches_candidate0"] is False
+    assert candidate1["decoded_chunk_length_matches_candidate0"] is False
+    assert candidate1["frame_range_matches_candidate0"] is False

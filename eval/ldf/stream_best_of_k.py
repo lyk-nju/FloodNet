@@ -142,6 +142,11 @@ def _score_step_output(
         "commit_frame_range": tuple(step_output.commit_frame_range),
         "decoded_chunk_frame_range": tuple(step_output.decoded_chunk_frame_range),
         "target_xz_frame_range": tuple(step_output.target_xz_frame_range),
+        "decoded_chunk_length": int(step_output.decoded_chunk.shape[0]),
+        "commit_frame_range_matches_candidate0": True,
+        "decoded_chunk_frame_range_matches_candidate0": True,
+        "target_xz_frame_range_matches_candidate0": True,
+        "decoded_chunk_length_matches_candidate0": True,
         "frame_range_matches_candidate0": True,
     }
     return score, debug
@@ -239,11 +244,29 @@ def run_best_of_k_step(
             scores.append(score)
             score_debugs.append(debug)
 
-        candidate0_range = tuple(candidates[0].step_output.commit_frame_range)
+        candidate0_output = candidates[0].step_output
+        candidate0_commit_range = tuple(candidate0_output.commit_frame_range)
+        candidate0_decoded_range = tuple(candidate0_output.decoded_chunk_frame_range)
+        candidate0_target_range = tuple(candidate0_output.target_xz_frame_range)
+        candidate0_length = int(candidate0_output.decoded_chunk.shape[0])
         for candidate, debug in zip(candidates, score_debugs):
-            matches = tuple(candidate.step_output.commit_frame_range) == candidate0_range
-            debug["frame_range_matches_candidate0"] = bool(matches)
-            if not matches:
+            output = candidate.step_output
+            commit_matches = tuple(output.commit_frame_range) == candidate0_commit_range
+            decoded_matches = tuple(output.decoded_chunk_frame_range) == candidate0_decoded_range
+            target_matches = tuple(output.target_xz_frame_range) == candidate0_target_range
+            length_matches = int(output.decoded_chunk.shape[0]) == candidate0_length
+            aggregate_matches = (
+                commit_matches
+                and decoded_matches
+                and target_matches
+                and length_matches
+            )
+            debug["commit_frame_range_matches_candidate0"] = bool(commit_matches)
+            debug["decoded_chunk_frame_range_matches_candidate0"] = bool(decoded_matches)
+            debug["target_xz_frame_range_matches_candidate0"] = bool(target_matches)
+            debug["decoded_chunk_length_matches_candidate0"] = bool(length_matches)
+            debug["frame_range_matches_candidate0"] = bool(aggregate_matches)
+            if not aggregate_matches:
                 force_candidate0 = True
 
         gate_cfg = ConservativeGateConfig(
