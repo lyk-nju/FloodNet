@@ -160,6 +160,17 @@ def _run_validation_generation_mode(
     stream_traj_horizon_tokens: int | None = 20,
     stream_token_dt: float = 0.20,
     stream_frames_per_token: int = 4,
+    stream_best_of_k: int = 1,
+    stream_best_of_k_score: str = "xz",
+    stream_best_of_k_xz_weight: float = 1.0,
+    stream_best_of_k_fde_weight: float = 1.0,
+    stream_best_of_k_cont_weight: float = 0.0,
+    stream_best_of_k_vel_weight: float = 0.5,
+    stream_best_of_k_rel_margin: float = 0.10,
+    stream_best_of_k_abs_margin: float = 0.03,
+    stream_best_of_k_cont_tol: float = 0.03,
+    stream_best_of_k_force_candidate0: bool = False,
+    stream_best_of_k_switch_cooldown_steps: int = 0,
     num_denoise_steps=None,
 ) -> dict:
     if generation_mode != T2M_STREAM_GENERATE_STEP:
@@ -183,6 +194,19 @@ def _run_validation_generation_mode(
         traj_horizon_tokens=stream_traj_horizon_tokens,
         token_dt=float(stream_token_dt),
         frames_per_token=int(stream_frames_per_token),
+        best_of_k=int(stream_best_of_k),
+        best_of_k_score=str(stream_best_of_k_score),
+        best_of_k_xz_weight=float(stream_best_of_k_xz_weight),
+        best_of_k_fde_weight=float(stream_best_of_k_fde_weight),
+        best_of_k_cont_weight=float(stream_best_of_k_cont_weight),
+        best_of_k_vel_weight=float(stream_best_of_k_vel_weight),
+        best_of_k_rel_margin=float(stream_best_of_k_rel_margin),
+        best_of_k_abs_margin=float(stream_best_of_k_abs_margin),
+        best_of_k_cont_tol=float(stream_best_of_k_cont_tol),
+        best_of_k_force_candidate0=bool(stream_best_of_k_force_candidate0),
+        best_of_k_switch_cooldown_steps=int(
+            stream_best_of_k_switch_cooldown_steps
+        ),
     )
     return {
         "generated": [stream_output["latent_stream"]],
@@ -325,6 +349,37 @@ def run_validation_generation_eval(module, batch, batch_idx=None, test_loader_id
                             ],
                             stream_token_dt=eval_cfg["stream_token_dt"],
                             stream_frames_per_token=eval_cfg["stream_frames_per_token"],
+                            stream_best_of_k=eval_cfg["stream_best_of_k"],
+                            stream_best_of_k_score=eval_cfg[
+                                "stream_best_of_k_score"
+                            ],
+                            stream_best_of_k_xz_weight=eval_cfg[
+                                "stream_best_of_k_xz_weight"
+                            ],
+                            stream_best_of_k_fde_weight=eval_cfg[
+                                "stream_best_of_k_fde_weight"
+                            ],
+                            stream_best_of_k_cont_weight=eval_cfg[
+                                "stream_best_of_k_cont_weight"
+                            ],
+                            stream_best_of_k_vel_weight=eval_cfg[
+                                "stream_best_of_k_vel_weight"
+                            ],
+                            stream_best_of_k_rel_margin=eval_cfg[
+                                "stream_best_of_k_rel_margin"
+                            ],
+                            stream_best_of_k_abs_margin=eval_cfg[
+                                "stream_best_of_k_abs_margin"
+                            ],
+                            stream_best_of_k_cont_tol=eval_cfg[
+                                "stream_best_of_k_cont_tol"
+                            ],
+                            stream_best_of_k_force_candidate0=eval_cfg[
+                                "stream_best_of_k_force_candidate0"
+                            ],
+                            stream_best_of_k_switch_cooldown_steps=eval_cfg[
+                                "stream_best_of_k_switch_cooldown_steps"
+                            ],
                             num_denoise_steps=eval_cfg["num_denoise_steps"],
                         )
                     if _debug and run_idx == 0 and _cap_idx == 0 and sample_idx == 0:

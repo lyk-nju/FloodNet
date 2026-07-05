@@ -30,6 +30,56 @@ def test_validation_dataloaders_always_include_test_probes():
     assert loaders == [val_loader] + probe_loaders
 
 
+def test_generation_eval_cfg_exposes_stream_best_of_k_defaults_and_overrides():
+    from utils.training.ldf.validation_eval_runtime import build_generation_eval_cfg
+
+    default_cfg = build_generation_eval_cfg(OmegaConf.create({"validation": {}}))
+
+    assert default_cfg["stream_best_of_k"] == 1
+    assert default_cfg["stream_best_of_k_score"] == "xz"
+    assert default_cfg["stream_best_of_k_xz_weight"] == 1.0
+    assert default_cfg["stream_best_of_k_fde_weight"] == 1.0
+    assert default_cfg["stream_best_of_k_cont_weight"] == 0.0
+    assert default_cfg["stream_best_of_k_vel_weight"] == 0.5
+    assert default_cfg["stream_best_of_k_rel_margin"] == 0.10
+    assert default_cfg["stream_best_of_k_abs_margin"] == 0.03
+    assert default_cfg["stream_best_of_k_cont_tol"] == 0.03
+    assert default_cfg["stream_best_of_k_force_candidate0"] is False
+    assert default_cfg["stream_best_of_k_switch_cooldown_steps"] == 0
+
+    custom_cfg = build_generation_eval_cfg(
+        OmegaConf.create(
+            {
+                "validation": {
+                    "eval_stream_best_of_k": 4,
+                    "eval_stream_best_of_k_score": "xz",
+                    "eval_stream_best_of_k_xz_weight": 0.5,
+                    "eval_stream_best_of_k_fde_weight": 2.0,
+                    "eval_stream_best_of_k_cont_weight": 0.25,
+                    "eval_stream_best_of_k_vel_weight": 0.75,
+                    "eval_stream_best_of_k_rel_margin": 0.20,
+                    "eval_stream_best_of_k_abs_margin": 0.05,
+                    "eval_stream_best_of_k_cont_tol": 0.07,
+                    "eval_stream_best_of_k_force_candidate0": True,
+                    "eval_stream_best_of_k_switch_cooldown_steps": 2,
+                }
+            }
+        )
+    )
+
+    assert custom_cfg["stream_best_of_k"] == 4
+    assert custom_cfg["stream_best_of_k_score"] == "xz"
+    assert custom_cfg["stream_best_of_k_xz_weight"] == 0.5
+    assert custom_cfg["stream_best_of_k_fde_weight"] == 2.0
+    assert custom_cfg["stream_best_of_k_cont_weight"] == 0.25
+    assert custom_cfg["stream_best_of_k_vel_weight"] == 0.75
+    assert custom_cfg["stream_best_of_k_rel_margin"] == 0.20
+    assert custom_cfg["stream_best_of_k_abs_margin"] == 0.05
+    assert custom_cfg["stream_best_of_k_cont_tol"] == 0.07
+    assert custom_cfg["stream_best_of_k_force_candidate0"] is True
+    assert custom_cfg["stream_best_of_k_switch_cooldown_steps"] == 2
+
+
 def test_training_package_no_longer_exports_async_eval_helpers():
     import utils.training as training
 
