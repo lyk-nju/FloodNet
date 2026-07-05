@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import random
+
+import numpy as np
 import pytest
 import torch
 
+from eval.ldf.stream_state import (
+    StepOutput,
+    capture_runtime_snapshot,
+    restore_runtime_snapshot,
+)
 from eval.ldf.stream_scoring import (
     ConservativeGateConfig,
     CandidateScore,
@@ -171,3 +179,109 @@ def test_root_xz_helpers_return_finite_xz_shapes():
     assert previous_xz.shape == (2, 2)
     assert torch.isfinite(decoded_xz).all()
     assert torch.isfinite(previous_xz).all()
+
+
+class _StatefulVAEModel:
+    def __init__(self):
+        self._conv_num = 1
+        self._conv_idx = [3]
+        self._feat_map = [torch.tensor([1.0, 2.0])]
+
+
+class _StatefulVAE:
+    def __init__(self):
+        self.model = _StatefulVAEModel()
+
+
+class _StatefulConditioner:
+    def __init__(self):
+        self.timeline = {"head": torch.tensor([1.0])}
+        self.root_plan = {"anchor": torch.tensor([2.0])}
+
+
+class _StatefulModel:
+    def __init__(self):
+        self.generated = torch.ones(1, 4, 5, 1, 1)
+        self.commit_index = 2
+        self.current_step = 7
+        self.batch_size = 1
+        self.seq_len = 4
+        self.num_denoise_steps = 10
+        self.dt = 0.1
+        self.text_condition_list = [[torch.tensor([3.0])]]
+        self._traj_buf = {"value": torch.tensor([4.0])}
+
+
+def test_runtime_snapshot_deep_clones_mutable_state():
+    model = _StatefulModel()
+    vae = _StatefulVAE()
+    conditioner = _StatefulConditioner()
+
+    snapshot = capture_runtime_snapshot(
+        model=model,
+        vae=vae,
+        stream_conditioner=conditioner,
+        first_chunk=False,
+        generated_frames=12,
+        chunk_frame_ends=[4, 8, 12],
+    )
+    model.generated.zero_()
+    model.text_condition_list[0][0].fill_(9.0)
+    vae.model._feat_map[0].fill_(8.0)
+    conditioner.timeline["head"].fill_(7.0)
+
+    restore_runtime_snapshot(model=model, vae=vae, stream_conditioner=conditioner, snapshot=snapshot)
+
+    assert torch.allclose(model.generated, torch.ones(1, 4, 5, 1, 1))
+    assert torch.allclose(model.text_condition_list[0][0], torch.tensor([3.0]))
+    assert torch.allclose(vae.model._feat_map[0], torch.tensor([1.0, 2.0]))
+    assert torch.allclose(conditioner.timeline["head"], torch.tensor([1.0]))
+    assert snapshot.first_chunk is False
+    assert snapshot.generated_frames == 12
+    assert snapshot.chunk_frame_ends == [4, 8, 12]
+    assert model.generated.data_ptr() != snapshot.model_state["generated"].data_ptr()
+
+
+def test_runtime_snapshot_restores_rng_state():
+    model = _StatefulModel()
+    vae = _StatefulVAE()
+    random.seed(11)
+    np.random.seed(11)
+    torch.manual_seed(11)
+
+    snapshot = capture_runtime_snapshot(
+        model=model,
+        vae=vae,
+        stream_conditioner=None,
+        first_chunk=True,
+        generated_frames=0,
+        chunk_frame_ends=[],
+    )
+    expected_py = random.random()
+    expected_np = float(np.random.rand())
+    expected_torch = float(torch.rand(1).item())
+
+    random.seed(99)
+    np.random.seed(99)
+    torch.manual_seed(99)
+    restore_runtime_snapshot(model=model, vae=vae, stream_conditioner=None, snapshot=snapshot)
+
+    assert random.random() == expected_py
+    assert float(np.random.rand()) == expected_np
+    assert float(torch.rand(1).item()) == expected_torch
+
+
+def test_step_output_records_explicit_ranges():
+    output = StepOutput(
+        clean_committed_latent=torch.zeros(1, 4),
+        decoded_chunk=torch.zeros(4, 263),
+        commit_token_range=(2, 3),
+        commit_frame_range=(8, 12),
+        decoded_chunk_frame_range=(8, 12),
+        target_xz_frame_range=(8, 12),
+        debug={"ready_to_commit_token": 2},
+    )
+
+    assert output.commit_token_range == (2, 3)
+    assert output.commit_frame_range == (8, 12)
+    assert output.debug["ready_to_commit_token"] == 2
