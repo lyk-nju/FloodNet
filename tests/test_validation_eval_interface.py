@@ -80,6 +80,47 @@ def test_generation_eval_cfg_exposes_stream_best_of_k_defaults_and_overrides():
     assert custom_cfg["stream_best_of_k_switch_cooldown_steps"] == 2
 
 
+def test_stream_generate_step_accepts_stream_best_of_k_selector_config_kwargs():
+    from inspect import signature
+
+    from eval.ldf.stream_generation import (
+        StreamBestOfKConfig,
+        run_stream_generate_step_sample,
+    )
+
+    expected_kwargs = {
+        "best_of_k_vel_weight": 0.75,
+        "best_of_k_rel_margin": 0.20,
+        "best_of_k_abs_margin": 0.05,
+        "best_of_k_cont_tol": 0.07,
+        "best_of_k_force_candidate0": True,
+        "best_of_k_switch_cooldown_steps": 2,
+    }
+    params = signature(run_stream_generate_step_sample).parameters
+
+    for name in expected_kwargs:
+        assert name in params
+
+    cfg = StreamBestOfKConfig.from_values(
+        k=4,
+        vel_weight=expected_kwargs["best_of_k_vel_weight"],
+        rel_margin=expected_kwargs["best_of_k_rel_margin"],
+        abs_margin=expected_kwargs["best_of_k_abs_margin"],
+        cont_tol=expected_kwargs["best_of_k_cont_tol"],
+        force_candidate0=expected_kwargs["best_of_k_force_candidate0"],
+        switch_cooldown_steps=expected_kwargs[
+            "best_of_k_switch_cooldown_steps"
+        ],
+    )
+
+    assert cfg.vel_weight == 0.75
+    assert cfg.rel_margin == 0.20
+    assert cfg.abs_margin == 0.05
+    assert cfg.cont_tol == 0.07
+    assert cfg.force_candidate0 is True
+    assert cfg.switch_cooldown_steps == 2
+
+
 def test_training_package_no_longer_exports_async_eval_helpers():
     import utils.training as training
 
