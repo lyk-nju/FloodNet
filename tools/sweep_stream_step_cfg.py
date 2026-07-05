@@ -341,6 +341,7 @@ def _run_worker(worker_id: int, gpu_id: int, combos: list[tuple[float, float]], 
                     best_of_k_debug=bool(args.best_of_k_debug),
                 )
             original_time = time.perf_counter() - start_time
+            best_of_k_info = stream_out.get("stream_best_of_k", {}) or {}
             metrics = _compute_traj_metrics(
                 stream_out["decoded_feature"],
                 sample_batch,
@@ -446,6 +447,15 @@ def _run_worker(worker_id: int, gpu_id: int, combos: list[tuple[float, float]], 
                     "time_stream_original_sec": float(original_time),
                     "time_root_replaced_posthoc_sec": float(posthoc_time),
                     "time_root_replaced_feedback_sec": float(feedback_time),
+                    "stream_best_of_k_switch_count": float(
+                        best_of_k_info.get("switch_count", 0)
+                    ),
+                    "stream_best_of_k_step_count": float(
+                        best_of_k_info.get("step_count", 0)
+                    ),
+                    "stream_best_of_k_total_elapsed_sec": float(
+                        best_of_k_info.get("total_elapsed_sec", 0.0)
+                    ),
                     **video_paths,
                 }
             )
@@ -479,6 +489,15 @@ def _run_worker(worker_id: int, gpu_id: int, combos: list[tuple[float, float]], 
         time_feedback_mean, time_feedback_std = _stats(
             [m["time_root_replaced_feedback_sec"] for m in run_metrics]
         )
+        best_of_k_switch_mean, best_of_k_switch_std = _stats(
+            [m["stream_best_of_k_switch_count"] for m in run_metrics]
+        )
+        best_of_k_step_mean, best_of_k_step_std = _stats(
+            [m["stream_best_of_k_step_count"] for m in run_metrics]
+        )
+        best_of_k_elapsed_mean, best_of_k_elapsed_std = _stats(
+            [m["stream_best_of_k_total_elapsed_sec"] for m in run_metrics]
+        )
         arc_mean, arc_std = _stats([m["path_arc_ade"] for m in run_metrics])
         record = {
             "cfg_text": float(cfg_text),
@@ -510,6 +529,12 @@ def _run_worker(worker_id: int, gpu_id: int, combos: list[tuple[float, float]], 
             "time_root_replaced_posthoc_sec_std": time_posthoc_std,
             "time_root_replaced_feedback_sec_mean": time_feedback_mean,
             "time_root_replaced_feedback_sec_std": time_feedback_std,
+            "stream_best_of_k_switch_count_mean": best_of_k_switch_mean,
+            "stream_best_of_k_switch_count_std": best_of_k_switch_std,
+            "stream_best_of_k_step_count_mean": best_of_k_step_mean,
+            "stream_best_of_k_step_count_std": best_of_k_step_std,
+            "stream_best_of_k_total_elapsed_sec_mean": best_of_k_elapsed_mean,
+            "stream_best_of_k_total_elapsed_sec_std": best_of_k_elapsed_std,
             "root_feedback_fps_mean": (
                 float(run_metrics[0]["target_total_frames"]) / time_feedback_mean
                 if math.isfinite(time_feedback_mean) and time_feedback_mean > 0
@@ -536,6 +561,7 @@ def _run_worker(worker_id: int, gpu_id: int, combos: list[tuple[float, float]], 
             "best_of_k_switch_cooldown_steps": int(
                 args.best_of_k_switch_cooldown_steps
             ),
+            "best_of_k_debug": bool(args.best_of_k_debug),
             "stream_mode": "stream_generate_step",
             "sample_name": str(sample_batch["name"][0]),
             "caption_index": sample_batch.get("_caption_index"),
@@ -586,6 +612,12 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
         "time_root_replaced_posthoc_sec_std",
         "time_root_replaced_feedback_sec_mean",
         "time_root_replaced_feedback_sec_std",
+        "stream_best_of_k_switch_count_mean",
+        "stream_best_of_k_switch_count_std",
+        "stream_best_of_k_step_count_mean",
+        "stream_best_of_k_step_count_std",
+        "stream_best_of_k_total_elapsed_sec_mean",
+        "stream_best_of_k_total_elapsed_sec_std",
         "root_feedback_fps_mean",
         "path_arc_ade_mean",
         "path_arc_ade_std",
@@ -606,6 +638,7 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
         "best_of_k_cont_tol",
         "best_of_k_force_candidate0",
         "best_of_k_switch_cooldown_steps",
+        "best_of_k_debug",
         "sample_name",
         "gpu_id",
         "worker_id",
@@ -677,6 +710,7 @@ def main() -> None:
         "best_of_k_cont_tol": args.best_of_k_cont_tol,
         "best_of_k_force_candidate0": args.best_of_k_force_candidate0,
         "best_of_k_switch_cooldown_steps": args.best_of_k_switch_cooldown_steps,
+        "best_of_k_debug": args.best_of_k_debug,
         "render_video": args.render_video,
     }
     with (out_dir / "sweep_config.json").open("w", encoding="utf-8") as handle:
