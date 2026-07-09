@@ -33,10 +33,24 @@ def _load_vae(cfg, device):
 def _load_model(cfg, ckpt_path, device):
     model = instantiate_ldf_model(cfg.model.target, cfg.model.params)
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    ckpt_keys = set(ckpt["state_dict"].keys())
+    state_dict = dict(ckpt["state_dict"])
+    if (
+        any(k.startswith("local_traj_encoder.") for k in state_dict)
+        and not any(k.startswith("traj_encoder.frame_encoder.") for k in state_dict)
+    ):
+        remapped = {}
+        for key, value in state_dict.items():
+            if key.startswith("local_traj_encoder."):
+                remapped["traj_encoder.frame_encoder." + key[len("local_traj_encoder."):]] = value
+            elif key.startswith("traj_encoder."):
+                remapped["traj_encoder.token_encoder." + key[len("traj_encoder."):]] = value
+            else:
+                remapped[key] = value
+        state_dict = remapped
+    ckpt_keys = set(state_dict.keys())
     cn_missing = not any(k.startswith("controlnet.") for k in ckpt_keys)
     strict = not cn_missing
-    result = model.load_state_dict(ckpt["state_dict"], strict=strict)
+    result = model.load_state_dict(state_dict, strict=strict)
     if not strict and result.missing_keys:
         if any("controlnet." in k for k in result.missing_keys):
             model.controlnet.init_from_backbone(model.model)

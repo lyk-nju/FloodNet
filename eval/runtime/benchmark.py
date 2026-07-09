@@ -99,6 +99,10 @@ from eval.runtime.root_sources import (
     root_source_metadata,
     runtime_debug_condition_source,
 )
+from eval.runtime.root_projection import (
+    LateDenoiseRootProjectionConfig,
+    TimeConsistentRootGuidanceConfig,
+)
 from eval.runtime.runners import (
     build_turn_metric_target as _build_turn_metric_target,
     root_plan_events_to_diagnostic_arrays,
@@ -141,6 +145,90 @@ _ROOT_CONDITION_SOURCES = {
     "rootrefiner_gtheading",
     "rootrefiner_gtprogress",
 }
+
+
+def build_runtime_root_projection_config_from_args(
+    args,
+) -> LateDenoiseRootProjectionConfig | None:
+    if not bool(getattr(args, "late_root_projection", False)):
+        return None
+    return LateDenoiseRootProjectionConfig(
+        enabled=True,
+        alpha=float(getattr(args, "late_root_projection_alpha", 0.6)),
+        projection_start_step=int(getattr(args, "late_root_projection_start_step", 6)),
+        max_delta_per_frame=float(
+            getattr(args, "late_root_projection_max_delta_per_frame", 0.03)
+        ),
+        max_delta_per_chunk=float(
+            getattr(args, "late_root_projection_max_delta_per_chunk", 0.10)
+        ),
+        latent_blend_gain=float(
+            getattr(args, "late_root_projection_latent_blend_gain", 0.5)
+        ),
+        final_step_gain=float(
+            getattr(args, "late_root_projection_final_step_gain", 1.0)
+        ),
+        frame_ramp=not bool(
+            getattr(args, "late_root_projection_no_frame_ramp", False)
+        ),
+    )
+
+
+def build_time_consistent_guidance_config_from_args(
+    args,
+) -> TimeConsistentRootGuidanceConfig | None:
+    if not bool(getattr(args, "time_consistent_root_guidance", False)):
+        return None
+    return TimeConsistentRootGuidanceConfig(
+        enabled=True,
+        projection_step=parse_csv_ints(
+            getattr(args, "time_consistent_guidance_step", "8"),
+            default=(8,),
+        ),
+        alpha=float(getattr(args, "time_consistent_guidance_alpha", 0.2)),
+        guidance_strength=float(
+            getattr(args, "time_consistent_guidance_strength", 1.0)
+        ),
+        max_delta_per_frame=float(
+            getattr(args, "time_consistent_guidance_max_delta_per_frame", 0.03)
+        ),
+        max_delta_per_chunk=float(
+            getattr(args, "time_consistent_guidance_max_delta_per_chunk", 0.10)
+        ),
+        max_latent_delta=float(
+            getattr(args, "time_consistent_guidance_max_latent_delta", 0.25)
+        ),
+        projection_target_mode=str(
+            getattr(args, "time_consistent_guidance_projection_target_mode", "relative_shape")
+        ),
+        mixed_global_weight=float(
+            getattr(args, "time_consistent_guidance_mixed_global_weight", 0.3)
+        ),
+        mixed_local_weight=float(
+            getattr(args, "time_consistent_guidance_mixed_local_weight", 1.0)
+        ),
+        debug=bool(getattr(args, "time_consistent_guidance_debug", False)),
+    )
+
+
+def apply_runtime_cfg_overrides(cfg, args) -> None:
+    """Apply runtime benchmark inference-only config overrides."""
+    cfg_text = getattr(args, "cfg_text", None)
+    cfg_traj = getattr(args, "cfg_traj", None)
+    if cfg_text is not None:
+        OmegaConf.update(
+            cfg,
+            "model.params.cfg_scale_text",
+            float(cfg_text),
+            merge=False,
+        )
+    if cfg_traj is not None:
+        OmegaConf.update(
+            cfg,
+            "model.params.cfg_scale_traj",
+            float(cfg_traj),
+            merge=False,
+        )
 _ROOT_REFINER_SOURCES = {
     "rootrefiner",
     "rootrefiner_gtnum",
@@ -679,9 +767,78 @@ def main():
     p.add_argument("--history_length", type=int, default=30)
     p.add_argument("--traj_horizon_tokens", type=int, default=20)
     p.add_argument("--num_denoise_steps", type=int, default=10)
+    p.add_argument("--cfg_text", type=float, default=None)
+    p.add_argument("--cfg_traj", type=float, default=None)
     p.add_argument("--waypoint_dt", type=float, default=0.05)
     p.add_argument("--token_dt", type=float, default=0.20)
     p.add_argument("--motion_fps", type=float, default=20.0)
+    p.add_argument(
+        "--late_root_projection",
+        action="store_true",
+        default=False,
+        help="Enable eval/runtime late-denoise current-token root projection.",
+    )
+    p.add_argument("--late_root_projection_alpha", type=float, default=0.6)
+    p.add_argument("--late_root_projection_start_step", type=int, default=6)
+    p.add_argument("--late_root_projection_max_delta_per_frame", type=float, default=0.03)
+    p.add_argument("--late_root_projection_max_delta_per_chunk", type=float, default=0.10)
+    p.add_argument("--late_root_projection_latent_blend_gain", type=float, default=0.5)
+    p.add_argument("--late_root_projection_final_step_gain", type=float, default=1.0)
+    p.add_argument(
+        "--late_root_projection_no_frame_ramp",
+        action="store_true",
+        default=False,
+        help="Disable per-frame boundary ramp inside each projected token.",
+    )
+    p.add_argument(
+        "--time_consistent_root_guidance",
+        action="store_true",
+        default=False,
+        help="Enable eval/runtime time-consistent current-token root guidance.",
+    )
+    p.add_argument(
+        "--time_consistent_guidance_step",
+        default="8",
+        help="Denoise local step(s) for time-consistent guidance, e.g. 8 or 8,9,10.",
+    )
+    p.add_argument("--time_consistent_guidance_alpha", type=float, default=0.2)
+    p.add_argument("--time_consistent_guidance_strength", type=float, default=1.0)
+    p.add_argument(
+        "--time_consistent_guidance_max_delta_per_frame",
+        type=float,
+        default=0.03,
+    )
+    p.add_argument(
+        "--time_consistent_guidance_max_delta_per_chunk",
+        type=float,
+        default=0.10,
+    )
+    p.add_argument(
+        "--time_consistent_guidance_max_latent_delta",
+        type=float,
+        default=0.25,
+    )
+    p.add_argument(
+        "--time_consistent_guidance_projection_target_mode",
+        choices=("relative_shape", "absolute", "mixed"),
+        default="relative_shape",
+    )
+    p.add_argument(
+        "--time_consistent_guidance_mixed_global_weight",
+        type=float,
+        default=0.3,
+    )
+    p.add_argument(
+        "--time_consistent_guidance_mixed_local_weight",
+        type=float,
+        default=1.0,
+    )
+    p.add_argument(
+        "--time_consistent_guidance_debug",
+        action="store_true",
+        default=False,
+        help="Write accounting debug records for time-consistent root guidance.",
+    )
     p.add_argument(
         "--traj_condition_path",
         choices=("rootplan_7d", "legacy_xyz"),
@@ -755,11 +912,24 @@ def main():
         help="Comma-separated blend-token values for runtime debug turn family.",
     )
     args = p.parse_args()
+    root_projection_config = build_runtime_root_projection_config_from_args(args)
+    time_consistent_guidance_config = build_time_consistent_guidance_config_from_args(args)
+    runtime_debug_specs = (
+        _build_runtime_debug_specs_from_args(args) if args.runtime_debug_matrix else []
+    )
 
-    if args.runtime_debug_matrix and not (args.root_refiner_config and args.root_refiner_ckpt):
+    runtime_debug_needs_refiner = any(
+        normalize_root_source(spec.root_source) in _ROOT_REFINER_SOURCES
+        for spec in runtime_debug_specs
+    )
+    if (
+        args.runtime_debug_matrix
+        and runtime_debug_needs_refiner
+        and not (args.root_refiner_config and args.root_refiner_ckpt)
+    ):
         p.error(
-            "--runtime_debug_matrix requires --root_refiner_config and "
-            "--root_refiner_ckpt so gtroot/rootrefiner diagnostics can be compared"
+            "--runtime_debug_matrix with rootrefiner sources requires "
+            "--root_refiner_config and --root_refiner_ckpt"
         )
 
     run_id = args.runtime_debug_run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -767,9 +937,6 @@ def main():
         output_root=args.output_dir,
         ckpt_tag=infer_ckpt_tag(args.ckpt),
         run_id=run_id,
-    )
-    runtime_debug_specs = (
-        _build_runtime_debug_specs_from_args(args) if args.runtime_debug_matrix else []
     )
     if (
         args.runtime_debug_matrix
@@ -790,6 +957,7 @@ def main():
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     cfg = load_config(config_path=args.config)
+    apply_runtime_cfg_overrides(cfg.config, args)
     OmegaConf.update(cfg.config, "test_vae_ckpt", args.vae_ckpt)
     if args.precomputed_text_emb_path:
         OmegaConf.update(cfg.config, "model.params.use_precomputed_text_emb", True)
@@ -804,9 +972,6 @@ def main():
     if args.root_refiner_config or args.root_refiner_ckpt:
         if not (args.root_refiner_config and args.root_refiner_ckpt):
             p.error("--root_refiner_config and --root_refiner_ckpt must be provided together")
-        from omegaconf import OmegaConf
-
-        from utils.initialize import load_config
         from utils.inference.stream_generator import StreamGenerator
         from utils.training.root_refiner.lightning_module import RootRefinerLightningModule
 
@@ -884,6 +1049,11 @@ def main():
                     spec.sample_id,
                 )
             sample = sample_cache[spec.sample_id]
+            if (
+                time_consistent_guidance_config is not None
+                and bool(time_consistent_guidance_config.debug)
+            ):
+                setattr(vae, "_time_consistent_guidance_debug_records", [])
             print(
                 f"\n--- {root_source}/{spec.family}/"
                 f"{'/'.join(spec.parts) if spec.parts else spec.name} ---"
@@ -909,6 +1079,8 @@ def main():
                 root_refiner_runtime=variant_root_refiner,
                 replan_events=replan_events,
                 root_plan_events=root_plan_events,
+                root_projection_config=root_projection_config,
+                time_consistent_guidance_config=time_consistent_guidance_config,
             )
             motion_yaw_offset = 0.0
             split_tok = None
@@ -1035,6 +1207,27 @@ def main():
                 root_plan_events=root_plan_events,
             )
             _add_refiner_condition_aliases(rec)
+            leaf_dir = debug_layout.experiment_dir(root_source, spec.family, *spec.parts)
+            if (
+                time_consistent_guidance_config is not None
+                and bool(time_consistent_guidance_config.debug)
+            ):
+                guidance_records = list(
+                    getattr(vae, "_time_consistent_guidance_debug_records", []) or []
+                )
+                guidance_accounting = summarize_numeric_records(guidance_records)
+                rec["time_consistent_guidance_record_count"] = len(guidance_records)
+                rec["time_consistent_guidance_accounting"] = guidance_accounting
+                if guidance_records:
+                    ensure_dir(leaf_dir)
+                    write_json_strict(
+                        leaf_dir / "time_consistent_guidance_debug_records.json",
+                        guidance_records,
+                    )
+                    write_json_strict(
+                        leaf_dir / "time_consistent_guidance_accounting.json",
+                        guidance_accounting,
+                    )
             all_recs.append(rec)
             write_experiment_metrics(
                 debug_layout,
@@ -1056,7 +1249,6 @@ def main():
                 target_frames=len(pr),
                 motion_fps=args.motion_fps,
             )
-            leaf_dir = debug_layout.experiment_dir(root_source, spec.family, *spec.parts)
             if not args.no_save_plots and pr is not None and visual_target_root is not None:
                 _write_runtime_case_visuals(
                     leaf_dir / "plots",
@@ -1221,14 +1413,21 @@ def main():
             )
             replan_events: list[dict] = []
             root_plan_events: list[dict] = []
-            kw = dict(hl=args.history_length, nds=args.num_denoise_steps,
-                      hz=args.traj_horizon_tokens, tdt=args.token_dt,
-                      wpdt=args.waypoint_dt, fps=args.motion_fps,
-                      condition_path=variant.condition_path,
-                      root_refiner_runtime=variant_root_refiner,
-                      replan_events=replan_events,
-                      root_plan_events=root_plan_events,
-                      force_no_traj=variant.force_no_traj)
+            kw = dict(
+                hl=args.history_length,
+                nds=args.num_denoise_steps,
+                hz=args.traj_horizon_tokens,
+                tdt=args.token_dt,
+                wpdt=args.waypoint_dt,
+                fps=args.motion_fps,
+                condition_path=variant.condition_path,
+                root_refiner_runtime=variant_root_refiner,
+                replan_events=replan_events,
+                root_plan_events=root_plan_events,
+                force_no_traj=variant.force_no_traj,
+                root_projection_config=root_projection_config,
+                time_consistent_guidance_config=time_consistent_guidance_config,
+            )
             visual_target_root = None
             motion_yaw_offset = 0.0
 

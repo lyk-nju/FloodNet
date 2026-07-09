@@ -364,6 +364,13 @@ def _nanmedian_from_samples(per_sample: list[dict], key: str) -> float:
     return float((vals[mid - 1] + vals[mid]) / 2)
 
 
+def _nanmax_from_samples(per_sample: list[dict], key: str) -> float:
+    vals = [s[key] for s in per_sample if key in s and not math.isnan(s[key])]
+    if not vals:
+        return float("nan")
+    return float(max(vals))
+
+
 def summarize_per_sample(
     per_sample: list[dict],
     *,
@@ -405,6 +412,14 @@ def summarize_per_sample(
         "xyz_ADE": _nanmean_from_samples(per_sample, "xyz_ADE"),
         "xyz_FDE": _nanmean_from_samples(per_sample, "xyz_FDE"),
         "heading_error_deg": _nanmedian_from_samples(per_sample, "heading_error_deg"),
+        "heading_error_p90_deg": _nanmedian_from_samples(
+            per_sample,
+            "heading_error_p90_deg",
+        ),
+        "heading_error_max_deg": _nanmax_from_samples(
+            per_sample,
+            "heading_error_max_deg",
+        ),
         "fwd_speed_MAE": _nanmean_from_samples(per_sample, "fwd_speed_MAE"),
         "lateral_speed_MAE": _nanmean_from_samples(per_sample, "lateral_speed_MAE"),
         "yaw_rate_MAE": _nanmean_from_samples(per_sample, "yaw_rate_MAE"),

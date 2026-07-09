@@ -90,6 +90,25 @@ def test_heading_error_deg_quarter_turn():
     mask = torch.ones(T, dtype=torch.bool)
     m = compute_sample_metrics(pred, gt, mask)
     assert abs(m["heading_error_deg"] - 90.0) < 1e-3
+    assert abs(m["heading_error_p90_deg"] - 90.0) < 1e-3
+    assert abs(m["heading_error_max_deg"] - 90.0) < 1e-3
+
+
+def test_heading_error_reports_p90_and_max():
+    gt = _unit_heading_wp(4, yaw_val=0.0)
+    pred = torch.stack(
+        [
+            _unit_heading_wp(1, yaw_val=0.0)[0],
+            _unit_heading_wp(1, yaw_val=math.radians(10.0))[0],
+            _unit_heading_wp(1, yaw_val=math.radians(20.0))[0],
+            _unit_heading_wp(1, yaw_val=math.radians(90.0))[0],
+        ],
+        dim=0,
+    )
+    mask = torch.ones(4, dtype=torch.bool)
+    m = compute_sample_metrics(pred, gt, mask)
+    assert abs(m["heading_error_max_deg"] - 90.0) < 1e-3
+    assert m["heading_error_p90_deg"] > m["heading_error_deg"]
 
 
 def test_masked_frames_excluded_from_metrics():
@@ -125,6 +144,8 @@ def test_empty_valid_returns_nan_metrics():
     m = compute_sample_metrics(pred, gt, mask)
     assert math.isnan(m["xyz_ADE"])
     assert math.isnan(m["heading_error_deg"])
+    assert math.isnan(m["heading_error_p90_deg"])
+    assert math.isnan(m["heading_error_max_deg"])
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +249,7 @@ def test_run_benchmark_smoke_finite_metrics_and_report(tmp_path):
     expected_keys = {
         "n_samples", "frame_MAE", "frame_acc_pm1", "frame_acc_pm4",
         "xyz_ADE", "xyz_FDE", "heading_error_deg",
+        "heading_error_p90_deg", "heading_error_max_deg",
         "fwd_speed_MAE", "lateral_speed_MAE", "yaw_rate_MAE", "smoothness_acc_mean",
     }
     assert expected_keys.issubset(summary.keys())
@@ -237,7 +259,8 @@ def test_run_benchmark_smoke_finite_metrics_and_report(tmp_path):
     # must not be NaN/Inf since inputs are well-formed).
     assert 0.0 <= summary["frame_acc_pm1"] <= 1.0
     assert 0.0 <= summary["frame_acc_pm4"] <= 1.0
-    for k in ("frame_MAE", "xyz_ADE", "xyz_FDE", "heading_error_deg", "fwd_speed_MAE",
+    for k in ("frame_MAE", "xyz_ADE", "xyz_FDE", "heading_error_deg",
+               "heading_error_p90_deg", "heading_error_max_deg", "fwd_speed_MAE",
                "yaw_rate_MAE", "smoothness_acc_mean"):
         assert math.isfinite(summary[k]), f"{k} not finite: {summary[k]}"
         assert summary[k] >= 0.0

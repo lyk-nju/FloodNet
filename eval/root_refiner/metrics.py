@@ -38,6 +38,8 @@ def compute_sample_metrics(pred_wp: Tensor, gt_wp: Tensor, mask: Tensor) -> dict
                 "xyz_ADE",
                 "xyz_FDE",
                 "heading_error_deg",
+                "heading_error_p90_deg",
+                "heading_error_max_deg",
                 "fwd_speed_MAE",
                 "yaw_rate_MAE",
                 "lateral_speed_MAE",
@@ -56,6 +58,8 @@ def compute_sample_metrics(pred_wp: Tensor, gt_wp: Tensor, mask: Tensor) -> dict
     gt_yaw = _heading_to_yaw(gv[:, 3:5])
     head_err = wrap_angle(pred_yaw - gt_yaw).abs() * _RAD2DEG
     heading_error_deg = head_err.median().item()
+    heading_error_p90_deg = torch.quantile(head_err, 0.9).item()
+    heading_error_max_deg = head_err.max().item()
 
     fwd_mae = (pv[:, 5] - gv[:, 5]).abs().mean().item()
     yaw_mae = (pv[:, 6] - gv[:, 6]).abs().mean().item()
@@ -78,6 +82,8 @@ def compute_sample_metrics(pred_wp: Tensor, gt_wp: Tensor, mask: Tensor) -> dict
         "xyz_ADE": ade,
         "xyz_FDE": fde,
         "heading_error_deg": heading_error_deg,
+        "heading_error_p90_deg": heading_error_p90_deg,
+        "heading_error_max_deg": heading_error_max_deg,
         "fwd_speed_MAE": fwd_mae,
         "yaw_rate_MAE": yaw_mae,
         "lateral_speed_MAE": lateral_mae,

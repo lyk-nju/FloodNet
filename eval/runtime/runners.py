@@ -17,6 +17,12 @@ from eval.runtime.transforms import (
     rotate_xz_points,
     rotate_world_7d_about_anchor,
 )
+from eval.runtime.root_projection import (
+    LateDenoiseRootProjectionConfig,
+    build_late_denoise_root_projection_callback,
+    TimeConsistentRootGuidanceConfig,
+    build_time_consistent_root_guidance_callback,
+)
 from utils.inference.timeline import (
     RootFrameState,
     RootTimeline,
@@ -97,6 +103,41 @@ def build_rootplan_stream_step_payload(
         chunk_size=chunk_size,
         history_length=history_length,
         traj_horizon_tokens=traj_horizon_tokens,
+    )
+
+
+def _stream_generate_step_with_projection(
+    model: Any,
+    vae: Any,
+    step_payload: dict,
+    *,
+    first_chunk: bool,
+    condition_provider,
+    root_projection_config: LateDenoiseRootProjectionConfig | None = None,
+    time_consistent_guidance_config: TimeConsistentRootGuidanceConfig | None = None,
+):
+    projection_callback = None
+    if time_consistent_guidance_config is not None:
+        projection_callback = build_time_consistent_root_guidance_callback(
+            vae=vae,
+            config=time_consistent_guidance_config,
+        )
+    if projection_callback is None and root_projection_config is not None:
+        projection_callback = build_late_denoise_root_projection_callback(
+            vae=vae,
+            config=root_projection_config,
+        )
+    if projection_callback is None:
+        return model.stream_generate_step(
+            step_payload,
+            first_chunk=first_chunk,
+            condition=condition_provider,
+        )
+    return model.stream_generate_step(
+        step_payload,
+        first_chunk=first_chunk,
+        condition=condition_provider,
+        projection_callback=projection_callback,
     )
 
 
@@ -475,9 +516,13 @@ def run_step_case(
     fps = float(kwargs.get("fps", 20.0))
     condition_path = str(kwargs.get("condition_path", "rootplan_7d"))
     root_refiner = kwargs.get("root_refiner")
+    if root_refiner is None:
+        root_refiner = kwargs.get("root_refiner_runtime")
     replan_events = kwargs.get("replan_events")
     root_plan_events = kwargs.get("root_plan_events")
     force_no_traj = bool(kwargs.get("force_no_traj", False))
+    root_projection_config = kwargs.get("root_projection_config")
+    time_consistent_guidance_config = kwargs.get("time_consistent_guidance_config")
     text = sample["text"] if isinstance(sample["text"], str) else sample["text"][0]
     timeline = new_eval_timeline()
     vae.clear_cache()
@@ -542,10 +587,14 @@ def run_step_case(
             first_chunk=first_chunk,
             device=device,
         )
-        out = model.stream_generate_step(
+        out = _stream_generate_step_with_projection(
+            model,
+            vae,
             step_payload,
             first_chunk=first_chunk,
-            condition=condition_provider,
+            condition_provider=condition_provider,
+            root_projection_config=root_projection_config,
+            time_consistent_guidance_config=time_consistent_guidance_config,
         )
         decoded = (
             vae.stream_decode(
@@ -598,10 +647,15 @@ def run_babel_case(
     mode: str,
     condition_path: str = "rootplan_7d",
     root_refiner: Any = None,
+    root_refiner_runtime: Any = None,
     replan_events: list | None = None,
     force_no_traj: bool = False,
     root_plan_events: list | None = None,
+    root_projection_config: LateDenoiseRootProjectionConfig | None = None,
+    time_consistent_guidance_config: TimeConsistentRootGuidanceConfig | None = None,
 ):
+    if root_refiner is None:
+        root_refiner = root_refiner_runtime
     tl = sample["token_length"]
     tfs = 1 + 4 * (tl - 1) if tl > 1 else 1
     gt_route = sample["traj"].numpy()
@@ -703,10 +757,14 @@ def run_babel_case(
             first_chunk=first_chunk,
             device=device,
         )
-        out = model.stream_generate_step(
+        out = _stream_generate_step_with_projection(
+            model,
+            vae,
             step_payload,
             first_chunk=first_chunk,
-            condition=condition_provider,
+            condition_provider=condition_provider,
+            root_projection_config=root_projection_config,
+            time_consistent_guidance_config=time_consistent_guidance_config,
         )
         decoded = (
             vae.stream_decode(
@@ -759,13 +817,18 @@ def run_real_case(
     rotate_plan_deg: float = 0.0,
     condition_path: str = "rootplan_7d",
     root_refiner: Any = None,
+    root_refiner_runtime: Any = None,
     replan_events: list | None = None,
     force_no_traj: bool = False,
     gt_motion_7d: bool = False,
     root_plan_events: list | None = None,
     force_root_refiner_num_tokens: bool = False,
     root_refiner_gt_override: str | None = None,
+    root_projection_config: LateDenoiseRootProjectionConfig | None = None,
+    time_consistent_guidance_config: TimeConsistentRootGuidanceConfig | None = None,
 ):
+    if root_refiner is None:
+        root_refiner = root_refiner_runtime
     tl = sample["token_length"]
     tfs = 1 + 4 * (tl - 1) if tl > 1 else 1
     gr_arr = sample["traj"].numpy()
@@ -896,10 +959,14 @@ def run_real_case(
             first_chunk=first_chunk,
             device=device,
         )
-        out = model.stream_generate_step(
+        out = _stream_generate_step_with_projection(
+            model,
+            vae,
             step_payload,
             first_chunk=first_chunk,
-            condition=condition_provider,
+            condition_provider=condition_provider,
+            root_projection_config=root_projection_config,
+            time_consistent_guidance_config=time_consistent_guidance_config,
         )
         dec = (
             vae.stream_decode(
@@ -953,10 +1020,15 @@ def run_turn_case(
     blend_tokens: int | float = 4,
     condition_path: str = "rootplan_7d",
     root_refiner: Any = None,
+    root_refiner_runtime: Any = None,
     replan_events: list | None = None,
     force_no_traj: bool = False,
     root_plan_events: list | None = None,
+    root_projection_config: LateDenoiseRootProjectionConfig | None = None,
+    time_consistent_guidance_config: TimeConsistentRootGuidanceConfig | None = None,
 ):
+    if root_refiner is None:
+        root_refiner = root_refiner_runtime
     tl = sample["token_length"]
     tfs = 1 + 4 * (tl - 1) if tl > 1 else 1
     gr_arr = sample["traj"].numpy()
@@ -1111,10 +1183,14 @@ def run_turn_case(
             first_chunk=first_chunk,
             device=device,
         )
-        out = model.stream_generate_step(
+        out = _stream_generate_step_with_projection(
+            model,
+            vae,
             step_payload,
             first_chunk=first_chunk,
-            condition=condition_provider,
+            condition_provider=condition_provider,
+            root_projection_config=root_projection_config,
+            time_consistent_guidance_config=time_consistent_guidance_config,
         )
         dec = (
             vae.stream_decode(
