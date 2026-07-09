@@ -53,6 +53,12 @@ def _true_zT_method_metadata() -> dict[str, str]:
         "not_optimized_variable": "model.generated[start:end] current x_beta",
         "oracle_line": "B_true_zT_initializer",
         "commit_strategy": "full_stream_shadow_rollout",
+        "decode_surrogate": "offline_vae_decode",
+        "decode_surrogate_note": (
+            "Optimization loss is computed with vae.decode(latent_stream) as a "
+            "differentiable offline surrogate; final runtime behavior may differ "
+            "when using VAE stream_decode/cache."
+        ),
     }
 
 

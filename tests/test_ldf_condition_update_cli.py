@@ -5,6 +5,7 @@ import torch
 from tools.run_ldf_condition_update_eval import (
     _build_condition_scenario_from_args,
     _parse_args,
+    resolve_effective_update_commit,
 )
 from eval.ldf.runtime_update.root_source import RootSourceProposal
 from utils.motion_process import build_physical_7d_from_5d
@@ -116,6 +117,24 @@ def test_condition_update_cli_accepts_root_source_refiner_options(monkeypatch):
 
     assert args.root_source_refiner_ckpt == "refiner.ckpt"
     assert args.root_source_refiner_heading_override == "path_tangent"
+
+
+def test_effective_update_commit_waits_for_next_uncommitted_token_boundary():
+    assert resolve_effective_update_commit(
+        raw_update_frame=123,
+        first_uncommitted_token=31,
+        frames_per_token=4,
+    ) == 32
+    assert resolve_effective_update_commit(
+        raw_update_frame=121,
+        first_uncommitted_token=31,
+        frames_per_token=4,
+    ) == 31
+    assert resolve_effective_update_commit(
+        raw_update_frame=123,
+        first_uncommitted_token=33,
+        frames_per_token=4,
+    ) == 33
 
 
 def test_cli_dispatches_repeat_splice_source():

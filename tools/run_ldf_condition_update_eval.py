@@ -90,6 +90,27 @@ from utils.motion_process import (
 from utils.token_frame import frame_idx_to_token_idx, num_tokens_for_frame_len, token_start_frame
 
 
+def resolve_effective_update_commit(
+    raw_update_frame: int,
+    first_uncommitted_token: int,
+    frames_per_token: int,
+) -> int:
+    """Resolve when a route update can first affect LDF token generation.
+
+    Route updates may arrive at any frame, but the LDF condition may only
+    change at a token boundary that has not already started.  If an update
+    arrives inside token k's frame coverage, it is delayed to token k+1.
+    """
+    raw_commit = frame_idx_to_token_idx(
+        int(raw_update_frame),
+        int(frames_per_token),
+    )
+    token_start = token_start_frame(raw_commit, int(frames_per_token))
+    if int(raw_update_frame) > int(token_start):
+        raw_commit += 1
+    return max(int(raw_commit), int(first_uncommitted_token))
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/ldf_test.yaml")
@@ -722,8 +743,30 @@ def _run_ldf_direct_multi_update_one(
             for frame in update_frames
         }
     )
+    update_records = []
+    for frame in update_frames:
+        raw_commit = frame_idx_to_token_idx(frame, frames_per_token)
+        first_uncommitted = raw_commit
+        if int(frame) > token_start_frame(raw_commit, frames_per_token):
+            first_uncommitted = raw_commit + 1
+        effective_commit = resolve_effective_update_commit(
+            frame,
+            first_uncommitted,
+            frames_per_token,
+        )
+        update_records.append(
+            {
+                "raw_update_frame": int(frame),
+                "raw_update_commit": int(raw_commit),
+                "first_uncommitted_token": int(first_uncommitted),
+                "effective_update_commit": int(effective_commit),
+                "effective_update_frame_start": int(
+                    token_start_frame(effective_commit, frames_per_token)
+                ),
+            }
+        )
     update_commits = [
-        frame_idx_to_token_idx(frame, frames_per_token) for frame in update_frames
+        int(record["effective_update_commit"]) for record in update_records
     ]
 
     initial_anchor = route_traj7[0].to(device=device, dtype=torch.float32)
@@ -958,10 +1001,22 @@ def _run_ldf_direct_multi_update_one(
                         sample_batch,
                         condition_traj7,
                     )
+                    update_record = update_records[next_update_idx]
                     condition_snapshots.append(
                         {
                             "name": f"update_{next_update_idx}",
                             "switch_frame": int(condition_switch_frame),
+                            "raw_update_frame": int(update_record["raw_update_frame"]),
+                            "raw_update_commit": int(update_record["raw_update_commit"]),
+                            "first_uncommitted_token": int(
+                                update_record["first_uncommitted_token"]
+                            ),
+                            "effective_update_commit": int(
+                                update_record["effective_update_commit"]
+                            ),
+                            "effective_update_frame_start": int(
+                                update_record["effective_update_frame_start"]
+                            ),
                             "segment_source": segment_source.detach().cpu().float(),
                             "condition_traj7": condition_traj7.detach().cpu().float(),
                         }
@@ -1171,6 +1226,21 @@ def _run_ldf_direct_multi_update_one(
         "payload_snapshots": payload_snapshots,
         "root_plans": root_plans,
         "update_frames": [int(frame) for frame in update_frames],
+        "raw_update_frames": [
+            int(record["raw_update_frame"]) for record in update_records
+        ],
+        "raw_update_commits": [
+            int(record["raw_update_commit"]) for record in update_records
+        ],
+        "first_uncommitted_tokens": [
+            int(record["first_uncommitted_token"]) for record in update_records
+        ],
+        "effective_update_commits": [
+            int(record["effective_update_commit"]) for record in update_records
+        ],
+        "effective_update_frame_starts": [
+            int(record["effective_update_frame_start"]) for record in update_records
+        ],
         "update_commits": [int(commit) for commit in update_commits],
         "switch_frames": [int(frame) for frame in switch_frames],
         "update_triggered": bool(all(triggered_flags)) if triggered_flags else False,
@@ -1415,6 +1485,26 @@ def main() -> int:
                     "decoded_root_xz": _root_xz(decoded).numpy().astype(np.float32),
                     "route_traj7": offline_route_traj7.numpy().astype(np.float32),
                     "update_frames": np.asarray(run_out.get("update_frames", []), dtype=np.int64),
+                    "raw_update_frames": np.asarray(
+                        run_out.get("raw_update_frames", run_out.get("update_frames", [])),
+                        dtype=np.int64,
+                    ),
+                    "raw_update_commits": np.asarray(
+                        run_out.get("raw_update_commits", []),
+                        dtype=np.int64,
+                    ),
+                    "first_uncommitted_tokens": np.asarray(
+                        run_out.get("first_uncommitted_tokens", []),
+                        dtype=np.int64,
+                    ),
+                    "effective_update_commits": np.asarray(
+                        run_out.get("effective_update_commits", run_out.get("update_commits", [])),
+                        dtype=np.int64,
+                    ),
+                    "effective_update_frame_starts": np.asarray(
+                        run_out.get("effective_update_frame_starts", []),
+                        dtype=np.int64,
+                    ),
                     "switch_frames": np.asarray(run_out.get("switch_frames", []), dtype=np.int64),
                     "update_commits": np.asarray(run_out.get("update_commits", []), dtype=np.int64),
                 }
@@ -1530,6 +1620,24 @@ def main() -> int:
                     )),
                     "switch_frames": [
                         int(frame) for frame in run_out.get("switch_frames", [])
+                    ],
+                    "raw_update_frames": [
+                        int(frame) for frame in run_out.get("raw_update_frames", [])
+                    ],
+                    "raw_update_commits": [
+                        int(commit) for commit in run_out.get("raw_update_commits", [])
+                    ],
+                    "first_uncommitted_tokens": [
+                        int(commit)
+                        for commit in run_out.get("first_uncommitted_tokens", [])
+                    ],
+                    "effective_update_commits": [
+                        int(commit)
+                        for commit in run_out.get("effective_update_commits", [])
+                    ],
+                    "effective_update_frame_starts": [
+                        int(frame)
+                        for frame in run_out.get("effective_update_frame_starts", [])
                     ],
                     "update_commits": [
                         int(commit) for commit in run_out.get("update_commits", [])

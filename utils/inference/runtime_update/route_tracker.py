@@ -64,7 +64,12 @@ class RouteProgressTracker:
         current = torch.as_tensor(current_xz, dtype=self.xz.dtype).detach().cpu().view(2)
         yaw = torch.as_tensor(current_yaw, dtype=self.xz.dtype).detach().cpu().reshape(())
         lower_bound = self._last_index if min_index is None else max(self._last_index, int(min_index))
-        lo = max(0, lower_bound - self.search_back)
+        lower_bound = min(max(0, int(lower_bound)), int(self.xz.shape[0]) - 1)
+        # Runtime route progress is a hard monotonic contract.  Do not let
+        # behind-route candidates participate in the argmin and then clamp the
+        # result afterward, because that makes debug metrics describe a point
+        # different from the returned route_index.
+        lo = lower_bound
         hi = min(int(self.xz.shape[0]), lower_bound + self.search_forward + 1)
         candidates = self.xz[lo:hi]
         dist = torch.linalg.norm(candidates - current[None, :], dim=-1)
@@ -73,8 +78,7 @@ class RouteProgressTracker:
         heading_dot = (route_heading * actor_heading).sum(-1).clamp(-1.0, 1.0)
         cost = dist + float(self.heading_weight) * (1.0 - heading_dot)
         best_local = int(torch.argmin(cost).item())
-        route_index = max(lower_bound, lo + best_local)
-        route_index = min(route_index, int(self.xz.shape[0]) - 1)
+        route_index = min(lo + best_local, int(self.xz.shape[0]) - 1)
         self._last_index = route_index
 
         target_arc = float(self._arc[route_index].item()) + max(0.0, self.lookahead_m)
@@ -83,8 +87,8 @@ class RouteProgressTracker:
         return RouteProgress(
             route_index=route_index,
             future_index=future_index,
-            distance=float(dist[min(best_local, int(dist.shape[0]) - 1)].item()),
-            heading_dot=float(heading_dot[min(best_local, int(heading_dot.shape[0]) - 1)].item()),
+            distance=float(dist[best_local].item()),
+            heading_dot=float(heading_dot[best_local].item()),
         )
 
 

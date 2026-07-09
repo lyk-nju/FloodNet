@@ -20,6 +20,14 @@ def build_active_window_root_plan(
     frames_per_token: int = 4,
     source: str = "active_window",
 ) -> RootPlan:
+    """Build a legacy/diagnostic RootPlan from an active-window world segment.
+
+    This helper exists for compatibility with older eval paths and tests that
+    compare RootPlan payloads.  The active-window runtime contract should
+    prefer :func:`build_world_condition_stream_payload`, which keeps the full
+    world-frame condition and canonicalizes the actual active-window payload at
+    the final boundary.
+    """
     segment = world_segment_traj7.detach().to(
         device=anchor_state.world_xz.device,
         dtype=torch.float32,

@@ -117,6 +117,22 @@ def test_active_window_segment_can_pin_route_progress_to_update_boundary():
     assert result.future_index > result.route_index
 
 
+def test_route_tracker_metrics_match_monotonic_route_index_when_current_is_behind():
+    xz = torch.stack([torch.zeros(80), torch.linspace(0.0, 7.9, 80)], dim=-1)
+    route = _traj7_from_xz_yaw(xz, torch.zeros(80))
+    tracker = RouteProgressTracker(route, lookahead_m=0.10)
+
+    result = tracker.project(
+        current_xz=xz[20],
+        current_yaw=torch.tensor(0.0),
+        min_index=50,
+    )
+
+    assert result.route_index == 50
+    expected_distance = torch.linalg.norm(xz[50] - xz[20]).item()
+    assert math.isclose(result.distance, expected_distance, rel_tol=0.0, abs_tol=1e-6)
+
+
 def test_active_window_segment_honors_requested_bridge_frames():
     xz = torch.stack([torch.zeros(160), torch.linspace(0.0, 8.0, 160)], dim=-1)
     route = _traj7_from_xz_yaw(xz, torch.zeros(160))
@@ -291,7 +307,7 @@ def test_world_condition_payload_uses_absolute_active_window_frames():
         RootFrameState.initial(xz=(0.0, 0.0), yaw=0.0, dtype=torch.float32)
     )
     for commit in range(1, 40):
-        frame = commit * 4
+        frame = token_end_frame(commit - 1, 4)
         timeline.append(
             RootFrameState(
                 commit_idx=commit,
@@ -316,10 +332,11 @@ def test_world_condition_payload_uses_absolute_active_window_frames():
     assert payload["traj_abs_start_token"] == 2
     assert payload["body_anchor_abs_token"] == 2
     assert payload["traj_substep_payloads"]
-    # abs token 2 starts at frame 5, so local payload frame 112 is abs frame 117; body anchor state is commit 2, frame 8 in this test timeline.
+    # abs token 2 starts at frame 5, so local payload frame 112 is abs
+    # frame 117; body anchor state commit 2 is token 1's end frame, frame 4.
     assert torch.allclose(
         payload["traj_cond_7d_frame"][0, 112, [0, 2]],
-        world[117, [0, 2]] - world[8, [0, 2]],
+        world[117, [0, 2]] - world[4, [0, 2]],
         atol=1e-5,
     )
 
@@ -369,7 +386,7 @@ def test_world_condition_payload_uses_generated_history_before_current_commit():
         RootFrameState.initial(xz=(1.5, 0.0), yaw=0.0, dtype=torch.float32)
     )
     for commit in range(1, 45):
-        frame = commit * 4
+        frame = token_end_frame(commit - 1, 4)
         timeline.append(
             RootFrameState(
                 commit_idx=commit,
@@ -429,7 +446,7 @@ def test_payload_builder_keeps_substep_payloads_with_history0_anchor():
         )
     )
     for commit in range(1, 40):
-        frame = commit * 4
+        frame = token_end_frame(commit - 1, 4)
         timeline.append(
             RootFrameState(
                 commit_idx=commit,
