@@ -13,8 +13,20 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import numpy as np
-from utils.motion_process import StreamJointRecovery263, append_traj_deltas_5d_to_7d
+from eval.ldf.stream_generation import (
+    _decode_latent_chunk,
+    _decode_raw_chunk_preserving_feedback_cache,
+    _encode_corrected_chunk_token,
+    _write_committed_latent_to_model,
+)
+from utils.motion_process import (
+    StreamJointRecovery263,
+    append_traj_deltas_5d_to_7d,
+    recover_root_rot_pos,
+    replace_root_channels_263_window_from_7d,
+)
 from utils.inference.root_plan import RootPlan
+from utils.inference.runtime_update import RootSourceProposal
 from utils.inference.route_condition import (
     RoutePlan,
     RouteReferenceMode,
@@ -90,6 +102,10 @@ class ModelManager(WebRuntime):
         self.smoothing_alpha = 0.5  # Default: medium smoothing
         self.stream_recovery = StreamJointRecovery263(joints_num=22, smoothing_alpha=self.smoothing_alpha)
         self._reset_root_timeline()
+        self.root_feedback_enabled = bool(traj_mask_cfg.get("root_feedback_enabled", False))
+        self.root_feedback_xz_blend_alpha = self._coerce_root_feedback_alpha(
+            traj_mask_cfg.get("root_feedback_xz_blend_alpha", 0.5)
+        )
         
         # Generation state
         self.current_text = ""
@@ -151,7 +167,8 @@ class ModelManager(WebRuntime):
             f"horizon_tokens={self.traj_horizon_tokens}, "
             f"repeat_policy={self.traj_repeat_policy}, "
             f"update_delay={self.traj_update_delay_enabled}:{self.traj_update_delay_tokens}, "
-            f"update_blend={self.traj_update_blend_enabled}:{self.traj_update_blend_tokens}"
+            f"update_blend={self.traj_update_blend_enabled}:{self.traj_update_blend_tokens}, "
+            f"root_feedback={self.root_feedback_enabled}:{self.root_feedback_xz_blend_alpha:.2f}"
         )
         
         # Model generation state
@@ -164,6 +181,127 @@ class ModelManager(WebRuntime):
         self._display_traj = None  # (T, 3) np.ndarray or None
 
         print("ModelManager initialized successfully")
+
+    @staticmethod
+    def _coerce_root_feedback_alpha(value) -> float:
+        try:
+            alpha = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"root_feedback_xz_blend_alpha must be a number, got {value!r}"
+            ) from exc
+        return float(np.clip(alpha, 0.0, 1.0))
+
+    def _set_root_feedback_controls(
+        self,
+        *,
+        enabled=None,
+        xz_blend_alpha=None,
+    ) -> None:
+        if not hasattr(self, "root_feedback_enabled"):
+            self.root_feedback_enabled = False
+        if not hasattr(self, "root_feedback_xz_blend_alpha"):
+            self.root_feedback_xz_blend_alpha = 0.5
+        if enabled is not None:
+            self.root_feedback_enabled = TrajectoryController._coerce_bool(
+                enabled,
+                default=bool(getattr(self, "root_feedback_enabled", False)),
+                name="root_feedback_enabled",
+            )
+        if xz_blend_alpha is not None:
+            self.root_feedback_xz_blend_alpha = self._coerce_root_feedback_alpha(
+                xz_blend_alpha
+            )
+
+    def _root_feedback_target_from_payload(self, traj_input, decoded_chunk):
+        if not bool(getattr(self, "root_feedback_enabled", False)):
+            return None
+        if not isinstance(traj_input, dict):
+            return None
+        cond = traj_input.get("traj_cond_7d_frame")
+        if cond is None:
+            return None
+        if torch.is_tensor(cond):
+            traj = cond[0] if cond.dim() == 3 else cond
+        else:
+            traj = torch.as_tensor(cond, dtype=torch.float32)
+        if traj.dim() != 2 or traj.shape[-1] < 5 or int(traj.shape[0]) <= 0:
+            return None
+
+        abs_start_token = int(
+            traj_input.get(
+                "traj_abs_start_token",
+                traj_input.get("body_anchor_abs_token", 0),
+            )
+        )
+        abs_start_frame = token_start_frame(abs_start_token)
+        local_start = max(0, int(self._generated_frame_count) - int(abs_start_frame))
+        need = local_start + int(decoded_chunk.shape[0]) + 1
+        target = traj.to(device=decoded_chunk.device, dtype=decoded_chunk.dtype)
+        if int(target.shape[0]) < need:
+            tail = target[-1:].expand(need - int(target.shape[0]), -1)
+            target = torch.cat([target, tail], dim=0)
+        target = target[local_start:need].clone()
+        if int(target.shape[0]) < 2:
+            return None
+
+        alpha = float(getattr(self, "root_feedback_xz_blend_alpha", 1.0))
+        alpha = float(np.clip(alpha, 0.0, 1.0))
+        if alpha < 1.0:
+            dummy_tail = decoded_chunk.new_zeros((1, decoded_chunk.shape[-1]))
+            generated_prefix = torch.cat([decoded_chunk, dummy_tail], dim=0)
+            _, generated_xyz = recover_root_rot_pos(generated_prefix.unsqueeze(0))
+            generated_xyz = generated_xyz[0, : int(target.shape[0])]
+            target_xz = target[:, [0, 2]].clone()
+            target_xz = target_xz - target_xz[:1] + generated_xyz[:1, [0, 2]]
+            target[:, [0, 2]] = (
+                (1.0 - alpha) * generated_xyz[:, [0, 2]]
+                + alpha * target_xz
+            )
+        return target
+
+    def _apply_root_feedback_to_latent(
+        self,
+        *,
+        generated,
+        decoded_raw,
+        traj_input,
+        local_commit_index: int,
+    ):
+        device = next(self.model.parameters()).device
+        target = self._root_feedback_target_from_payload(traj_input, decoded_raw)
+        if target is None:
+            latent_token = generated[0].detach()
+            decoded = _decode_latent_chunk(
+                self.vae,
+                latent_token,
+                first_chunk=self.first_chunk,
+                device=device,
+            )
+            return latent_token.detach().cpu(), decoded
+        corrected = replace_root_channels_263_window_from_7d(
+            decoded_raw,
+            target,
+            start_frame=0,
+        )
+        corrected_latent = _encode_corrected_chunk_token(
+            self.vae,
+            corrected,
+            first_chunk=self.first_chunk,
+            device=device,
+        )
+        _decode_latent_chunk(
+            self.vae,
+            corrected_latent,
+            first_chunk=self.first_chunk,
+            device=device,
+        )
+        _write_committed_latent_to_model(
+            self.model,
+            corrected_latent,
+            int(local_commit_index),
+        )
+        return corrected_latent, corrected
 
     def _sample_waypoint_mask(self, waypoint_len: int) -> np.ndarray:
         """Sample traj_mask over user waypoints (length n), with keep ratio randomly sampled."""
@@ -929,8 +1067,15 @@ class ModelManager(WebRuntime):
             return False
         anchor_state = timeline.at_commit(anchor_commit)
         root_plan = self._build_root_plan_from_stream_plan(plan, anchor_state)
-        self._rootplan_controller().set_active(
+        root_source = RootSourceProposal.from_root_plan(
             root_plan,
+            name=f"{plan.source}:root_source",
+            source_kind=str(plan.source),
+            metadata={"route_plan_version": int(plan.version)},
+        )
+        self._rootplan_controller().set_active_source(
+            root_source,
+            contract="absolute_route",
             model_plan_version=int(plan.version),
         )
         self.stream_generator.timeline = timeline
@@ -950,8 +1095,15 @@ class ModelManager(WebRuntime):
             return None
         anchor_state = timeline.at_commit(anchor_commit)
         root_plan = self._build_root_plan_from_stream_plan(plan, anchor_state)
-        with self._rootplan_controller().temporarily_active(
+        root_source = RootSourceProposal.from_root_plan(
             root_plan,
+            name=f"{plan.source}:temporary_root_source",
+            source_kind=str(plan.source),
+            metadata={"route_plan_version": int(plan.version)},
+        )
+        with self._rootplan_controller().temporarily_active_source(
+            root_source,
+            contract="absolute_route",
             model_plan_version=model_traj_plan_version,
         ):
             return self._build_rootplan_stream_traj_input()
@@ -967,7 +1119,10 @@ class ModelManager(WebRuntime):
         timeline = getattr(self, "_root_timeline", None)
         if (
             timeline is None
-            or self._rootplan_controller().active_plan is None
+            or (
+                self._rootplan_controller().active_plan is None
+                and self._rootplan_controller().active_source is None
+            )
         ):
             return None
 
@@ -995,7 +1150,11 @@ class ModelManager(WebRuntime):
 
         # ── No pending update: sample from active plan ──────────────────
         if event is None:
-            if plan is not None and self._rootplan_controller().active_plan is None:
+            if (
+                plan is not None
+                and self._rootplan_controller().active_plan is None
+                and self._rootplan_controller().active_source is None
+            ):
                 self._activate_root_plan_from_stream_plan(plan)
             future = sample_route_future(
                 plan,
@@ -1066,7 +1225,11 @@ class ModelManager(WebRuntime):
         model_plan_version = getattr(self, "_model_traj_plan_version", None)
         if w <= 0.0:
             self._trajectory_state = "delay"
-            if event.old_route is not None and self._rootplan_controller().active_plan is None:
+            if (
+                event.old_route is not None
+                and self._rootplan_controller().active_plan is None
+                and self._rootplan_controller().active_source is None
+            ):
                 self._activate_root_plan_from_stream_plan(event.old_route)
             rootplan_payload = self._build_rootplan_stream_traj_input()
             model_plan_version = getattr(self, "_model_traj_plan_version", None)
@@ -1137,7 +1300,14 @@ class ModelManager(WebRuntime):
         self.generation_state = GenerationState.RUNNING
         print("Generation resumed")
     
-    def reset(self, history_length=None, smoothing_alpha=None, denoise_steps=None):
+    def reset(
+        self,
+        history_length=None,
+        smoothing_alpha=None,
+        denoise_steps=None,
+        root_feedback_enabled=None,
+        root_feedback_xz_blend_alpha=None,
+    ):
         """Reset generation state completely
         
         Args:
@@ -1147,6 +1317,9 @@ class ModelManager(WebRuntime):
                 - 0.0 = infinite smoothing
                 - Recommended: 0.3-0.7 for visible smoothing
             denoise_steps: Number of denoising steps (1-50, default 10)
+            root_feedback_enabled: Whether decoded root is blended toward the
+                active 7D condition and re-encoded into streaming history.
+            root_feedback_xz_blend_alpha: XZ blend strength in [0, 1].
         """
         self.generation_state = GenerationState.RESETTING
         # Stop if running, then poll until thread truly exits (max 10s total)
@@ -1190,6 +1363,16 @@ class ModelManager(WebRuntime):
         if smoothing_alpha is not None:
             self.smoothing_alpha = np.clip(smoothing_alpha, 0.0, 1.0)
             print(f"Smoothing alpha updated to: {self.smoothing_alpha}")
+
+        self._set_root_feedback_controls(
+            enabled=root_feedback_enabled,
+            xz_blend_alpha=root_feedback_xz_blend_alpha,
+        )
+        print(
+            "Root feedback controls: "
+            f"enabled={self.root_feedback_enabled}, "
+            f"xz_alpha={self.root_feedback_xz_blend_alpha:.2f}"
+        )
         
         # Recreate stream recovery with new smoothing alpha
         self.stream_recovery = StreamJointRecovery263(
@@ -1205,7 +1388,12 @@ class ModelManager(WebRuntime):
             num_denoise_steps=self.denoise_steps,
         )
         self.generation_state = GenerationState.IDLE
-        print(f"Model reset - history: {self.history_length}, smoothing: {self.smoothing_alpha}, steps: {self.denoise_steps}")
+        print(
+            f"Model reset - history: {self.history_length}, "
+            f"smoothing: {self.smoothing_alpha}, steps: {self.denoise_steps}, "
+            f"root_feedback: {self.root_feedback_enabled}:"
+            f"{self.root_feedback_xz_blend_alpha:.2f}"
+        )
         return True
     
     def _generation_loop(self, stop_event=None):
@@ -1241,6 +1429,13 @@ class ModelManager(WebRuntime):
                         
                         # Generate from model (1 token)
                         # Note: denoise_steps is set in init_generated, not here
+                        local_commit_index = int(
+                            getattr(
+                                self.model,
+                                "commit_index",
+                                getattr(self, "_absolute_commit_index", 0),
+                            )
+                        )
                         output = self.model.stream_generate_step(
                             x,
                             first_chunk=self.first_chunk,
@@ -1252,10 +1447,26 @@ class ModelManager(WebRuntime):
                             + int(generated.shape[1])
                         )
                         
-                        # Decode with VAE (1 token -> 4 frames)
-                        decoded = self.vae.stream_decode(
-                            generated[0][None, :], first_chunk=self.first_chunk
-                        )[0]
+                        latent_token = generated[0].detach()
+                        if bool(getattr(self, "root_feedback_enabled", False)):
+                            decoded_raw = _decode_raw_chunk_preserving_feedback_cache(
+                                self.vae,
+                                latent_token,
+                                first_chunk=self.first_chunk,
+                                device=next(self.model.parameters()).device,
+                            )
+                            latent_token, decoded = self._apply_root_feedback_to_latent(
+                                generated=generated,
+                                decoded_raw=decoded_raw,
+                                traj_input=traj_input,
+                                local_commit_index=local_commit_index,
+                            )
+                        else:
+                            # Decode with VAE (1 token -> 4 frames)
+                            decoded = self.vae.stream_decode(
+                                latent_token.to(next(self.model.parameters()).device)[None, :],
+                                first_chunk=self.first_chunk,
+                            )[0].float().detach().cpu()
                         
                         self.first_chunk = False
                         
@@ -1328,6 +1539,12 @@ class ModelManager(WebRuntime):
             "model_traj_plan_version": self._model_traj_plan_version,
             "smoothing_alpha": self.smoothing_alpha,
             "denoise_steps": self.denoise_steps,
+            "root_feedback_enabled": bool(
+                getattr(self, "root_feedback_enabled", False)
+            ),
+            "root_feedback_xz_blend_alpha": float(
+                getattr(self, "root_feedback_xz_blend_alpha", 0.0)
+            ),
         }
         controls = getattr(self, "trajectory_runtime_controls", None)
         if controls is not None:

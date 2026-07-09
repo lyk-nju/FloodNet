@@ -12,6 +12,11 @@ from utils.conditions.root_refiner import RootRefinerPathCondition
 from utils.inference.condition_manager import ConditionManager
 from utils.inference.root_plan import RootPlan, build_root_plan_stream_payload
 from utils.inference.route_condition import RoutePlan
+from utils.inference.runtime_update import RootSourceProposal
+from utils.inference.runtime_update import RouteProgressTracker
+from utils.inference.runtime_update import build_world_condition_stream_payload
+from utils.inference.runtime_update import compose_active_window_segment
+from utils.inference.runtime_update import compose_active_window_world_condition
 from utils.inference.timeline import RootFrameState, RootTimeline
 from utils.local_frame import canonicalize_5d
 from utils.motion_process import build_physical_7d_from_5d
@@ -75,6 +80,9 @@ class StreamGenerator:
             RootFrameState.initial(device=self.device, dtype=torch.float32)
         )
         self.active_root_plan: RootPlan | None = None
+        self.active_root_source_proposal: RootSourceProposal | None = None
+        self.active_root_source_contract: str = "absolute_route"
+        self._active_root_source_tracker: RouteProgressTracker | None = None
 
     @property
     def batch_size(self) -> int:
@@ -87,6 +95,7 @@ class StreamGenerator:
         )
         self.timeline = RootTimeline(state)
         self.active_root_plan = None
+        self.clear_active_root_source()
         self.condition_manager.reset(text=text)
 
     def init_ldf_generation(
@@ -113,6 +122,42 @@ class StreamGenerator:
     def absolute_commit_index(self) -> int:
         return int(self.timeline.head.commit_idx)
 
+    def set_active_root_source_proposal(
+        self,
+        proposal: RootSourceProposal,
+        *,
+        contract: str = "absolute_route",
+    ) -> None:
+        """Set the world-frame route proposal consumed by runtime-update payloads.
+
+        The proposal is an upstream route source only. This method does not
+        directly expose the proposal to LDF; payload construction still goes
+        through the active-window / absolute-route runtime contract below.
+        """
+        if not isinstance(proposal, RootSourceProposal):
+            raise TypeError(
+                "proposal must be RootSourceProposal, got "
+                f"{type(proposal).__name__}"
+            )
+        contract = str(contract)
+        if contract not in {"absolute_route", "active_window"}:
+            raise ValueError(
+                "contract must be 'absolute_route' or 'active_window', got "
+                f"{contract!r}"
+            )
+        self.active_root_source_proposal = proposal
+        self.active_root_source_contract = contract
+        self._active_root_source_tracker = (
+            RouteProgressTracker(proposal.proposal_traj7)
+            if contract == "active_window"
+            else None
+        )
+
+    def clear_active_root_source(self) -> None:
+        self.active_root_source_proposal = None
+        self.active_root_source_contract = "absolute_route"
+        self._active_root_source_tracker = None
+
     def build_root_plan_stream_payload(
         self,
         *,
@@ -129,6 +174,12 @@ class StreamGenerator:
             if absolute_commit_index is None
             else int(absolute_commit_index)
         )
+        root_source_payload = self.build_root_source_stream_payload(
+            local_commit_index=local_commit,
+            absolute_commit_index=absolute_commit,
+        )
+        if root_source_payload is not None:
+            return root_source_payload
         return build_root_plan_stream_payload(
             self.active_root_plan,
             self.timeline,
@@ -137,6 +188,77 @@ class StreamGenerator:
             chunk_size=int(getattr(self.ldf_model, "chunk_size", 1)),
             history_length=self.history_length,
             traj_horizon_tokens=self.traj_horizon_tokens,
+        )
+
+    def build_root_source_stream_payload(
+        self,
+        *,
+        local_commit_index: int | None = None,
+        absolute_commit_index: int | None = None,
+        generated_history_traj7: torch.Tensor | None = None,
+    ) -> dict | None:
+        """Build an LDF stream payload from the active RootSourceProposal.
+
+        ``absolute_route`` uses the authored world route as the model condition.
+        ``active_window`` requires frame-level generated history so the runtime
+        can build a generated-history prefix and bridge before canonicalizing.
+        """
+        proposal = self.active_root_source_proposal
+        if proposal is None:
+            return None
+        local_commit = (
+            int(getattr(self.ldf_model, "commit_index", 0))
+            if local_commit_index is None
+            else int(local_commit_index)
+        )
+        absolute_commit = (
+            self.absolute_commit_index()
+            if absolute_commit_index is None
+            else int(absolute_commit_index)
+        )
+        route_traj7 = proposal.proposal_traj7.to(
+            device=self.device,
+            dtype=torch.float32,
+        )
+        if self.active_root_source_contract == "absolute_route":
+            world_condition = route_traj7
+        elif self.active_root_source_contract == "active_window":
+            if generated_history_traj7 is None:
+                raise ValueError(
+                    "active_window root-source payload requires "
+                    "generated_history_traj7; token-level RootTimeline is not "
+                    "enough to reconstruct frame-level history safely."
+                )
+            generated_history = generated_history_traj7.to(
+                device=self.device,
+                dtype=torch.float32,
+            )
+            current_frame = token_start_frame(int(absolute_commit))
+            segment = compose_active_window_segment(
+                route_traj7,
+                generated_history,
+                current_frame=current_frame,
+                tracker=self._active_root_source_tracker,
+            )
+            world_condition = compose_active_window_world_condition(
+                route_traj7,
+                generated_history,
+                segment,
+                current_frame=current_frame,
+            ).to(device=self.device, dtype=torch.float32)
+        else:
+            raise ValueError(
+                f"unknown root-source contract {self.active_root_source_contract!r}"
+            )
+        return build_world_condition_stream_payload(
+            world_condition,
+            self.timeline,
+            local_commit_index=local_commit,
+            absolute_commit_index=absolute_commit,
+            chunk_size=int(getattr(self.ldf_model, "chunk_size", 1)),
+            history_length=self.history_length,
+            traj_horizon_tokens=self.traj_horizon_tokens,
+            generated_history_traj7=generated_history_traj7,
         )
 
     @torch.no_grad()

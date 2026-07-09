@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from utils.inference.root_plan import RootPlan, build_root_plan_stream_payload
+from utils.inference.runtime_update import RootSourceProposal
 from utils.inference.stream_generator import StreamGenerator
 from utils.inference.timeline import RootFrameState, RootTimeline
 
@@ -49,6 +50,18 @@ def _root_plan(valid_frames: int = 80) -> RootPlan:
     )
 
 
+def _root_source(valid_frames: int = 80) -> RootSourceProposal:
+    proposal = torch.zeros(valid_frames, 7)
+    proposal[:, 0] = torch.arange(valid_frames, dtype=torch.float32) * 0.1
+    proposal[:, 3] = 1.0
+    return RootSourceProposal(
+        name="unit_world_route",
+        proposal_traj7=proposal,
+        source_kind="synthetic",
+        update_frames=[12, 24],
+    )
+
+
 def test_build_root_plan_stream_payload_builds_substep_payloads():
     payload = build_root_plan_stream_payload(
         _root_plan(),
@@ -88,3 +101,53 @@ def test_stream_generator_builds_payload_from_active_root_plan():
     assert payload is not None
     assert payload["traj_num_tokens"] == 12
     assert payload["traj_cond_frame_mask"].any()
+
+
+def test_stream_generator_builds_payload_from_absolute_root_source_proposal():
+    ldf = _DummyLdf()
+    generator = StreamGenerator(
+        ldf_model=ldf,
+        timeline=_timeline(16),
+        history_length=9,
+        traj_horizon_tokens=4,
+        device="cpu",
+    )
+    generator.set_active_root_source_proposal(
+        _root_source(),
+        contract="absolute_route",
+    )
+
+    payload = generator.build_root_source_stream_payload(
+        local_commit_index=3,
+        absolute_commit_index=3,
+    )
+
+    assert payload is not None
+    assert payload["traj_num_tokens"] == 12
+    assert payload["traj_cond_frame_mask"].any()
+    assert payload["traj_substep_payloads"]
+
+
+def test_stream_generator_prefers_active_root_source_over_root_plan_payload():
+    ldf = _DummyLdf()
+    generator = StreamGenerator(
+        ldf_model=ldf,
+        timeline=_timeline(16),
+        history_length=9,
+        traj_horizon_tokens=4,
+        device="cpu",
+    )
+    generator.active_root_plan = _root_plan()
+    generator.active_root_plan.waypoints_local_7d[:, 0] = 100.0
+    generator.set_active_root_source_proposal(
+        _root_source(),
+        contract="absolute_route",
+    )
+
+    payload = generator.build_root_plan_stream_payload(
+        local_commit_index=3,
+        absolute_commit_index=3,
+    )
+
+    assert payload is not None
+    assert payload["traj_cond_7d_frame"][..., 0].abs().max() < 100.0

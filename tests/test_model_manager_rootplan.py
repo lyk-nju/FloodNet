@@ -154,6 +154,53 @@ def test_pause_generation_can_preserve_resetting_state():
     assert mgr.generation_state is GenerationState.RESETTING
 
 
+def test_rootplan_controller_clears_active_root_source_when_setting_root_plan():
+    from utils.inference.runtime_update import RootSourceProposal
+    from web_demo.runtime.rootplan_controller import RootPlanController
+
+    generator = StreamGenerator(ldf_model=_DummyModel(), device="cpu")
+    source = torch.zeros(8, 7)
+    source[:, 3] = 1.0
+    generator.set_active_root_source_proposal(
+        RootSourceProposal(
+            name="stale_source",
+            proposal_traj7=source,
+            source_kind="synthetic",
+        ),
+        contract="absolute_route",
+    )
+    controller = RootPlanController(generator)
+
+    controller.set_active(_plan(source="manual"))
+
+    assert generator.active_root_source_proposal is None
+    assert controller.active_plan is not None
+
+
+def test_rootplan_controller_can_temporarily_activate_root_source():
+    from utils.inference.runtime_update import RootSourceProposal
+    from web_demo.runtime.rootplan_controller import RootPlanController
+
+    generator = StreamGenerator(ldf_model=_DummyModel(), device="cpu")
+    controller = RootPlanController(generator)
+    old_plan = _plan(source="old")
+    controller.set_active(old_plan)
+    source = torch.zeros(8, 7)
+    source[:, 3] = 1.0
+    proposal = RootSourceProposal(
+        name="temporary_source",
+        proposal_traj7=source,
+        source_kind="synthetic",
+    )
+
+    with controller.temporarily_active_source(proposal, contract="absolute_route"):
+        assert generator.active_root_source_proposal is proposal
+        assert controller.active_plan is None
+
+    assert controller.active_plan is old_plan
+    assert generator.active_root_source_proposal is None
+
+
 class _DummyModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -311,7 +358,7 @@ def test_rootplan_stream_payload_uses_body_window_left_commit():
     )
 
 
-def test_activate_root_plan_from_route_sets_stream_generator_active_plan():
+def test_activate_root_plan_from_route_sets_stream_generator_active_root_source():
     mgr = _manager()
     mgr.model.commit_index = 0
     mgr.current_text = "turn right"
@@ -330,8 +377,9 @@ def test_activate_root_plan_from_route_sets_stream_generator_active_plan():
     ok = mgr._activate_root_plan_from_stream_plan(route)
 
     assert ok is True
-    assert mgr.stream_generator.active_root_plan is not None
-    assert mgr.stream_generator.active_root_plan.source == "manual"
+    assert mgr.stream_generator.active_root_plan is None
+    assert mgr.stream_generator.active_root_source_proposal is not None
+    assert mgr.stream_generator.active_root_source_proposal.source_kind == "manual"
 
 
 def test_update_trajectory_second_edit_uses_route_update_contract():
@@ -460,6 +508,40 @@ def test_reset_clears_model_manager_and_stream_generator_route_state():
     assert mgr.stream_generator.condition_manager.route.pending_update is None
 
 
+def test_reset_accepts_root_feedback_runtime_controls():
+    mgr = _trajectory_manager()
+    mgr.frame_buffer = _FakeFrameBuffer()
+    mgr.vae = _FakeVae()
+    mgr.first_chunk = True
+    mgr.root_xz_history = []
+    mgr.root_5d_history = []
+    mgr._generated_frame_count = 0
+    mgr._absolute_commit_index = 0
+    mgr.is_generating = False
+    mgr.reset_pending = False
+    mgr.smoothing_alpha = 0.5
+    mgr.denoise_steps = 10
+    mgr.current_text = "walk"
+    mgr.generation_state = GenerationState.IDLE
+    mgr.traj_time_mode = "timestamped"
+    mgr._model_traj_plan_version = None
+    mgr.traj_update_delay_enabled = True
+    mgr.traj_update_blend_enabled = True
+    mgr.root_feedback_enabled = False
+    mgr.root_feedback_xz_blend_alpha = 0.0
+
+    assert mgr.reset(
+        root_feedback_enabled=True,
+        root_feedback_xz_blend_alpha=0.75,
+    ) is True
+
+    assert mgr.root_feedback_enabled is True
+    assert mgr.root_feedback_xz_blend_alpha == 0.75
+    status = mgr.get_buffer_status()
+    assert status["root_feedback_enabled"] is True
+    assert status["root_feedback_xz_blend_alpha"] == 0.75
+
+
 def test_stream_recovery_append_uses_session_anchor_after_timeline_trim():
     mgr = _trajectory_manager()
     mgr._session_anchor_state = _state(0, xz=(0.0, 0.0))
@@ -499,7 +581,8 @@ def test_build_stream_traj_input_retries_activation_after_anchor_state_arrives()
     payload = mgr._build_stream_traj_input()
 
     assert payload is not None
-    assert mgr.stream_generator.active_root_plan is not None
+    assert mgr.stream_generator.active_root_plan is None
+    assert mgr.stream_generator.active_root_source_proposal is not None
     assert mgr._trajectory_state == "active_7d"
 
 
