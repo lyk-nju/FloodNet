@@ -1,4 +1,5 @@
 import warnings
+import math
 
 import torch
 import torch.nn as nn
@@ -500,7 +501,14 @@ class DiffForcingWanModel(nn.Module):
                 ]
             return pred
 
-    def generate(self, x, *, condition: LDFCondition | None = None, num_denoise_steps=None):
+    def generate(
+        self,
+        x,
+        *,
+        condition: LDFCondition | None = None,
+        num_denoise_steps=None,
+        initial_noise: torch.Tensor | None = None,
+    ):
         """
         Generation - Diffusion Forcing inference
         Uses triangular noise schedule, progressively generating from left to right
@@ -521,11 +529,26 @@ class DiffForcingWanModel(nn.Module):
 
         device = next(self.parameters()).device
 
-        # Initialize entire sequence as pure noise
-        generated = torch.randn(
-            batch_size, seq_len + self.chunk_size, self.input_dim, device=device
-        )
+        # Initialize entire sequence as pure noise, or use a caller-provided
+        # differentiable noise tensor for oracle latent-initialization evals.
+        if initial_noise is None:
+            generated = torch.randn(
+                batch_size, seq_len + self.chunk_size, self.input_dim, device=device
+            )
+        else:
+            generated = initial_noise.to(device=device).clone()
+            expected_shape = (batch_size, seq_len + self.chunk_size, self.input_dim)
+            if tuple(generated.shape) != expected_shape:
+                raise ValueError(
+                    "initial_noise must have shape "
+                    f"{expected_shape}; got {tuple(generated.shape)}"
+                )
         generated = self.preprocess(generated)  # (B, C, T, 1, 1)
+        differentiable_noise = (
+            initial_noise is not None
+            and torch.is_grad_enabled()
+            and bool(initial_noise.requires_grad)
+        )
 
         # Calculate total number of time steps needed
         max_t = 1 + (seq_len - 1) / self.chunk_size
@@ -548,7 +571,7 @@ class DiffForcingWanModel(nn.Module):
         for step in range(total_steps):
             # Current time step
             t = step * dt
-            start_index = max(0, int(self.chunk_size * (t - 1)) + 1)
+            start_index = max(0, math.floor(self.chunk_size * (t - 1)) + 1)
             end_index = int(self.chunk_size * t) + 1
             time_steps = torch.full((batch_size,), t, device=device)
 
@@ -576,11 +599,17 @@ class DiffForcingWanModel(nn.Module):
                 traj_token_mask=condition.traj_token_mask,
             )
 
+            generated_delta = torch.zeros_like(generated) if differentiable_noise else None
             for i in range(batch_size):
                 predicted_result_i = predicted_result[i]  # (C, input_length, 1, 1)
                 if self.prediction_type == "vel":
                     predicted_vel = predicted_result_i[:, start_index:end_index, ...]
-                    generated[i, :, start_index:end_index, ...] += predicted_vel * dt
+                    if differentiable_noise:
+                        generated_delta[i, :, start_index:end_index, ...] = (
+                            predicted_vel * dt
+                        )
+                    else:
+                        generated[i, :, start_index:end_index, ...] += predicted_vel * dt
                 elif self.prediction_type == "x0":
                     nl = (
                         noise_level[i, start_index:end_index]
@@ -593,7 +622,12 @@ class DiffForcingWanModel(nn.Module):
                         predicted_result_i[:, start_index:end_index, ...]
                         - generated[i, :, start_index:end_index, ...]
                     ) / nl
-                    generated[i, :, start_index:end_index, ...] += predicted_vel * dt
+                    if differentiable_noise:
+                        generated_delta[i, :, start_index:end_index, ...] = (
+                            predicted_vel * dt
+                        )
+                    else:
+                        generated[i, :, start_index:end_index, ...] += predicted_vel * dt
                 elif self.prediction_type == "noise":
                     denom = (
                         1
@@ -607,7 +641,14 @@ class DiffForcingWanModel(nn.Module):
                         generated[i, :, start_index:end_index, ...]
                         - predicted_result_i[:, start_index:end_index, ...]
                     ) / denom
-                    generated[i, :, start_index:end_index, ...] += predicted_vel * dt
+                    if differentiable_noise:
+                        generated_delta[i, :, start_index:end_index, ...] = (
+                            predicted_vel * dt
+                        )
+                    else:
+                        generated[i, :, start_index:end_index, ...] += predicted_vel * dt
+            if differentiable_noise:
+                generated = generated + generated_delta
 
         generated = self.postprocess(generated)  # (B, T, C)
         y_hat_out = []
@@ -671,7 +712,7 @@ class DiffForcingWanModel(nn.Module):
         for step in range(total_steps):
             # Current time step
             t = step * dt
-            start_index = max(0, int(self.chunk_size * (t - 1)) + 1)
+            start_index = max(0, math.floor(self.chunk_size * (t - 1)) + 1)
             end_index = int(self.chunk_size * t) + 1
             time_steps = torch.full((batch_size,), t, device=device)
 
@@ -767,6 +808,7 @@ class DiffForcingWanModel(nn.Module):
         batch_size=1,
         num_denoise_steps=None,
         traj_buffer=None,
+        initial_generated: torch.Tensor | None = None,
     ):
         self.seq_len = seq_len
         self.batch_size = batch_size
@@ -778,15 +820,37 @@ class DiffForcingWanModel(nn.Module):
         self.dt = 1 / self.num_denoise_steps
         self.current_step = 0
         self.text_condition_list = [[] for _ in range(self.batch_size)]
-        self.generated = torch.randn(
-            self.batch_size, self.seq_len * 2 + self.chunk_size, self.input_dim
+        expected_shape = (
+            self.batch_size,
+            self.seq_len * 2 + self.chunk_size,
+            self.input_dim,
         )
-        self.generated = self.preprocess(self.generated)  # (B, C, T, 1, 1)
+        try:
+            device = next(self.parameters()).device
+        except StopIteration:
+            device = torch.device("cpu")
+        if initial_generated is None:
+            generated = torch.randn(*expected_shape, device=device)
+        else:
+            generated = initial_generated.to(device=device)
+            if tuple(generated.shape) != expected_shape:
+                raise ValueError(
+                    "initial_generated must have shape "
+                    f"{expected_shape}; got {tuple(generated.shape)}"
+                )
+            generated = generated.clone()
+        self.generated = self.preprocess(generated)  # (B, C, T, 1, 1)
         self.commit_index = 0
         self._traj_buf = traj_buffer
 
     @torch.no_grad()
-    def stream_generate_step(self, x=None, first_chunk=True, condition=None):
+    def stream_generate_step(
+        self,
+        x=None,
+        first_chunk=True,
+        condition=None,
+        projection_callback=None,
+    ):
         """
         Streaming generation step - Diffusion Forcing inference
         Uses triangular noise schedule, progressively generating from left to right
@@ -802,6 +866,11 @@ class DiffForcingWanModel(nn.Module):
         device = next(self.parameters()).device
         if first_chunk:
             self.generated = self.generated.to(device)
+        differentiable_generated = (
+            torch.is_grad_enabled()
+            and torch.is_tensor(self.generated)
+            and bool(self.generated.requires_grad)
+        )
 
         end_step = (
             (self.commit_index + self.chunk_size)
@@ -810,7 +879,7 @@ class DiffForcingWanModel(nn.Module):
         )
         while self.current_step < end_step:
             current_time = self.current_step * self.dt
-            start_index = max(0, int(self.chunk_size * (current_time - 1)) + 1)
+            start_index = max(0, math.floor(self.chunk_size * (current_time - 1)) + 1)
             end_index = int(self.chunk_size * current_time) + 1
             time_steps = torch.full((self.batch_size,), current_time, device=device)
 
@@ -851,6 +920,12 @@ class DiffForcingWanModel(nn.Module):
                 traj_token_mask=step_condition.traj_token_mask,
             )
 
+            guidance_token_state = None
+            guidance_token_idx = int(self.commit_index)
+            guidance_capture = None
+            generated_delta = (
+                torch.zeros_like(self.generated) if differentiable_generated else None
+            )
             for i in range(self.batch_size):
                 predicted_result_i = predicted_result[i]  # (C, input_length, 1, 1)
                 if end_index > self.seq_len:
@@ -867,11 +942,36 @@ class DiffForcingWanModel(nn.Module):
                         ],
                         dim=1,
                     )
+                rel_commit_idx = guidance_token_idx - start_index
+                capture_guidance_state = (
+                    projection_callback is not None
+                    and i == 0
+                    and 0 <= rel_commit_idx < end_index - start_index
+                )
+                if capture_guidance_state:
+                    x_beta_before_update = (
+                        self.generated[i, :, guidance_token_idx, ...]
+                        .detach()
+                        .clone()
+                    )
+                    beta_before = (
+                        noise_level_for_update[i, guidance_token_idx]
+                        .detach()
+                        .clone()
+                    )
                 if self.prediction_type == "vel":
                     predicted_vel = predicted_result_i[:, start_index:end_index, ...]
-                    self.generated[i, :, start_index:end_index, ...] += (
-                        predicted_vel * self.dt
-                    )
+                    if capture_guidance_state:
+                        guidance_predicted_vel = (
+                            predicted_vel[:, rel_commit_idx, ...]
+                            .detach()
+                            .clone()
+                        )
+                    update = predicted_vel * self.dt
+                    if differentiable_generated:
+                        generated_delta[i, :, start_index:end_index, ...] = update
+                    else:
+                        self.generated[i, :, start_index:end_index, ...] += update
                 elif self.prediction_type == "x0":
                     nl = (
                         noise_level_for_update[i, start_index:end_index]
@@ -884,9 +984,17 @@ class DiffForcingWanModel(nn.Module):
                         predicted_result_i[:, start_index:end_index, ...]
                         - self.generated[i, :, start_index:end_index, ...]
                     ) / nl
-                    self.generated[i, :, start_index:end_index, ...] += (
-                        predicted_vel * self.dt
-                    )
+                    if capture_guidance_state:
+                        guidance_predicted_vel = (
+                            predicted_vel[:, rel_commit_idx, ...]
+                            .detach()
+                            .clone()
+                        )
+                    update = predicted_vel * self.dt
+                    if differentiable_generated:
+                        generated_delta[i, :, start_index:end_index, ...] = update
+                    else:
+                        self.generated[i, :, start_index:end_index, ...] += update
                 elif self.prediction_type == "noise":
                     denom = (
                         1
@@ -900,10 +1008,81 @@ class DiffForcingWanModel(nn.Module):
                         self.generated[i, :, start_index:end_index, ...]
                         - predicted_result_i[:, start_index:end_index, ...]
                     ) / denom
-                    self.generated[i, :, start_index:end_index, ...] += (
-                        predicted_vel * self.dt
-                    )
+                    if capture_guidance_state:
+                        guidance_predicted_vel = (
+                            predicted_vel[:, rel_commit_idx, ...]
+                            .detach()
+                            .clone()
+                        )
+                    update = predicted_vel * self.dt
+                    if differentiable_generated:
+                        generated_delta[i, :, start_index:end_index, ...] = update
+                    else:
+                        self.generated[i, :, start_index:end_index, ...] += update
+                if capture_guidance_state:
+                    guidance_capture = {
+                        "i": i,
+                        "x_beta_before_update": x_beta_before_update,
+                        "predicted_vel": guidance_predicted_vel,
+                        "beta_before": beta_before,
+                    }
+                if capture_guidance_state and not differentiable_generated:
+                    beta_after = (beta_before - float(self.dt)).clamp(min=0.0)
+                    guidance_token_state = {
+                        "x_beta_before_update": x_beta_before_update,
+                        "predicted_vel": guidance_predicted_vel,
+                        "beta_before": beta_before,
+                        "beta_after": beta_after,
+                        "x_after_velocity_update": (
+                            self.generated[i, :, guidance_token_idx, ...]
+                            .detach()
+                            .clone()
+                        ),
+                    }
+            if differentiable_generated:
+                self.generated = self.generated + generated_delta
+                if guidance_capture is not None:
+                    beta_before = guidance_capture["beta_before"]
+                    beta_after = (beta_before - float(self.dt)).clamp(min=0.0)
+                    capture_i = int(guidance_capture["i"])
+                    guidance_token_state = {
+                        "x_beta_before_update": guidance_capture[
+                            "x_beta_before_update"
+                        ],
+                        "predicted_vel": guidance_capture["predicted_vel"],
+                        "beta_before": beta_before,
+                        "beta_after": beta_after,
+                        "x_after_velocity_update": (
+                            self.generated[capture_i, :, guidance_token_idx, ...]
+                            .detach()
+                            .clone()
+                        ),
+                    }
+            if projection_callback is not None and start_index < end_index:
+                guidance_token_state = guidance_token_state or {}
+                projection_callback(
+                    model=self,
+                    step_input=x,
+                    first_chunk=first_chunk,
+                    commit_index=int(self.commit_index),
+                    current_step=int(self.current_step),
+                    current_time=float(current_time),
+                    start_index=int(start_index),
+                    end_index=int(end_index),
+                    time_steps=time_steps,
+                    noise_level_full=noise_level_full,
+                    condition=step_condition,
+                    **guidance_token_state,
+                )
             self.current_step += 1
+        if projection_callback is not None and hasattr(
+            projection_callback,
+            "finalize_commit_debug",
+        ):
+            projection_callback.finalize_commit_debug(
+                model=self,
+                commit_index=int(self.commit_index),
+            )
         output = self.generated[:, :, self.commit_index : self.commit_index + 1, ...]
         output = self.postprocess(output)  # (B, 1, C)
         out = {}

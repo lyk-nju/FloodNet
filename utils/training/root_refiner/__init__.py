@@ -24,6 +24,11 @@ from .dataset_builder import (
 from .losses import masked_mean, second_order_diff_l2, smooth_l1_masked
 from .sample_builder import RefinerSampleBuilder
 from .sample_creator import RefinerSample, RefinerSampleCreator
+from .sampling_schedule import (
+    TrainingSchedule,
+    TrainingSchedulePhase,
+    apply_training_schedule_to_cfg,
+)
 from .text_encoder import (
     FrozenStubTextEncoder,
     PrecomputedT5PooledTextEncoder,
@@ -41,8 +46,11 @@ __all__ = [
     "RefinerSampleCreator",
     "RootRefinerBatchBuilder",
     "RootRefinerDataset",
+    "TrainingSchedule",
+    "TrainingSchedulePhase",
     "apply_default_fixed_validation_dataset",
     "apply_fixed_overfit_datasets",
+    "apply_training_schedule_to_cfg",
     "build_datasets",
     "build_fixed_samples",
     "build_humanml3d_dataset_cfg",

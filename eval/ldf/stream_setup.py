@@ -97,6 +97,11 @@ def _resolve_ema_params(model, checkpoint, cfg):
     n_shadow = len(checkpoint["ema_state"]["shadow_params"])
     all_params = list(model.parameters())
     backbone_params = list(model.model.parameters()) if getattr(model, "model", None) is not None else []
+    state_dict = checkpoint.get("state_dict", {})
+    legacy_split_traj_encoder = (
+        any(key.startswith("local_traj_encoder.") for key in state_dict)
+        and not any(key.startswith("traj_encoder.frame_encoder.") for key in state_dict)
+    )
     if n_shadow == len(all_params):
         return all_params
     if backbone_params and n_shadow == len(backbone_params):
@@ -104,7 +109,19 @@ def _resolve_ema_params(model, checkpoint, cfg):
     if getattr(model, "freeze_backbone", False) and getattr(model, "controlnet", None) is not None:
         ema_params = list(model.controlnet.parameters())
         if getattr(model, "traj_encoder", None) is not None:
-            ema_params.extend(list(model.traj_encoder.parameters()))
+            if legacy_split_traj_encoder:
+                # Old 7D stream ckpts stored EMA after the old module order:
+                # controlnet -> traj_encoder(TokenTrajEncoder) -> local_traj_encoder(FrameTrajEncoder).
+                # The current wrapper exposes frame_encoder before token_encoder, so keep the
+                # checkpoint order when copying shadow params.
+                token_encoder = getattr(model.traj_encoder, "token_encoder", None)
+                frame_encoder = getattr(model.traj_encoder, "frame_encoder", None)
+                if token_encoder is not None:
+                    ema_params.extend(list(token_encoder.parameters()))
+                if frame_encoder is not None:
+                    ema_params.extend(list(frame_encoder.parameters()))
+            else:
+                ema_params.extend(list(model.traj_encoder.parameters()))
         if len(ema_params) == n_shadow:
             return ema_params
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -114,6 +131,37 @@ def _resolve_ema_params(model, checkpoint, cfg):
         f"EMA shadow_params count ({n_shadow}) does not match any known param group. "
         "Check freeze settings or EMA checkpoint compatibility."
     )
+
+
+def _remap_legacy_split_traj_encoder_state_dict(state_dict: dict) -> dict:
+    """Map old 7D stream ckpt traj encoder keys onto the current wrapper.
+
+    Older ckpts used two sibling modules:
+      local_traj_encoder.*  -> frame-level Conv encoder
+      traj_encoder.*        -> token-level MLP encoder
+
+    Current code wraps those as:
+      traj_encoder.frame_encoder.*
+      traj_encoder.token_encoder.*
+    """
+    if not (
+        any(key.startswith("local_traj_encoder.") for key in state_dict)
+        and not any(key.startswith("traj_encoder.frame_encoder.") for key in state_dict)
+    ):
+        return state_dict
+    remapped = {}
+    for key, value in state_dict.items():
+        if key.startswith("local_traj_encoder."):
+            remapped[
+                "traj_encoder.frame_encoder." + key[len("local_traj_encoder."):]
+            ] = value
+        elif key.startswith("traj_encoder."):
+            remapped[
+                "traj_encoder.token_encoder." + key[len("traj_encoder."):]
+            ] = value
+        else:
+            remapped[key] = value
+    return remapped
 
 
 def load_eval_model_and_vae(cfg, ckpt_path: str, vae_ckpt_path: str, device: torch.device, use_ema: bool):
@@ -133,6 +181,9 @@ def load_eval_model_and_vae(cfg, ckpt_path: str, vae_ckpt_path: str, device: tor
 
     model = instantiate_ldf_model(cfg.model.target, cfg.model.params)
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    checkpoint["state_dict"] = _remap_legacy_split_traj_encoder_state_dict(
+        checkpoint["state_dict"]
+    )
     ckpt_keys = set(checkpoint["state_dict"].keys())
     strict = any(key.startswith("controlnet.") for key in ckpt_keys)
     load_result = model.load_state_dict(checkpoint["state_dict"], strict=strict)

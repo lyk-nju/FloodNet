@@ -8,14 +8,17 @@ from pathlib import Path
 from omegaconf import OmegaConf
 from utils.initialize import load_config
 from utils.training.root_refiner.config_validate import validate_refiner_config
+from utils.training.root_refiner.sampling_schedule import apply_training_schedule_to_cfg
 
 
 _CFG_DIR = Path(__file__).resolve().parent.parent / "configs"
 
 
 def _load(name: str) -> dict:
+    cfg = load_config(str(_CFG_DIR / name)).config
+    apply_training_schedule_to_cfg(cfg)
     return OmegaConf.to_container(
-        load_config(str(_CFG_DIR / name)).config,
+        cfg,
         resolve=True,
     )
 
@@ -83,6 +86,33 @@ def _minimal_cfg() -> dict:
 def test_shipped_refiner_configs_are_valid():
     validate_refiner_config(_load("root_refiner.yaml"))
     validate_refiner_config(_load("root_refiner_train.yaml"))
+    validate_refiner_config(_load("root_refiner_train_root_branch_finetune.yaml"))
+    validate_refiner_config(
+        _load("root_refiner_train_scheduled_200k_root_branch_50k.yaml")
+    )
+
+
+def test_shipped_refiner_configs_validate_before_omegaconf_resolution():
+    for name in (
+        "root_refiner.yaml",
+        "root_refiner_train.yaml",
+        "root_refiner_train_root_branch_finetune.yaml",
+        "root_refiner_train_scheduled_200k_root_branch_50k.yaml",
+    ):
+        validate_refiner_config(load_config(str(_CFG_DIR / name)).config)
+
+
+def test_scheduled_refiner_config_derives_trainer_max_steps_before_resolution():
+    cfg = load_config(
+        str(_CFG_DIR / "root_refiner_train_scheduled_200k_root_branch_50k.yaml")
+    ).config
+
+    schedule = apply_training_schedule_to_cfg(cfg)
+    resolved = OmegaConf.to_container(cfg, resolve=True)
+
+    assert schedule.total_steps == 450000
+    assert resolved["trainer"]["max_steps"] == 450000
+    assert resolved["lr_scheduler"]["params"]["num_training_steps"] == 450000
 
 
 def test_rejects_history_condition_config():
@@ -178,6 +208,47 @@ def test_rejects_legacy_loss_weight_names():
     cfg["loss_weights"]["speed"] = 1.0
 
     with pytest.raises(ValueError, match="legacy"):
+        validate_refiner_config(cfg)
+
+
+def test_rejects_unknown_freeze_refiner_module():
+    cfg = _minimal_cfg()
+    cfg["freeze"] = {"refiner_modules": ["duration_head", "not_a_module"]}
+
+    with pytest.raises(ValueError, match="freeze.refiner_modules"):
+        validate_refiner_config(cfg)
+
+
+def test_rejects_unknown_training_schedule_freeze_refiner_module():
+    cfg = _minimal_cfg()
+    cfg["training_schedule"] = {
+        "enabled": True,
+        "phases": [
+            {
+                "name": "bad_freeze",
+                "steps": 100,
+                "freeze": {"refiner_modules": ["not_a_module"]},
+            },
+        ],
+    }
+
+    with pytest.raises(ValueError, match="training_schedule.phases"):
+        validate_refiner_config(cfg)
+
+
+def test_rejects_training_schedule_without_positive_steps():
+    cfg = _minimal_cfg()
+    cfg["training_schedule"] = {
+        "enabled": True,
+        "phases": [
+            {
+                "name": "empty",
+                "steps": 0,
+            },
+        ],
+    }
+
+    with pytest.raises(ValueError, match="training_schedule.phases"):
         validate_refiner_config(cfg)
 
 

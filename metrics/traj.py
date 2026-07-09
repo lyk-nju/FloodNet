@@ -158,6 +158,69 @@ def _compute_path_only_metrics(pred_path: np.ndarray, gt_path: np.ndarray) -> Di
     return {"path_arc_ade": path_arc_ade, "path_chamfer": path_chamfer}
 
 
+def _compute_tail_fde_metrics(
+    pred_xz: torch.Tensor,
+    gt_xz: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    tail_fde_frames: int,
+) -> Dict:
+    """Endpoint metrics that allow a generated tail after the GT sequence.
+
+    ``fde`` remains the time-aligned endpoint error at the last valid GT frame.
+    These extra metrics ask whether the prediction reaches the same final target
+    within a short reaction window after that frame.
+    """
+    tail_fde_frames = max(0, int(tail_fde_frames))
+    result: Dict = {"tail_fde_frames": tail_fde_frames}
+    if tail_fde_frames <= 0:
+        return result
+
+    pred_xz = pred_xz.float().cpu()
+    gt_xz = gt_xz.float().cpu()
+    mask = mask.float().cpu()
+    valid = mask > 0
+    if pred_xz.shape[0] == 0 or gt_xz.shape[0] == 0 or not bool(valid.any()):
+        result.update(
+            {
+                "fde_plus_extra": float("nan"),
+                "fde_tail_min_extra": float("nan"),
+                "fde_plus_extra_frame": -1,
+                "fde_tail_min_extra_frame": -1,
+            }
+        )
+        return result
+
+    last_gt_idx = int(valid.nonzero(as_tuple=False)[-1].item())
+    if pred_xz.shape[0] <= last_gt_idx:
+        result.update(
+            {
+                "fde_plus_extra": float("nan"),
+                "fde_tail_min_extra": float("nan"),
+                "fde_plus_extra_frame": -1,
+                "fde_tail_min_extra_frame": -1,
+            }
+        )
+        return result
+
+    target_idx = min(last_gt_idx + tail_fde_frames, pred_xz.shape[0] - 1)
+    gt_final = gt_xz[last_gt_idx]
+    tail = pred_xz[last_gt_idx:target_idx + 1]
+    tail_dist = (tail - gt_final).norm(dim=-1)
+    min_offset = int(tail_dist.argmin().item())
+    result.update(
+        {
+            "fde_plus_extra": float(
+                (pred_xz[target_idx] - gt_final).norm(dim=-1).item()
+            ),
+            "fde_tail_min_extra": float(tail_dist[min_offset].item()),
+            "fde_plus_extra_frame": int(target_idx),
+            "fde_tail_min_extra_frame": int(last_gt_idx + min_offset),
+        }
+    )
+    return result
+
+
 def _calculate_skating_ratio_from_joints(joints_xyz: np.ndarray) -> float:
     """HumanML3D-compatible skating ratio (OmniControl thresholds)."""
     if joints_xyz.ndim != 3 or joints_xyz.shape[0] < 2:
@@ -196,6 +259,7 @@ def _compute_traj_metrics(
     batch: Dict,
     sample_idx: int,
     seg_size: int,
+    tail_fde_frames: int = 0,
 ) -> Dict:
     """Return dict with time-aligned traj metrics plus path-only spatial metrics."""
     with torch.no_grad():
@@ -211,12 +275,23 @@ def _compute_traj_metrics(
     )
     gt_xz = batch["traj"][sample_idx][:traj_len, [0, 2]].float().cpu()  # (T_gt, 2)
     mask = batch["traj_mask"][sample_idx][:traj_len].float().cpu()  # (T_gt,)
+    pred_xz_full = pred_xz
+    gt_xz_full = gt_xz
+    mask_full = mask
 
     T = min(pred_xz.shape[0], gt_xz.shape[0])
     pred_xz, gt_xz, mask = pred_xz[:T], gt_xz[:T], mask[:T]
     n_masked = mask.sum().item()
 
     result: Dict = {"T": T, "masked_ratio": n_masked / max(T, 1)}
+    result.update(
+        _compute_tail_fde_metrics(
+            pred_xz_full,
+            gt_xz_full,
+            mask_full,
+            tail_fde_frames=tail_fde_frames,
+        )
+    )
 
     if n_masked > 0:
         diff = pred_xz - gt_xz  # (T, 2)
@@ -283,11 +358,23 @@ def _average_traj_metrics(run_metrics: List[Dict]) -> Dict:
         result["T"] = run_metrics[0]["T"]
     if "masked_ratio" in run_metrics[0]:
         result["masked_ratio"] = run_metrics[0]["masked_ratio"]
-    for key in ("ade", "fde", "mse", "traj_jitter", "path_arc_ade", "path_chamfer"):
+    for key in (
+        "ade",
+        "fde",
+        "mse",
+        "traj_jitter",
+        "path_arc_ade",
+        "path_chamfer",
+        "fde_plus_extra",
+        "fde_tail_min_extra",
+    ):
         vals = [r[key] for r in run_metrics if key in r and r[key] == r[key]]
         if vals:
             result[key] = float(np.mean(vals))
             result[f"{key}_std"] = float(np.std(vals))
+    for key in ("tail_fde_frames", "fde_plus_extra_frame", "fde_tail_min_extra_frame"):
+        if key in run_metrics[0]:
+            result[key] = run_metrics[0][key]
     for list_key in ("seg_mse", "prefix_mse"):
         if list_key not in run_metrics[0]:
             continue

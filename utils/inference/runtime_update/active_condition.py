@@ -162,7 +162,7 @@ def compose_active_window_segment(
 
     future_offset = max(1, min(int(future_idx - route_idx), int(rebased_5d.shape[0]) - 1))
     end_yaw = rebased_yaw[future_offset]
-    timeline_bridge_frames = max(2, int(future_offset) + 1)
+    timeline_bridge_frames = max(2, int(bridge_frames), int(future_offset) + 1)
     bridge_5d = _build_bridge_5d(
         start_5d=start_5d,
         end_5d=rebased_5d[future_offset],
@@ -224,7 +224,7 @@ def compose_active_window_world_condition(
     patch_end = min(int(out.shape[0]), frame + int(seg.shape[0]))
     if patch_end > frame:
         out[frame:patch_end] = seg[: patch_end - frame].to(dtype=out.dtype)
-    return out
+    return build_physical_7d_from_5d(out[:, :5])
 
 
 __all__ = [

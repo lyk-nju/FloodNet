@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import os
+import multiprocessing as mp
 
 import torch
 import wandb
 from lightning import Trainer, seed_everything
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.strategies import DDPStrategy
 from lightning.pytorch.utilities import rank_zero_info
@@ -23,7 +24,9 @@ from utils.initialize import (
 from utils.training.root_refiner import (
     apply_default_fixed_validation_dataset,
     apply_fixed_overfit_datasets,
+    apply_training_schedule_to_cfg,
     build_datasets,
+    TrainingSchedule,
     worker_init_fn,
 )
 from utils.training.root_refiner.config_validate import validate_refiner_config
@@ -40,6 +43,74 @@ def _resolve_cfg(cfg) -> dict:
     return OmegaConf.to_container(cfg.config, resolve=True)
 
 
+def _load_initial_checkpoint(model: RefinerLightningModule, ckpt_path: str) -> None:
+    """Load model weights from a Lightning checkpoint without optimizer state."""
+    checkpoint = torch.load(ckpt_path, map_location="cpu")
+    state_dict = checkpoint.get("state_dict", checkpoint)
+    model.load_state_dict(state_dict, strict=True)
+    rank_zero_info(f"Loaded initial RootRefiner weights from {ckpt_path}")
+
+
+class RootRefinerTrainingScheduleCallback(Callback):
+    """Apply RootRefiner sampling/freeze phases from trainer.global_step."""
+
+    def __init__(self, schedule: TrainingSchedule, shared_phase):
+        super().__init__()
+        self.schedule = schedule
+        self.shared_phase = shared_phase
+        self._last_phase_index: int | None = None
+
+    def on_fit_start(self, trainer, pl_module) -> None:
+        self._apply(trainer, pl_module)
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx) -> None:
+        self._apply(trainer, pl_module)
+
+    def _apply(self, trainer, pl_module) -> None:
+        phase_index = self.schedule.phase_index_for_step(int(trainer.global_step))
+        if self.shared_phase is not None:
+            with self.shared_phase.get_lock():
+                self.shared_phase.value = phase_index
+        pl_module.apply_schedule_freeze(
+            self.schedule.freeze_modules_for_phase_index(phase_index)
+        )
+        if phase_index == self._last_phase_index:
+            return
+        phase = self.schedule.phase(phase_index)
+        rank_zero_info(
+            f"RootRefiner training schedule phase={phase_index} "
+            f"name={phase.name} steps=[{phase.start_step}, {phase.end_step}) "
+            f"freeze={list(phase.freeze_refiner_modules)}"
+        )
+        self._last_phase_index = phase_index
+
+
+class StepOffsetModelCheckpoint(ModelCheckpoint):
+    """ModelCheckpoint that displays an offset training step in filenames."""
+
+    def __init__(self, *args, step_offset: int = 0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.step_offset = int(step_offset)
+
+    def format_checkpoint_name(
+        self,
+        metrics,
+        filename=None,
+        ver=None,
+        prefix=None,
+    ) -> str:
+        if self.step_offset:
+            metrics = dict(metrics)
+            step = metrics.get("step", torch.tensor(0))
+            metrics["step"] = torch.as_tensor(step) + self.step_offset
+        return super().format_checkpoint_name(
+            metrics,
+            filename=filename,
+            ver=ver,
+            prefix=prefix,
+        )
+
+
 def main():
     """Build config, datasets, model, and launch training or validation."""
     ##############################
@@ -47,6 +118,7 @@ def main():
     ##############################
     torch.set_float32_matmul_precision("high")
     cfg = load_config()
+    training_schedule = apply_training_schedule_to_cfg(cfg.config)
     validate_refiner_config(cfg.config)
 
     seed_everything(cfg.seed, workers=True)
@@ -101,6 +173,17 @@ def main():
     train_ds, val_suites = build_datasets(cfg_dict, seed=int(cfg.seed))
     train_ds, val_suites = apply_fixed_overfit_datasets(train_ds, val_suites, cfg_dict)
     train_ds, val_suites = apply_default_fixed_validation_dataset(train_ds, val_suites)
+    schedule_shared_phase = None
+    if training_schedule is not None and train_ds is not None:
+        schedule_shared_phase = mp.Value("i", 0)
+        if hasattr(train_ds, "attach_training_schedule"):
+            train_ds.attach_training_schedule(training_schedule, schedule_shared_phase)
+        else:
+            rank_zero_info(
+                "RootRefiner training schedule is enabled, but the train dataset "
+                "does not expose attach_training_schedule; sampling phases will "
+                "not update this dataset."
+            )
     OmegaConf.update(
         cfg.config,
         "validation.suites",
@@ -152,14 +235,24 @@ def main():
     # lightning module
     ##############################
     model = RefinerLightningModule(cfg_dict)
+    init_ckpt = cfg.get("init_ckpt", None)
+    if init_ckpt and cfg.resume_ckpt:
+        raise ValueError(
+            "Use either init_ckpt for weight-only initialization or resume_ckpt "
+            "for full trainer-state resume, not both."
+        )
+    if init_ckpt:
+        _load_initial_checkpoint(model, init_ckpt)
 
     ##############################
     # trainer
     ##############################
     callbacks = []
-    checkpoint_callback = ModelCheckpoint(
+    checkpoint_cfg = cfg.get("checkpoint", {})
+    checkpoint_callback = StepOffsetModelCheckpoint(
         dirpath=cfg.save_dir,
         filename="refiner_step_{step:06d}",
+        step_offset=int(checkpoint_cfg.get("step_offset", 0) or 0),
         every_n_train_steps=cfg.validation.save_every_n_steps,
         save_top_k=cfg.validation.save_top_k,
         monitor=cfg.validation.get("monitor"),
@@ -170,6 +263,13 @@ def main():
     )
     if cfg.train:
         callbacks.append(checkpoint_callback)
+        if training_schedule is not None:
+            callbacks.append(
+                RootRefinerTrainingScheduleCallback(
+                    training_schedule,
+                    schedule_shared_phase,
+                )
+            )
 
     trainer_kwargs = OmegaConf.to_container(cfg.trainer, resolve=True)
     devices = trainer_kwargs.get("devices", 1)

@@ -77,6 +77,27 @@ def test_stream_window_sampler_falls_back_below_preferred_min_for_short_clips():
     assert sample["horizon_cap_clip"].tolist() == [2, 3]
 
 
+def test_stream_window_sampler_caps_horizon_by_minimum_history_room():
+    torch.manual_seed(4)
+    sample = sample_stream_window_indices(
+        torch.tensor([25], dtype=torch.long),
+        context_tokens=30,
+        chunk_size=5,
+        rollout_span=4,
+        history_tokens_min=4,
+        history_tokens_max=10,
+        horizon_tokens_min=5,
+        horizon_tokens_max=15,
+    )
+
+    assert int(sample["horizon_tokens"][0].item()) <= 12
+    assert int(sample["active_left_tokens"][0].item()) >= 4
+    assert bool(
+        sample["active_left_tokens"] + 5 + 4 + sample["horizon_tokens"]
+        <= torch.tensor([25])
+    )
+
+
 def test_stream_window_sampler_keeps_absolute_horizon_floor_when_preferred_min_is_zero():
     torch.manual_seed(3)
     sample = sample_stream_window_indices(

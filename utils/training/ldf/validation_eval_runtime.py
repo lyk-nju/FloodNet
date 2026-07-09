@@ -50,37 +50,6 @@ def build_generation_eval_cfg(cfg):
         "stream_frames_per_token": int(
             validation_cfg.get("eval_stream_frames_per_token", 4)
         ),
-        "stream_best_of_k": int(validation_cfg.get("eval_stream_best_of_k", 1)),
-        "stream_best_of_k_score": str(
-            validation_cfg.get("eval_stream_best_of_k_score", "xz")
-        ),
-        "stream_best_of_k_xz_weight": float(
-            validation_cfg.get("eval_stream_best_of_k_xz_weight", 1.0)
-        ),
-        "stream_best_of_k_fde_weight": float(
-            validation_cfg.get("eval_stream_best_of_k_fde_weight", 1.0)
-        ),
-        "stream_best_of_k_cont_weight": float(
-            validation_cfg.get("eval_stream_best_of_k_cont_weight", 0.0)
-        ),
-        "stream_best_of_k_vel_weight": float(
-            validation_cfg.get("eval_stream_best_of_k_vel_weight", 0.5)
-        ),
-        "stream_best_of_k_rel_margin": float(
-            validation_cfg.get("eval_stream_best_of_k_rel_margin", 0.10)
-        ),
-        "stream_best_of_k_abs_margin": float(
-            validation_cfg.get("eval_stream_best_of_k_abs_margin", 0.03)
-        ),
-        "stream_best_of_k_cont_tol": float(
-            validation_cfg.get("eval_stream_best_of_k_cont_tol", 0.03)
-        ),
-        "stream_best_of_k_force_candidate0": bool(
-            validation_cfg.get("eval_stream_best_of_k_force_candidate0", False)
-        ),
-        "stream_best_of_k_switch_cooldown_steps": int(
-            validation_cfg.get("eval_stream_best_of_k_switch_cooldown_steps", 0)
-        ),
         "num_denoise_steps": validation_cfg.get("eval_num_denoise_steps", None),
     }
 

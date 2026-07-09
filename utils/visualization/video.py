@@ -24,6 +24,7 @@ def render_single_video(
     frames: np.ndarray = None,
     traj_mask: np.ndarray = None,
     traj_xz: np.ndarray = None,
+    cond_traj_mask: np.ndarray = None,
 ):
     chains = get_humanml3d_chains()
     joint_positions = convert_motion_to_joints(motion, dim, mean_np, std_np)
@@ -37,7 +38,7 @@ def render_single_video(
             traj_mask=traj_mask,
             traj_mask_point_radius=int(render_setting.get("traj_mask_point_radius", 4)),
             traj_xz=traj_xz,
-            cond_traj_mask=traj_mask,
+            cond_traj_mask=cond_traj_mask if cond_traj_mask is not None else traj_mask,
             cond_traj_point_radius=int(
                 render_setting.get("cond_traj_point_radius", 5)
             ),

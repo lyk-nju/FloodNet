@@ -37,6 +37,18 @@
                     </div>
                     <span class="param-hint">0.0=max, 1.0=none</span>
                 </div>
+
+                <div class="param-item param-slider">
+                    <label class="param-checkbox-label" for="rootFeedbackEnabled">
+                        <input type="checkbox" id="rootFeedbackEnabled">
+                        Root Feedback
+                    </label>
+                    <div class="slider-container">
+                        <input type="range" id="rootFeedbackAlpha" min="0" max="1" step="0.05" value="0.5">
+                        <span id="rootFeedbackValue" class="slider-value">0.50</span>
+                    </div>
+                    <span class="param-hint">blend decoded root toward active 7D condition</span>
+                </div>
             </div>
 
             <div class="param-note">
@@ -73,6 +85,10 @@
                 <div class="status-item">
                     <span class="status-label">Steps:</span>
                     <span id="currentSteps" class="status-value">10</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Root Feedback:</span>
+                    <span id="currentRootFeedback" class="status-value">Off · 0.50</span>
                 </div>
             </div>
 

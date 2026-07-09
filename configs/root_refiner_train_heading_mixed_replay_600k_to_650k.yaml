@@ -1,11 +1,11 @@
-exp_name: root_refiner_heading_hard_decoder_finetune_550k_to_600k
+exp_name: root_refiner_heading_mixed_replay_600k_to_650k
 seed: 1234
 debug: false
 train: true
 deterministic: false
 save_dir: /data1/yuankai/text2Motion/FloodDiffusion/outputs
 resume_ckpt:
-init_ckpt: /data1/yuankai/text2Motion/FloodDiffusion/outputs/20260703_152336_root_refiner_heading_decoder_finetune_500k_to_550k/refiner_step_550000.ckpt
+init_ckpt: /data1/yuankai/text2Motion/FloodDiffusion/outputs/20260703_171118_root_refiner_heading_hard_decoder_finetune_550k_to_600k/refiner_step_600000.ckpt
 
 logger:
   wandb:
@@ -23,7 +23,7 @@ trainer:
   gradient_clip_val: 1.0
 
 checkpoint:
-  step_offset: 550000
+  step_offset: 600000
 
 validation:
   validation_steps: 1000
@@ -102,7 +102,6 @@ freeze:
   refiner_modules:
     - duration_head
     - condition_encoder
-    - root_transformer
 
 optimizer:
   target: AdamW
@@ -149,27 +148,68 @@ data:
 
   raw_data_dir: ${dirs.raw_data}
   dataset: humanml3d
-  train_split_file: train_difficult.txt
+  train_split_file: train_heading_mixed_replay_600k.txt
   val_split_file: val.txt
   feature_path: new_joint_vecs
   text_path: texts
 
 sampling:
-  full_plan_ratio: 1.0
-  horizon_policy: max
+  full_plan_ratio: 0.7
+  horizon_policy: random
 
   path_condition:
     policy: mixed
     ratios:
-      dense_path: 0.7
-      sparse_path: 0.2
-      goal_point: 0.1
+      dense_path: 0.5
+      sparse_path: 0.3
+      goal_point: 0.2
 
     offset_start:
       enabled: true
-      prob: 0.2
+      prob: 0.25
       max_frames: 20
-      apply_to: [dense_path]
+      apply_to: [dense_path, sparse_path]
 
     sparse_path:
-      point_range: [10, 50]
+      point_range: [8, 40]
+
+training_schedule:
+  enabled: true
+  phases:
+    - name: mixed_replay_random
+      steps: 25000
+      sampling:
+        full_plan_ratio: 0.7
+        horizon_policy: random
+        path_condition:
+          policy: mixed
+          ratios:
+            dense_path: 0.5
+            sparse_path: 0.3
+            goal_point: 0.2
+          offset_start:
+            enabled: true
+            prob: 0.25
+            max_frames: 20
+            apply_to: [dense_path, sparse_path]
+          sparse_path:
+            point_range: [8, 40]
+
+    - name: mixed_replay_hard_horizon
+      steps: 25000
+      sampling:
+        full_plan_ratio: 0.8
+        horizon_policy: max
+        path_condition:
+          policy: mixed
+          ratios:
+            dense_path: 0.45
+            sparse_path: 0.3
+            goal_point: 0.25
+          offset_start:
+            enabled: true
+            prob: 0.3
+            max_frames: 20
+            apply_to: [dense_path, sparse_path]
+          sparse_path:
+            point_range: [10, 50]

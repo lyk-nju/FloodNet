@@ -202,15 +202,27 @@ def sample_stream_window_indices(
                 f"horizon_cap_clip={horizon_cap_clip}, "
                 f"horizon_abs_min={horizon_abs_min}"
             )
-        short_fallback = horizon_cap_clip < horizon_pref_min
+        horizon_cap_history = horizon_cap_clip - history_tokens_min
+        if horizon_cap_history < horizon_abs_min:
+            raise ValueError(
+                "stream window sampling requires room for active chunk, rollout, "
+                "minimum history, and at least one horizon token; "
+                f"sample={batch_idx}, token_length={token_count}, "
+                f"horizon_cap_history={horizon_cap_history}, "
+                f"history_tokens_min={history_tokens_min}, "
+                f"horizon_abs_min={horizon_abs_min}"
+            )
+        horizon_cap = min(horizon_cap_clip, horizon_cap_history)
+        short_fallback = horizon_cap < horizon_pref_min
         horizon_low = horizon_pref_min if not short_fallback else horizon_abs_min
-        horizon_high = min(horizon_tokens_max, horizon_cap_clip)
+        horizon_high = min(horizon_tokens_max, horizon_cap)
         if horizon_high < horizon_low:
             raise ValueError(
                 "stream window sampling found no valid horizon range; "
                 f"sample={batch_idx}, horizon_low={horizon_low}, "
                 f"horizon_high={horizon_high}, "
-                f"horizon_cap_clip={horizon_cap_clip}"
+                f"horizon_cap_clip={horizon_cap_clip}, "
+                f"horizon_cap_history={horizon_cap_history}"
             )
         if horizon_override is None:
             horizon_value = torch.randint(

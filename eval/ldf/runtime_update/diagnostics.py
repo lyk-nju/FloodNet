@@ -12,6 +12,7 @@ import torch
 from eval.ldf.experiments.artifacts import plot_7d_xz_heading
 from utils.inference.timeline import RootFrameState, RootTimeline
 from utils.local_frame import heading_dir_xz, uncanonicalize_7d
+from utils.token_frame import num_tokens_for_frame_len, token_end_frame
 
 
 def yaw_from_7d(traj7: torch.Tensor) -> torch.Tensor:
@@ -37,9 +38,15 @@ def build_timeline_from_generated_traj7(
             source="replay_generated",
         )
     )
-    max_commit = max(1, int(np.ceil(float(generated.shape[0]) / float(frames_per_token))))
+    max_commit = max(
+        1,
+        int(num_tokens_for_frame_len(int(generated.shape[0]), int(frames_per_token))),
+    )
     for commit in range(1, max_commit + 1):
-        frame = min(commit * int(frames_per_token) - 1, int(generated.shape[0]) - 1)
+        frame = min(
+            token_end_frame(int(commit) - 1, int(frames_per_token)),
+            int(generated.shape[0]) - 1,
+        )
         timeline.append(
             RootFrameState(
                 commit_idx=int(commit),

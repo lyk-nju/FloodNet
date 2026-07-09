@@ -102,6 +102,122 @@ def build_physical_7d_from_5d(wp5: torch.Tensor) -> torch.Tensor:
     return append_traj_deltas_5d_to_7d(wp5)
 
 
+def _unwrap_yaw(yaw: torch.Tensor) -> torch.Tensor:
+    from utils.local_frame import wrap_angle
+
+    if yaw.shape[-1] <= 1:
+        return yaw.clone()
+    diff = wrap_angle(yaw[..., 1:] - yaw[..., :-1])
+    return torch.cat([yaw[..., :1], yaw[..., :1] + torch.cumsum(diff, dim=-1)], dim=-1)
+
+
+def replace_root_channels_263_from_7d(
+    feature_263: torch.Tensor,
+    traj_7d: torch.Tensor,
+    *,
+    hold_tail: bool = True,
+) -> torch.Tensor:
+    """Return a copy of ``feature_263`` whose recoverable root follows ``traj_7d``.
+
+    Only the HumanML3D root channels are rewritten:
+      - channel 0: root rotation velocity
+      - channels 1:3: local root XZ velocity
+      - channel 3: root height
+
+    Body/local pose channels are left untouched. Because HumanML3D stores root
+    XZ as integrated velocity, frame 0 is anchored at world XZ zero; callers that
+    need absolute offsets should compare/use paths in that same origin convention.
+    """
+    if feature_263.dim() != 2 or feature_263.shape[-1] < 4:
+        raise ValueError(
+            "replace_root_channels_263_from_7d expects feature_263 [T,D>=4], "
+            f"got {tuple(feature_263.shape)}"
+        )
+    if traj_7d.dim() != 2 or traj_7d.shape[-1] < 5:
+        raise ValueError(
+            "replace_root_channels_263_from_7d expects traj_7d [T,>=5], "
+            f"got {tuple(traj_7d.shape)}"
+        )
+    return replace_root_channels_263_window_from_7d(
+        feature_263,
+        traj_7d,
+        start_frame=0,
+        hold_tail=hold_tail,
+    )
+
+
+def replace_root_channels_263_window_from_7d(
+    feature_263: torch.Tensor,
+    traj_7d: torch.Tensor,
+    *,
+    start_frame: int,
+    hold_tail: bool = True,
+) -> torch.Tensor:
+    """Rewrite root channels for a stream chunk at ``start_frame``.
+
+    The chunk receives frame-local feature rows but the root velocities are
+    derived from the global target frames ``[start_frame, start_frame + T]`` so
+    independently corrected chunks can be concatenated without boundary drift.
+    """
+    if feature_263.dim() != 2 or feature_263.shape[-1] < 4:
+        raise ValueError(
+            "replace_root_channels_263_window_from_7d expects feature_263 "
+            f"[T,D>=4], got {tuple(feature_263.shape)}"
+        )
+    if traj_7d.dim() != 2 or traj_7d.shape[-1] < 5:
+        raise ValueError(
+            "replace_root_channels_263_window_from_7d expects traj_7d [T,>=5], "
+            f"got {tuple(traj_7d.shape)}"
+        )
+    out = feature_263.clone()
+    num_frames = int(out.shape[0])
+    if num_frames <= 0 or traj_7d.shape[0] <= 0:
+        return out
+
+    start_frame = max(0, int(start_frame))
+    needed = start_frame + num_frames + 1
+    traj = traj_7d.to(device=out.device, dtype=out.dtype)
+    if hold_tail and traj.shape[0] < needed:
+        tail = traj[-1:].expand(needed - traj.shape[0], -1)
+        traj = torch.cat([traj, tail], dim=0)
+    if traj.shape[0] <= start_frame:
+        out[:, :4] = 0.0
+        return out
+
+    yaw = _unwrap_yaw(torch.atan2(traj[:, 4], traj[:, 3]))
+    yaw = yaw - yaw[:1]
+    half_angle = -0.5 * yaw
+
+    current = traj[start_frame:min(start_frame + num_frames, traj.shape[0])]
+    valid = int(current.shape[0])
+    out[:valid, 0] = 0.0
+    out[:valid, 1:3] = 0.0
+    out[:valid, 3] = current[:, 1]
+    if valid < num_frames:
+        out[valid:, :4] = 0.0
+    if valid <= 0:
+        return out
+
+    next_end = min(start_frame + valid + 1, traj.shape[0])
+    if next_end - start_frame < 2:
+        return out
+    xyz_pair = traj[start_frame:next_end, :3]
+    half_pair = half_angle[start_frame:next_end]
+    num_deltas = int(xyz_pair.shape[0] - 1)
+    out[:num_deltas, 0] = half_pair[1:] - half_pair[:-1]
+
+    delta_xz = xyz_pair[1:, [0, 2]] - xyz_pair[:-1, [0, 2]]
+    delta_world = torch.zeros((num_deltas, 3), device=out.device, dtype=out.dtype)
+    delta_world[:, [0, 2]] = delta_xz
+    q_next = torch.zeros((num_deltas, 4), device=out.device, dtype=out.dtype)
+    q_next[:, 0] = torch.cos(half_pair[1:])
+    q_next[:, 2] = torch.sin(half_pair[1:])
+    local_delta = qrot(q_next, delta_world)
+    out[:num_deltas, 1] = local_delta[:, 0]
+    out[:num_deltas, 2] = local_delta[:, 2]
+    return out
+
+
 def append_traj_deltas_5d_to_7d(
     traj_5d: torch.Tensor,
     *,

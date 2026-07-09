@@ -75,12 +75,18 @@ def apply_history_corruption(
             corrupted[batch_idx, mask_indices, :] = mask_vector
         if noisy_count > 0:
             noise = (
-                torch.randn(noisy_count, latent_dim, generator=generator, device=device)
+                torch.randn(
+                    noisy_count,
+                    latent_dim,
+                    generator=generator,
+                    device=device,
+                    dtype=dtype,
+                )
                 * sigma
             )
             corrupted[batch_idx, noisy_indices, :] = (
                 clean_feature[batch_idx, noisy_indices, :] + noise
-            )
+            ).to(dtype=dtype)
 
     return corrupted
 

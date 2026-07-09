@@ -252,8 +252,12 @@ class MotionApp {
         this.denoiseSteps = document.getElementById('denoiseSteps');
         this.smoothingAlpha = document.getElementById('smoothingAlpha');
         this.smoothingValue = document.getElementById('smoothingValue');
+        this.rootFeedbackEnabled = document.getElementById('rootFeedbackEnabled');
+        this.rootFeedbackAlpha = document.getElementById('rootFeedbackAlpha');
+        this.rootFeedbackValue = document.getElementById('rootFeedbackValue');
         this.currentSmoothing = document.getElementById('currentSmoothing');
         this.currentSteps = document.getElementById('currentSteps');
+        this.currentRootFeedback = document.getElementById('currentRootFeedback');
         this.startResetBtn = document.getElementById('startResetBtn');
         this.updateBtn = document.getElementById('updateBtn');
         this.pauseResumeBtn = document.getElementById('pauseResumeBtn');
@@ -307,6 +311,12 @@ class MotionApp {
             const value = parseFloat(e.target.value).toFixed(2);
             this.smoothingValue.textContent = value;
         });
+        if (this.rootFeedbackAlpha) {
+            this.rootFeedbackAlpha.addEventListener('input', (e) => {
+                const value = parseFloat(e.target.value).toFixed(2);
+                this.rootFeedbackValue.textContent = value;
+            });
+        }
     }
 
     async toggleStartReset() {
@@ -347,6 +357,8 @@ class MotionApp {
         }
 
         const smoothingAlpha = parseFloat(this.smoothingAlpha.value);
+        const rootFeedbackEnabled = Boolean(this.rootFeedbackEnabled && this.rootFeedbackEnabled.checked);
+        const rootFeedbackAlpha = parseFloat(this.rootFeedbackAlpha ? this.rootFeedbackAlpha.value : 0.5);
 
         this.isProcessing = true;
         this.statusEl.textContent = 'Initializing...';
@@ -361,6 +373,8 @@ class MotionApp {
                     history_length: historyLength,
                     smoothing_alpha: smoothingAlpha,
                     denoise_steps: denoiseSteps,
+                    root_feedback_enabled: rootFeedbackEnabled,
+                    root_feedback_xz_blend_alpha: rootFeedbackAlpha,
                     force: force
                 })
             });
@@ -668,6 +682,8 @@ class MotionApp {
         const historyLength = parseInt(this.historyLength.value) || 30;
         const smoothingAlpha = parseFloat(this.smoothingAlpha.value);
         const denoiseSteps = parseInt(this.denoiseSteps.value) || 10;
+        const rootFeedbackEnabled = Boolean(this.rootFeedbackEnabled && this.rootFeedbackEnabled.checked);
+        const rootFeedbackAlpha = parseFloat(this.rootFeedbackAlpha ? this.rootFeedbackAlpha.value : 0.5);
 
         this.isProcessing = true;
         try {
@@ -678,7 +694,9 @@ class MotionApp {
                     session_id: this.sessionId,
                     history_length: historyLength,
                     smoothing_alpha: smoothingAlpha,
-                    denoise_steps: denoiseSteps
+                    denoise_steps: denoiseSteps,
+                    root_feedback_enabled: rootFeedbackEnabled,
+                    root_feedback_xz_blend_alpha: rootFeedbackAlpha
                 })
             });
 
@@ -1064,6 +1082,16 @@ class MotionApp {
                 // Update current denoising steps display
                 if (data.denoise_steps !== undefined) {
                     this.currentSteps.textContent = data.denoise_steps;
+                }
+
+                if (
+                    this.currentRootFeedback
+                    && data.root_feedback_enabled !== undefined
+                    && data.root_feedback_xz_blend_alpha !== undefined
+                ) {
+                    const feedbackState = data.root_feedback_enabled ? 'On' : 'Off';
+                    const feedbackAlpha = Number(data.root_feedback_xz_blend_alpha).toFixed(2);
+                    this.currentRootFeedback.textContent = `${feedbackState} · ${feedbackAlpha}`;
                 }
             }
 

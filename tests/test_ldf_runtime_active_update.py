@@ -7,6 +7,7 @@ from eval.ldf.runtime_update.active_condition import (
     compose_active_window_world_condition,
 )
 from eval.ldf.runtime_update.diagnostics import (
+    build_timeline_from_generated_traj7,
     validate_trajectory_diagnostics,
 )
 from eval.ldf.runtime_update.payload_builder import (
@@ -20,6 +21,7 @@ from eval.ldf.runtime_update.route_tracker import (
 from utils.inference.timeline import RootFrameState, RootTimeline
 from utils.local_frame import heading_dir_xz
 from utils.motion_process import build_physical_7d_from_5d
+from utils.token_frame import token_end_frame, token_range_to_frame_slice
 
 
 def _traj7_from_xz_yaw(xz: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
@@ -115,6 +117,38 @@ def test_active_window_segment_can_pin_route_progress_to_update_boundary():
     assert result.future_index > result.route_index
 
 
+def test_active_window_segment_honors_requested_bridge_frames():
+    xz = torch.stack([torch.zeros(160), torch.linspace(0.0, 8.0, 160)], dim=-1)
+    route = _traj7_from_xz_yaw(xz, torch.zeros(160))
+    generated = route.clone()
+    current_frame = 72
+
+    short = compose_active_window_segment(
+        route,
+        generated,
+        current_frame=current_frame,
+        current_yaw=torch.tensor(0.0),
+        target_end_frame=130,
+        min_route_index=current_frame,
+        lookahead_m=0.20,
+        bridge_frames=8,
+    )
+    long = compose_active_window_segment(
+        route,
+        generated,
+        current_frame=current_frame,
+        current_yaw=torch.tensor(0.0),
+        target_end_frame=130,
+        min_route_index=current_frame,
+        lookahead_m=0.20,
+        bridge_frames=24,
+    )
+
+    assert short.bridge_frames >= 8
+    assert long.bridge_frames >= 24
+    assert long.bridge_frames > short.bridge_frames
+
+
 
 def test_active_window_segment_rebases_future_route_instead_of_snapping_back():
     route_xz = torch.stack([torch.zeros(180), torch.linspace(0.0, 9.0, 180)], dim=-1)
@@ -189,6 +223,45 @@ def test_active_window_world_condition_keeps_render_and_feedback_route_continuou
         atol=0.08,
     )
     assert float(speed.max().item()) < 0.12
+    recomputed = build_physical_7d_from_5d(world_condition[:, :5])
+    assert torch.allclose(world_condition[:, 5:7], recomputed[:, 5:7], atol=1e-6)
+
+
+def test_active_window_world_condition_recomputes_delta_after_patch():
+    route_xz = torch.stack([torch.zeros(80), torch.linspace(0.0, 4.0, 80)], dim=-1)
+    route = _traj7_from_xz_yaw(route_xz, torch.zeros(80))
+    generated = route.clone()
+    current_frame = 20
+    generated[: current_frame + 1, 0] += 0.4
+    segment = compose_active_window_segment(
+        route,
+        generated[: current_frame + 1],
+        current_frame=current_frame,
+        current_yaw=torch.tensor(0.0),
+        target_end_frame=60,
+        min_route_index=current_frame,
+        lookahead_m=0.20,
+        bridge_frames=8,
+    )
+    corrupted = segment.segment_traj7.clone()
+    corrupted[:, 5:7] = 123.0
+    corrupted_segment = type(segment)(
+        segment_traj7=corrupted,
+        route_index=segment.route_index,
+        future_index=segment.future_index,
+        current_frame=segment.current_frame,
+        bridge_frames=segment.bridge_frames,
+    )
+
+    world_condition = compose_active_window_world_condition(
+        route,
+        generated[: current_frame + 1],
+        corrupted_segment,
+        current_frame=current_frame,
+    )
+
+    recomputed = build_physical_7d_from_5d(world_condition[:, :5])
+    assert torch.allclose(world_condition[:, 5:7], recomputed[:, 5:7], atol=1e-6)
 
 
 def test_diagnostics_rejects_unreasonable_runtime_condition_speed():
@@ -251,6 +324,40 @@ def test_world_condition_payload_uses_absolute_active_window_frames():
     )
 
 
+def test_world_condition_payload_uses_token_range_frame_slice_for_start0():
+    route_xz = torch.stack([torch.zeros(120), torch.arange(120, dtype=torch.float32)], dim=-1)
+    world = _traj7_from_xz_yaw(route_xz, torch.zeros(120))
+    timeline = RootTimeline(
+        RootFrameState.initial(xz=(0.0, 0.0), yaw=0.0, dtype=torch.float32)
+    )
+    for commit in range(1, 40):
+        frame = token_end_frame(commit - 1, 4)
+        timeline.append(
+            RootFrameState(
+                commit_idx=commit,
+                world_xz=world[min(frame, world.shape[0] - 1), [0, 2]].clone(),
+                world_yaw=torch.tensor(0.0),
+                source="test",
+            )
+        )
+
+    payload = build_world_condition_stream_payload(
+        world,
+        timeline,
+        local_commit_index=0,
+        absolute_commit_index=0,
+        chunk_size=2,
+        history_length=30,
+        traj_horizon_tokens=3,
+        frames_per_token=4,
+    )
+
+    assert payload is not None
+    frame_slice = token_range_to_frame_slice(0, payload["traj_num_tokens"], 4)
+    assert payload["traj_cond_7d_frame"].shape[1] == frame_slice.stop - frame_slice.start
+    assert payload["traj_cond_7d_frame"].shape[1] == 17
+
+
 
 
 def test_world_condition_payload_uses_generated_history_before_current_commit():
@@ -298,6 +405,17 @@ def test_world_condition_payload_uses_generated_history_before_current_commit():
     # which is generated history at commit 31 and must not come from the future route.
     assert torch.allclose(world_payload[112, [0, 2]], generated_world[117, [0, 2]], atol=1e-5)
     assert not torch.allclose(world_payload[112, [0, 2]], future_world[117, [0, 2]], atol=1e-3)
+
+
+def test_replay_timeline_maps_commit_to_last_committed_token_end_frame():
+    xz = torch.stack([torch.zeros(140), torch.arange(140, dtype=torch.float32)], dim=-1)
+    generated = _traj7_from_xz_yaw(xz, torch.zeros(140))
+
+    timeline = build_timeline_from_generated_traj7(generated, frames_per_token=4)
+
+    assert torch.allclose(timeline.at_commit(1).world_xz, generated[0, [0, 2]])
+    assert torch.allclose(timeline.at_commit(31).world_xz, generated[120, [0, 2]])
+    assert not torch.allclose(timeline.at_commit(31).world_xz, generated[123, [0, 2]])
 
 
 def test_payload_builder_keeps_substep_payloads_with_history0_anchor():

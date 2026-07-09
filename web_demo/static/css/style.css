@@ -179,7 +179,7 @@ body {
 /* Compact parameters row */
 .params-row {
     display: grid;
-    grid-template-columns: 1fr 1fr 1.5fr;
+    grid-template-columns: 1fr 1fr 1.5fr 1.6fr;
     gap: 15px;
     margin-bottom: 15px;
 }
@@ -201,6 +201,18 @@ body {
     font-weight: 500;
     color: #666;
     font-size: 0.85em;
+}
+
+.param-checkbox-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.param-checkbox-label input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    margin: 0;
 }
 
 .param-item input[type="number"] {

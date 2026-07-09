@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import random as random_module
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import torch
 
@@ -98,6 +98,46 @@ class RootRefinerBatchBuilder:
         self.sample_creator._rng = random_module.Random(base)
         self.sample_builder._rng = random_module.Random(base)
 
+    def set_sampling_config(self, sampling_cfg: Mapping[str, Any]) -> None:
+        path_condition_cfg = sampling_cfg.get("path_condition") or {}
+        offset_cfg = path_condition_cfg.get("offset_start") or {}
+
+        self.full_plan_ratio = float(
+            sampling_cfg.get("full_plan_ratio", self.full_plan_ratio)
+        )
+        self.horizon_policy = str(
+            sampling_cfg.get("horizon_policy", self.horizon_policy)
+        )
+        self.path_condition_policy = str(
+            path_condition_cfg.get("policy", self.path_condition_policy)
+        )
+        ratios = path_condition_cfg.get("ratios", self.path_condition_ratios)
+        self.path_condition_ratios = None if ratios is None else dict(ratios)
+        self.offset_start_enabled = bool(
+            offset_cfg.get("enabled", self.offset_start_enabled)
+        )
+        self.offset_start_prob = float(
+            offset_cfg.get("prob", self.offset_start_prob)
+        )
+        self.offset_start_max_frames = int(
+            offset_cfg.get("max_frames", self.offset_start_max_frames)
+        )
+        self.offset_start_apply_to = tuple(
+            offset_cfg.get("apply_to", self.offset_start_apply_to)
+        )
+
+        self.sample_creator.full_plan_ratio = self.full_plan_ratio
+        self.sample_creator.horizon_policy = self.horizon_policy
+        self.sample_creator.path_condition_policy = self.path_condition_policy
+        if self.path_condition_ratios is not None:
+            self.sample_creator.path_condition_ratios = dict(
+                self.path_condition_ratios
+            )
+        self.sample_creator.offset_start_enabled = self.offset_start_enabled
+        self.sample_creator.offset_start_prob = self.offset_start_prob
+        self.sample_creator.offset_start_max_frames = self.offset_start_max_frames
+        self.sample_creator.offset_start_apply_to = self.offset_start_apply_to
+
     def build(
         self,
         raw_sample: dict[str, Any],
@@ -186,6 +226,9 @@ class RootRefinerDataset(Dataset):
         self.offset_start_max_frames = self.batch_builder.offset_start_max_frames
         self.offset_start_apply_to = self.batch_builder.offset_start_apply_to
         self.sparse_path_point_range = self.batch_builder.sparse_path_point_range
+        self._training_schedule = None
+        self._training_schedule_shared_phase = None
+        self._active_schedule_phase_index: int | None = None
 
         self._sample_lengths = [
             self._effective_motion_length(i) for i in range(len(raw_dataset))
@@ -208,6 +251,7 @@ class RootRefinerDataset(Dataset):
         return len(self.valid_indices)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
+        self.sync_training_schedule_phase()
         return self._process(self.valid_indices[int(idx)])
 
     def get_sample(
@@ -237,6 +281,33 @@ class RootRefinerDataset(Dataset):
     def reset_rng(self) -> None:
         self.batch_builder.reset_rng()
 
+    def attach_training_schedule(self, schedule, shared_phase) -> None:
+        self._training_schedule = schedule
+        self._training_schedule_shared_phase = shared_phase
+        self._active_schedule_phase_index = None
+        self.sync_training_schedule_phase()
+
+    def sync_training_schedule_phase(self) -> None:
+        if self._training_schedule is None:
+            return
+        phase_index = int(self._training_schedule_shared_phase.value)
+        if phase_index == self._active_schedule_phase_index:
+            return
+        sampling_cfg = self._training_schedule.sampling_for_phase_index(phase_index)
+        self.batch_builder.set_sampling_config(sampling_cfg)
+        self._refresh_sampling_attrs()
+        self._active_schedule_phase_index = phase_index
+
+    def _refresh_sampling_attrs(self) -> None:
+        self.full_plan_ratio = self.batch_builder.full_plan_ratio
+        self.horizon_policy = self.batch_builder.horizon_policy
+        self.path_condition_policy = self.batch_builder.path_condition_policy
+        self.path_condition_ratios = self.batch_builder.path_condition_ratios
+        self.offset_start_enabled = self.batch_builder.offset_start_enabled
+        self.offset_start_prob = self.batch_builder.offset_start_prob
+        self.offset_start_max_frames = self.batch_builder.offset_start_max_frames
+        self.offset_start_apply_to = self.batch_builder.offset_start_apply_to
+
     def _process(
         self,
         raw_idx: int,
@@ -248,6 +319,7 @@ class RootRefinerDataset(Dataset):
         force_no_path_aug: bool = False,
         force_text_idx: int | None = None,
     ) -> dict[str, Any]:
+        self.sync_training_schedule_phase()
         raw_sample = dict(self.raw_dataset[int(raw_idx)])
         raw_sample.setdefault("raw_id", raw_sample.get("name", str(raw_idx)))
         raw_sample.setdefault("split_index", int(raw_idx))

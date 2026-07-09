@@ -7,6 +7,7 @@ import torch
 from utils.inference.root_plan import RootPlan, build_root_plan_stream_payload
 from utils.inference.timeline import RootFrameState
 from utils.local_frame import canonicalize_7d
+from utils.motion_process import build_physical_7d_from_5d
 from utils.token_frame import num_tokens_for_frame_len
 
 
@@ -90,6 +91,7 @@ def _slice_world_condition(
             count = hist_end - hist_start
             out[dst0 : dst0 + count] = history[hist_start:hist_end]
             mask[dst0 : dst0 + count] = True
+    out = build_physical_7d_from_5d(out[:, :5])
     return out, mask
 
 
@@ -104,14 +106,19 @@ def _build_single_world_condition_payload(
     frames_per_token: int,
     generated_history_traj7: torch.Tensor | None = None,
 ) -> dict | None:
-    from utils.token_frame import token_start_frame
+    from utils.token_frame import token_range_to_frame_slice
 
     num_tokens = max(0, int(absolute_final_right_token) + int(horizon_tokens) - int(absolute_start_token))
     if num_tokens <= 0 or not timeline.has_exact_state(int(absolute_start_token)):
         return None
     body_anchor_state = timeline.at_commit(int(absolute_start_token))
-    frame_start = token_start_frame(int(absolute_start_token), int(frames_per_token))
-    frame_count = int(num_tokens) * int(frames_per_token)
+    frame_slice = token_range_to_frame_slice(
+        int(absolute_start_token),
+        int(num_tokens),
+        int(frames_per_token),
+    )
+    frame_start = int(frame_slice.start)
+    frame_count = int(frame_slice.stop - frame_slice.start)
     world_slice, mask = _slice_world_condition(
         world_condition_traj7.to(
             device=body_anchor_state.world_xz.device,

@@ -37,6 +37,11 @@ def register_routes(
             history_length = data.get("history_length", 30)
             smoothing_alpha = data.get("smoothing_alpha", None)
             denoise_steps = data.get("denoise_steps", None)
+            root_feedback_enabled = data.get("root_feedback_enabled", None)
+            root_feedback_xz_blend_alpha = data.get(
+                "root_feedback_xz_blend_alpha",
+                None,
+            )
             force = data.get("force", False)
 
             if not session_id:
@@ -100,6 +105,8 @@ def register_routes(
                 history_length=history_length,
                 smoothing_alpha=smoothing_alpha,
                 denoise_steps=denoise_steps,
+                root_feedback_enabled=root_feedback_enabled,
+                root_feedback_xz_blend_alpha=root_feedback_xz_blend_alpha,
             ):
                 session_service.release(session_id)
                 return jsonify({
@@ -355,6 +362,11 @@ def register_routes(
             history_length = data.get("history_length", 30)
             smoothing_alpha = data.get("smoothing_alpha", None)
             denoise_steps = data.get("denoise_steps", None)
+            root_feedback_enabled = data.get("root_feedback_enabled", None)
+            root_feedback_xz_blend_alpha = data.get(
+                "root_feedback_xz_blend_alpha",
+                None,
+            )
 
             if session_id and not session_service.can_reset(session_id):
                 return jsonify({
@@ -368,6 +380,8 @@ def register_routes(
                     history_length=history_length,
                     smoothing_alpha=smoothing_alpha,
                     denoise_steps=denoise_steps,
+                    root_feedback_enabled=root_feedback_enabled,
+                    root_feedback_xz_blend_alpha=root_feedback_xz_blend_alpha,
                 ):
                     return jsonify({
                         "status": "error",

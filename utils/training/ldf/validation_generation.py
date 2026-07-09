@@ -148,31 +148,6 @@ def _batch_text(model_batch: dict, batch_size: int):
     return text
 
 
-def _summarize_stream_best_of_k(records: list[dict]) -> dict:
-    records = [item for item in records if isinstance(item, dict) and item]
-    if not records:
-        return {}
-
-    def _mean_field(field: str) -> float:
-        values = []
-        for item in records:
-            value = item.get(field)
-            try:
-                value = float(value)
-            except (TypeError, ValueError):
-                continue
-            if value == value:
-                values.append(value)
-        return float(np.mean(values)) if values else float("nan")
-
-    return {
-        "stream_best_of_k": _mean_field("k"),
-        "stream_best_of_k_switch_count": _mean_field("switch_count"),
-        "stream_best_of_k_step_count": _mean_field("step_count"),
-        "stream_best_of_k_total_elapsed_sec": _mean_field("total_elapsed_sec"),
-    }
-
-
 def _run_validation_generation_mode(
     model,
     model_batch,
@@ -185,17 +160,6 @@ def _run_validation_generation_mode(
     stream_traj_horizon_tokens: int | None = 20,
     stream_token_dt: float = 0.20,
     stream_frames_per_token: int = 4,
-    stream_best_of_k: int = 1,
-    stream_best_of_k_score: str = "xz",
-    stream_best_of_k_xz_weight: float = 1.0,
-    stream_best_of_k_fde_weight: float = 1.0,
-    stream_best_of_k_cont_weight: float = 0.0,
-    stream_best_of_k_vel_weight: float = 0.5,
-    stream_best_of_k_rel_margin: float = 0.10,
-    stream_best_of_k_abs_margin: float = 0.03,
-    stream_best_of_k_cont_tol: float = 0.03,
-    stream_best_of_k_force_candidate0: bool = False,
-    stream_best_of_k_switch_cooldown_steps: int = 0,
     num_denoise_steps=None,
 ) -> dict:
     if generation_mode != T2M_STREAM_GENERATE_STEP:
@@ -219,25 +183,11 @@ def _run_validation_generation_mode(
         traj_horizon_tokens=stream_traj_horizon_tokens,
         token_dt=float(stream_token_dt),
         frames_per_token=int(stream_frames_per_token),
-        best_of_k=int(stream_best_of_k),
-        best_of_k_score=str(stream_best_of_k_score),
-        best_of_k_xz_weight=float(stream_best_of_k_xz_weight),
-        best_of_k_fde_weight=float(stream_best_of_k_fde_weight),
-        best_of_k_cont_weight=float(stream_best_of_k_cont_weight),
-        best_of_k_vel_weight=float(stream_best_of_k_vel_weight),
-        best_of_k_rel_margin=float(stream_best_of_k_rel_margin),
-        best_of_k_abs_margin=float(stream_best_of_k_abs_margin),
-        best_of_k_cont_tol=float(stream_best_of_k_cont_tol),
-        best_of_k_force_candidate0=bool(stream_best_of_k_force_candidate0),
-        best_of_k_switch_cooldown_steps=int(
-            stream_best_of_k_switch_cooldown_steps
-        ),
     )
     return {
         "generated": [stream_output["latent_stream"]],
         "decoded_feature": [stream_output["decoded_feature"]],
         "text": _batch_text(model_batch, 1),
-        "stream_best_of_k": stream_output.get("stream_best_of_k", {}),
     }
 
 
@@ -295,7 +245,6 @@ def run_validation_generation_eval(module, batch, batch_idx=None, test_loader_id
             _all_cap_ctrl = []
             _all_flat_traj = []
             _all_flat_ctrl = []
-            _stream_best_of_k_records = []
             fwd_stat = None
 
             if "feature_text_end" in sample_batch:
@@ -376,43 +325,8 @@ def run_validation_generation_eval(module, batch, batch_idx=None, test_loader_id
                             ],
                             stream_token_dt=eval_cfg["stream_token_dt"],
                             stream_frames_per_token=eval_cfg["stream_frames_per_token"],
-                            stream_best_of_k=eval_cfg["stream_best_of_k"],
-                            stream_best_of_k_score=eval_cfg[
-                                "stream_best_of_k_score"
-                            ],
-                            stream_best_of_k_xz_weight=eval_cfg[
-                                "stream_best_of_k_xz_weight"
-                            ],
-                            stream_best_of_k_fde_weight=eval_cfg[
-                                "stream_best_of_k_fde_weight"
-                            ],
-                            stream_best_of_k_cont_weight=eval_cfg[
-                                "stream_best_of_k_cont_weight"
-                            ],
-                            stream_best_of_k_vel_weight=eval_cfg[
-                                "stream_best_of_k_vel_weight"
-                            ],
-                            stream_best_of_k_rel_margin=eval_cfg[
-                                "stream_best_of_k_rel_margin"
-                            ],
-                            stream_best_of_k_abs_margin=eval_cfg[
-                                "stream_best_of_k_abs_margin"
-                            ],
-                            stream_best_of_k_cont_tol=eval_cfg[
-                                "stream_best_of_k_cont_tol"
-                            ],
-                            stream_best_of_k_force_candidate0=eval_cfg[
-                                "stream_best_of_k_force_candidate0"
-                            ],
-                            stream_best_of_k_switch_cooldown_steps=eval_cfg[
-                                "stream_best_of_k_switch_cooldown_steps"
-                            ],
                             num_denoise_steps=eval_cfg["num_denoise_steps"],
                         )
-                        if generation_mode == T2M_STREAM_GENERATE_STEP:
-                            _stream_best_of_k_records.append(
-                                output.get("stream_best_of_k", {})
-                            )
                     if _debug and run_idx == 0 and _cap_idx == 0 and sample_idx == 0:
                         _post_sd = _hash_sd(module.model.state_dict())
                         _post_ema = _hash_ema(module.ema)
@@ -496,9 +410,6 @@ def run_validation_generation_eval(module, batch, batch_idx=None, test_loader_id
                     "text": sample_text,
                     "text_all": _all_captions,
                 }
-                record.update(
-                    _summarize_stream_best_of_k(_stream_best_of_k_records)
-                )
                 # Aggregate per-caption metrics: for each scalar field,
                 # store caption-mean and cross-caption mean/std.
                 _scalar_fields = (

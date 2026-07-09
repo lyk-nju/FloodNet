@@ -168,6 +168,7 @@ def render_motion_video(
     render_setting: dict | None = None,
     traj_xz=None,
     traj_mask=None,
+    cond_traj_mask=None,
 ) -> Path:
     from utils.visualization.video import render_single_video
 
@@ -180,6 +181,9 @@ def render_motion_video(
         render_setting=render_setting or {},
         traj_xz=None if traj_xz is None else _as_numpy(traj_xz),
         traj_mask=None if traj_mask is None else _as_numpy(traj_mask),
+        cond_traj_mask=(
+            None if cond_traj_mask is None else _as_numpy(cond_traj_mask)
+        ),
     )
     return out
 

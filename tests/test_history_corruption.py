@@ -169,6 +169,29 @@ def test_noisy_tokens_are_clean_plus_gaussian():
     )
 
 
+def test_noisy_corruption_preserves_bfloat16_dtype():
+    B, T, D, cs = 1, 80, 4, 5
+    clean = torch.zeros(B, T, D, dtype=torch.bfloat16)
+    mask_emb = torch.zeros(D, dtype=torch.float32)
+    z_std = torch.ones(D, dtype=torch.float32)
+    end_idx = torch.tensor([T])
+
+    out = apply_history_corruption(
+        clean,
+        end_idx,
+        mask_emb=mask_emb,
+        z_std=z_std,
+        chunk_size=cs,
+        alpha_mask=0.0,
+        alpha_noisy=1.0,
+        generator=_gen(11),
+    )
+
+    assert out.dtype == torch.bfloat16
+    assert torch.equal(out[:, T - cs :, :], clean[:, T - cs :, :])
+    assert not torch.equal(out, clean)
+
+
 def test_returns_new_tensor_input_unchanged():
     clean, mask_emb, z_std, cs, end_idx = _setup()
     clean_copy = clean.clone()

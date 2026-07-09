@@ -159,7 +159,20 @@ def test_frame_encoder_zeros_invalid_frames_before_conv():
     assert torch.allclose(o_clean, o_perturbed, atol=1e-5)
 
 
-def test_frame_encoder_masks_invalid_hidden_between_conv_layers():
+def test_frame_encoder_keeps_dense_mask_on_legacy_masked_path():
+    enc = FrameTrajEncoder().eval()
+    x = torch.randn(2, 5, 4, 7, requires_grad=True)
+    dense_mask = torch.ones(2, 5, 4, requires_grad=True)
+
+    out_without_mask = enc(x, frame_mask=None)
+    out_with_dense_mask = enc(x, frame_mask=dense_mask)
+
+    assert torch.allclose(out_without_mask, out_with_dense_mask, atol=0.0, rtol=0.0)
+    out_with_dense_mask.sum().backward()
+    assert dense_mask.grad is not None
+
+
+def test_frame_encoder_uses_legacy_partial_mask_semantics():
     enc = FrameTrajEncoder(hidden_dim=1, out_dim=1).eval()
     with torch.no_grad():
         enc.conv1.weight.zero_()
@@ -176,7 +189,18 @@ def test_frame_encoder_masks_invalid_hidden_between_conv_layers():
     with torch.no_grad():
         out = enc(x, frame_mask=mask)
 
-    assert torch.allclose(out, torch.zeros_like(out), atol=1e-6)
+    # Legacy LocalTrajEncoder semantics: invalid frames are zeroed before the
+    # conv stack, but conv activations are not re-masked between layers. Only
+    # the final frame pooling is masked.
+    masked_x = x * mask.unsqueeze(-1)
+    expected = masked_x.reshape(1, 4, 7).transpose(1, 2).contiguous()
+    expected = enc.act(enc.conv1(expected))
+    expected = enc.act(enc.conv2(expected))
+    expected = (expected * mask.reshape(1, 4).unsqueeze(1)).sum(dim=-1)
+    expected = expected / mask.reshape(1, 4).sum(dim=-1).clamp(min=1.0)
+    expected = expected.reshape(1, 1, 1)
+
+    assert torch.allclose(out, expected, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------

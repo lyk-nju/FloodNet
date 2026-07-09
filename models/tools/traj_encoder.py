@@ -44,7 +44,6 @@ class FrameTrajEncoder(nn.Module):
                 f"frame_mask shape {tuple(frame_mask.shape)} != (B,T,{num_frames}) "
                 f"= ({batch_size},{num_tokens},{num_frames})"
             )
-
         if frame_mask is not None:
             x = x * frame_mask.to(dtype=x.dtype).unsqueeze(-1)
 
@@ -54,25 +53,18 @@ class FrameTrajEncoder(nn.Module):
             .transpose(1, 2)
             .contiguous()
         )
-        feature_mask = None
-        if frame_mask is not None:
-            flat_frame_mask = frame_mask.reshape(batch_size * num_tokens, num_frames)
-            feature_mask = flat_frame_mask.unsqueeze(1).to(features.dtype)
-
         features = self.conv1(features)
-        if feature_mask is not None:
-            features = features * feature_mask
         features = self.act(features)
 
         features = self.conv2(features)
-        if feature_mask is not None:
-            features = features * feature_mask
         features = self.act(features)
 
         # Pool frames back to one trajectory token.
         if frame_mask is None:
             features = features.mean(dim=-1)
         else:
+            flat_frame_mask = frame_mask.reshape(batch_size * num_tokens, num_frames)
+            feature_mask = flat_frame_mask.unsqueeze(1).to(features.dtype)
             numerator = (features * feature_mask).sum(dim=-1)
             denominator = feature_mask.sum(dim=-1).clamp(min=1.0)
             features = numerator / denominator

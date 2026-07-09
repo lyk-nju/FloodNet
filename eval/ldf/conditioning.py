@@ -102,17 +102,23 @@ class LdfEvalStreamConditioner:
         token_dt: float,
         device,
         frames_per_token: int = 4,
+        extra_frames: int = 0,
     ):
         self.device = torch.device(device)
         self.history_length = int(history_length)
         self.traj_horizon_tokens = int(traj_horizon_tokens)
         self.frames_per_token = int(frames_per_token)
+        self.extra_frames = max(0, int(extra_frames))
+        extra_tail_tokens = num_tokens_for_frame_len(
+            self.extra_frames,
+            self.frames_per_token,
+        )
         self.root_plan = build_gt_rootplan_from_batch(
             sample_batch,
             token_dt=token_dt,
             frames_per_token=frames_per_token,
             device=self.device,
-            tail_hold_tokens=self.traj_horizon_tokens,
+            tail_hold_tokens=self.traj_horizon_tokens + extra_tail_tokens,
         )
         self.timeline = RootTimeline(
             RootFrameState(

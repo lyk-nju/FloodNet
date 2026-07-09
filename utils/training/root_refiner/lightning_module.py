@@ -8,6 +8,7 @@ optimizer/scheduler construction.
 from __future__ import annotations
 
 import logging
+import math
 
 import lightning.pytorch as pl
 import torch
@@ -17,6 +18,7 @@ from torch import nn
 
 from models.root_refiner import RootRefiner
 from utils.initialize import instantiate
+from utils.local_frame import wrap_angle
 from utils.motion_process import build_physical_7d_from_5d
 from utils.training.root_refiner.config_validate import validate_refiner_config
 from utils.training.root_refiner.losses import (
@@ -27,6 +29,7 @@ from utils.training.root_refiner.losses import (
     smooth_l1_masked,
     sparse_path_control_loss,
 )
+from utils.training.root_refiner.sampling_schedule import TrainingSchedule
 from utils.training.root_refiner.text_encoder import resolve_text_encoder
 
 log = logging.getLogger(__name__)
@@ -34,6 +37,37 @@ log = logging.getLogger(__name__)
 
 class RootRefinerLightningModule(pl.LightningModule):
     """Lightning module for RootRefiner training and validation."""
+
+    _FREEZE_REFINER_PARAMETER_PREFIXES = {
+        "condition_encoder": (
+            "refiner.cls_token",
+            "refiner.text_proj.",
+            "refiner.path_proj.",
+            "refiner.path_control_proj.",
+            "refiner.stats_proj.",
+            "refiner.hist_proj.",
+            "refiner.path_pos_emb.",
+            "refiner.hist_pos_emb.",
+            "refiner.cond_transformer.",
+        ),
+        "duration_head": (
+            "refiner.duration_head.",
+        ),
+        "root_transformer": (
+            "refiner.root_queries",
+            "refiner.root_pos_emb.",
+            "refiner.root_progress_proj.",
+            "refiner.frame_count_emb.",
+            "refiner.root_transformer.",
+        ),
+        "root_decoder": (
+            "refiner.root_decoder.",
+        ),
+    }
+    _FREEZE_REFINER_PARAMETER_PREFIXES["root_branch"] = (
+        *_FREEZE_REFINER_PARAMETER_PREFIXES["root_transformer"],
+        *_FREEZE_REFINER_PARAMETER_PREFIXES["root_decoder"],
+    )
 
     def __init__(self, cfg: dict, text_encoder: nn.Module | None = None):
         super().__init__()
@@ -58,6 +92,12 @@ class RootRefinerLightningModule(pl.LightningModule):
         self.loss_weights = dict(cfg.get("loss_weights", {}))
         self.heading_form = cfg.get("loss", {}).get("heading_form", "cosine")
         self.validation_suite_names = self._validation_suite_names(cfg)
+        self._permanently_frozen_parameter_names: set[str] = set()
+        self.freeze_refiner_modules = self._freeze_refiner_modules_from_cfg(cfg)
+        self.schedule_freeze_refiner_modules = (
+            self._schedule_freeze_refiner_modules_from_cfg(cfg)
+        )
+        self._apply_freeze_config()
         self.save_hyperparameters(ignore=["text_encoder"])
 
     @staticmethod
@@ -69,6 +109,82 @@ class RootRefinerLightningModule(pl.LightningModule):
             if isinstance(suite, dict) and suite.get("name")
         ]
         return names or ["default"]
+
+    @staticmethod
+    def _freeze_refiner_modules_from_cfg(cfg: dict) -> tuple[str, ...]:
+        freeze_cfg = cfg.get("freeze") or {}
+        modules = freeze_cfg.get("refiner_modules") or []
+        if isinstance(modules, str):
+            modules = [modules]
+        return tuple(str(module) for module in modules)
+
+    @staticmethod
+    def _schedule_freeze_refiner_modules_from_cfg(cfg: dict) -> tuple[str, ...]:
+        schedule = TrainingSchedule.from_config(cfg)
+        if schedule is None:
+            return ()
+        return schedule.all_schedule_freeze_modules()
+
+    @classmethod
+    def _matches_parameter_prefix(cls, name: str, prefixes: tuple[str, ...]) -> bool:
+        return any(name == prefix or name.startswith(prefix) for prefix in prefixes)
+
+    def _apply_freeze_config(self) -> None:
+        if not self.freeze_refiner_modules:
+            return
+        prefixes = tuple(
+            prefix
+            for module_name in self.freeze_refiner_modules
+            for prefix in self._FREEZE_REFINER_PARAMETER_PREFIXES[module_name]
+        )
+        frozen_parameters = 0
+        frozen_tensors = 0
+        for name, parameter in self.named_parameters():
+            if self._matches_parameter_prefix(name, prefixes):
+                parameter.requires_grad_(False)
+                self._permanently_frozen_parameter_names.add(name)
+                frozen_parameters += int(parameter.numel())
+                frozen_tensors += 1
+        trainable_parameters = sum(
+            int(parameter.numel())
+            for parameter in self.parameters()
+            if parameter.requires_grad
+        )
+        log.info(
+            "RootRefiner freeze config: modules=%s, frozen_tensors=%d, "
+            "frozen_parameters=%d, trainable_parameters=%d",
+            list(self.freeze_refiner_modules),
+            frozen_tensors,
+            frozen_parameters,
+            trainable_parameters,
+        )
+
+    def apply_schedule_freeze(self, refiner_modules: list[str] | tuple[str, ...]) -> None:
+        controlled_modules = self.schedule_freeze_refiner_modules or tuple(
+            str(module) for module in refiner_modules
+        )
+        if not controlled_modules:
+            return
+        controlled_prefixes = self._prefixes_for_refiner_modules(controlled_modules)
+        frozen_prefixes = self._prefixes_for_refiner_modules(refiner_modules)
+        for name, parameter in self.named_parameters():
+            if name in self._permanently_frozen_parameter_names:
+                continue
+            if self._matches_parameter_prefix(name, controlled_prefixes):
+                parameter.requires_grad_(
+                    not self._matches_parameter_prefix(name, frozen_prefixes)
+                )
+
+    @classmethod
+    def _prefixes_for_refiner_modules(
+        cls,
+        refiner_modules: list[str] | tuple[str, ...],
+    ) -> tuple[str, ...]:
+        return tuple(
+            prefix
+            for module_name in refiner_modules
+            for prefix in cls._FREEZE_REFINER_PARAMETER_PREFIXES[str(module_name)]
+        )
 
     def forward(
         self,
@@ -147,19 +263,24 @@ class RootRefinerLightningModule(pl.LightningModule):
         )
 
         pred_h = F.normalize(out["waypoints"][..., 3:5], dim=-1, eps=1e-6)
-        gt_h = target_wp[..., 3:5]
+        gt_h = F.normalize(target_wp[..., 3:5], dim=-1, eps=1e-6)
+        heading_dot = (pred_h * gt_h).sum(-1).clamp(-1.0, 1.0)
         if self.heading_form == "cosine":
-            head_term = 1.0 - (pred_h * gt_h).sum(-1)
+            head_term = 1.0 - heading_dot
             loss_heading = masked_mean(head_term, target_mask)
         else:
             loss_heading = smooth_l1_masked(pred_h, gt_h, target_mask)
+        heading_flip_margin = math.cos(math.radians(60.0))
+        loss_heading_flip = masked_mean(
+            F.relu(heading_flip_margin - heading_dot).pow(2),
+            target_mask,
+        )
 
         pred_waypoints5 = torch.cat([out["waypoints"][..., :3], pred_h], dim=-1)
-        target_waypoints5 = torch.cat(
-            [target_wp[..., :3], F.normalize(target_wp[..., 3:5], dim=-1, eps=1e-6)],
-            dim=-1,
-        )
-        pred_delta = self._to_physical_7d(pred_waypoints5)[..., 5:7]
+        target_waypoints5 = torch.cat([target_wp[..., :3], gt_h], dim=-1)
+        pred_delta = self._to_physical_7d(
+            self._prepend_local_anchor_5d(pred_waypoints5)
+        )[:, 1:, 5:7]
         if "waypoints_physical" in batch:
             target_physical = batch["waypoints_physical"].to(
                 device=pred_waypoints5.device,
@@ -171,10 +292,11 @@ class RootRefinerLightningModule(pl.LightningModule):
                 dtype=pred_waypoints5.dtype,
             )
         else:
-            target_physical = self._to_physical_7d(target_waypoints5)
+            target_physical = self._to_physical_7d(
+                self._prepend_local_anchor_5d(target_waypoints5)
+            )[:, 1:]
         target_delta = target_physical[..., 5:7]
         delta_mask = target_mask.clone()
-        delta_mask[:, 0] = False
         loss_fwd_delta = smooth_l1_masked(
             pred_delta[..., 0:1],
             target_delta[..., 0:1],
@@ -185,6 +307,25 @@ class RootRefinerLightningModule(pl.LightningModule):
             target_delta[..., 1:2],
             delta_mask,
         )
+        if pred_h.shape[1] < 2:
+            loss_yaw_jump = pred_h.new_zeros(())
+        else:
+            target_valid = target_mask.bool()
+            valid_heading = target_valid & (pred_h.norm(dim=-1) > 1e-6)
+            identity_heading = pred_h.new_tensor([1.0, 0.0]).view(1, 1, 2)
+            yaw_jump_heading = torch.where(
+                valid_heading.unsqueeze(-1),
+                pred_h,
+                identity_heading,
+            )
+            pred_yaw = torch.atan2(yaw_jump_heading[..., 1], yaw_jump_heading[..., 0])
+            pred_yaw_delta = wrap_angle(pred_yaw[:, 1:] - pred_yaw[:, :-1])
+            yaw_jump_mask = target_valid[:, 1:] & target_valid[:, :-1]
+            yaw_jump_threshold = math.radians(45.0)
+            loss_yaw_jump = masked_mean(
+                F.relu(pred_yaw_delta.abs() - yaw_jump_threshold).pow(2),
+                yaw_jump_mask,
+            )
         weights = self.loss_weights
         loss_smoothness = second_order_diff_l2(pred_delta, delta_mask)
         if float(weights.get("path_control", 0.0)) == 0.0:
@@ -196,8 +337,10 @@ class RootRefinerLightningModule(pl.LightningModule):
             + weights.get("frame_pace", 1.0) * loss_frame_pace
             + weights.get("xyz", 5.0) * loss_xyz
             + weights.get("heading", 1.0) * loss_heading
+            + weights.get("heading_flip", 0.0) * loss_heading_flip
             + weights.get("fwd_delta", 0.5) * loss_fwd_delta
             + weights.get("yaw_delta", 0.5) * loss_yaw_delta
+            + weights.get("yaw_jump", 0.0) * loss_yaw_jump
             + weights.get("path_control", 0.0) * loss_path_control
             + weights.get("smoothness", 0.0) * loss_smoothness
         )
@@ -219,8 +362,10 @@ class RootRefinerLightningModule(pl.LightningModule):
             "frame_pace": loss_frame_pace,
             "xyz": loss_xyz,
             "heading": loss_heading,
+            "heading_flip": loss_heading_flip,
             "fwd_delta": loss_fwd_delta,
             "yaw_delta": loss_yaw_delta,
+            "yaw_jump": loss_yaw_jump,
             "path_control": loss_path_control,
             "smoothness": loss_smoothness,
             "frame_pace_mae": float_err_mean,
@@ -338,6 +483,13 @@ class RootRefinerLightningModule(pl.LightningModule):
 
     def _to_physical_7d(self, waypoints5: torch.Tensor) -> torch.Tensor:
         return build_physical_7d_from_5d(waypoints5)
+
+    @staticmethod
+    def _prepend_local_anchor_5d(waypoints5: torch.Tensor) -> torch.Tensor:
+        anchor = waypoints5.new_zeros(waypoints5.shape[0], 1, waypoints5.shape[-1])
+        anchor[..., 1] = waypoints5[:, :1, 1]
+        anchor[..., 3] = 1.0
+        return torch.cat([anchor, waypoints5], dim=1)
 
     def _common_prefix_mask(self, batch: dict, out: dict) -> torch.Tensor:
         target_mask = batch["waypoints_mask"]
@@ -460,11 +612,29 @@ class RootRefinerLightningModule(pl.LightningModule):
         optim_target = opt_cfg["target"]
         if len(optim_target.split(".")) == 1:
             optim_target = "torch.optim." + optim_target
+        dynamic_prefixes = self._prefixes_for_refiner_modules(
+            self.schedule_freeze_refiner_modules
+        )
+        trainable_parameters = [
+            parameter
+            for name, parameter in self.named_parameters()
+            if parameter.requires_grad
+            or (
+                dynamic_prefixes
+                and name not in self._permanently_frozen_parameter_names
+                and self._matches_parameter_prefix(name, dynamic_prefixes)
+            )
+        ]
+        if not trainable_parameters:
+            raise ValueError(
+                "RootRefiner has no trainable parameters after applying "
+                "freeze.refiner_modules."
+            )
         optimizer = instantiate(
             target=optim_target,
             cfg=None,
             hfstyle=False,
-            params=(p for p in self.parameters() if p.requires_grad),
+            params=trainable_parameters,
             **dict(opt_cfg.get("params") or {}),
         )
 

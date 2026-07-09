@@ -350,40 +350,6 @@ def _run_stream_eval(
     traj_horizon_tokens = int(_traj_horizon_raw) if _traj_horizon_raw is not None else None
     token_dt = float(cfg.get("eval.token_dt", cfg.get("stream.token_dt", 0.20)))
     frames_per_token = int(cfg.get("eval.frames_per_token", cfg.get("data.frames_per_token", 4)))
-    best_of_k = int(cfg.get("eval.stream_best_of_k", cfg.get("eval_stream_best_of_k", 1)))
-    best_of_k_score = str(
-        cfg.get("eval.stream_best_of_k_score", cfg.get("eval_stream_best_of_k_score", "xz"))
-    )
-    best_of_k_xz_weight = float(
-        cfg.get("eval.stream_best_of_k_xz_weight", cfg.get("eval_stream_best_of_k_xz_weight", 1.0))
-    )
-    best_of_k_fde_weight = float(
-        cfg.get("eval.stream_best_of_k_fde_weight", cfg.get("eval_stream_best_of_k_fde_weight", 1.0))
-    )
-    best_of_k_cont_weight = float(
-        cfg.get("eval.stream_best_of_k_cont_weight", cfg.get("eval_stream_best_of_k_cont_weight", 0.0))
-    )
-    best_of_k_vel_weight = float(
-        cfg.get("eval.stream_best_of_k_vel_weight", cfg.get("eval_stream_best_of_k_vel_weight", 0.5))
-    )
-    best_of_k_rel_margin = float(
-        cfg.get("eval.stream_best_of_k_rel_margin", cfg.get("eval_stream_best_of_k_rel_margin", 0.10))
-    )
-    best_of_k_abs_margin = float(
-        cfg.get("eval.stream_best_of_k_abs_margin", cfg.get("eval_stream_best_of_k_abs_margin", 0.03))
-    )
-    best_of_k_cont_tol = float(
-        cfg.get("eval.stream_best_of_k_cont_tol", cfg.get("eval_stream_best_of_k_cont_tol", 0.03))
-    )
-    best_of_k_force_candidate0 = bool(
-        cfg.get("eval.stream_best_of_k_force_candidate0", cfg.get("eval_stream_best_of_k_force_candidate0", False))
-    )
-    best_of_k_switch_cooldown_steps = int(
-        cfg.get("eval.stream_best_of_k_switch_cooldown_steps", cfg.get("eval_stream_best_of_k_switch_cooldown_steps", 0))
-    )
-    best_of_k_debug = bool(
-        cfg.get("eval.stream_best_of_k_debug", cfg.get("eval_stream_best_of_k_debug", False))
-    )
 
     sample_root = run_dir / "samples"
     sample_root.mkdir(parents=True, exist_ok=True)
@@ -412,7 +378,7 @@ def _run_stream_eval(
         f"probe={probe_tag} stream_mode={stream_mode} device={device} "
         f"num_runs={num_runs} batch_size={batch_size} text_device={text_device} "
         f"group_present_segments={int(group_present_segments)} history_length={history_length} "
-        f"traj_horizon_tokens={traj_horizon_tokens} best_of_k={best_of_k} "
+        f"traj_horizon_tokens={traj_horizon_tokens} "
         f"out_dir={run_dir}"
     )
 
@@ -469,18 +435,6 @@ def _run_stream_eval(
                         traj_horizon_tokens=traj_horizon_tokens,
                         token_dt=token_dt,
                         frames_per_token=frames_per_token,
-                        best_of_k=best_of_k,
-                        best_of_k_score=best_of_k_score,
-                        best_of_k_xz_weight=best_of_k_xz_weight,
-                        best_of_k_fde_weight=best_of_k_fde_weight,
-                        best_of_k_cont_weight=best_of_k_cont_weight,
-                        best_of_k_vel_weight=best_of_k_vel_weight,
-                        best_of_k_rel_margin=best_of_k_rel_margin,
-                        best_of_k_abs_margin=best_of_k_abs_margin,
-                        best_of_k_cont_tol=best_of_k_cont_tol,
-                        best_of_k_force_candidate0=best_of_k_force_candidate0,
-                        best_of_k_switch_cooldown_steps=best_of_k_switch_cooldown_steps,
-                        best_of_k_debug=best_of_k_debug,
                     )
                 else:
                     raise ValueError(f"Unsupported stream_mode: {stream_mode}")
@@ -505,23 +459,6 @@ def _run_stream_eval(
                 ),
                 "stream_rollout_time_sec": stream_elapsed_sec,
             }
-            best_of_k_info = stream_out.get("stream_best_of_k", {})
-            if best_of_k_info.get("enabled", False):
-                stream_metric["stream_best_of_k"] = float(best_of_k_info.get("k", 1))
-                stream_metric["stream_best_of_k_total_elapsed_sec"] = float(
-                    best_of_k_info.get("total_elapsed_sec", 0.0)
-                )
-                stream_metric["stream_best_of_k_switch_count"] = float(
-                    best_of_k_info.get("switch_count", 0)
-                )
-                stream_metric["stream_best_of_k_step_count"] = float(
-                    best_of_k_info.get("step_count", 0)
-                )
-                if best_of_k_debug:
-                    stream_metric["stream_best_of_k_records"] = best_of_k_info.get(
-                        "records",
-                        [],
-                    )
 
             if compute_offline_baseline:
                 _seed_eval_locally(sample_seed)
@@ -568,7 +505,6 @@ def _run_stream_eval(
                             traj_horizon_tokens=traj_horizon_tokens,
                             token_dt=token_dt,
                             frames_per_token=frames_per_token,
-                            best_of_k=1,
                         )
                     else:
                         raise ValueError(f"Unsupported stream_mode: {stream_mode}")
@@ -606,20 +542,6 @@ def _run_stream_eval(
         sample_record["stream_num_boundaries"] = _average_scalar_metric(stream_runs, "stream_num_boundaries")
         sample_record["stream_yaw_error"] = _average_scalar_metric(stream_runs, "stream_yaw_error")
         sample_record["stream_rollout_time_sec"] = _average_scalar_metric(stream_runs, "stream_rollout_time_sec")
-        if best_of_k > 1:
-            sample_record["stream_best_of_k"] = float(best_of_k)
-            sample_record["stream_best_of_k_total_elapsed_sec"] = _average_scalar_metric(
-                stream_runs,
-                "stream_best_of_k_total_elapsed_sec",
-            )
-            sample_record["stream_best_of_k_switch_count"] = _average_scalar_metric(
-                stream_runs,
-                "stream_best_of_k_switch_count",
-            )
-            sample_record["stream_best_of_k_step_count"] = _average_scalar_metric(
-                stream_runs,
-                "stream_best_of_k_step_count",
-            )
         if compute_offline_baseline:
             sample_record["stream_offline_feature_l2_mean"] = _average_scalar_metric(stream_runs, "stream_offline_feature_l2_mean")
             sample_record["stream_offline_feature_l2_max"] = _average_scalar_metric(stream_runs, "stream_offline_feature_l2_max")

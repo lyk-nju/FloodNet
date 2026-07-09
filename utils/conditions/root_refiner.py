@@ -119,6 +119,7 @@ def build_dense_path_condition(
 ) -> RootRefinerPathCondition:
     max_frames = int(max_frames or valid_frame_count)
     path, valid_mask = _resample_path(future_xz, n_path)
+    path_features = compute_path_features(future_xz)
     control_mask = valid_mask.clone()
     supervision_mask = _path_supervision_mask(max_frames, valid_frame_count, 0)
     return RootRefinerPathCondition(
@@ -126,8 +127,8 @@ def build_dense_path_condition(
         path_valid_mask=valid_mask,
         path_control_mask=control_mask,
         path_supervision_mask=supervision_mask,
-        path_features=compute_path_features(path),
-        path_features_raw=compute_path_features(path),
+        path_features=path_features,
+        path_features_raw=path_features,
         path_mode="dense_path",
         offset_start_frames=0,
     )

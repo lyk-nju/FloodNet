@@ -416,8 +416,9 @@ def _tiny_cfg():
             "pace": 0.5,
             "frame_pace": 0.1,
             "xyz": 5.0, "heading": 1.0,
-            "fwd_delta": 0.5, "yaw_delta": 0.5, "path_control": 0.0,
-            "smoothness": 0.0,
+            "heading_flip": 0.5,
+            "fwd_delta": 0.5, "yaw_delta": 0.5, "yaw_jump": 0.2,
+            "path_control": 0.0, "smoothness": 0.0,
         },
         # tests opt into the debug stub explicitly (real training must wire LDF).
         "text_encoder": {"debug_stub": True},
@@ -473,13 +474,90 @@ def test_loss_dict_keys_match_config_weights_and_no_speed():
     out = module(batch)
     losses = module._compute_loss(out, batch)
     expected = {"loss", "pace", "frame_pace", "xyz", "heading",
-                "fwd_delta", "yaw_delta", "path_control", "smoothness"}
+                "heading_flip", "fwd_delta", "yaw_delta", "yaw_jump",
+                "path_control", "smoothness"}
     expected |= set(RefinerLightningModule.METRIC_KEYS)
     assert set(losses.keys()) == expected
     assert "speed" not in losses
     # all finite
     for k, v in losses.items():
         assert torch.isfinite(v).all(), f"{k} not finite"
+
+
+def test_yaw_delta_supervises_anchor_to_first_future_frame():
+    module = RefinerLightningModule(_tiny_cfg())
+    batch = _make_batch(module, B=1)
+    batch["waypoints_mask"] = torch.zeros_like(batch["waypoints_mask"])
+    batch["waypoints_mask"][:, 0] = True
+    batch["waypoints"].zero_()
+    batch["waypoints"][..., 3] = 1.0
+    batch["waypoints_physical"] = torch.zeros(
+        1,
+        module.refiner.max_frames,
+        7,
+        dtype=batch["waypoints"].dtype,
+    )
+    batch["waypoints_physical"][..., 3] = 1.0
+    batch["waypoints_physical"][0, 0, 6] = torch.pi / 2.0
+    out = {
+        "pred_log_pace": torch.zeros(1),
+        "pred_frames_float": batch["num_frames"].to(torch.float32),
+        "pred_frames": batch["num_frames"],
+        "used_frames": batch["num_frames"],
+        "waypoints": batch["waypoints"].clone(),
+    }
+
+    losses = module._compute_loss(out, batch)
+
+    assert losses["yaw_delta"].item() > 0.1
+
+
+def test_heading_flip_penalizes_opposite_heading():
+    module = RefinerLightningModule(_tiny_cfg())
+    batch = _make_batch(module, B=1)
+    batch["waypoints_mask"] = torch.zeros_like(batch["waypoints_mask"])
+    batch["waypoints_mask"][:, 0] = True
+    batch["waypoints"].zero_()
+    batch["waypoints"][..., 3] = 1.0
+    out_waypoints = batch["waypoints"].clone()
+    out_waypoints[0, 0, 3] = -1.0
+    out_waypoints[0, 0, 4] = 0.0
+    out = {
+        "pred_log_pace": torch.zeros(1),
+        "pred_frames_float": batch["num_frames"].to(torch.float32),
+        "pred_frames": batch["num_frames"],
+        "used_frames": batch["num_frames"],
+        "waypoints": out_waypoints,
+    }
+
+    losses = module._compute_loss(out, batch)
+
+    assert losses["heading_flip"].item() > 1.0
+
+
+def test_yaw_jump_penalizes_large_predicted_heading_jumps():
+    module = RefinerLightningModule(_tiny_cfg())
+    batch = _make_batch(module, B=1)
+    batch["waypoints_mask"] = torch.zeros_like(batch["waypoints_mask"])
+    batch["waypoints_mask"][:, :2] = True
+    batch["waypoints"].zero_()
+    batch["waypoints"][..., 3] = 1.0
+    out_waypoints = batch["waypoints"].clone()
+    out_waypoints[0, 0, 3] = 1.0
+    out_waypoints[0, 0, 4] = 0.0
+    out_waypoints[0, 1, 3] = -0.5
+    out_waypoints[0, 1, 4] = 0.8660254
+    out = {
+        "pred_log_pace": torch.zeros(1),
+        "pred_frames_float": batch["num_frames"].to(torch.float32),
+        "pred_frames": batch["num_frames"],
+        "used_frames": batch["num_frames"],
+        "waypoints": out_waypoints,
+    }
+
+    losses = module._compute_loss(out, batch)
+
+    assert losses["yaw_jump"].item() > 0.1
 
 
 def test_pace_loss_uses_path_length_plus_start_distance():
@@ -663,6 +741,271 @@ def test_configure_optimizers_returns_adamw():
     module = RefinerLightningModule(_tiny_cfg())
     opt = module.configure_optimizers()
     assert isinstance(opt, torch.optim.AdamW)
+
+
+def test_load_initial_checkpoint_loads_lightning_state_dict(tmp_path):
+    from train_refiner import _load_initial_checkpoint
+
+    source = RefinerLightningModule(_tiny_cfg())
+    target = RefinerLightningModule(_tiny_cfg())
+    with torch.no_grad():
+        source.refiner.root_decoder.out_conv2.bias.fill_(0.123)
+        target.refiner.root_decoder.out_conv2.bias.zero_()
+    ckpt_path = tmp_path / "refiner.ckpt"
+    torch.save({"state_dict": source.state_dict()}, ckpt_path)
+
+    _load_initial_checkpoint(target, str(ckpt_path))
+
+    assert torch.allclose(
+        target.refiner.root_decoder.out_conv2.bias,
+        source.refiner.root_decoder.out_conv2.bias,
+    )
+
+
+def test_step_offset_checkpoint_formats_display_step(tmp_path):
+    from train_refiner import StepOffsetModelCheckpoint
+
+    checkpoint = StepOffsetModelCheckpoint(
+        dirpath=str(tmp_path),
+        filename="refiner_step_{step:06d}",
+        step_offset=450000,
+        auto_insert_metric_name=False,
+    )
+
+    path = checkpoint.format_checkpoint_name({"step": torch.tensor(50000)})
+
+    assert path.endswith("refiner_step_500000.ckpt")
+
+
+def test_freeze_config_freezes_duration_and_condition_modules_only():
+    cfg = _tiny_cfg()
+    cfg["freeze"] = {
+        "refiner_modules": ["duration_head", "condition_encoder"],
+    }
+
+    module = RefinerLightningModule(cfg)
+    named_params = dict(module.named_parameters())
+
+    frozen_prefixes = (
+        "refiner.duration_head.",
+        "refiner.text_proj.",
+        "refiner.path_proj.",
+        "refiner.path_control_proj.",
+        "refiner.stats_proj.",
+        "refiner.hist_proj.",
+        "refiner.path_pos_emb.",
+        "refiner.hist_pos_emb.",
+        "refiner.cond_transformer.",
+    )
+    for name, parameter in named_params.items():
+        if name == "refiner.cls_token" or name.startswith(frozen_prefixes):
+            assert not parameter.requires_grad, name
+
+    assert named_params["refiner.root_queries"].requires_grad
+    assert any(
+        name.startswith("refiner.root_transformer.") and parameter.requires_grad
+        for name, parameter in named_params.items()
+    )
+    assert any(
+        name.startswith("refiner.root_decoder.") and parameter.requires_grad
+        for name, parameter in named_params.items()
+    )
+
+    optimizer = module.configure_optimizers()
+    optimizer_param_ids = {
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
+    for name, parameter in named_params.items():
+        if not parameter.requires_grad:
+            assert id(parameter) not in optimizer_param_ids, name
+
+
+def test_training_schedule_sets_total_steps_from_phase_steps():
+    from utils.training.root_refiner.sampling_schedule import (
+        apply_training_schedule_to_cfg,
+    )
+
+    cfg = _tiny_cfg()
+    cfg["trainer"] = {"max_steps": 1}
+    cfg["training_schedule"] = {
+        "enabled": True,
+        "phases": [
+            {"name": "base", "steps": 200},
+            {"name": "finetune", "steps": 50},
+        ],
+    }
+
+    schedule = apply_training_schedule_to_cfg(cfg)
+
+    assert cfg["trainer"]["max_steps"] == 250
+    assert schedule.phase_index_for_step(0) == 0
+    assert schedule.phase_index_for_step(199) == 0
+    assert schedule.phase_index_for_step(200) == 1
+    assert schedule.phase_index_for_step(249) == 1
+
+
+def test_training_schedule_freeze_keeps_future_trainable_params_in_optimizer():
+    cfg = _tiny_cfg()
+    cfg["training_schedule"] = {
+        "enabled": True,
+        "phases": [
+            {
+                "name": "decoder_only",
+                "steps": 2,
+                "freeze": {"refiner_modules": ["duration_head"]},
+            },
+            {
+                "name": "all_trainable",
+                "steps": 2,
+                "freeze": {"refiner_modules": []},
+            },
+        ],
+    }
+    module = RefinerLightningModule(cfg)
+
+    optimizer = module.configure_optimizers()
+    optimizer_param_ids = {
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
+    duration_parameters = list(module.refiner.duration_head.parameters())
+    assert duration_parameters
+    assert all(id(parameter) in optimizer_param_ids for parameter in duration_parameters)
+
+    module.apply_schedule_freeze(["duration_head"])
+    assert all(not parameter.requires_grad for parameter in duration_parameters)
+    module.apply_schedule_freeze([])
+    assert all(parameter.requires_grad for parameter in duration_parameters)
+
+
+def test_training_schedule_shared_phase_updates_dataset_sampling():
+    import multiprocessing as mp
+    from utils.training.root_refiner.sampling_schedule import TrainingSchedule
+
+    ds = make_root_refiner_from_samples(
+        [_make_clip(60) for _ in range(2)],
+        full_plan_ratio=0.7,
+        horizon_policy="random",
+        path_condition_policy="mixed",
+        path_condition_ratios={
+            "dense_path": 1.0,
+            "sparse_path": 0.0,
+            "goal_point": 0.0,
+        },
+        offset_start_enabled=False,
+        offset_start_prob=0.0,
+        seed=0,
+    )
+    cfg = {
+        "sampling": {
+            "full_plan_ratio": 0.7,
+            "horizon_policy": "random",
+            "path_condition": {
+                "policy": "mixed",
+                "ratios": {
+                    "dense_path": 1.0,
+                    "sparse_path": 0.0,
+                    "goal_point": 0.0,
+                },
+                "offset_start": {
+                    "enabled": False,
+                    "prob": 0.0,
+                    "max_frames": 40,
+                    "apply_to": ["dense_path", "sparse_path"],
+                },
+            },
+        },
+        "training_schedule": {
+            "enabled": True,
+            "phases": [
+                {
+                    "name": "dense",
+                    "steps": 1,
+                },
+                {
+                    "name": "sparse_offset",
+                    "steps": 1,
+                    "sampling": {
+                        "path_condition": {
+                            "ratios": {
+                                "dense_path": 0.0,
+                                "sparse_path": 1.0,
+                                "goal_point": 0.0,
+                            },
+                            "offset_start": {
+                                "enabled": True,
+                                "prob": 1.0,
+                            },
+                        },
+                    },
+                },
+            ],
+        },
+    }
+    schedule = TrainingSchedule.from_config(cfg)
+    shared_phase = mp.Value("i", 0)
+    ds.attach_training_schedule(schedule, shared_phase)
+
+    ds.sync_training_schedule_phase()
+    assert ds.path_condition_ratios == {
+        "dense_path": 1.0,
+        "sparse_path": 0.0,
+        "goal_point": 0.0,
+    }
+    assert ds.offset_start_enabled is False
+
+    shared_phase.value = 1
+    ds.sync_training_schedule_phase()
+    assert ds.path_condition_ratios == {
+        "dense_path": 0.0,
+        "sparse_path": 1.0,
+        "goal_point": 0.0,
+    }
+    assert ds.offset_start_enabled is True
+    assert ds.offset_start_prob == 1.0
+
+
+def test_training_schedule_callback_switches_phase_and_freeze():
+    import multiprocessing as mp
+    from train_refiner import RootRefinerTrainingScheduleCallback
+    from utils.training.root_refiner.sampling_schedule import TrainingSchedule
+
+    cfg = _tiny_cfg()
+    cfg["training_schedule"] = {
+        "enabled": True,
+        "phases": [
+            {
+                "name": "duration_frozen",
+                "steps": 2,
+                "freeze": {"refiner_modules": ["duration_head"]},
+            },
+            {
+                "name": "all_trainable",
+                "steps": 2,
+                "freeze": {"refiner_modules": []},
+            },
+        ],
+    }
+    schedule = TrainingSchedule.from_config(cfg)
+    shared_phase = mp.Value("i", 0)
+    callback = RootRefinerTrainingScheduleCallback(schedule, shared_phase)
+    module = RefinerLightningModule(cfg)
+    trainer = type("TrainerStub", (), {})()
+
+    trainer.global_step = 0
+    callback.on_train_batch_start(trainer, module, batch={}, batch_idx=0)
+    assert shared_phase.value == 0
+    duration_parameters = list(module.refiner.duration_head.parameters())
+    assert duration_parameters
+    assert all(not parameter.requires_grad for parameter in duration_parameters)
+
+    trainer.global_step = 2
+    callback.on_train_batch_start(trainer, module, batch={}, batch_idx=1)
+    assert shared_phase.value == 1
+    assert all(parameter.requires_grad for parameter in duration_parameters)
 
 
 # ---------------------------------------------------------------------------

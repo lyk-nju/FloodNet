@@ -1,11 +1,11 @@
-exp_name: root_refiner_heading_hard_decoder_finetune_550k_to_600k
+exp_name: root_refiner_scheduled_450k_from_finetune
 seed: 1234
 debug: false
 train: true
 deterministic: false
 save_dir: /data1/yuankai/text2Motion/FloodDiffusion/outputs
 resume_ckpt:
-init_ckpt: /data1/yuankai/text2Motion/FloodDiffusion/outputs/20260703_152336_root_refiner_heading_decoder_finetune_500k_to_550k/refiner_step_550000.ckpt
+init_ckpt: /data1/yuankai/text2Motion/FloodDiffusion/outputs/20260625_114725_root_refiner_root_branch_finetune/refiner_step_050000.ckpt
 
 logger:
   wandb:
@@ -15,15 +15,11 @@ logger:
     train_exclude_log_keys: []
 
 trainer:
-  max_steps: 50000
   accelerator: auto
-  devices: [4]
+  devices: [1, 2]
   log_every_n_steps: 50
   precision: bf16-mixed
   gradient_clip_val: 1.0
-
-checkpoint:
-  step_offset: 550000
 
 validation:
   validation_steps: 1000
@@ -98,16 +94,10 @@ model:
 
     pace_text_dim: 32
 
-freeze:
-  refiner_modules:
-    - duration_head
-    - condition_encoder
-    - root_transformer
-
 optimizer:
   target: AdamW
   params:
-    lr: 5.0e-6
+    lr: 5.0e-5
     weight_decay: 0.01
 
 lr_scheduler:
@@ -115,19 +105,19 @@ lr_scheduler:
   interval: step
   frequency: 1
   params:
-    num_warmup_steps: 1000
+    num_warmup_steps: 5000
     num_training_steps: ${trainer.max_steps}
 
 loss_weights:
-  pace: 0.0
-  frame_pace: 0.0
+  pace: 1.0
+  frame_pace: 0.02
 
-  xyz: 2.0
-  heading: 3.0
-  heading_flip: 2.0
-  fwd_delta: 0.0
-  yaw_delta: 0.5
-  yaw_jump: 0.5
+  xyz: 5.0
+  heading: 1.0
+  heading_flip: 0.5
+  fwd_delta: 0.1
+  yaw_delta: 0.2
+  yaw_jump: 0.2
   path_control: 0.0
   smoothness: 0.0
 
@@ -145,31 +135,85 @@ data:
   train_bs: 64
   val_bs: 128
   test_bs: 128
-  num_workers: 4
+  num_workers: 8
 
   raw_data_dir: ${dirs.raw_data}
   dataset: humanml3d
-  train_split_file: train_difficult.txt
+  train_split_file: train.txt
   val_split_file: val.txt
   feature_path: new_joint_vecs
   text_path: texts
 
 sampling:
-  full_plan_ratio: 1.0
-  horizon_policy: max
+  full_plan_ratio: 0.7
+  horizon_policy: random
 
   path_condition:
     policy: mixed
     ratios:
-      dense_path: 0.7
-      sparse_path: 0.2
-      goal_point: 0.1
+      dense_path: 1.0
+      sparse_path: 0.0
+      goal_point: 0.0
 
     offset_start:
-      enabled: true
-      prob: 0.2
-      max_frames: 20
-      apply_to: [dense_path]
+      enabled: false
+      prob: 0.0
+      max_frames: 40
+      apply_to: [dense_path, sparse_path]
 
     sparse_path:
-      point_range: [10, 50]
+      point_range: [3, 8]
+
+training_schedule:
+  enabled: true
+  phases:
+    - name: dense_warmup_from_finetune
+      steps: 50000
+      sampling:
+        full_plan_ratio: 0.7
+        horizon_policy: random
+        path_condition:
+          policy: mixed
+          ratios:
+            dense_path: 1.0
+            sparse_path: 0.0
+            goal_point: 0.0
+          offset_start:
+            enabled: false
+            prob: 0.0
+            max_frames: 0
+            apply_to: []
+
+    - name: dense_sparse_offset
+      steps: 200000
+      sampling:
+        full_plan_ratio: 0.7
+        horizon_policy: random
+        path_condition:
+          policy: mixed
+          ratios:
+            dense_path: 0.7
+            sparse_path: 0.3
+            goal_point: 0.0
+          offset_start:
+            enabled: true
+            prob: 0.4
+            max_frames: 40
+            apply_to: [dense_path, sparse_path]
+
+    - name: dense_sparse_goal_offset
+      steps: 200000
+      sampling:
+        full_plan_ratio: 0.5
+        horizon_policy: random
+        path_condition:
+          policy: mixed
+          ratios:
+            dense_path: 0.4
+            sparse_path: 0.3
+            goal_point: 0.3
+          offset_start:
+            enabled: true
+            prob: 0.4
+            max_frames: 40
+            apply_to: [dense_path, sparse_path]

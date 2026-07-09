@@ -136,7 +136,9 @@ def save_config_and_codes(config, save_dir) -> None:
         ".git",
         "__pycache__",
         ".pytest_cache",
+        "output_eval",
         "outputs",
+        "sanity_check",
     }
     for root, dirnames, filenames in os.walk(current_dir, topdown=True):
         dirnames[:] = [name for name in dirnames if name not in excluded_names]

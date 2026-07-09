@@ -2,15 +2,11 @@
 
 from __future__ import annotations
 
-import copy
-import time
 from typing import Dict, List, Optional
 
 import torch
 
 from eval.ldf.conditioning import LdfEvalStreamConditioner
-from eval.ldf.stream_best_of_k import StreamBestOfKConfig, run_best_of_k_step
-from eval.ldf.stream_step import run_one_stream_step
 from metrics.stream import decode_stream_chunks
 from utils.inference.stream_generator import StreamGenerator
 from utils.motion_process import (
@@ -59,10 +55,6 @@ def _to_python_int(value) -> int:
     return int(value)
 
 
-def _should_use_best_of_k(best_of_k: int) -> bool:
-    return int(best_of_k) > 1
-
-
 def _sample_traj7(sample_batch: Dict) -> torch.Tensor:
     traj7 = sample_batch.get("traj_cond_7d")
     if traj7 is None:
@@ -71,31 +63,6 @@ def _sample_traj7(sample_batch: Dict) -> torch.Tensor:
     if not torch.is_tensor(value):
         value = torch.as_tensor(value, dtype=torch.float32)
     return value.float()
-
-
-def _repeat_stream_batch_value(value, repeat: int):
-    repeat = int(repeat)
-    if torch.is_tensor(value):
-        if value.dim() > 0 and int(value.shape[0]) == 1:
-            return value.repeat((repeat,) + (1,) * (value.dim() - 1))
-        return value
-    if isinstance(value, dict):
-        return {
-            key: _repeat_stream_batch_value(item, repeat)
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        if len(value) == 1 and not isinstance(value[0], dict):
-            return [copy.deepcopy(value[0]) for _ in range(repeat)]
-        return [_repeat_stream_batch_value(item, repeat) for item in value]
-    return value
-
-
-def _repeat_stream_step_payload(step_payload: Dict, repeat: int) -> Dict:
-    return {
-        key: _repeat_stream_batch_value(value, repeat)
-        for key, value in step_payload.items()
-    }
 
 
 def _replace_chunk_root_from_condition(
@@ -192,96 +159,6 @@ def _clone_cache_value(value):
     return value
 
 
-def _snapshot_stream_model_state(model) -> dict:
-    state = {}
-    for name in (
-        "generated",
-        "commit_index",
-        "current_step",
-        "batch_size",
-        "seq_len",
-        "num_denoise_steps",
-        "dt",
-        "text_condition_list",
-    ):
-        if hasattr(model, name):
-            state[name] = _clone_cache_value(getattr(model, name))
-    if hasattr(model, "_traj_buf"):
-        try:
-            state["_traj_buf"] = copy.deepcopy(getattr(model, "_traj_buf"))
-        except Exception:
-            state["_traj_buf"] = getattr(model, "_traj_buf")
-    return state
-
-
-def _restore_stream_model_state(model, state: dict) -> None:
-    for name, value in state.items():
-        if name == "_traj_buf":
-            try:
-                value = copy.deepcopy(value)
-            except Exception:
-                pass
-        else:
-            value = _clone_cache_value(value)
-        setattr(model, name, value)
-
-
-def _expand_stream_model_state_for_candidates(model, candidate_count: int) -> None:
-    candidate_count = int(candidate_count)
-    generated = getattr(model, "generated", None)
-    if not torch.is_tensor(generated):
-        raise RuntimeError("best-of-K stream proposal requires model.generated tensor state")
-    if int(generated.shape[0]) == candidate_count:
-        expanded = generated.detach().clone()
-    elif int(generated.shape[0]) == 1:
-        expanded = generated.expand(
-            (candidate_count,) + tuple(generated.shape[1:])
-        ).detach().clone()
-    else:
-        raise RuntimeError(
-            "best-of-K stream proposal expects current batch size 1; "
-            f"got generated batch {generated.shape[0]}."
-        )
-    model.generated = expanded
-    model.batch_size = candidate_count
-    text_condition_list = getattr(model, "text_condition_list", [[]])
-    if len(text_condition_list) == 1:
-        model.text_condition_list = [
-            _clone_cache_value(text_condition_list[0])
-            for _ in range(candidate_count)
-        ]
-    elif len(text_condition_list) != candidate_count:
-        model.text_condition_list = [
-            _clone_cache_value(text_condition_list[0] if text_condition_list else [])
-            for _ in range(candidate_count)
-        ]
-
-
-def _select_candidate_stream_model_state(model, candidate_idx: int) -> None:
-    candidate_idx = int(candidate_idx)
-    generated = getattr(model, "generated", None)
-    if torch.is_tensor(generated) and generated.shape[0] > 1:
-        model.generated = generated[candidate_idx : candidate_idx + 1].detach().clone()
-    text_condition_list = getattr(model, "text_condition_list", None)
-    if isinstance(text_condition_list, list) and len(text_condition_list) > 1:
-        model.text_condition_list = [
-            _clone_cache_value(text_condition_list[candidate_idx])
-        ]
-    model.batch_size = 1
-
-
-def _randomize_candidate_future_noise(model, local_commit_index: int) -> None:
-    generated = getattr(model, "generated", None)
-    if not torch.is_tensor(generated) or generated.shape[0] <= 1:
-        return
-    start = max(0, int(local_commit_index))
-    if start >= int(generated.shape[2]):
-        return
-    # Keep candidate 0 as the default stream proposal for this state. Best-of-K
-    # should add alternatives, not silently replace the K=1 proposal.
-    generated[1:, :, start:, ...] = torch.randn_like(generated[1:, :, start:, ...])
-
-
 def _snapshot_vae_decode_cache(vae):
     model = getattr(vae, "model", None)
     if model is None:
@@ -349,197 +226,6 @@ def _decode_raw_chunk_preserving_feedback_cache(
     return decoded
 
 
-def _candidate_latents_from_generated_output(generated, expected_count: int) -> torch.Tensor:
-    if torch.is_tensor(generated):
-        if generated.dim() == 3:
-            latents = generated[:, 0, :]
-        elif generated.dim() == 2:
-            latents = generated
-        elif generated.dim() == 1:
-            latents = generated.view(1, -1)
-        else:
-            raise ValueError(
-                "stream_generate_step generated tensor must be [B,1,C], [B,C], or [C]; "
-                f"got {tuple(generated.shape)}"
-            )
-    elif isinstance(generated, list):
-        items = []
-        for item in generated:
-            if item is None:
-                continue
-            if item.dim() == 2:
-                items.append(item[0])
-            elif item.dim() == 1:
-                items.append(item)
-            else:
-                raise ValueError(
-                    "stream_generate_step generated list entries must be [1,C] or [C]; "
-                    f"got {tuple(item.shape)}"
-                )
-        latents = torch.stack(items, dim=0) if items else torch.zeros(0)
-    else:
-        raise TypeError(f"Unsupported generated output type: {type(generated)!r}")
-    if int(latents.shape[0]) != int(expected_count):
-        raise ValueError(
-            f"best-of-K expected {expected_count} candidates, got {latents.shape[0]}"
-        )
-    return latents.detach().cpu()
-
-
-def _target_xz_slice(sample_batch: Dict, *, start_frame: int, frame_count: int) -> torch.Tensor:
-    target = _sample_traj7(sample_batch)
-    needed = int(start_frame) + int(frame_count)
-    if target.shape[0] < needed:
-        pad = target[-1:].expand(needed - target.shape[0], -1)
-        target = torch.cat([target, pad], dim=0)
-    return target[int(start_frame) : needed, [0, 2]].float().cpu()
-
-
-def _decoded_chunk_root_xz(
-    decoded_chunk: torch.Tensor,
-    previous_decoded_chunks: Optional[List[torch.Tensor]],
-) -> torch.Tensor:
-    chunks = list(previous_decoded_chunks or []) + [decoded_chunk]
-    full = torch.cat(chunks, dim=0)
-    _, root_xyz = recover_root_rot_pos(full.unsqueeze(0))
-    start = int(full.shape[0] - decoded_chunk.shape[0])
-    return root_xyz[0, start : start + decoded_chunk.shape[0], [0, 2]].float().cpu()
-
-
-def _stream_candidate_xz_score(
-    decoded_chunk: torch.Tensor,
-    sample_batch: Dict,
-    *,
-    start_frame: int,
-    previous_decoded_chunks: Optional[List[torch.Tensor]],
-    cfg: StreamBestOfKConfig,
-) -> tuple[float, dict]:
-    pred_xz = _decoded_chunk_root_xz(decoded_chunk, previous_decoded_chunks)
-    target_xz = _target_xz_slice(
-        sample_batch,
-        start_frame=int(start_frame),
-        frame_count=int(pred_xz.shape[0]),
-    )
-    valid = min(int(pred_xz.shape[0]), int(target_xz.shape[0]))
-    if valid <= 0:
-        return 0.0, {"xz_mean": 0.0, "xz_fde": 0.0, "continuity": 0.0}
-    pred_xz = pred_xz[:valid]
-    target_xz = target_xz[:valid]
-    per_frame = torch.linalg.norm(pred_xz - target_xz, dim=-1)
-    xz_mean = float(per_frame.mean().item())
-    xz_fde = float(per_frame[-1].item())
-    continuity = 0.0
-    if float(cfg.cont_weight) != 0.0 and previous_decoded_chunks:
-        previous_full = torch.cat(previous_decoded_chunks, dim=0)
-        _, previous_xyz = recover_root_rot_pos(previous_full.unsqueeze(0))
-        previous_xz = previous_xyz[0, -1, [0, 2]].float().cpu()
-        continuity = float(torch.linalg.norm(pred_xz[0] - previous_xz).item())
-    score = (
-        float(cfg.xz_weight) * xz_mean
-        + float(cfg.fde_weight) * xz_fde
-        + float(cfg.cont_weight) * continuity
-    )
-    return float(score), {
-        "xz_mean": xz_mean,
-        "xz_fde": xz_fde,
-        "continuity": continuity,
-    }
-
-
-def _stream_generate_step_best_of_k(
-    *,
-    model,
-    vae,
-    stream: StreamGenerator,
-    step_payload: Dict,
-    sample_batch: Dict,
-    first_chunk: bool,
-    device: torch.device,
-    local_commit_index: int,
-    generated_frames: int,
-    previous_decoded_chunks: Optional[List[torch.Tensor]],
-    cfg: StreamBestOfKConfig,
-) -> dict:
-    started = time.perf_counter()
-    base_state = _snapshot_stream_model_state(model)
-    base_vae_cache = _snapshot_vae_decode_cache(vae)
-    try:
-        # Propose K candidates by temporarily expanding the streaming state.
-        # The model still auto-commits internally, so we slice it back to the
-        # selected candidate below before the next stream step can observe it.
-        _expand_stream_model_state_for_candidates(model, cfg.k)
-        _randomize_candidate_future_noise(model, local_commit_index)
-        batched_payload = _repeat_stream_step_payload(step_payload, cfg.k)
-        condition_provider = stream.build_ldf_condition_provider(
-            batched_payload,
-            first_chunk=first_chunk,
-            device=device,
-        )
-        output = model.stream_generate_step(
-            batched_payload,
-            first_chunk=first_chunk,
-            condition=condition_provider,
-        )
-        candidate_latents = _candidate_latents_from_generated_output(
-            output["generated"],
-            cfg.k,
-        )
-        scores: list[float] = []
-        score_parts: list[dict] = []
-        for candidate_idx in range(cfg.k):
-            _restore_vae_decode_cache(vae, base_vae_cache)
-            latent_token = candidate_latents[candidate_idx : candidate_idx + 1]
-            decoded = _decode_raw_chunk_preserving_feedback_cache(
-                vae,
-                latent_token,
-                first_chunk=first_chunk,
-                device=device,
-            )
-            score, parts = _stream_candidate_xz_score(
-                decoded,
-                sample_batch,
-                start_frame=generated_frames,
-                previous_decoded_chunks=previous_decoded_chunks,
-                cfg=cfg,
-            )
-            scores.append(score)
-            score_parts.append(parts)
-
-        selected_idx = int(torch.as_tensor(scores).argmin().item())
-        # Commit selected latent only: keep the selected batch row of
-        # model.generated/text_condition_list and discard all other proposals.
-        _select_candidate_stream_model_state(model, selected_idx)
-        _restore_vae_decode_cache(vae, base_vae_cache)
-        selected_latent = candidate_latents[selected_idx : selected_idx + 1]
-        selected_decoded = _decode_latent_chunk(
-            vae,
-            selected_latent,
-            first_chunk=first_chunk,
-            device=device,
-        )
-        diversity = 0.0
-        if candidate_latents.shape[0] > 1:
-            diversity = float(
-                (candidate_latents - candidate_latents[:1]).abs().max().item()
-            )
-        return {
-            "latent_token": selected_latent,
-            "decoded_chunk": selected_decoded,
-            "record": {
-                "selected_idx": selected_idx,
-                "scores": [float(value) for value in scores],
-                "selected_score": float(scores[selected_idx]),
-                "score_parts": score_parts,
-                "latent_pairwise_max_abs": diversity,
-                "elapsed_sec": float(time.perf_counter() - started),
-            },
-        }
-    except Exception:
-        _restore_stream_model_state(model, base_state)
-        _restore_vae_decode_cache(vae, base_vae_cache)
-        raise
-
-
 def run_stream_generate_sample(model, vae, sample_batch: Dict, device: torch.device, num_denoise_steps: Optional[int]):
     model_batch = build_stream_input(sample_batch, device, model=model)
     latent_chunks: List[torch.Tensor] = []
@@ -576,46 +262,7 @@ def run_stream_generate_step_sample(
     extra_frames: int = 0,
     root_replace_feedback: bool = False,
     root_feedback_xz_blend_alpha: float = 1.0,
-    best_of_k: int = 1,
-    best_of_k_score: str = "xz",
-    best_of_k_xz_weight: float = 1.0,
-    best_of_k_fde_weight: float = 1.0,
-    best_of_k_cont_weight: float = 0.0,
-    best_of_k_vel_weight: float = 0.5,
-    best_of_k_rel_margin: float = 0.10,
-    best_of_k_abs_margin: float = 0.03,
-    best_of_k_cont_tol: float = 0.03,
-    best_of_k_force_candidate0: bool = False,
-    best_of_k_switch_cooldown_steps: int = 0,
-    best_of_k_debug: bool = False,
 ):
-    use_best_of_k = _should_use_best_of_k(best_of_k)
-    best_of_k_cfg: Optional[StreamBestOfKConfig] = None
-    if use_best_of_k:
-        best_of_k_cfg = StreamBestOfKConfig.from_values(
-            k=best_of_k,
-            score=best_of_k_score,
-            xz_weight=best_of_k_xz_weight,
-            fde_weight=best_of_k_fde_weight,
-            cont_weight=best_of_k_cont_weight,
-            vel_weight=best_of_k_vel_weight,
-            rel_margin=best_of_k_rel_margin,
-            abs_margin=best_of_k_abs_margin,
-            cont_tol=best_of_k_cont_tol,
-            force_candidate0=best_of_k_force_candidate0,
-            switch_cooldown_steps=best_of_k_switch_cooldown_steps,
-            debug=best_of_k_debug,
-        )
-    if use_best_of_k and root_replace_feedback:
-        raise ValueError(
-            "best-of-K candidate selection commits the selected latent directly "
-            "and cannot be combined with root replacement feedback in this "
-            "minimal eval path."
-        )
-    if use_best_of_k and sample_batch.get("traj_cond_7d") is None:
-        raise ValueError(
-            "best-of-K xz candidate selection requires sample_batch['traj_cond_7d']."
-        )
     total_tokens = _to_python_int(sample_batch["token_length"][0])
     total_frames = _to_python_int(sample_batch["feature_length"][0])
     extra_frames = max(0, int(extra_frames))
@@ -667,9 +314,6 @@ def run_stream_generate_step_sample(
     decoded_chunks: List[torch.Tensor] = []
     chunk_frame_ends: List[int] = []
     generated_frames = 0
-    best_of_k_records: list[dict] = []
-    best_of_k_total_elapsed_sec = 0.0
-    steps_since_switch = 10**9
 
     try:
         for commit_index in range(step_count):
@@ -688,68 +332,29 @@ def run_stream_generate_step_sample(
                 current_text,
                 traj_input=traj_input,
             )
-            if use_best_of_k:
-                assert best_of_k_cfg is not None
-                step_output, record = run_best_of_k_step(
-                    model=model,
-                    vae=vae,
-                    stream=stream,
-                    stream_conditioner=stream_conditioner,
-                    step_payload=step_payload,
-                    sample_batch=sample_batch,
+            condition_provider = stream.build_ldf_condition_provider(
+                step_payload,
+                first_chunk=first_chunk,
+                device=device,
+            )
+            output = model.stream_generate_step(
+                step_payload,
+                first_chunk=first_chunk,
+                condition=condition_provider,
+            )
+            latent_token = output["generated"][0].detach().cpu()
+            if root_replace_feedback:
+                decoded_chunk_raw = _decode_raw_chunk_preserving_feedback_cache(
+                    vae,
+                    latent_token,
                     first_chunk=first_chunk,
                     device=device,
-                    local_commit_index=local_commit_index,
-                    generated_frames=generated_frames,
-                    previous_decoded_chunks=decoded_chunks,
-                    chunk_frame_ends=chunk_frame_ends,
-                    frames_per_token=int(frames_per_token),
-                    cfg=best_of_k_cfg,
-                    steps_since_switch=steps_since_switch,
                 )
-                latent_token = step_output.clean_committed_latent
-                decoded_chunk_raw = step_output.decoded_chunk
-                record["commit_index"] = int(commit_index)
-                record["local_commit_index"] = int(local_commit_index)
-                best_of_k_records.append(record)
-                if int(record["selected_idx"]) == 0:
-                    steps_since_switch += 1
-                else:
-                    steps_since_switch = 0
-                best_of_k_total_elapsed_sec += float(record.get("elapsed_sec", 0.0))
             else:
-                if root_replace_feedback:
-                    condition_provider = stream.build_ldf_condition_provider(
-                        step_payload,
-                        first_chunk=first_chunk,
-                        device=device,
-                    )
-                    output = model.stream_generate_step(
-                        step_payload,
-                        first_chunk=first_chunk,
-                        condition=condition_provider,
-                    )
-                    latent_token = output["generated"][0].detach().cpu()
-                    decoded_chunk_raw = _decode_raw_chunk_preserving_feedback_cache(
-                        vae,
-                        latent_token,
-                        first_chunk=first_chunk,
-                        device=device,
-                    )
-                else:
-                    step_output = run_one_stream_step(
-                        model=model,
-                        vae=vae,
-                        stream=stream,
-                        step_payload=step_payload,
-                        first_chunk=first_chunk,
-                        device=device,
-                        local_commit_index=local_commit_index,
-                        generated_frames=generated_frames,
-                        frames_per_token=frames_per_token,
-                    )
-                    latent_token = step_output.clean_committed_latent
-                    decoded_chunk_raw = step_output.decoded_chunk
+                decoded_chunk_raw = vae.stream_decode(
+                    output["generated"][0][None, :],
+                    first_chunk=first_chunk,
+                )[0].float().detach().cpu()
             chunk_start_frame = int(generated_frames)
             if root_replace_feedback:
                 decoded_chunk = _replace_chunk_root_from_condition(
@@ -814,78 +419,6 @@ def run_stream_generate_step_sample(
         "extra_frames": int(extra_frames),
         "root_replace_feedback": bool(root_replace_feedback),
         "root_feedback_xz_blend_alpha": float(root_feedback_xz_blend_alpha),
-        "stream_best_of_k": {
-            "enabled": bool(use_best_of_k),
-            "k": int(best_of_k_cfg.k) if best_of_k_cfg is not None else max(1, int(best_of_k)),
-            "score": str(best_of_k_cfg.score) if best_of_k_cfg is not None else best_of_k_score,
-            "xz_weight": (
-                float(best_of_k_cfg.xz_weight)
-                if best_of_k_cfg is not None
-                else best_of_k_xz_weight
-            ),
-            "fde_weight": (
-                float(best_of_k_cfg.fde_weight)
-                if best_of_k_cfg is not None
-                else best_of_k_fde_weight
-            ),
-            "cont_weight": (
-                float(best_of_k_cfg.cont_weight)
-                if best_of_k_cfg is not None
-                else best_of_k_cont_weight
-            ),
-            "vel_weight": (
-                float(best_of_k_cfg.vel_weight)
-                if best_of_k_cfg is not None
-                else best_of_k_vel_weight
-            ),
-            "rel_margin": (
-                float(best_of_k_cfg.rel_margin)
-                if best_of_k_cfg is not None
-                else best_of_k_rel_margin
-            ),
-            "abs_margin": (
-                float(best_of_k_cfg.abs_margin)
-                if best_of_k_cfg is not None
-                else best_of_k_abs_margin
-            ),
-            "cont_tol": (
-                float(best_of_k_cfg.cont_tol)
-                if best_of_k_cfg is not None
-                else best_of_k_cont_tol
-            ),
-            "force_candidate0": (
-                bool(best_of_k_cfg.force_candidate0)
-                if best_of_k_cfg is not None
-                else best_of_k_force_candidate0
-            ),
-            "switch_cooldown_steps": (
-                int(best_of_k_cfg.switch_cooldown_steps)
-                if best_of_k_cfg is not None
-                else best_of_k_switch_cooldown_steps
-            ),
-            "total_elapsed_sec": float(best_of_k_total_elapsed_sec),
-            "switch_count": (
-                int(
-                    sum(
-                        1
-                        for item in best_of_k_records
-                        if int(item.get("selected_idx", 0)) != 0
-                    )
-                )
-                if best_of_k_cfg is not None
-                else 0
-            ),
-            "step_count": (
-                int(len(best_of_k_records))
-                if best_of_k_cfg is not None
-                else 0
-            ),
-            "records": (
-                best_of_k_records
-                if best_of_k_cfg is not None and bool(best_of_k_cfg.debug)
-                else []
-            ),
-        },
     }
 
 
@@ -903,7 +436,6 @@ def run_offline_generate_sample(model, vae, sample_batch: Dict, device: torch.de
 
 __all__ = [
     "StreamTextRolloutController",
-    "StreamBestOfKConfig",
     "build_stream_input",
     "run_offline_generate_sample",
     "run_stream_generate_sample",

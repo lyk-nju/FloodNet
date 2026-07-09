@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import pytest
 import torch
 
 import models.diffusion_forcing_wan as diffusion_wan_mod
@@ -94,6 +95,51 @@ def test_stream_state_buffer_is_injected_from_inference_layer():
     model.init_generated(5, batch_size=2, num_denoise_steps=4, traj_buffer=buffer)
 
     assert model._traj_buf is buffer
+
+
+def test_oracle_initial_noise_api_is_explicit():
+    assert "initial_noise" in inspect.signature(DiffForcingWanModel.generate).parameters
+    assert "initial_generated" in inspect.signature(
+        DiffForcingWanModel.init_generated
+    ).parameters
+
+
+def test_init_generated_accepts_initial_generated_buffer():
+    model = DiffForcingWanModel.__new__(DiffForcingWanModel)
+    torch.nn.Module.__init__(model)
+    model.noise_steps = 4
+    model.chunk_size = 2
+    model.input_dim = 3
+    model.preprocess = lambda x: x
+
+    initial_generated = torch.arange(2 * 12 * 3, dtype=torch.float32).view(2, 12, 3)
+    model.init_generated(
+        5,
+        batch_size=2,
+        num_denoise_steps=4,
+        initial_generated=initial_generated,
+    )
+
+    assert torch.equal(model.generated, initial_generated)
+    initial_generated.add_(100.0)
+    assert not torch.equal(model.generated, initial_generated)
+
+
+def test_init_generated_rejects_wrong_initial_generated_shape():
+    model = DiffForcingWanModel.__new__(DiffForcingWanModel)
+    torch.nn.Module.__init__(model)
+    model.noise_steps = 4
+    model.chunk_size = 2
+    model.input_dim = 3
+    model.preprocess = lambda x: x
+
+    with pytest.raises(ValueError, match="initial_generated must have shape"):
+        model.init_generated(
+            5,
+            batch_size=2,
+            num_denoise_steps=4,
+            initial_generated=torch.zeros(2, 11, 3),
+        )
 
 
 def test_forward_is_network_forward_not_training_step():
@@ -236,3 +282,103 @@ def test_generate_consumes_prepared_condition_without_raw_condition_adapters():
     assert model.recorded["condition"]["traj_seq_lens"] is traj_seq_lens
     assert model.recorded["condition"]["traj_token_mask"] is traj_token_mask
     assert model.recorded["condition"]["seq_len"] == 3
+
+
+def test_generate_accepts_initial_noise_with_gradient():
+    model = DiffForcingWanModel.__new__(DiffForcingWanModel)
+    torch.nn.Module.__init__(model)
+    model._dummy_param = torch.nn.Parameter(torch.zeros(()))
+    model.input_dim = 2
+    model.chunk_size = 1
+    model.noise_steps = 1
+    model.time_embedding_scale = 1.0
+    model.prediction_type = "vel"
+
+    def denoise(
+        noisy_input,
+        t_scaled,
+        text_cond_ctx,
+        text_null_ctx,
+        traj_emb,
+        traj_seq_lens,
+        seq_len,
+        batch_size,
+        traj_token_mask=None,
+    ):
+        return [torch.zeros_like(noisy_input[0])]
+
+    model._denoise_with_cfg = denoise
+    model.preprocess = lambda x: x.permute(0, 2, 1)[:, :, :, None, None]
+    model.postprocess = lambda x: x.squeeze(-1).squeeze(-1).permute(0, 2, 1)
+
+    condition = LDFCondition(
+        text_context=["cond"],
+        text_null_context=["null"],
+        seq_len=3,
+        attn_len=3,
+    )
+    initial_noise = torch.arange(6, dtype=torch.float32).view(1, 3, 2)
+    initial_noise.requires_grad_(True)
+    batch = {"feature_length": torch.tensor([2])}
+
+    out = model.generate(
+        batch,
+        condition=condition,
+        num_denoise_steps=1,
+        initial_noise=initial_noise,
+    )
+    loss = out["generated"][0].sum()
+    loss.backward()
+
+    assert torch.equal(out["generated"][0], initial_noise[0, :2])
+    assert initial_noise.grad is not None
+    assert torch.equal(initial_noise.grad[0, :2], torch.ones(2, 2))
+
+
+def test_generate_initial_noise_gradient_survives_multiple_denoise_updates():
+    model = DiffForcingWanModel.__new__(DiffForcingWanModel)
+    torch.nn.Module.__init__(model)
+    model._dummy_param = torch.nn.Parameter(torch.zeros(()))
+    model.input_dim = 2
+    model.chunk_size = 1
+    model.noise_steps = 2
+    model.time_embedding_scale = 1.0
+    model.prediction_type = "vel"
+
+    def denoise(
+        noisy_input,
+        t_scaled,
+        text_cond_ctx,
+        text_null_ctx,
+        traj_emb,
+        traj_seq_lens,
+        seq_len,
+        batch_size,
+        traj_token_mask=None,
+    ):
+        return [noisy_input[0] * 0.1]
+
+    model._denoise_with_cfg = denoise
+    model.preprocess = lambda x: x.permute(0, 2, 1)[:, :, :, None, None]
+    model.postprocess = lambda x: x.squeeze(-1).squeeze(-1).permute(0, 2, 1)
+
+    condition = LDFCondition(
+        text_context=["cond"],
+        text_null_context=["null"],
+        seq_len=4,
+        attn_len=4,
+    )
+    initial_noise = torch.randn(1, 4, 2, requires_grad=True)
+    batch = {"feature_length": torch.tensor([3])}
+
+    out = model.generate(
+        batch,
+        condition=condition,
+        num_denoise_steps=2,
+        initial_noise=initial_noise,
+    )
+    loss = out["generated"][0].pow(2).sum()
+    loss.backward()
+
+    assert initial_noise.grad is not None
+    assert torch.isfinite(initial_noise.grad).all()

@@ -23,12 +23,15 @@ from eval.ldf.runtime_update.diagnostics import (
     validate_trajectory_diagnostics,
     yaw_from_7d,
 )
-from utils.inference.runtime_update.active_condition import compose_active_window_segment
+from utils.inference.runtime_update.active_condition import (
+    compose_active_window_segment,
+    compose_active_window_world_condition,
+)
 from utils.inference.runtime_update.payload_builder import (
     build_world_condition_stream_payload,
 )
 from utils.inference.runtime_update.route_tracker import RouteProgressTracker
-from utils.token_frame import token_start_frame
+from utils.token_frame import token_end_frame, token_range_to_frame_slice
 
 
 def _parse_args() -> argparse.Namespace:
@@ -136,8 +139,12 @@ def main() -> int:
             tracker=tracker,
         )
         segments.append(segment)
-        end = min(target_frames, anchor_frame + int(segment.segment_traj7.shape[0]))
-        composed[anchor_frame:end] = segment.segment_traj7[: end - anchor_frame]
+        composed = compose_active_window_world_condition(
+            composed,
+            generated[: anchor_frame + 1],
+            segment,
+            current_frame=anchor_frame,
+        )
         active_plans.append((int(update_commit), composed.clone()))
         reference = route[
             int(segment.route_index) : min(
@@ -188,7 +195,7 @@ def main() -> int:
             continue
         generated_prefix_frames = min(
             int(generated.shape[0]),
-            token_start_frame(int(commit), int(args.frames_per_token)) + 1,
+            token_end_frame(int(commit) - 1, int(args.frames_per_token)) + 1,
         )
         payload_generated_history = generated[:generated_prefix_frames]
         current_payload_frame = max(0, int(payload_generated_history.shape[0]) - 1)
@@ -237,8 +244,17 @@ def main() -> int:
             new_world_payloads.append(new_world)
             payload_diag = trajectory_diagnostics(new_world)
             payload_abs_start = int(payload.get("traj_abs_start_token", 0)) if payload else 0
-            payload_frame_start = token_start_frame(payload_abs_start, int(args.frames_per_token))
-            payload_current_frame = token_start_frame(int(commit), int(args.frames_per_token))
+            payload_num_tokens = int(payload.get("traj_num_tokens", 0)) if payload else 0
+            payload_frame_slice = token_range_to_frame_slice(
+                payload_abs_start,
+                payload_num_tokens,
+                int(args.frames_per_token),
+            )
+            payload_frame_start = int(payload_frame_slice.start)
+            payload_current_frame = token_end_frame(
+                int(commit) - 1,
+                int(args.frames_per_token),
+            )
             future_local_start = max(0, min(int(new_world.shape[0]) - 1, payload_current_frame - payload_frame_start))
             future_world = new_world[future_local_start:]
             future_payload_diag = trajectory_diagnostics(future_world)

@@ -154,6 +154,69 @@ def test_stream_generate_step_keeps_latent_length_separate_from_future_traj():
     assert model.recorded.text_context_lens == model.recorded.model_sls
 
 
+def test_init_generated_accepts_stream_initial_buffer():
+    model = DiffForcingWanModel.__new__(DiffForcingWanModel)
+    torch.nn.Module.__init__(model)
+    model.noise_steps = 2
+    model.chunk_size = 1
+    model.input_dim = 2
+    model.preprocess = lambda x: x.permute(0, 2, 1)[:, :, :, None, None]
+
+    initial_generated = torch.arange(10, dtype=torch.float32).view(1, 5, 2)
+
+    model.init_generated(
+        2,
+        batch_size=1,
+        num_denoise_steps=2,
+        initial_generated=initial_generated,
+    )
+
+    assert model.generated.requires_grad is False
+    assert torch.equal(
+        model.generated.squeeze(-1).squeeze(-1).permute(0, 2, 1),
+        initial_generated,
+    )
+
+
+def test_stream_generate_step_can_backpropagate_to_initial_buffer():
+    model = _make_stream_step_harness(
+        seq_len=2,
+        chunk_size=1,
+        num_denoise_steps=2,
+        generated_len=5,
+    )
+
+    def denoise(
+        noisy_input,
+        t_scaled,
+        text_cond_ctx,
+        text_null_ctx,
+        traj_emb,
+        traj_seq_lens,
+        seq_len,
+        batch_size,
+        traj_token_mask=None,
+    ):
+        return [noisy_input[0] * 0.1]
+
+    model._denoise_with_cfg = denoise
+    initial_generated = torch.randn(1, 5, 2, requires_grad=True)
+    model.generated = initial_generated.permute(0, 2, 1)[:, :, :, None, None]
+
+    with torch.enable_grad():
+        output = DiffForcingWanModel.stream_generate_step.__wrapped__(
+            model,
+            {},
+            first_chunk=True,
+            condition=_condition_provider(model, {"text": ["walk"]}),
+        )
+        loss = output["generated"].pow(2).sum()
+        loss.backward()
+
+    assert initial_generated.grad is not None
+    assert torch.isfinite(initial_generated.grad).all()
+
+
 def test_stream_generate_step_reuses_direct_7d_payload_across_chunk_substeps():
     model = _make_stream_step_harness(
         seq_len=30,
@@ -185,3 +248,102 @@ def test_stream_generate_step_reuses_direct_7d_payload_across_chunk_substeps():
     assert model.recorded.seq_lens == model.recorded.model_sls
     assert model.recorded.t_lens == model.recorded.model_sls
     assert model.recorded.text_context_lens == model.recorded.model_sls
+
+
+def test_stream_generate_step_calls_projection_hook_after_denoise_update():
+    model = _make_stream_step_harness(
+        seq_len=4,
+        chunk_size=2,
+        num_denoise_steps=2,
+        commit_index=0,
+        current_step=0,
+        generated_len=8,
+    )
+
+    def denoise(*args, **kwargs):
+        return [torch.ones(2, 1, 1, 1)]
+
+    model._denoise_with_cfg = denoise
+    calls = []
+
+    def projection_hook(**kwargs):
+        calls.append(
+            {
+                "commit_index": kwargs["commit_index"],
+                "start_index": kwargs["start_index"],
+                "end_index": kwargs["end_index"],
+                "current_step": kwargs["current_step"],
+                "generated_value": float(
+                    kwargs["model"].generated[0, 0, kwargs["start_index"], 0, 0]
+                ),
+            }
+        )
+
+    model.stream_generate_step(
+        {},
+        first_chunk=True,
+        condition=_condition_provider(model, {"text": ["walk"]}),
+        projection_callback=projection_hook,
+    )
+
+    assert calls == [
+        {
+            "commit_index": 0,
+            "start_index": 0,
+            "end_index": 1,
+            "current_step": 0,
+            "generated_value": 0.5,
+        },
+        {
+            "commit_index": 0,
+            "start_index": 0,
+            "end_index": 2,
+            "current_step": 1,
+            "generated_value": 1.0,
+        },
+    ]
+
+
+def test_stream_generate_step_projection_hook_receives_time_consistent_state():
+    model = _make_stream_step_harness(
+        seq_len=4,
+        chunk_size=1,
+        num_denoise_steps=10,
+        commit_index=0,
+        current_step=8,
+        generated_len=8,
+    )
+    model.generated[0, :, 0, 0, 0] = torch.tensor([1.0, 2.0])
+
+    def denoise(*args, **kwargs):
+        return [torch.tensor([[[[0.5]]], [[[-0.5]]]])]
+
+    model._denoise_with_cfg = denoise
+    calls = []
+
+    def projection_hook(**kwargs):
+        calls.append(
+            {
+                "current_step": kwargs["current_step"],
+                "x_before": kwargs["x_beta_before_update"].detach().clone(),
+                "predicted_vel": kwargs["predicted_vel"].detach().clone(),
+                "beta_before": kwargs["beta_before"].detach().clone(),
+                "beta_after": kwargs["beta_after"].detach().clone(),
+                "x_after": kwargs["x_after_velocity_update"].detach().clone(),
+            }
+        )
+
+    model.stream_generate_step(
+        {},
+        first_chunk=False,
+        condition=_condition_provider(model, {"text": ["walk"]}),
+        projection_callback=projection_hook,
+    )
+
+    call = next(item for item in calls if item["current_step"] == 8)
+    assert call["current_step"] == 8
+    assert torch.allclose(call["x_before"][:, 0, 0], torch.tensor([1.0, 2.0]))
+    assert torch.allclose(call["predicted_vel"][:, 0, 0], torch.tensor([0.5, -0.5]))
+    assert torch.isclose(call["beta_before"], torch.tensor(0.2))
+    assert torch.isclose(call["beta_after"], torch.tensor(0.1))
+    assert torch.allclose(call["x_after"][:, 0, 0], torch.tensor([1.05, 1.95]))

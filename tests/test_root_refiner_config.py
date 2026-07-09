@@ -108,14 +108,9 @@ def test_model_block_required_keys_and_values():
         assert model[k] == v, f"model.{k} = {model[k]}, expected {v}"
 
 
-def test_canonicalization_block():
+def test_canonicalization_block_is_not_user_config():
     cfg = _load()
-    canon = cfg["canonicalization"]
-    assert canon["mode"] == "b_full"
-    assert canon["anchor"] == "first_effective_frame"
-    # ⚠ scalar, NOT a range — see TODO §T_A_07 hard constraint
-    assert canon["full_plan_valid_history_frames"] == 1
-    assert "min" not in str(canon.get("full_plan_valid_history_frames", ""))
+    assert "canonicalization" not in cfg
 
 
 def test_ldf_style_runtime_blocks():
@@ -133,12 +128,12 @@ def test_ldf_style_runtime_blocks():
 
 def test_loss_and_loss_weights():
     cfg = _load()
-    assert cfg["loss"]["heading_form"] == "cosine"
+    assert "loss" not in cfg
     weights = cfg["loss_weights"]
     expected_w = {
         "pace": 0.5,
         "frame_pace": 0.1,
-        "xyz": 5.0,
+        "xyz": 20.0,
         "heading": 1.0,
         "fwd_delta": 0.5,
         "yaw_delta": 0.5,
