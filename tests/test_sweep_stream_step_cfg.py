@@ -48,24 +48,3 @@ def test_root_feedback_xz_blend_alpha_has_hard_replace_default(monkeypatch):
 
     assert args.root_feedback_xz_blend_alpha == 1.0
 
-
-def test_write_csv_includes_best_of_k_runtime_metrics(tmp_path):
-    csv_path = tmp_path / "results.csv"
-    row = {
-        "cfg_text": 1.25,
-        "cfg_traj": 3.0,
-        "ade_mean": 0.1,
-        "ade_std": 0.0,
-        "stream_best_of_k_switch_count_mean": 2.0,
-        "stream_best_of_k_step_count_mean": 46.0,
-        "stream_best_of_k_total_elapsed_sec_mean": 4.5,
-        "best_of_k_debug": True,
-    }
-
-    sweep_stream_step_cfg._write_csv(csv_path, [row])
-
-    text = csv_path.read_text()
-    assert "stream_best_of_k_switch_count_mean" in text
-    assert "stream_best_of_k_step_count_mean" in text
-    assert "stream_best_of_k_total_elapsed_sec_mean" in text
-    assert "best_of_k_debug" in text

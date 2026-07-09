@@ -106,23 +106,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num_denoise_steps", type=int, default=None)
     parser.add_argument("--frames_per_token", type=int, default=4)
     parser.add_argument("--token_dt", type=float, default=0.20)
-    parser.add_argument(
-        "--best_of_k",
-        type=int,
-        default=1,
-        help="Number of stream_generate_step candidates to sample and select by XZ score.",
-    )
-    parser.add_argument("--best_of_k_score", default="xz")
-    parser.add_argument("--best_of_k_xz_weight", type=float, default=1.0)
-    parser.add_argument("--best_of_k_fde_weight", type=float, default=1.0)
-    parser.add_argument("--best_of_k_cont_weight", type=float, default=0.0)
-    parser.add_argument("--best_of_k_vel_weight", type=float, default=0.5)
-    parser.add_argument("--best_of_k_rel_margin", type=float, default=0.10)
-    parser.add_argument("--best_of_k_abs_margin", type=float, default=0.03)
-    parser.add_argument("--best_of_k_cont_tol", type=float, default=0.03)
-    parser.add_argument("--best_of_k_force_candidate0", action="store_true")
-    parser.add_argument("--best_of_k_switch_cooldown_steps", type=int, default=0)
-    parser.add_argument("--best_of_k_debug", action="store_true")
     parser.add_argument("--sample_name", default="000021")
     parser.add_argument("--probe_tag", default="cfg_sweep_000021")
     parser.add_argument(
@@ -325,23 +308,8 @@ def _run_worker(worker_id: int, gpu_id: int, combos: list[tuple[float, float]], 
                     token_dt=float(args.token_dt),
                     frames_per_token=int(args.frames_per_token),
                     extra_frames=int(args.extra_frames),
-                    best_of_k=int(args.best_of_k),
-                    best_of_k_score=str(args.best_of_k_score),
-                    best_of_k_xz_weight=float(args.best_of_k_xz_weight),
-                    best_of_k_fde_weight=float(args.best_of_k_fde_weight),
-                    best_of_k_cont_weight=float(args.best_of_k_cont_weight),
-                    best_of_k_vel_weight=float(args.best_of_k_vel_weight),
-                    best_of_k_rel_margin=float(args.best_of_k_rel_margin),
-                    best_of_k_abs_margin=float(args.best_of_k_abs_margin),
-                    best_of_k_cont_tol=float(args.best_of_k_cont_tol),
-                    best_of_k_force_candidate0=bool(args.best_of_k_force_candidate0),
-                    best_of_k_switch_cooldown_steps=int(
-                        args.best_of_k_switch_cooldown_steps
-                    ),
-                    best_of_k_debug=bool(args.best_of_k_debug),
                 )
             original_time = time.perf_counter() - start_time
-            best_of_k_info = stream_out.get("stream_best_of_k", {}) or {}
             metrics = _compute_traj_metrics(
                 stream_out["decoded_feature"],
                 sample_batch,
@@ -447,15 +415,6 @@ def _run_worker(worker_id: int, gpu_id: int, combos: list[tuple[float, float]], 
                     "time_stream_original_sec": float(original_time),
                     "time_root_replaced_posthoc_sec": float(posthoc_time),
                     "time_root_replaced_feedback_sec": float(feedback_time),
-                    "stream_best_of_k_switch_count": float(
-                        best_of_k_info.get("switch_count", 0)
-                    ),
-                    "stream_best_of_k_step_count": float(
-                        best_of_k_info.get("step_count", 0)
-                    ),
-                    "stream_best_of_k_total_elapsed_sec": float(
-                        best_of_k_info.get("total_elapsed_sec", 0.0)
-                    ),
                     **video_paths,
                 }
             )
@@ -489,15 +448,6 @@ def _run_worker(worker_id: int, gpu_id: int, combos: list[tuple[float, float]], 
         time_feedback_mean, time_feedback_std = _stats(
             [m["time_root_replaced_feedback_sec"] for m in run_metrics]
         )
-        best_of_k_switch_mean, best_of_k_switch_std = _stats(
-            [m["stream_best_of_k_switch_count"] for m in run_metrics]
-        )
-        best_of_k_step_mean, best_of_k_step_std = _stats(
-            [m["stream_best_of_k_step_count"] for m in run_metrics]
-        )
-        best_of_k_elapsed_mean, best_of_k_elapsed_std = _stats(
-            [m["stream_best_of_k_total_elapsed_sec"] for m in run_metrics]
-        )
         arc_mean, arc_std = _stats([m["path_arc_ade"] for m in run_metrics])
         record = {
             "cfg_text": float(cfg_text),
@@ -529,12 +479,6 @@ def _run_worker(worker_id: int, gpu_id: int, combos: list[tuple[float, float]], 
             "time_root_replaced_posthoc_sec_std": time_posthoc_std,
             "time_root_replaced_feedback_sec_mean": time_feedback_mean,
             "time_root_replaced_feedback_sec_std": time_feedback_std,
-            "stream_best_of_k_switch_count_mean": best_of_k_switch_mean,
-            "stream_best_of_k_switch_count_std": best_of_k_switch_std,
-            "stream_best_of_k_step_count_mean": best_of_k_step_mean,
-            "stream_best_of_k_step_count_std": best_of_k_step_std,
-            "stream_best_of_k_total_elapsed_sec_mean": best_of_k_elapsed_mean,
-            "stream_best_of_k_total_elapsed_sec_std": best_of_k_elapsed_std,
             "root_feedback_fps_mean": (
                 float(run_metrics[0]["target_total_frames"]) / time_feedback_mean
                 if math.isfinite(time_feedback_mean) and time_feedback_mean > 0
@@ -548,20 +492,6 @@ def _run_worker(worker_id: int, gpu_id: int, combos: list[tuple[float, float]], 
             "root_replace_condition": bool(args.root_replace_condition),
             "root_replace_feedback": bool(args.root_replace_feedback),
             "root_feedback_xz_blend_alpha": float(args.root_feedback_xz_blend_alpha),
-            "best_of_k": int(args.best_of_k),
-            "best_of_k_score": str(args.best_of_k_score),
-            "best_of_k_xz_weight": float(args.best_of_k_xz_weight),
-            "best_of_k_fde_weight": float(args.best_of_k_fde_weight),
-            "best_of_k_cont_weight": float(args.best_of_k_cont_weight),
-            "best_of_k_vel_weight": float(args.best_of_k_vel_weight),
-            "best_of_k_rel_margin": float(args.best_of_k_rel_margin),
-            "best_of_k_abs_margin": float(args.best_of_k_abs_margin),
-            "best_of_k_cont_tol": float(args.best_of_k_cont_tol),
-            "best_of_k_force_candidate0": bool(args.best_of_k_force_candidate0),
-            "best_of_k_switch_cooldown_steps": int(
-                args.best_of_k_switch_cooldown_steps
-            ),
-            "best_of_k_debug": bool(args.best_of_k_debug),
             "stream_mode": "stream_generate_step",
             "sample_name": str(sample_batch["name"][0]),
             "caption_index": sample_batch.get("_caption_index"),
@@ -612,12 +542,6 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
         "time_root_replaced_posthoc_sec_std",
         "time_root_replaced_feedback_sec_mean",
         "time_root_replaced_feedback_sec_std",
-        "stream_best_of_k_switch_count_mean",
-        "stream_best_of_k_switch_count_std",
-        "stream_best_of_k_step_count_mean",
-        "stream_best_of_k_step_count_std",
-        "stream_best_of_k_total_elapsed_sec_mean",
-        "stream_best_of_k_total_elapsed_sec_std",
         "root_feedback_fps_mean",
         "path_arc_ade_mean",
         "path_arc_ade_std",
@@ -627,18 +551,6 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
         "root_replace_condition",
         "root_replace_feedback",
         "root_feedback_xz_blend_alpha",
-        "best_of_k",
-        "best_of_k_score",
-        "best_of_k_xz_weight",
-        "best_of_k_fde_weight",
-        "best_of_k_cont_weight",
-        "best_of_k_vel_weight",
-        "best_of_k_rel_margin",
-        "best_of_k_abs_margin",
-        "best_of_k_cont_tol",
-        "best_of_k_force_candidate0",
-        "best_of_k_switch_cooldown_steps",
-        "best_of_k_debug",
         "sample_name",
         "gpu_id",
         "worker_id",
@@ -699,18 +611,6 @@ def main() -> None:
         "root_replace_condition": args.root_replace_condition,
         "root_replace_feedback": args.root_replace_feedback,
         "root_feedback_xz_blend_alpha": args.root_feedback_xz_blend_alpha,
-        "best_of_k": args.best_of_k,
-        "best_of_k_score": args.best_of_k_score,
-        "best_of_k_xz_weight": args.best_of_k_xz_weight,
-        "best_of_k_fde_weight": args.best_of_k_fde_weight,
-        "best_of_k_cont_weight": args.best_of_k_cont_weight,
-        "best_of_k_vel_weight": args.best_of_k_vel_weight,
-        "best_of_k_rel_margin": args.best_of_k_rel_margin,
-        "best_of_k_abs_margin": args.best_of_k_abs_margin,
-        "best_of_k_cont_tol": args.best_of_k_cont_tol,
-        "best_of_k_force_candidate0": args.best_of_k_force_candidate0,
-        "best_of_k_switch_cooldown_steps": args.best_of_k_switch_cooldown_steps,
-        "best_of_k_debug": args.best_of_k_debug,
         "render_video": args.render_video,
     }
     with (out_dir / "sweep_config.json").open("w", encoding="utf-8") as handle:
