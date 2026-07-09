@@ -58,6 +58,28 @@ active_noisy_state      # 当前 denoise schedule 中的 x_beta
 future_initial_noise    # 尚未进入 denoise 的 z_T
 ```
 
+注意：当前代码里还没有真正独立的 `future_initial_noise` buffer。第一版实现不要假设存在这个 buffer，而要先用 `model.generated + beta/schedule` 构造状态视图：
+
+```python
+@dataclass
+class StreamLatentStateView:
+    committed_ids: torch.Tensor
+    active_ids: torch.Tensor
+    frontier_ids: torch.Tensor
+
+    committed_latents: torch.Tensor       # clean-ish z0 / history
+    active_latents: torch.Tensor          # current x_beta
+    frontier_base_zT: torch.Tensor        # beta ~= 1, not yet denoised
+
+    active_beta: torch.Tensor
+    frontier_beta: torch.Tensor
+    active_offsets: torch.Tensor
+    frontier_offsets: torch.Tensor
+
+    commit_index: int
+    current_step: int
+```
+
 其中 initializer 只作用于：
 
 ```text
@@ -75,7 +97,7 @@ active_noisy_state
 
 ## 2. 数据怎么来
 
-这里不建议大规模离线收集 oracle \(Z_T^*\) 数据集，因为单样本 oracle optimization 代价较高。训练数据来自在线 rollout 中动态采样的 decision states。
+这里不建议大规模离线收集 oracle \(Z_T^*\) 数据集，因为单样本 oracle optimization 代价较高，而且 full-sequence oracle 和最终 runtime 形态不一致。训练数据来自在线 rollout 中动态采样的 decision states。
 
 每个训练样本是：
 
@@ -111,7 +133,9 @@ k = sample_decision_index(sample)
 state = rollout_until(state, commit_index=k, rollin_policy=current_rollin)
 ```
 
-`rollin_policy` 可以是：
+第一版先使用 Gaussian rollin，让可微训练闭环尽快跑通。initializer rollin 只在 residual 版本有效后作为 Stage 2 加入。
+
+`rollin_policy` 后续可以是：
 
 - Gaussian baseline；
 - initializer；
@@ -212,6 +236,21 @@ frontier_ids = find_frontier_zT_tokens(
 )
 ```
 
+第一版 frontier ids 可以用：
+
+```text
+beta >= 0.999
+index > commit_index
+```
+
+更稳的版本还应额外记录：
+
+```text
+token_update_count == 0
+```
+
+真正的 pure \(z_T\) 是“还没有被 triangular schedule update 过”，而不只是“beta 看起来接近 1”。
+
 如果不够数量，跳过当前 state。
 
 ```python
@@ -256,6 +295,30 @@ alpha = min(1.0, global_step / warmup_steps)
 zT_frontier = base_zT + alpha * delta_zT
 ```
 
+第一版输入尽量最小化：
+
+```text
+history_latents: 最近 history_length 个 committed latents
+active_latents: 当前 active x_beta
+active_beta / active_offsets
+local_traj: generated-anchor local trajectory
+text_embedding
+frontier_offsets
+```
+
+最小模型可以是：
+
+```text
+history encoder: mean-pool / small Transformer
+active encoder: mean-pool with beta / offset embedding
+traj encoder: MLP or 1D conv
+text projection: Linear
+fusion: MLP
+output head: M * latent_dim
+```
+
+先验证能不能训练出收益，再追求结构优雅。
+
 ### 5.2 第二版：Gaussian prior
 
 后续可升级为：
@@ -291,6 +354,14 @@ Shadow rollout 用于让 frontier \(z_T\) 生效并计算 loss。它不改变真
 - 不更新 LDF / VAE 参数；
 - 但不要 `torch.no_grad()` 包住 LDF / VAE forward，因为梯度需要从 loss 传回 initializer；
 - rollout 到 frontier tokens 进入 denoise schedule 并产生 decoded motion。
+
+实现上应像 oracle prototype 一样使用可微 step：
+
+```python
+DiffForcingWanModel.stream_generate_step.__wrapped__(...)
+```
+
+或者抽一个正式的 differentiable helper。不能调用被 `@torch.no_grad()` 包住的普通推理路径。
 
 ### 6.2 伪代码
 
@@ -438,12 +509,13 @@ for global_step in range(num_train_steps):
     state = rollout_until(
         state,
         commit_index=k,
-        rollin_policy=scheduled_rollin_policy(initializer, global_step),
+        rollin_policy="gaussian",
     )
 
     # extract context
-    H_k = extract_committed_history(state, history_length).detach()
-    A_k = extract_active_boundary(state).detach()
+    view = StreamLatentStateView.from_model(model, state)
+    H_k = view.committed_latents[-history_length:].detach()
+    A_k = view.active_latents.detach()
     c_k = get_text_embedding(sample).detach()
     tau_k = build_future_local_trajectory(
         state=state,
@@ -453,24 +525,20 @@ for global_step in range(num_train_steps):
     ).detach()
 
     # find frontier zT
-    frontier_ids = find_frontier_zT_tokens(
-        state,
-        num_tokens=frontier_tokens,
-        beta_threshold=0.999,
-        require_stage="initial_zT",
-    )
+    frontier_ids = view.frontier_ids[:frontier_tokens]
     if len(frontier_ids) < frontier_tokens:
         continue
 
-    base_zT = state.future_initial_noise[frontier_ids].detach()
+    base_zT = view.frontier_base_zT[:frontier_tokens].detach()
 
     # initializer prediction
     delta_zT = initializer(
         history=H_k,
         active=A_k,
+        active_beta=view.active_beta.detach(),
         text=c_k,
         traj=tau_k,
-        frontier_offsets=frontier_ids - state.commit_index,
+        frontier_offsets=view.frontier_offsets[:frontier_tokens].detach(),
     )
 
     alpha = min(1.0, global_step / warmup_steps)
@@ -512,7 +580,7 @@ for global_step in range(num_train_steps):
 
 ## 9. Scheduled rollin
 
-Initializer 初期很弱，不应一开始完全控制 rollout。采用 schedule：
+Initializer 初期很弱，第一版先用 Gaussian rollin。Stage 1 验证有效后，再采用 schedule：
 
 \[
 p_{init}=\min(1,\frac{step}{T_{warmup}})
@@ -569,6 +637,9 @@ diagnostics = {
     "method": "online_frontier_zT_initializer",
     "frontier_ids": frontier_ids,
     "frontier_offsets": frontier_ids - commit_index,
+    "frontier_beta": frontier_beta,
+    "affected_frame_range": affected_frame_range,
+    "tail_no_effect_window": tail_no_effect_window,
     "base_zT_mean": base_zT.mean(),
     "base_zT_std": base_zT.std(),
     "delta_zT_norm": delta_zT.norm(),
@@ -592,6 +663,7 @@ Sanity checks：
 4. 梯度应流到 initializer 参数；
 5. frontier token 的 stage 必须是 `initial_zT`；
 6. loss window 必须覆盖 frontier token 生效后的 frames。
+7. inject 只改变 frontier ids，committed / active latents 不变。
 
 ---
 
@@ -648,22 +720,23 @@ text_semantic_score
 第一阶段只做最小可行版本：
 
 ```text
+state view = StreamLatentStateView(model.generated + beta/schedule)
 frontier_tokens = 5
 initializer = small MLP / tiny Transformer
 output = delta_zT
 loss = xz + 0.05 * vel + 1e-4 * noise_reg
-rollin = Gaussian only or scheduled rollin
+rollin = Gaussian only
 freeze LDF + VAE
 train small number of steps
 ```
 
 等这个版本确认有效后，再升级：
 
-1. 加 generated_anchor full eval；
+1. 加 scheduled initializer rollin；
 2. 加 heading / continuity；
 3. 输出 \(\mu,\sigma\)；
 4. 加 KL；
-5. initializer rollin；
+5. optional oracle-label distillation ablation；
 6. optional PPO / policy gradient。
 
 ---

@@ -211,15 +211,15 @@ z_T\rightarrow x_\beta\rightarrow z_0
 
 如果我们优化当前 active window 的 `model.generated[start:end]`，实际优化的是当前 denoising state \(x_\beta\)，不是最初始 \(z_T\)。这种方法可以作为 runtime correction oracle，但不能支撑「学习更好的初始去噪起点」这个理论 claim。
 
-因此我们区分三条线：
+因此我们区分三条线，并明确主次：
 
 | 实验线 | 优化变量 | 语义 | 用途 |
 |---|---|---|---|
 | A | 当前 active \(x_\beta\) | noisy-state correction | 工程 upper bound / runtime correction |
-| B-full | 全序列 initial \(Z_T\) | full-stream zT oracle | 概念验证，不是 runtime 形式 |
-| B-frontier | 未来最早未激活 \(Z_T^{frontier}\) | true local initializer | 主线 |
+| B-frontier oracle | 未来最早未激活 \(Z_T^{frontier}\) | true local zT oracle | 验证 frontier \(z_T\) 可控性 |
+| Learned residual initializer | \(\Delta_\phi(H,A,c,\tau)\) | online residual initializer | 主线方法 |
 
-我们的主线是 **B-frontier**。
+full-sequence \(Z_T\) oracle / oracle-label distillation 只作为 optional upper-bound 或 teacher-label ablation，不作为主线。我们的主线是 **learned residual initializer for B-frontier future zT**。
 
 ---
 

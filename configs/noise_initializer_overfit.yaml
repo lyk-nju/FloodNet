@@ -1,0 +1,62 @@
+exp_name: noise_initializer_overfit_000021_cap0
+seed: 1234
+device: cuda:0
+
+ldf_config: configs/ldf_test.yaml
+ckpt: outputs/step_405000.ckpt
+vae_ckpt: null
+use_ema: true
+
+meta_path: /data1/yuankai/text2Motion/FloodDiffusion/raw_data/HumanML3D/test_000021_codex.txt
+sample_name: "000021"
+caption_index: 0
+max_frames: 0
+
+cfg_text: 1.25
+cfg_traj: 3.0
+history_length: 30
+history_tokens: 30
+traj_horizon_tokens: 20
+token_dt: 0.20
+frames_per_token: 4
+num_denoise_steps: null
+
+frontier_tokens: 5
+beta_threshold: 0.999
+optimize_every_tokens: 5
+apply_initializer_rollin: true
+apply_initializer_every_tokens: 5
+loss_horizon_tokens: 20
+train_steps_per_commit: 1
+max_commits: 20
+alpha: 1.0
+
+model:
+  params:
+    latent_dim: 4
+    text_dim: 4096
+    frontier_tokens: 5
+    hidden_dim: 256
+    traj_emb_dim: 128
+    freeze_traj_encoder: true
+    zero_init_output: true
+
+text_encoder:
+  type: precomputed_t5_pool
+  precomputed_text_emb_path: ${dirs.raw_data}/HumanML3D/t5_text_embeddings.pt
+  pooling: mean
+
+optimizer:
+  lr: 0.0003
+  weight_decay: 0.0
+
+rollout:
+  alpha: 1.0
+  loss_horizon_tokens: 20
+
+loss:
+  lambda_vel: 0.05
+  lambda_delta: 0.0001
+  anchor_mode: target_anchor_abs
+
+out_dir: eval/out_eval/noise_initializer_overfit/ckpt_405000/sample_000021/cap0
