@@ -59,6 +59,15 @@ def test_kernel_consumes_exact_payload_without_route_or_timeline_access():
     assert model.seen_step_input["traj_cond_7d_frame"] is payload["traj_cond_7d_frame"]
 
 
+def test_kernel_exposes_model_chunk_size_for_payload_substeps():
+    model = _KernelLdf()
+    model.chunk_size = 5
+
+    generator = StreamGenerator(ldf_model=model, device="cpu")
+
+    assert generator.chunk_size == 5
+
+
 def test_kernel_rejects_multi_token_generation_result():
     model = _KernelLdf()
     generator = StreamGenerator(ldf_model=model, device="cpu")

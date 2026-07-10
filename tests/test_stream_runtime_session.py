@@ -78,6 +78,7 @@ class _FakeVae:
         self.decoder_count = 0
         self.encoder_count = 0
         self.calls = []
+        self.clear_count = 0
 
     def snapshot_stream_state(self):
         return {
@@ -106,6 +107,7 @@ class _FakeVae:
         return torch.zeros(1, 1, 2)
 
     def clear_cache(self):
+        self.clear_count += 1
         self.decoder_count = 0
         self.encoder_count = 0
 
@@ -159,6 +161,12 @@ def _proposal():
         version=1,
         metadata={},
     )
+
+
+def test_session_initializes_owned_vae_cache_before_first_step():
+    session = _session()
+
+    assert session.vae.clear_count == 1
 
 
 def test_two_steps_commit_frame0_then_frame4():

@@ -80,6 +80,10 @@ class StreamGenerator:
     def batch_size(self) -> int:
         return int(getattr(self.ldf_model, "batch_size", 1))
 
+    @property
+    def chunk_size(self) -> int:
+        return int(getattr(self.ldf_model, "chunk_size", 1))
+
     def reset(self, initial_state: RootFrameState | None = None, *, text: str = "") -> None:
         del initial_state
         self.condition_manager.reset(text=text)

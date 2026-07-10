@@ -74,6 +74,8 @@ class StreamRuntimeSession:
         self.first_chunk = generated_history.next_frame_abs == 0
         self.session_anchor_state = copy.deepcopy(timeline.earliest)
         self.session_epoch = 0
+        if hasattr(self.vae, "clear_cache"):
+            self.vae.clear_cache()
 
     @property
     def model(self):

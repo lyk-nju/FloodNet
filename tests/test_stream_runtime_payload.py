@@ -122,6 +122,7 @@ def test_payload_substep_masks_follow_composed_history_route_and_padding():
     assert payload is not None
     subpayloads = payload["traj_substep_payloads"]
     assert subpayloads
+    assert [item["traj_start_token"] for item in subpayloads] == [2, 3, 4, 5, 6]
     saw_generated_history = False
     saw_valid_route = False
     saw_terminal_hold_padding = False
