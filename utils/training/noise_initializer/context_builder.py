@@ -38,6 +38,7 @@ class NoiseInitializerContext:
             "traj_token_frames": self.traj_token_frames,
             "traj_frame_mask": self.traj_frame_mask,
             "frontier_offsets": self.frontier_offsets,
+            "frontier_base_zT": self.frontier_base_zT,
         }
 
 

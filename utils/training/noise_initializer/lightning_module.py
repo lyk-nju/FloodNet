@@ -86,8 +86,15 @@ class NoiseInitializerLightningModule(pl.LightningModule):
             alpha=float(rollout_cfg.get("alpha", 1.0)),
             rollout_tokens=int(rollout_cfg.get("loss_horizon_tokens", 1)),
             first_chunk=bool(batch.get("first_chunk", True)),
+            max_delta_norm_ratio=rollout_cfg.get("max_delta_norm_ratio", None),
         )
-        pred_xz = self.decode_latents_fn(self.vae, result.shadow_latents)
+        pred_xz = self.decode_latents_fn(
+            self.vae,
+            result.shadow_latents,
+            committed_prefix_latents=batch.get("committed_prefix_latents"),
+            shadow_start_token=int(batch.get("commit_index", 0)),
+            frames_per_token=int(batch.get("frames_per_token", 4)),
+        )
         target_xz = batch["target_xz"].to(device=pred_xz.device, dtype=pred_xz.dtype)
         target_mask = batch["target_mask"].to(device=pred_xz.device, dtype=pred_xz.dtype)
         traj_loss, parts = anchored_root_xz_loss(
@@ -99,7 +106,7 @@ class NoiseInitializerLightningModule(pl.LightningModule):
             anchor_mode=str(loss_cfg.get("anchor_mode", "target_anchor_abs")),
             generated_anchor_xz=batch.get("generated_anchor_xz"),
         )
-        delta_reg = delta_zT_l2_regularization(result.delta_zT)
+        delta_reg = delta_zT_l2_regularization(result.raw_delta_zT)
         loss = traj_loss + float(loss_cfg.get("lambda_delta", 0.0)) * delta_reg
         if getattr(self, "_trainer", None) is not None:
             self.log("train/loss", loss, prog_bar=True)

@@ -17,6 +17,7 @@ def _inputs(batch_size: int = 2, latent_dim: int = 4, text_dim: int = 6):
         "traj_token_frames": torch.randn(batch_size, 7, 4, 7),
         "traj_frame_mask": torch.ones(batch_size, 7, 4),
         "frontier_offsets": torch.tensor([3, 4, 5]),
+        "frontier_base_zT": torch.randn(batch_size, 3, latent_dim),
     }
 
 
@@ -59,6 +60,19 @@ def test_noise_initializer_freezes_reused_traj_encoder_by_default():
         for name, parameter in model.named_parameters()
         if not name.startswith("traj_encoder.")
     )
+
+
+def test_noise_initializer_trains_new_traj_encoder_by_default():
+    model = NoiseInitializer(
+        latent_dim=4,
+        text_dim=6,
+        frontier_tokens=3,
+        hidden_dim=32,
+        traj_emb_dim=8,
+        zero_init_output=False,
+    )
+
+    assert any(parameter.requires_grad for parameter in model.traj_encoder.parameters())
 
 
 def test_noise_initializer_zero_init_starts_as_noop_delta():
@@ -108,3 +122,46 @@ def test_noise_initializer_rejects_wrong_frontier_offset_count():
 
     with pytest.raises(ValueError, match="frontier_offsets"):
         model(**inputs)
+
+
+def test_noise_initializer_output_depends_on_frontier_base_zT():
+    torch.manual_seed(7)
+    model = NoiseInitializer(
+        latent_dim=4,
+        text_dim=6,
+        frontier_tokens=3,
+        hidden_dim=32,
+        traj_encoder=TrajectoryEncoder(out_dim=8),
+        traj_emb_dim=8,
+        zero_init_output=False,
+    ).eval()
+    inputs = _inputs(batch_size=1)
+    shifted = dict(inputs)
+    shifted["frontier_base_zT"] = inputs["frontier_base_zT"] + 2.0
+
+    delta_a = model(**inputs)
+    delta_b = model(**shifted)
+
+    assert not torch.allclose(delta_a, delta_b)
+
+
+def test_noise_initializer_preserves_trajectory_token_order():
+    torch.manual_seed(11)
+    model = NoiseInitializer(
+        latent_dim=4,
+        text_dim=6,
+        frontier_tokens=3,
+        hidden_dim=32,
+        traj_encoder=TrajectoryEncoder(out_dim=8),
+        traj_emb_dim=8,
+        zero_init_output=False,
+    ).eval()
+    inputs = _inputs(batch_size=1)
+    reversed_inputs = dict(inputs)
+    reversed_inputs["traj_token_frames"] = inputs["traj_token_frames"].flip(1)
+    reversed_inputs["traj_frame_mask"] = inputs["traj_frame_mask"].flip(1)
+
+    delta_forward = model(**inputs)
+    delta_reversed = model(**reversed_inputs)
+
+    assert not torch.allclose(delta_forward, delta_reversed)

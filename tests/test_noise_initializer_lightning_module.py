@@ -8,6 +8,7 @@ from utils.training.noise_initializer.lightning_module import (
     NoiseInitializerLightningModule,
 )
 from utils.training.noise_initializer.losses import anchored_root_xz_loss
+from utils.training.noise_initializer.shadow_rollout import clip_delta_to_base_norm
 
 
 class _FakeInitializer(nn.Module):
@@ -58,7 +59,8 @@ def _rollout_fn(model, *, rollout_tokens: int, first_chunk: bool):
     return model.generated[:, :, 5 : 5 + rollout_tokens, 0, 0].permute(0, 2, 1) * model.weight
 
 
-def _decode_latents_fn(vae, latents):
+def _decode_latents_fn(vae, latents, **kwargs):
+    del kwargs
     return latents[0, :, :2] * vae.weight.detach()
 
 
@@ -114,6 +116,57 @@ def test_noise_initializer_lightning_training_step_backprops_to_initializer():
     assert initializer.scale.grad is not None
     assert model.weight.grad is None
     assert vae.weight.grad is None
+
+
+def test_noise_initializer_lightning_delta_regularization_uses_raw_delta_before_clip():
+    initializer = _FakeInitializer()
+    initializer.scale.data.fill_(10.0)
+    model = _FakeFrozenModel()
+    vae = _FakeFrozenVae()
+    module = NoiseInitializerLightningModule(
+        cfg={
+            "optimizer": {"lr": 1e-3},
+            "loss": {"lambda_vel": 0.0, "lambda_delta": 0.01},
+            "rollout": {
+                "alpha": 1.0,
+                "loss_horizon_tokens": 2,
+                "max_delta_norm_ratio": 0.1,
+            },
+        },
+        initializer=initializer,
+        ldf_model=model,
+        vae=vae,
+        rollout_fn=_rollout_fn,
+        decode_latents_fn=_decode_latents_fn,
+    )
+    batch = {
+        "context": _context(model),
+        "target_xz": torch.zeros(2, 2),
+        "target_mask": torch.ones(2),
+        "history_frames": 0,
+        "first_chunk": False,
+    }
+
+    loss = module.training_step(batch, 0)
+
+    raw_delta = torch.ones_like(batch["context"].frontier_base_zT) * initializer.scale.detach()
+    clipped_delta, _ = clip_delta_to_base_norm(
+        raw_delta,
+        batch["context"].frontier_base_zT,
+        max_delta_norm_ratio=0.1,
+    )
+    zt = batch["context"].frontier_base_zT + clipped_delta
+    pred_xz = (zt * model.weight.detach() * vae.weight.detach())[0]
+    traj_loss, _ = anchored_root_xz_loss(
+        pred_xz,
+        batch["target_xz"],
+        batch["target_mask"],
+        history_frames=0,
+        lambda_vel=0.0,
+    )
+    expected = traj_loss + 0.01 * raw_delta.pow(2).mean()
+
+    assert torch.allclose(loss.detach(), expected.detach())
 
 
 def test_noise_initializer_lightning_passes_generated_anchor_xz_to_loss():

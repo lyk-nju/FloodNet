@@ -49,6 +49,17 @@ def validate_noise_initializer_overfit_config(cfg: dict) -> None:
                 "text_encoder.type=precomputed_t5_pool requires "
                 "text_encoder.precomputed_text_emb_path"
             )
+    training_mode = str(cfg.get("training_mode", "online_multi_commit"))
+    if training_mode not in {"online_multi_commit", "fixed_snapshot_overfit"}:
+        raise ValueError(f"unknown training_mode: {training_mode!r}")
+    if training_mode == "fixed_snapshot_overfit":
+        fixed_commit = int(cfg.get("fixed_commit_index", 0))
+        if fixed_commit < 0:
+            raise ValueError(f"fixed_commit_index must be non-negative, got {fixed_commit}")
+        if bool(cfg.get("apply_initializer_rollin", False)):
+            raise ValueError(
+                "fixed_snapshot_overfit requires apply_initializer_rollin=false"
+            )
 
 
 __all__ = ["validate_noise_initializer_overfit_config"]

@@ -64,8 +64,10 @@ def test_context_builder_returns_noise_initializer_kwargs():
         "traj_token_frames",
         "traj_frame_mask",
         "frontier_offsets",
+        "frontier_base_zT",
     }
     assert kwargs["frontier_offsets"].shape == (3,)
+    assert torch.equal(kwargs["frontier_base_zT"], context.frontier_base_zT)
 
 
 def test_context_builder_uses_existing_token_range_padding_and_masking():

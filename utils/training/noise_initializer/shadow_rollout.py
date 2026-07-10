@@ -18,6 +18,7 @@ RolloutFn = Callable[..., torch.Tensor]
 
 @dataclass(frozen=True)
 class ResidualShadowRolloutResult:
+    raw_delta_zT: torch.Tensor
     delta_zT: torch.Tensor
     frontier_zT: torch.Tensor
     injected_generated: torch.Tensor
@@ -58,6 +59,13 @@ def restore_stream_state(model, state: dict) -> None:
 def snapshot_vae_cache(vae):
     if hasattr(vae, "snapshot_cache"):
         return vae.snapshot_cache()
+    model = getattr(vae, "model", None)
+    if model is not None:
+        cache = {}
+        for name in ("_conv_num", "_conv_idx", "_feat_map"):
+            if hasattr(model, name):
+                cache[name] = _clone_value(getattr(model, name))
+        return {"model_decode_cache": cache}
     if hasattr(vae, "_cache"):
         return _clone_value(getattr(vae, "_cache"))
     return None
@@ -66,6 +74,11 @@ def snapshot_vae_cache(vae):
 def restore_vae_cache(vae, state) -> None:
     if hasattr(vae, "restore_cache"):
         vae.restore_cache(state)
+    elif isinstance(state, dict) and "model_decode_cache" in state:
+        model = getattr(vae, "model", None)
+        if model is not None:
+            for name, value in state["model_decode_cache"].items():
+                setattr(model, name, _clone_value(value))
     elif hasattr(vae, "_cache"):
         setattr(vae, "_cache", _clone_value(state))
 
@@ -105,6 +118,45 @@ def inject_context_frontier_zT(
     return injected
 
 
+def clip_delta_to_base_norm(
+    delta_zT: torch.Tensor,
+    base_zT: torch.Tensor,
+    *,
+    max_delta_norm_ratio: float | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Clip each sample's residual norm relative to its base z_T norm."""
+
+    if max_delta_norm_ratio is None:
+        scale = torch.ones(
+            int(delta_zT.shape[0]),
+            1,
+            1,
+            device=delta_zT.device,
+            dtype=delta_zT.dtype,
+        )
+        return delta_zT, scale
+    ratio = float(max_delta_norm_ratio)
+    if ratio <= 0.0:
+        scale = torch.zeros(
+            int(delta_zT.shape[0]),
+            1,
+            1,
+            device=delta_zT.device,
+            dtype=delta_zT.dtype,
+        )
+        return delta_zT * 0.0, scale
+
+    delta_flat = delta_zT.reshape(int(delta_zT.shape[0]), -1)
+    base_flat = base_zT.to(device=delta_zT.device, dtype=delta_zT.dtype).reshape(
+        int(delta_zT.shape[0]),
+        -1,
+    )
+    delta_norm = delta_flat.norm(dim=1, keepdim=True).clamp(min=1e-12)
+    max_norm = base_flat.norm(dim=1, keepdim=True) * ratio
+    scale = (max_norm / delta_norm).clamp(max=1.0).view(-1, 1, 1)
+    return delta_zT * scale, scale
+
+
 def run_residual_shadow_rollout(
     *,
     model: nn.Module,
@@ -116,6 +168,7 @@ def run_residual_shadow_rollout(
     rollout_tokens: int = 1,
     first_chunk: bool = True,
     freeze_frozen_modules: bool = True,
+    max_delta_norm_ratio: float | None = None,
 ) -> ResidualShadowRolloutResult:
     """Predict residual frontier z_T and run a differentiable short rollout."""
 
@@ -138,7 +191,12 @@ def run_residual_shadow_rollout(
             )
         ):
             context_kwargs["frontier_base_zT"] = context.frontier_base_zT
-        delta_zT = initializer(**context_kwargs)
+        raw_delta_zT = initializer(**context_kwargs)
+        delta_zT, _ = clip_delta_to_base_norm(
+            raw_delta_zT,
+            context.frontier_base_zT,
+            max_delta_norm_ratio=max_delta_norm_ratio,
+        )
         frontier_zT = context.frontier_base_zT.to(delta_zT.device, delta_zT.dtype) + (
             float(alpha) * delta_zT
         )
@@ -159,6 +217,7 @@ def run_residual_shadow_rollout(
             restore_vae_cache(vae, vae_state)
 
     return ResidualShadowRolloutResult(
+        raw_delta_zT=raw_delta_zT,
         delta_zT=delta_zT,
         frontier_zT=frontier_zT,
         injected_generated=injected,
@@ -168,6 +227,7 @@ def run_residual_shadow_rollout(
 
 __all__ = [
     "ResidualShadowRolloutResult",
+    "clip_delta_to_base_norm",
     "freeze_module",
     "inject_context_frontier_zT",
     "restore_stream_state",

@@ -65,7 +65,9 @@ def anchored_root_xz_loss(
 
     pred_anchor = pred[:1].detach()
     anchor_mode = str(anchor_mode)
-    if anchor_mode == "target_anchor_abs":
+    if anchor_mode == "absolute":
+        pred_world = pred
+    elif anchor_mode == "target_anchor_abs":
         world_anchor = target[:1].detach()
     elif anchor_mode == "generated_anchor_abs":
         if generated_anchor_xz is None:
@@ -78,8 +80,8 @@ def anchored_root_xz_loss(
             )
     else:
         raise ValueError(f"unknown anchor_mode: {anchor_mode!r}")
-
-    pred_world = pred - pred_anchor + world_anchor
+    if anchor_mode != "absolute":
+        pred_world = pred - pred_anchor + world_anchor
     opt = slice(history_frames, n)
     opt_mask = m[opt]
     traj_error = (pred_world[opt] - target[opt]).pow(2).sum(dim=-1)

@@ -23,15 +23,22 @@ num_denoise_steps: null
 
 frontier_tokens: 5
 beta_threshold: 0.999
+require_zero_update_count: true
+training_mode: fixed_snapshot_overfit
+fixed_commit_index: 10
 optimize_every_tokens: 5
-apply_initializer_rollin: true
+apply_initializer_rollin: false
 apply_initializer_every_tokens: 5
-loss_horizon_tokens: 20
-train_steps_per_commit: 1
+loss_horizon_tokens: 10
+train_steps_per_commit: 1000
 max_commits: 20
+log_every_train_steps: 50
+terminal_hold_frames: 0
 alpha: 1.0
+max_delta_norm_ratio: 0.1
 
 model:
+  reuse_ldf_traj_encoder: true
   params:
     latent_dim: 4
     text_dim: 4096
@@ -52,11 +59,12 @@ optimizer:
 
 rollout:
   alpha: 1.0
-  loss_horizon_tokens: 20
+  loss_horizon_tokens: 10
+  max_delta_norm_ratio: 0.1
 
 loss:
   lambda_vel: 0.05
-  lambda_delta: 0.0001
-  anchor_mode: target_anchor_abs
+  lambda_delta: 0.01
+  anchor_mode: absolute
 
 out_dir: eval/out_eval/noise_initializer_overfit/ckpt_405000/sample_000021/cap0

@@ -60,8 +60,9 @@ class NoiseInitializer(nn.Module):
         hidden_dim: int = 512,
         traj_encoder: nn.Module | None = None,
         traj_emb_dim: int = 128,
-        freeze_traj_encoder: bool = True,
+        freeze_traj_encoder: bool | None = None,
         offset_scale: float = 32.0,
+        num_attention_heads: int = 4,
         zero_init_output: bool = True,
     ):
         super().__init__()
@@ -71,6 +72,7 @@ class NoiseInitializer(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.traj_emb_dim = int(traj_emb_dim)
         self.offset_scale = float(offset_scale)
+        self.num_attention_heads = int(num_attention_heads)
 
         if self.latent_dim <= 0:
             raise ValueError("latent_dim must be positive")
@@ -80,10 +82,16 @@ class NoiseInitializer(nn.Module):
             raise ValueError("frontier_tokens must be positive")
         if self.hidden_dim <= 0:
             raise ValueError("hidden_dim must be positive")
+        if self.num_attention_heads <= 0 or self.hidden_dim % self.num_attention_heads != 0:
+            raise ValueError(
+                "hidden_dim must be divisible by num_attention_heads: "
+                f"got hidden_dim={self.hidden_dim}, heads={self.num_attention_heads}"
+            )
 
+        owns_traj_encoder = traj_encoder is None
         self.traj_encoder = (
             TrajectoryEncoder(out_dim=self.traj_emb_dim)
-            if traj_encoder is None
+            if owns_traj_encoder
             else traj_encoder
         )
         encoder_out_dim = int(getattr(self.traj_encoder, "out_dim", self.traj_emb_dim))
@@ -92,7 +100,9 @@ class NoiseInitializer(nn.Module):
                 "traj_emb_dim must match traj_encoder.out_dim: "
                 f"got traj_emb_dim={self.traj_emb_dim}, encoder out_dim={encoder_out_dim}"
             )
-        if freeze_traj_encoder:
+        if freeze_traj_encoder is None:
+            freeze_traj_encoder = not owns_traj_encoder
+        if bool(freeze_traj_encoder):
             for parameter in self.traj_encoder.parameters():
                 parameter.requires_grad_(False)
 
@@ -120,13 +130,29 @@ class NoiseInitializer(nn.Module):
             nn.Linear(1, self.hidden_dim),
             nn.GELU(),
         )
-        self.fusion = nn.Sequential(
-            nn.LayerNorm(self.hidden_dim * 4),
-            nn.Linear(self.hidden_dim * 4, self.hidden_dim),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
+        self.frontier_base_proj = nn.Sequential(
+            nn.Linear(self.latent_dim, self.hidden_dim),
             nn.GELU(),
         )
+        self.position_proj = nn.Sequential(
+            nn.Linear(1, self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+        self.memory_type_embedding = nn.Parameter(torch.zeros(4, self.hidden_dim))
+        nn.init.normal_(self.memory_type_embedding, std=0.02)
+        self.cross_attention = nn.MultiheadAttention(
+            self.hidden_dim,
+            self.num_attention_heads,
+            batch_first=True,
+        )
+        self.fusion = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+        self.output_norm = nn.LayerNorm(self.hidden_dim)
         self.output_head = nn.Linear(self.hidden_dim, self.latent_dim)
         if bool(zero_init_output):
             nn.init.zeros_(self.output_head.weight)
@@ -142,6 +168,7 @@ class NoiseInitializer(nn.Module):
         text_embedding: torch.Tensor,
         traj_token_frames: torch.Tensor,
         frontier_offsets: torch.Tensor,
+        frontier_base_zT: torch.Tensor,
         traj_frame_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return ``delta_zT`` with shape ``[B, frontier_tokens, latent_dim]``."""
@@ -170,6 +197,16 @@ class NoiseInitializer(nn.Module):
                 "traj_token_frames must share batch size with history_latents: "
                 f"got {traj_token_frames.shape[0]} and {batch_size}"
             )
+        if tuple(frontier_base_zT.shape) != (
+            batch_size,
+            self.frontier_tokens,
+            self.latent_dim,
+        ):
+            raise ValueError(
+                "frontier_base_zT must have shape "
+                f"[{batch_size},{self.frontier_tokens},{self.latent_dim}], "
+                f"got {tuple(frontier_base_zT.shape)}"
+            )
 
         device = history_latents.device
         dtype = history_latents.dtype
@@ -196,10 +233,24 @@ class NoiseInitializer(nn.Module):
                 f"expected {self.frontier_tokens}, got {int(frontier_offsets_t.numel())}"
             )
 
-        history_feat = _mean_pool_tokens(
-            self.history_proj(history_latents),
-            name="history_features",
-        )
+        def add_position_and_type(features: torch.Tensor, type_index: int) -> torch.Tensor:
+            token_count = int(features.shape[1])
+            if token_count == 0:
+                return features
+            positions = torch.linspace(
+                -1.0,
+                1.0,
+                token_count,
+                device=device,
+                dtype=dtype,
+            ).view(1, token_count, 1)
+            return (
+                features
+                + self.position_proj(positions)
+                + self.memory_type_embedding[type_index].to(dtype=dtype).view(1, 1, -1)
+            )
+
+        history_feat = add_position_and_type(self.history_proj(history_latents), 0)
         active_input = torch.cat(
             [
                 active_latents,
@@ -208,7 +259,7 @@ class NoiseInitializer(nn.Module):
             ],
             dim=-1,
         )
-        active_feat = _mean_pool_tokens(self.active_proj(active_input), name="active_features")
+        active_feat = add_position_and_type(self.active_proj(active_input), 1)
         traj_emb = self.traj_encoder(
             traj_token_frames.to(device=device, dtype=dtype),
             frame_mask=(
@@ -217,17 +268,42 @@ class NoiseInitializer(nn.Module):
                 else traj_frame_mask.to(device=device, dtype=dtype)
             ),
         )
-        traj_feat = _mean_pool_tokens(self.traj_proj(traj_emb), name="traj_features")
-        text_feat = self.text_proj(text_embedding.to(device=device, dtype=dtype))
-
-        context = self.fusion(
-            torch.cat([history_feat, active_feat, text_feat, traj_feat], dim=-1)
+        traj_feat = add_position_and_type(self.traj_proj(traj_emb), 2)
+        text_feat = (
+            self.text_proj(text_embedding.to(device=device, dtype=dtype)).unsqueeze(1)
+            + self.memory_type_embedding[3].to(dtype=dtype).view(1, 1, -1)
         )
+        memory = torch.cat([history_feat, active_feat, traj_feat, text_feat], dim=1)
+
+        memory_mask = torch.zeros(
+            batch_size,
+            int(memory.shape[1]),
+            device=device,
+            dtype=torch.bool,
+        )
+        if traj_frame_mask is not None:
+            traj_valid = traj_frame_mask.to(device=device).reshape(
+                batch_size, int(traj_frame_mask.shape[1]), -1
+            ).any(dim=-1)
+            traj_start = int(history_feat.shape[1]) + int(active_feat.shape[1])
+            memory_mask[:, traj_start : traj_start + int(traj_feat.shape[1])] = ~traj_valid
+
         frontier_feat = self.frontier_offset_proj(
             (frontier_offsets_t / self.offset_scale).view(1, self.frontier_tokens, 1)
         )
-        token_context = context[:, None, :] + frontier_feat
-        return self.output_head(token_context)
+        query = self.frontier_base_proj(
+            frontier_base_zT.to(device=device, dtype=dtype)
+        ) + frontier_feat
+        attended, _ = self.cross_attention(
+            query,
+            memory,
+            memory,
+            key_padding_mask=memory_mask,
+            need_weights=False,
+        )
+        token_context = query + attended
+        token_context = token_context + self.fusion(token_context)
+        return self.output_head(self.output_norm(token_context))
 
 
 __all__ = ["NoiseInitializer"]
