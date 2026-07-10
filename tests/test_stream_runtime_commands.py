@@ -53,6 +53,18 @@ def test_prepare_is_non_destructive_and_ack_removes_exact_versions():
     assert [command.version for command in queue.prepare_due(0).commands] == [2]
 
 
+def test_release_discards_prepared_handle_without_removing_pending_commands():
+    queue = RuntimeCommandQueue()
+    queue.submit(SetText(version=1, requested_commit_abs=0, text="walk"))
+    batch = queue.prepare_due(0)
+
+    queue.release(batch)
+
+    assert queue.pending_versions == (1,)
+    with pytest.raises(ValueError, match="no longer valid"):
+        queue.ack(batch)
+
+
 def test_ack_rejects_a_caller_constructed_batch_without_removing_future_commands():
     queue = RuntimeCommandQueue()
     queue.submit(SetText(version=1, requested_commit_abs=5, text="future"))

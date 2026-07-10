@@ -288,6 +288,17 @@ class RuntimeCommandQueue:
                 if issued_token is token or versions.intersection(issued_batch.versions):
                     del self._issued_batches[issued_token]
 
+    def release(self, batch: PreparedCommandBatch) -> None:
+        """Discard one prepared handle without acknowledging its commands."""
+        if not isinstance(batch, PreparedCommandBatch):
+            raise TypeError("batch must be PreparedCommandBatch")
+        with self._lock:
+            token = batch._ack_token
+            issued = self._issued_batches.get(token)
+            if issued is not batch:
+                raise ValueError("batch was not issued by this queue or is no longer valid")
+            del self._issued_batches[token]
+
 
 def reduce_commands(
     base_config: RuntimeStepConfig,

@@ -108,6 +108,7 @@ class StreamGenerator:
         self.generated_frame_count = 0
         self.session_anchor_state = self.timeline.earliest
         self._generated_root_5d = self._initial_root_history(self.session_anchor_state)
+        self._runtime_session = None
 
     @property
     def batch_size(self) -> int:
@@ -675,7 +676,33 @@ class StreamGenerator:
                 + ", ".join(missing)
             )
 
+    def attach_runtime_session(self, session) -> None:
+        """Attach the sole execution owner used by compatibility calls."""
+        if getattr(session, "kernel", None) is not self:
+            raise ValueError("runtime session kernel must be this StreamGenerator")
+        self._runtime_session = session
+
     def execute_step(
+        self,
+        *,
+        text: str | None = None,
+        traj_input: dict | None = None,
+        num_denoise_steps: int | None = None,
+    ):
+        """Compatibility delegate to the authoritative runtime session."""
+        if self._runtime_session is None:
+            raise RuntimeError(
+                "StreamGenerator.execute_step requires an attached "
+                "StreamRuntimeSession; direct legacy execution was removed"
+            )
+        if text is not None or traj_input is not None or num_denoise_steps is not None:
+            raise ValueError(
+                "per-step overrides are runtime commands; submit them to the "
+                "attached StreamRuntimeSession before execute_step()"
+            )
+        return self._runtime_session.step()
+
+    def _legacy_execute_step(
         self,
         *,
         text: str | None = None,
