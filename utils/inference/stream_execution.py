@@ -67,6 +67,8 @@ class RootFeedbackResult:
 
 
 def snapshot_ldf_stream_state(model) -> dict[str, Any]:
+    if hasattr(model, "snapshot_stream_state"):
+        return {"formal": _clone_state(model.snapshot_stream_state())}
     names = (
         "generated",
         "commit_index",
@@ -81,6 +83,9 @@ def snapshot_ldf_stream_state(model) -> dict[str, Any]:
 
 
 def restore_ldf_stream_state(model, state: dict[str, Any]) -> None:
+    if "formal" in state and hasattr(model, "restore_stream_state"):
+        model.restore_stream_state(_clone_state(state["formal"]))
+        return
     for name, value in state.items():
         setattr(model, name, _clone_state(value))
 
@@ -98,6 +103,8 @@ _VAE_CACHE_NAMES = (
 def snapshot_vae_stream_state(vae) -> dict[str, Any] | None:
     if vae is None:
         return None
+    if hasattr(vae, "snapshot_stream_state"):
+        return {"formal": _clone_state(vae.snapshot_stream_state())}
     if hasattr(vae, "snapshot_cache"):
         return {"custom": _clone_state(vae.snapshot_cache())}
     model = getattr(vae, "model", None)
@@ -114,6 +121,9 @@ def snapshot_vae_stream_state(vae) -> dict[str, Any] | None:
 
 def restore_vae_stream_state(vae, state: dict[str, Any] | None) -> None:
     if vae is None or state is None:
+        return
+    if "formal" in state and hasattr(vae, "restore_stream_state"):
+        vae.restore_stream_state(_clone_state(state["formal"]))
         return
     if "custom" in state and hasattr(vae, "restore_cache"):
         vae.restore_cache(_clone_state(state["custom"]))

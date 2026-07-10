@@ -1,5 +1,8 @@
 import warnings
 import math
+import copy
+
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -9,6 +12,31 @@ from .tools.traj_encoder import TrajectoryEncoder
 from .tools.wan_model import WanModel
 from .tools.wan_controlnet import WanControlNet
 from utils.conditions.ldf import LDFCondition
+
+
+def _clone_stream_value(value):
+    if torch.is_tensor(value):
+        return value.detach().clone()
+    if isinstance(value, list):
+        return [_clone_stream_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_stream_value(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _clone_stream_value(item) for key, item in value.items()}
+    return copy.deepcopy(value)
+
+
+@dataclass(frozen=True)
+class StreamBufferMetadata:
+    """Absolute location of the model's rolling latent buffer."""
+
+    start_commit_abs: int
+    epoch: int
+    local_commit_index: int
+
+    @property
+    def absolute_commit_index(self) -> int:
+        return int(self.start_commit_abs) + int(self.local_commit_index)
 
 
 class DiffForcingWanModel(nn.Module):
@@ -841,7 +869,67 @@ class DiffForcingWanModel(nn.Module):
             generated = generated.clone()
         self.generated = self.preprocess(generated)  # (B, C, T, 1, 1)
         self.commit_index = 0
+        self.latent_buffer_start_commit_abs = 0
+        self.latent_buffer_epoch = 0
         self._traj_buf = traj_buffer
+
+    def stream_buffer_metadata(self) -> StreamBufferMetadata:
+        """Return immutable local-to-absolute rolling-buffer metadata."""
+        return StreamBufferMetadata(
+            start_commit_abs=int(getattr(self, "latent_buffer_start_commit_abs", 0)),
+            epoch=int(getattr(self, "latent_buffer_epoch", 0)),
+            local_commit_index=int(getattr(self, "commit_index", 0)),
+        )
+
+    def snapshot_stream_state(self) -> dict:
+        """Snapshot every mutable field advanced by streaming generation."""
+        names = (
+            "generated",
+            "commit_index",
+            "current_step",
+            "text_condition_list",
+            "seq_len",
+            "batch_size",
+            "num_denoise_steps",
+            "dt",
+            "cfg_scale_text",
+            "cfg_scale_traj",
+            "latent_buffer_start_commit_abs",
+            "latent_buffer_epoch",
+        )
+        state = {
+            name: _clone_stream_value(getattr(self, name))
+            for name in names
+            if hasattr(self, name)
+        }
+        trajectory_buffer = getattr(self, "_traj_buf", None)
+        if trajectory_buffer is not None and hasattr(
+            trajectory_buffer, "snapshot_stream_state"
+        ):
+            state["trajectory_buffer_state"] = _clone_stream_value(
+                trajectory_buffer.snapshot_stream_state()
+            )
+        return state
+
+    def restore_stream_state(self, state: dict) -> None:
+        """Restore a snapshot produced by :meth:`snapshot_stream_state`."""
+        if not isinstance(state, dict):
+            raise TypeError("stream state must be a dict")
+        trajectory_state = state.get("trajectory_buffer_state")
+        for name, value in state.items():
+            if name != "trajectory_buffer_state":
+                setattr(self, name, _clone_stream_value(value))
+        trajectory_buffer = getattr(self, "_traj_buf", None)
+        if trajectory_state is not None:
+            if trajectory_buffer is None or not hasattr(
+                trajectory_buffer, "restore_stream_state"
+            ):
+                raise RuntimeError(
+                    "trajectory buffer snapshot cannot be restored by active buffer"
+                )
+            trajectory_buffer.restore_stream_state(
+                _clone_stream_value(trajectory_state)
+            )
 
     @torch.no_grad()
     def stream_generate_step(
@@ -1108,6 +1196,12 @@ class DiffForcingWanModel(nn.Module):
                 self._traj_buf.roll(self.seq_len, device)
             self.current_step -= self.seq_len * self.num_denoise_steps / self.chunk_size
             self.commit_index -= self.seq_len
+            self.latent_buffer_start_commit_abs = int(
+                getattr(self, "latent_buffer_start_commit_abs", 0)
+            ) + int(self.seq_len)
+            self.latent_buffer_epoch = int(
+                getattr(self, "latent_buffer_epoch", 0)
+            ) + 1
             for i in range(self.batch_size):
                 self.text_condition_list[i] = self.text_condition_list[i][
                     self.seq_len :

@@ -8,8 +8,14 @@ from utils.conditions.ldf import LDFCondition
 
 
 class _NoopTrajBuffer:
+    def __init__(self):
+        self.rolls = []
+
     def update(self, x, commit_index, device):
         pass
+
+    def roll(self, amount, device):
+        self.rolls.append((int(amount), torch.device(device)))
 
 
 def _make_stream_step_harness(
@@ -152,6 +158,30 @@ def test_stream_generate_step_keeps_latent_length_separate_from_future_traj():
     assert model.recorded.seq_lens == model.recorded.model_sls
     assert model.recorded.t_lens == model.recorded.model_sls
     assert model.recorded.text_context_lens == model.recorded.model_sls
+
+
+def test_stream_generate_step_roll_updates_absolute_buffer_metadata():
+    model = _make_stream_step_harness(
+        seq_len=2,
+        chunk_size=1,
+        num_denoise_steps=1,
+        commit_index=3,
+        current_step=3,
+        generated_len=5,
+    )
+    model.latent_buffer_start_commit_abs = 0
+    model.latent_buffer_epoch = 0
+
+    model.stream_generate_step(
+        {},
+        first_chunk=False,
+        condition=_condition_provider(model, {"text": ["walk"]}),
+    )
+
+    assert model.commit_index == 2
+    assert model.latent_buffer_start_commit_abs == 2
+    assert model.latent_buffer_epoch == 1
+    assert model.stream_buffer_metadata().local_commit_index == 2
 
 
 def test_init_generated_accepts_stream_initial_buffer():

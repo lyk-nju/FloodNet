@@ -7,7 +7,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import copy
+
 CACHE_T = 2
+
+
+def _clone_cache_value(value):
+    if torch.is_tensor(value):
+        return value.detach().clone()
+    if isinstance(value, list):
+        return [_clone_cache_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_cache_value(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _clone_cache_value(item) for key, item in value.items()}
+    return copy.deepcopy(value)
 
 
 class CausalConv1d(nn.Conv1d):
@@ -760,3 +774,25 @@ class WanVAE_(nn.Module):
         self._enc_conv_num = count_conv1d(self.encoder)
         self._enc_conv_idx = [0]
         self._enc_feat_map = [None] * self._enc_conv_num
+
+    def snapshot_stream_state(self):
+        """Capture both causal encoder and decoder streaming caches."""
+        names = (
+            "_conv_num",
+            "_conv_idx",
+            "_feat_map",
+            "_enc_conv_num",
+            "_enc_conv_idx",
+            "_enc_feat_map",
+        )
+        return {
+            name: _clone_cache_value(getattr(self, name))
+            for name in names
+            if hasattr(self, name)
+        }
+
+    def restore_stream_state(self, state):
+        if not isinstance(state, dict):
+            raise TypeError("VAE stream state must be a dict")
+        for name, value in state.items():
+            setattr(self, name, _clone_cache_value(value))

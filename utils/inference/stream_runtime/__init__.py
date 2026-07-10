@@ -32,6 +32,7 @@ from .commands import (
 from .history import GeneratedRootHistory
 from .composer import ConditionComposer
 from .payload_builder import PayloadBuilder
+from .snapshots import RNGStreamState, restore_rng_state, snapshot_rng_state
 from .progress import (
     RelativeRouteProgressPolicy,
     RouteProjection,
@@ -43,6 +44,7 @@ __all__ = [
     "ComposeResult",
     "ConditionComposer",
     "PayloadBuilder",
+    "RNGStreamState",
     "ClearRootSource",
     "GeneratedRootHistory",
     "KernelStepResult",
@@ -70,4 +72,6 @@ __all__ = [
     "RelativeRouteProgressPolicy",
     "WorldRouteProgressPolicy",
     "reduce_commands",
+    "restore_rng_state",
+    "snapshot_rng_state",
 ]

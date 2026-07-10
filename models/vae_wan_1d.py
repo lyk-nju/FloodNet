@@ -3,7 +3,31 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import copy
+
 from .tools.wan_vae_1d import WanVAE_
+
+
+_STREAM_CACHE_NAMES = (
+    "_conv_num",
+    "_conv_idx",
+    "_feat_map",
+    "_enc_conv_num",
+    "_enc_conv_idx",
+    "_enc_feat_map",
+)
+
+
+def _clone_stream_cache(value):
+    if torch.is_tensor(value):
+        return value.detach().clone()
+    if isinstance(value, list):
+        return [_clone_stream_cache(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_stream_cache(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _clone_stream_cache(item) for key, item in value.items()}
+    return copy.deepcopy(value)
 
 
 class VAEWanModel(nn.Module):
@@ -194,6 +218,27 @@ class VAEWanModel(nn.Module):
 
     def clear_cache(self):
         self.model.clear_cache()
+
+    def snapshot_stream_state(self):
+        """Capture encoder and decoder causal caches owned by the VAE."""
+        if hasattr(self.model, "snapshot_stream_state"):
+            return {"model": self.model.snapshot_stream_state()}
+        return {
+            "model": {
+                name: _clone_stream_cache(getattr(self.model, name))
+                for name in _STREAM_CACHE_NAMES
+                if hasattr(self.model, name)
+            }
+        }
+
+    def restore_stream_state(self, state):
+        if not isinstance(state, dict) or "model" not in state:
+            raise TypeError("VAE stream state must contain model cache state")
+        if hasattr(self.model, "restore_stream_state"):
+            self.model.restore_stream_state(state["model"])
+            return
+        for name, value in state["model"].items():
+            setattr(self.model, name, _clone_stream_cache(value))
 
     def generate(self, x):
         features = x["feature"]
