@@ -405,6 +405,7 @@ def test_world_condition_payload_uses_absolute_active_window_frames():
     assert payload is not None
     assert payload["traj_abs_start_token"] == 2
     assert payload["body_anchor_abs_token"] == 2
+    assert payload["debug_world_frame_start_abs"] == 0
     assert payload["traj_substep_payloads"]
     # abs token 2 starts at frame 5, so local payload frame 112 is abs
     # frame 117; body anchor state commit 2 is token 1's end frame, frame 4.

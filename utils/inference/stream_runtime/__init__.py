@@ -31,6 +31,7 @@ from .commands import (
 )
 from .history import GeneratedRootHistory
 from .composer import ConditionComposer
+from .payload_builder import PayloadBuilder
 from .progress import (
     RelativeRouteProgressPolicy,
     RouteProjection,
@@ -41,6 +42,7 @@ __all__ = [
     "ActivatedRootSource",
     "ComposeResult",
     "ConditionComposer",
+    "PayloadBuilder",
     "ClearRootSource",
     "GeneratedRootHistory",
     "KernelStepResult",
