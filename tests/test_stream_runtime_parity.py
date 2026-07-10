@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import threading
+from types import MappingProxyType
 
 import numpy as np
 import torch
@@ -22,6 +23,7 @@ from utils.inference.stream_runtime import (
     StreamRuntimeSession,
 )
 from utils.inference.timeline import RootFrameState, RootTimeline
+from tools.check_stream_runtime_parity import _equal, _traj_cfg
 
 
 class _RollingModel:
@@ -204,3 +206,29 @@ def test_mid_step_commands_activate_together_at_next_boundary():
     assert kernel.calls[1][0] == "turn left"
     assert second.source_id == "route-next"
     assert second.actual_activation_commit == 1
+
+
+def test_real_parity_comparator_supports_read_only_nested_mappings():
+    left = MappingProxyType(
+        {"payload": MappingProxyType({"condition": torch.tensor([1.0, 2.0])})}
+    )
+    right = {"payload": {"condition": torch.tensor([1.0, 2.0])}}
+
+    assert _equal(left, right) is None
+
+
+def test_real_parity_config_disables_unused_root_refiner(tmp_path):
+    config = tmp_path / "stream.yaml"
+    config.write_text(
+        "traj_mask:\n"
+        "  history_length: 30\n"
+        "  root_refiner:\n"
+        "    enabled: true\n"
+        "    checkpoint: /tmp/refiner.ckpt\n"
+    )
+
+    traj_cfg = _traj_cfg(str(config))
+
+    assert traj_cfg["history_length"] == 30
+    assert traj_cfg["root_refiner"]["enabled"] is False
+    assert traj_cfg["root_refiner"]["checkpoint"] == "/tmp/refiner.ckpt"

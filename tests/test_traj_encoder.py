@@ -11,6 +11,7 @@ checkpoints and no longer auto-strips old trajectory encoder weights.
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
 
@@ -105,6 +106,27 @@ def _build_direct_traj_condition(model, x, model_sl, window_start_token, device,
         traj_encoder=model.traj_encoder,
         traj_sl=traj_sl,
     )
+
+
+def test_stream_direct_condition_accepts_numpy_frame_payload():
+    model = _dummy_stream_model()
+    payload = {
+        "traj_cond_7d_frame": np.zeros((1, 8, 7), dtype=np.float32),
+        "traj_start_token": 0,
+        "traj_num_tokens": 2,
+    }
+
+    embedding, lengths, token_mask = _build_direct_traj_condition(
+        model,
+        payload,
+        model_sl=2,
+        window_start_token=0,
+        device=torch.device("cpu"),
+    )
+
+    assert embedding.shape == (1, 2, 4)
+    assert torch.equal(lengths, torch.tensor([2]))
+    assert token_mask is None
 
 
 # ---------------------------------------------------------------------------

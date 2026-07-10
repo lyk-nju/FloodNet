@@ -63,7 +63,7 @@ from metrics.traj import (
 from utils.initialize import load_config
 from utils.inference.route_condition import RoutePlan, reanchor_route_to_xz
 from utils.inference.stream_generator import StreamGenerator
-from utils.inference.timeline import RootFrameState
+from utils.inference.timeline import RootFrameState, RootTimeline
 from utils.local_frame import (
     canonicalize_7d,
     transform_xz_local_to_world,
@@ -2161,7 +2161,6 @@ def _run_rootrefiner_update_one(
         history_motion_world_5d=None,
         reanchor_to_anchor_xz=False,
     )
-    stream.active_root_plan = first_plan
     stream_conditioner = LdfEvalStreamConditioner(
         sample_batch,
         history_length=int(args.history_length),
@@ -2170,7 +2169,7 @@ def _run_rootrefiner_update_one(
         frames_per_token=frames_per_token,
         device=device,
     )
-    stream_conditioner.timeline = stream.timeline
+    stream_conditioner.timeline = RootTimeline(initial_state)
     stream_conditioner.root_plan = first_plan
     stream_conditioner._anchor_xz = initial_state.world_xz.clone()
     stream_conditioner._anchor_yaw = initial_state.world_yaw.clone()
@@ -2253,7 +2252,6 @@ def _run_rootrefiner_update_one(
                 second_plan.debug_rootrefiner_update_anchor_yaw = (
                     _jsonify_debug_record(anchor_yaw_debug)
                 )
-                stream.active_root_plan = second_plan
                 stream_conditioner.root_plan = second_plan
                 condition_traj7 = _compose_rootrefiner_condition_traj7(
                     first_plan,
@@ -2336,7 +2334,6 @@ def _run_rootrefiner_update_one(
                 commit_idx=int(commit_index) + 1,
                 recovery=stream_recovery,
             )
-            stream.timeline = stream_conditioner.timeline
             if generated_frames >= target_total_frames:
                 break
     finally:
@@ -2492,8 +2489,6 @@ def _run_rootrefiner_multi_update_one(
     )
     first_plan.anchor_frame_idx = 0
     root_plans = [first_plan]
-    stream.active_root_plan = first_plan
-
     stream_conditioner = LdfEvalStreamConditioner(
         sample_batch,
         history_length=int(args.history_length),
@@ -2502,7 +2497,7 @@ def _run_rootrefiner_multi_update_one(
         frames_per_token=frames_per_token,
         device=device,
     )
-    stream_conditioner.timeline = stream.timeline
+    stream_conditioner.timeline = RootTimeline(initial_state)
     stream_conditioner.root_plan = first_plan
     stream_conditioner._anchor_xz = initial_state.world_xz.clone()
     stream_conditioner._anchor_yaw = initial_state.world_yaw.clone()
@@ -2602,7 +2597,6 @@ def _run_rootrefiner_multi_update_one(
                         _jsonify_debug_record(anchor_yaw_debug)
                     )
                     root_plans.append(plan)
-                    stream.active_root_plan = plan
                     stream_conditioner.root_plan = plan
                     condition_traj7 = _compose_multi_rootrefiner_condition_traj7(
                         root_plans,
@@ -2686,7 +2680,6 @@ def _run_rootrefiner_multi_update_one(
                 commit_idx=int(commit_index) + 1,
                 recovery=stream_recovery,
             )
-            stream.timeline = stream_conditioner.timeline
             if generated_frames >= target_total_frames:
                 break
     finally:

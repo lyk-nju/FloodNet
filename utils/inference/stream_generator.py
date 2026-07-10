@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass
 
 import numpy as np
@@ -11,31 +10,12 @@ import torch
 from utils.conditions.ldf import LDFCondition
 from utils.conditions.root_refiner import RootRefinerPathCondition
 from utils.inference.condition_manager import ConditionManager
-from utils.inference.root_plan import RootPlan, build_root_plan_stream_payload
+from utils.inference.root_plan import RootPlan
 from utils.inference.route_condition import RoutePlan
-from utils.inference.runtime_update import RootSourceProposal
-from utils.inference.runtime_update import RouteProgressTracker
-from utils.inference.runtime_update import build_world_condition_stream_payload
-from utils.inference.runtime_update import compose_active_window_segment
-from utils.inference.runtime_update import compose_active_window_world_condition
-from utils.inference.timeline import RootFrameState, RootTimeline
-from utils.inference.timeline import recovery_root_state_to_world
-from utils.inference.stream_execution import (
-    RootFeedbackConfig,
-    StreamCommitEvent,
-    decode_token_with_root_feedback,
-    restore_ldf_stream_state,
-    restore_recovery_state,
-    restore_vae_stream_state,
-    snapshot_ldf_stream_state,
-    snapshot_recovery_state,
-    snapshot_vae_stream_state,
-)
+from utils.inference.timeline import RootFrameState
 from utils.inference.stream_runtime import KernelStepResult
 from utils.local_frame import canonicalize_5d
-from utils.motion_process import build_physical_7d_from_5d
 from utils.token_frame import (
-    commit_boundary_frame,
     frame_idx_to_token_idx,
     num_tokens_for_frame_len,
     prefix_len_from_tail_invalid,
@@ -73,15 +53,12 @@ class StreamGenerator:
         condition_manager: ConditionManager | None = None,
         root_refiner=None,
         root_text_encoder=None,
-        timeline: RootTimeline | None = None,
         device=None,
         token_dt: float = 0.20,
         history_length: int = 30,
         traj_horizon_tokens: int = 20,
         default_anchor_y: float = 1.0,
         vae=None,
-        motion_recovery=None,
-        root_feedback: RootFeedbackConfig | None = None,
     ):
         self.ldf_model = ldf_model
         self.condition_manager = condition_manager or ConditionManager()
@@ -94,20 +71,9 @@ class StreamGenerator:
         self.history_length = int(history_length)
         self.traj_horizon_tokens = int(traj_horizon_tokens)
         self.default_anchor_y = float(default_anchor_y)
-        self.timeline = timeline or RootTimeline(
-            RootFrameState.initial(device=self.device, dtype=torch.float32)
-        )
-        self.active_root_plan: RootPlan | None = None
-        self.active_root_source_proposal: RootSourceProposal | None = None
-        self.active_root_source_contract: str = "absolute_route"
-        self._active_root_source_tracker: RouteProgressTracker | None = None
-        self.vae = vae
-        self.motion_recovery = motion_recovery
-        self.root_feedback_config = root_feedback or RootFeedbackConfig()
-        self.first_chunk = True
-        self.generated_frame_count = 0
-        self.session_anchor_state = self.timeline.earliest
-        self._generated_root_5d = self._initial_root_history(self.session_anchor_state)
+        # ``vae`` remains accepted for one compatibility release so old
+        # constructors do not break; execution ownership belongs to the session.
+        del vae
         self._runtime_session = None
 
     @property
@@ -115,13 +81,7 @@ class StreamGenerator:
         return int(getattr(self.ldf_model, "batch_size", 1))
 
     def reset(self, initial_state: RootFrameState | None = None, *, text: str = "") -> None:
-        state = initial_state or RootFrameState.initial(
-            device=self.device,
-            dtype=torch.float32,
-        )
-        self.timeline = RootTimeline(state)
-        self.active_root_plan = None
-        self.clear_active_root_source()
+        del initial_state
         self.condition_manager.reset(text=text)
 
     def init_ldf_generation(
@@ -142,201 +102,10 @@ class StreamGenerator:
 
     def build_step_input(self, text: str | None = None, traj_input: dict | None = None) -> dict:
         if text is None:
-            text = self.condition_manager.text.text_at(self.absolute_commit_index())
+            text = self.condition_manager.text.text_at(
+                int(getattr(self.ldf_model, "commit_index", 0))
+            )
         return StreamStepInput(text=str(text), traj_input=traj_input).as_dict()
-
-    def absolute_commit_index(self) -> int:
-        return int(self.timeline.head.commit_idx)
-
-    def set_active_root_source_proposal(
-        self,
-        proposal: RootSourceProposal,
-        *,
-        contract: str = "absolute_route",
-    ) -> None:
-        """Set the world-frame route proposal consumed by runtime-update payloads.
-
-        The proposal is an upstream route source only. This method does not
-        directly expose the proposal to LDF; payload construction still goes
-        through the active-window / absolute-route runtime contract below.
-        """
-        if not isinstance(proposal, RootSourceProposal):
-            raise TypeError(
-                "proposal must be RootSourceProposal, got "
-                f"{type(proposal).__name__}"
-            )
-        contract = str(contract)
-        if contract not in {"absolute_route", "active_window"}:
-            raise ValueError(
-                "contract must be 'absolute_route' or 'active_window', got "
-                f"{contract!r}"
-            )
-        self.active_root_source_proposal = proposal
-        self.active_root_source_contract = contract
-        self._active_root_source_tracker = (
-            RouteProgressTracker(proposal.future_traj7)
-            if contract == "active_window"
-            else None
-        )
-
-    def clear_active_root_source(self) -> None:
-        self.active_root_source_proposal = None
-        self.active_root_source_contract = "absolute_route"
-        self._active_root_source_tracker = None
-
-    def build_root_plan_stream_payload(
-        self,
-        *,
-        local_commit_index: int | None = None,
-        absolute_commit_index: int | None = None,
-        generated_history_traj7: torch.Tensor | None = None,
-    ) -> dict | None:
-        local_commit = (
-            int(getattr(self.ldf_model, "commit_index", 0))
-            if local_commit_index is None
-            else int(local_commit_index)
-        )
-        absolute_commit = (
-            self.absolute_commit_index()
-            if absolute_commit_index is None
-            else int(absolute_commit_index)
-        )
-        root_source_payload = self.build_root_source_stream_payload(
-            local_commit_index=local_commit,
-            absolute_commit_index=absolute_commit,
-            generated_history_traj7=generated_history_traj7,
-        )
-        if root_source_payload is not None:
-            return root_source_payload
-        return build_root_plan_stream_payload(
-            self.active_root_plan,
-            self.timeline,
-            local_commit_index=local_commit,
-            absolute_commit_index=absolute_commit,
-            chunk_size=int(getattr(self.ldf_model, "chunk_size", 1)),
-            history_length=self.history_length,
-            traj_horizon_tokens=self.traj_horizon_tokens,
-        )
-
-    def build_root_source_stream_payload(
-        self,
-        *,
-        local_commit_index: int | None = None,
-        absolute_commit_index: int | None = None,
-        generated_history_traj7: torch.Tensor | None = None,
-    ) -> dict | None:
-        """Build an LDF stream payload from the active RootSourceProposal.
-
-        ``absolute_route`` uses the authored world route as the model condition.
-        ``active_window`` requires frame-level generated history so the runtime
-        can build a generated-history prefix and bridge before canonicalizing.
-        """
-        proposal = self.active_root_source_proposal
-        if proposal is None:
-            return None
-        local_commit = (
-            int(getattr(self.ldf_model, "commit_index", 0))
-            if local_commit_index is None
-            else int(local_commit_index)
-        )
-        absolute_commit = (
-            self.absolute_commit_index()
-            if absolute_commit_index is None
-            else int(absolute_commit_index)
-        )
-        route_traj7 = proposal.future_traj7.to(
-            device=self.device,
-            dtype=torch.float32,
-        )
-        current_frame_abs = commit_boundary_frame(int(absolute_commit))
-        route_frame_local = min(
-            max(0, int(current_frame_abs)),
-            max(0, int(route_traj7.shape[0]) - 1),
-        )
-        if self.active_root_source_contract == "absolute_route":
-            world_condition = route_traj7
-        elif self.active_root_source_contract == "active_window":
-            if generated_history_traj7 is None:
-                raise ValueError(
-                    "active_window root-source payload requires "
-                    "generated_history_traj7; token-level RootTimeline is not "
-                    "enough to reconstruct frame-level history safely."
-                )
-            generated_history = generated_history_traj7.to(
-                device=self.device,
-                dtype=torch.float32,
-            )
-            segment = compose_active_window_segment(
-                route_traj7,
-                generated_history,
-                current_frame=current_frame_abs,
-                route_frame_local=route_frame_local,
-                tracker=self._active_root_source_tracker,
-            )
-            world_condition = compose_active_window_world_condition(
-                route_traj7,
-                generated_history,
-                segment,
-                current_frame=current_frame_abs,
-                route_start_frame_abs=0,
-            ).to(device=self.device, dtype=torch.float32)
-        else:
-            raise ValueError(
-                f"unknown root-source contract {self.active_root_source_contract!r}"
-            )
-        return build_world_condition_stream_payload(
-            world_condition,
-            self.timeline,
-            local_commit_index=local_commit,
-            absolute_commit_index=absolute_commit,
-            chunk_size=int(getattr(self.ldf_model, "chunk_size", 1)),
-            history_length=self.history_length,
-            traj_horizon_tokens=self.traj_horizon_tokens,
-            generated_history_traj7=generated_history_traj7,
-        )
-
-    @torch.no_grad()
-    def refresh_root_plan(
-        self,
-        *,
-        force: bool = False,
-        anchor_state: RootFrameState | None = None,
-        route: RoutePlan | None = None,
-        text: str | None = None,
-        history_motion_world_5d=None,
-        forced_num_frames: int | None = None,
-    ) -> RootPlan | None:
-        if self.active_root_plan is not None and not force:
-            return self.active_root_plan
-        if self.root_refiner is None or self.root_text_encoder is None:
-            return None
-        anchor = anchor_state or self.timeline.head
-        condition = None
-        route_plan = route
-        text_value = text
-        if route_plan is None:
-            refiner = self.root_refiner
-            bundle = self.condition_manager.build_root_refiner_condition(
-                anchor_state=anchor,
-                history_motion_world_5d=history_motion_world_5d,
-                n_path=int(refiner.n_path),
-                max_frames=int(refiner.max_frames),
-                current_commit_idx=int(anchor.commit_idx),
-            )
-            route_plan = bundle.route
-            condition = bundle.path_condition
-            text_value = text_value or bundle.text
-            if route_plan is None or condition is None:
-                return None
-        self.active_root_plan = self.build_root_plan(
-            text=text_value or self.condition_manager.text.text_at(anchor.commit_idx),
-            route=route_plan,
-            anchor_state=anchor,
-            history_motion_world_5d=history_motion_world_5d,
-            forced_num_frames=forced_num_frames,
-            path_condition=condition,
-        )
-        return self.active_root_plan
 
     @torch.no_grad()
     def build_root_plan(
@@ -505,19 +274,10 @@ class StreamGenerator:
 
     def step(self, num_denoise_steps: int | None = None) -> dict:
         if num_denoise_steps is not None:
-            self.ldf_model.num_denoise_steps = int(num_denoise_steps)
-        traj_input = self.build_root_plan_stream_payload()
-        step_input = self.build_step_input(traj_input=traj_input)
-        provider = self.build_ldf_condition_provider(
-            step_input,
-            first_chunk=(int(getattr(self.ldf_model, "commit_index", 0)) == 0),
-            device=self.device,
-        )
-        return self.ldf_model.stream_generate_step(
-            step_input,
-            first_chunk=(int(getattr(self.ldf_model, "commit_index", 0)) == 0),
-            condition=provider,
-        )
+            raise ValueError(
+                "num_denoise_steps is a runtime command; submit it before step()"
+            )
+        return self.execute_step()
 
     def generate_token(
         self,
@@ -606,76 +366,6 @@ class StreamGenerator:
             latent_buffer_epoch=post_epoch,
         )
 
-    @staticmethod
-    def _initial_root_history(state: RootFrameState, y: float = 1.0) -> torch.Tensor:
-        yaw = state.world_yaw.detach().cpu().float().reshape(())
-        xz = state.world_xz.detach().cpu().float()
-        return torch.tensor(
-            [[
-                float(xz[0].item()),
-                float(y),
-                float(xz[1].item()),
-                float(torch.cos(yaw).item()),
-                float(torch.sin(yaw).item()),
-            ]],
-            dtype=torch.float32,
-        )
-
-    @property
-    def generated_history_traj7(self) -> torch.Tensor:
-        return build_physical_7d_from_5d(self._generated_root_5d.detach().clone())
-
-    def configure_execution(
-        self,
-        *,
-        vae=None,
-        motion_recovery=None,
-        root_feedback: RootFeedbackConfig | None = None,
-    ) -> None:
-        if vae is not None:
-            self.vae = vae
-        if motion_recovery is not None:
-            self.motion_recovery = motion_recovery
-        if root_feedback is not None:
-            if not isinstance(root_feedback, RootFeedbackConfig):
-                raise TypeError(
-                    "root_feedback must be RootFeedbackConfig, got "
-                    f"{type(root_feedback).__name__}"
-                )
-            self.root_feedback_config = root_feedback
-
-    def reset_execution_state(
-        self,
-        initial_state: RootFrameState | None = None,
-        *,
-        clear_vae_cache: bool = True,
-    ) -> None:
-        anchor = initial_state or self.timeline.earliest
-        self.timeline = RootTimeline(anchor)
-        self.session_anchor_state = anchor
-        self.first_chunk = True
-        self.generated_frame_count = 0
-        self._generated_root_5d = self._initial_root_history(
-            anchor,
-            y=self.default_anchor_y,
-        )
-        if self.motion_recovery is not None and hasattr(self.motion_recovery, "reset"):
-            self.motion_recovery.reset()
-        if clear_vae_cache and self.vae is not None and hasattr(self.vae, "clear_cache"):
-            self.vae.clear_cache()
-
-    def _require_execution_dependencies(self) -> None:
-        missing = []
-        if self.vae is None:
-            missing.append("vae")
-        if self.motion_recovery is None:
-            missing.append("motion_recovery")
-        if missing:
-            raise RuntimeError(
-                "execute_step requires configured execution dependencies: "
-                + ", ".join(missing)
-            )
-
     def attach_runtime_session(self, session) -> None:
         """Attach the sole execution owner used by compatibility calls."""
         if getattr(session, "kernel", None) is not self:
@@ -701,144 +391,6 @@ class StreamGenerator:
                 "attached StreamRuntimeSession before execute_step()"
             )
         return self._runtime_session.step()
-
-    def _legacy_execute_step(
-        self,
-        *,
-        text: str | None = None,
-        traj_input: dict | None = None,
-        num_denoise_steps: int | None = None,
-    ) -> StreamCommitEvent:
-        """Atomically execute and recover one committed LDF token."""
-
-        self._require_execution_dependencies()
-        if num_denoise_steps is not None:
-            self.ldf_model.num_denoise_steps = int(num_denoise_steps)
-
-        ldf_state = snapshot_ldf_stream_state(self.ldf_model)
-        vae_state = snapshot_vae_stream_state(self.vae)
-        recovery_state = snapshot_recovery_state(self.motion_recovery)
-        timeline_states = copy.deepcopy(self.timeline._states)
-        session_anchor = copy.deepcopy(self.session_anchor_state)
-        history_5d = self._generated_root_5d.detach().clone()
-        frame_count = int(self.generated_frame_count)
-        first_chunk = bool(self.first_chunk)
-
-        try:
-            local_commit_before = int(getattr(self.ldf_model, "commit_index", 0))
-            absolute_commit_before = int(self.timeline.head.commit_idx)
-            if traj_input is None:
-                traj_input = self.build_root_plan_stream_payload(
-                    local_commit_index=local_commit_before,
-                    absolute_commit_index=absolute_commit_before,
-                    generated_history_traj7=self.generated_history_traj7,
-                )
-            step_input = self.build_step_input(text=text, traj_input=traj_input)
-            provider = self.build_ldf_condition_provider(
-                step_input,
-                first_chunk=first_chunk,
-                device=self.device,
-            )
-            output = self.ldf_model.stream_generate_step(
-                step_input,
-                first_chunk=first_chunk,
-                condition=provider,
-            )
-            generated = output.get("generated")
-            if not torch.is_tensor(generated) or generated.dim() != 3:
-                raise ValueError(
-                    "stream_generate_step must return generated [B,T,C], got "
-                    f"{None if generated is None else tuple(generated.shape)}"
-                )
-            committed_tokens = int(generated.shape[1])
-            if committed_tokens != 1:
-                raise ValueError(
-                    "execute_step currently requires exactly one committed token; "
-                    f"got {committed_tokens}"
-                )
-            feedback = decode_token_with_root_feedback(
-                model=self.ldf_model,
-                vae=self.vae,
-                latent_token=generated[0].detach(),
-                traj_payload=traj_input,
-                generated_frame_count=frame_count,
-                local_commit_index=local_commit_before,
-                first_chunk=first_chunk,
-                config=self.root_feedback_config,
-                device=self.device,
-            )
-
-            joints = []
-            root_frames = []
-            for frame in feedback.decoded_motion_chunk:
-                frame_np = frame.detach().cpu().numpy()
-                joints.append(self.motion_recovery.process_frame(frame_np))
-                world_root, world_yaw = recovery_root_state_to_world(
-                    self.motion_recovery,
-                    self.session_anchor_state,
-                )
-                root_frames.append(
-                    [
-                        float(world_root[0]),
-                        float(frame[3].detach().cpu().item()),
-                        float(world_root[2]),
-                        float(np.cos(world_yaw)),
-                        float(np.sin(world_yaw)),
-                    ]
-                )
-
-            root_chunk_5d = torch.as_tensor(root_frames, dtype=torch.float32)
-            if frame_count == 0:
-                self._generated_root_5d = root_chunk_5d[:1]
-                if int(root_chunk_5d.shape[0]) > 1:
-                    self._generated_root_5d = torch.cat(
-                        [self._generated_root_5d, root_chunk_5d[1:]], dim=0
-                    )
-            else:
-                self._generated_root_5d = torch.cat(
-                    [self._generated_root_5d, root_chunk_5d], dim=0
-                )
-            self.generated_frame_count = frame_count + int(root_chunk_5d.shape[0])
-
-            absolute_commit_after = absolute_commit_before + committed_tokens
-            last = root_chunk_5d[-1]
-            new_state = RootFrameState(
-                commit_idx=absolute_commit_after,
-                world_xz=last[[0, 2]].to(
-                    device=self.session_anchor_state.world_xz.device,
-                    dtype=self.session_anchor_state.world_xz.dtype,
-                ),
-                world_yaw=torch.atan2(last[4], last[3]).to(
-                    device=self.session_anchor_state.world_yaw.device,
-                    dtype=self.session_anchor_state.world_yaw.dtype,
-                ),
-                source="stream_execute_step",
-            )
-            self.timeline.append(new_state)
-            self.first_chunk = False
-            return StreamCommitEvent(
-                local_commit_before=local_commit_before,
-                absolute_commit_before=absolute_commit_before,
-                absolute_commit_after=absolute_commit_after,
-                latent_token=feedback.latent_token.detach().cpu(),
-                decoded_motion_chunk=feedback.decoded_motion_chunk.detach().cpu(),
-                joint_frames=np.stack(joints, axis=0).astype(np.float32),
-                generated_root_traj7=self.generated_history_traj7,
-                timeline_state=new_state,
-                traj_payload=traj_input,
-                root_feedback_applied=bool(feedback.applied),
-                debug=dict(feedback.debug),
-            )
-        except Exception:
-            restore_ldf_stream_state(self.ldf_model, ldf_state)
-            restore_vae_stream_state(self.vae, vae_state)
-            restore_recovery_state(self.motion_recovery, recovery_state)
-            self.timeline._states = timeline_states
-            self.session_anchor_state = session_anchor
-            self._generated_root_5d = history_5d
-            self.generated_frame_count = frame_count
-            self.first_chunk = first_chunk
-            raise
 
     def _resolve_anchor_y(
         self,

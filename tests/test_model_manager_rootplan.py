@@ -97,7 +97,7 @@ def test_load_model_bundle_builds_one_stream_generator_with_root_modules(monkeyp
     assert bundle.ldf_model is fake_ldf
     assert bundle.cfg is fake_cfg
     assert bundle.stream_generator.ldf_model is fake_ldf
-    assert bundle.stream_generator.vae is fake_vae
+    assert not hasattr(bundle.stream_generator, "vae")
     assert bundle.stream_generator.root_refiner is fake_refiner
     assert bundle.root_refiner is fake_refiner
     assert bundle.stream_generator.root_text_encoder is fake_text_encoder
@@ -141,7 +141,7 @@ def test_model_manager_init_uses_model_bundle_not_stream_generator_helper(monkey
     assert mgr.model is fake_model
     assert mgr.cfg is fake_bundle.cfg
     assert mgr.stream_generator is fake_stream_generator
-    assert mgr.rootplan_controller.stream_generator is fake_stream_generator
+    assert not hasattr(mgr, "rootplan_controller")
     assert mgr.use_owned_stream_execution is False
     assert mgr.runtime_session.vae is fake_bundle.vae
     assert mgr.runtime_session.recovery is mgr.stream_recovery
@@ -172,22 +172,21 @@ def test_rootplan_controller_clears_active_root_source_when_setting_root_plan():
     generator = StreamGenerator(ldf_model=_DummyModel(), device="cpu")
     source = torch.zeros(8, 7)
     source[:, 3] = 1.0
-    generator.set_active_root_source_proposal(
-        RootSourceProposal(
-            future_traj7=source,
-            future_frame_mask=torch.ones(8, dtype=torch.bool),
-            source_id="stale_source",
-            version=1,
-            metadata={"source_kind": "synthetic"},
-        ),
-        contract="absolute_route",
+    proposal = RootSourceProposal(
+        future_traj7=source,
+        future_frame_mask=torch.ones(8, dtype=torch.bool),
+        source_id="stale_source",
+        version=1,
+        metadata={"source_kind": "synthetic"},
     )
     controller = RootPlanController(generator)
+    controller.set_active_source(proposal, contract="world_route")
 
     controller.set_active(_plan(source="manual"))
 
-    assert generator.active_root_source_proposal is None
+    assert controller.active_source is None
     assert controller.active_plan is not None
+    assert not hasattr(generator, "active_root_source_proposal")
 
 
 def test_rootplan_controller_can_temporarily_activate_root_source():
@@ -208,12 +207,12 @@ def test_rootplan_controller_can_temporarily_activate_root_source():
         metadata={"source_kind": "synthetic"},
     )
 
-    with controller.temporarily_active_source(proposal, contract="absolute_route"):
-        assert generator.active_root_source_proposal is proposal
+    with controller.temporarily_active_source(proposal, contract="world_route"):
+        assert controller.active_source is proposal
         assert controller.active_plan is None
 
     assert controller.active_plan is old_plan
-    assert generator.active_root_source_proposal is None
+    assert controller.active_source is None
 
 
 def test_temporary_root_plan_restores_source_contract_progress_and_version():
@@ -234,17 +233,17 @@ def test_temporary_root_plan_restores_source_contract_progress_and_version():
     controller = RootPlanController(generator)
     controller.set_active_source(
         proposal,
-        contract="active_window",
+        contract="relative_route",
         model_plan_version=7,
+        progress=5,
     )
-    generator._active_root_source_tracker._last_index = 5
 
     with controller.temporarily_active(_plan(source="temporary")):
         assert controller.active_plan.source == "temporary"
 
     assert controller.active_source is proposal
-    assert generator.active_root_source_contract == "active_window"
-    assert generator._active_root_source_tracker.last_index == 5
+    assert controller.source_contract == "relative_route"
+    assert controller.progress == 5
     assert controller.model_plan_version == 7
 
 
@@ -327,14 +326,12 @@ def _manager():
         traj_horizon_tokens=mgr.traj_horizon_tokens,
         token_dt=mgr.token_dt,
     )
-    mgr.stream_generator.timeline = mgr._root_timeline
     mgr.runtime_session = build_runtime_session(
         mgr.stream_generator,
         SimpleNamespace(),
     )
     mgr.runtime_session.timeline = mgr._root_timeline
     mgr._runtime_command_version = 0
-    mgr.stream_generator.active_root_plan = _plan()
     mgr.stream_recovery = SimpleNamespace(r_pos_accum=np.zeros(3, dtype=np.float32))
     return mgr
 
@@ -387,66 +384,17 @@ class _FakeVae:
         self.cleared = True
 
 
-def test_rootplan_stream_payload_uses_body_window_left_commit():
-    mgr = _manager()
-
-    payload = mgr._build_rootplan_stream_traj_input()
-
-    start_token = 2
-    num_tokens = 33
-    frame_slice = token_range_to_frame_slice(start_token, num_tokens)
-    assert payload["traj_start_token"] == start_token
-    assert payload["traj_abs_start_token"] == start_token
-    assert payload["traj_num_tokens"] == num_tokens
-    assert payload["body_anchor_token"] == start_token
-    assert payload["body_anchor_abs_token"] == start_token
-    assert payload["traj_cond_7d_frame"].shape == (
-        1,
-        frame_slice.stop - frame_slice.start,
-        7,
-    )
-    assert payload["traj_cond_frame_mask"].shape == (
-        1,
-        frame_slice.stop - frame_slice.start,
-    )
-    assert payload["traj_cond_frame_mask"].all()
-    assert float(payload["traj_cond_7d_frame"][0, 0, 0]) == float(
-        token_start_frame(start_token)
-    )
-
-
-def test_owned_rootplan_payload_uses_generator_frame_history(monkeypatch):
-    mgr = _manager()
-    mgr.use_owned_stream_execution = True
-    history = torch.zeros(9, 7)
-    history[:, 3] = 1.0
-    mgr.stream_generator._generated_root_5d = history[:, :5]
-    seen = {}
-
-    def build_payload(**kwargs):
-        seen.update(kwargs)
-        return {"payload": True}
-
-    monkeypatch.setattr(
-        mgr.stream_generator,
-        "build_root_plan_stream_payload",
-        build_payload,
-    )
-
-    assert mgr._build_rootplan_stream_traj_input() == {"payload": True}
-    assert torch.equal(
-        seen["generated_history_traj7"],
-        mgr.stream_generator.generated_history_traj7,
-    )
-
-
 def test_owned_root_refiner_history_ends_at_commit_boundary_frame():
     mgr = _manager()
     mgr.use_owned_stream_execution = True
     history_5d = torch.zeros(12, 5)
     history_5d[:, 0] = torch.arange(12, dtype=torch.float32)
     history_5d[:, 3] = 1.0
-    mgr.stream_generator._generated_root_5d = history_5d
+    from utils.motion_process import build_physical_7d_from_5d
+
+    mgr.runtime_session.generated_history.frames_7d = build_physical_7d_from_5d(
+        history_5d
+    )
 
     history = mgr._get_root_refiner_history_5d(anchor_commit=2)
 
@@ -459,7 +407,6 @@ def test_activate_root_plan_from_route_queues_runtime_root_source():
     mgr.model.commit_index = 0
     mgr.current_text = "turn right"
     mgr._root_timeline = _timeline(0)
-    mgr.stream_generator.timeline = mgr._root_timeline
     mgr.runtime_session.timeline = mgr._root_timeline
     mgr.stream_generator.root_refiner = None
 
@@ -474,8 +421,8 @@ def test_activate_root_plan_from_route_queues_runtime_root_source():
     ok = mgr._activate_root_plan_from_stream_plan(route)
 
     assert ok is True
-    assert mgr.stream_generator.active_root_plan.source == "test"
-    assert mgr.stream_generator.active_root_source_proposal is None
+    assert not hasattr(mgr.stream_generator, "active_root_plan")
+    assert not hasattr(mgr.stream_generator, "active_root_source_proposal")
     assert mgr.runtime_session.source_manager.active is None
     command = mgr.runtime_session.command_queue.snapshot()[-1]
     assert command.proposal.metadata["source_kind"] == "manual"
@@ -570,7 +517,6 @@ def test_get_current_root_xyz_prefers_timeline_head_world_xz():
 def test_first_update_trajectory_returns_display_preview_immediately():
     mgr = _trajectory_manager()
     mgr._root_timeline = RootTimeline(_state(0, xz=(2.0, 3.0)))
-    mgr.stream_generator.timeline = mgr._root_timeline
     mgr.runtime_session.timeline = mgr._root_timeline
     route = np.array([[0.0, 0.0], [0.0, 2.0]], dtype=np.float32)
 
@@ -600,7 +546,6 @@ def test_reset_clears_model_manager_and_stream_generator_route_state():
     mgr.current_traj_waypoints = np.ones((2, 3), dtype=np.float32)
     mgr.current_traj_times = np.array([0.0, 1.0], dtype=np.float32)
     mgr._display_traj = np.ones((2, 3), dtype=np.float32)
-    mgr.stream_generator.active_root_plan = _plan(source="stale")
     mgr.stream_generator.condition_manager.route.route = _route(version=2)
     mgr.stream_generator.condition_manager.route.pending_update = object()
 
@@ -682,9 +627,7 @@ def test_future_route_activation_is_queued_for_requested_boundary():
     mgr.history_length = 1
     mgr.stream_generator.history_length = 1
     mgr._root_timeline = _timeline(2)
-    mgr.stream_generator.timeline = mgr._root_timeline
     mgr.runtime_session.timeline = mgr._root_timeline
-    mgr.stream_generator.active_root_plan = None
     mgr.model.commit_index = 3
     mgr.model.chunk_size = 1
     mgr.active_traj_plan = _route(version=1, start_commit_index=3, end_z=4.0)
@@ -693,43 +636,8 @@ def test_future_route_activation_is_queued_for_requested_boundary():
     assert mgr._activate_root_plan_from_stream_plan(mgr.active_traj_plan) is True
     command = mgr.runtime_session.command_queue.snapshot()[-1]
     assert command.requested_commit_abs == 3
-    assert mgr.stream_generator.active_root_plan is None
-    assert mgr.stream_generator.active_root_source_proposal is None
-
-
-def test_pending_route_blend_payload_uses_temporary_blended_root_plan():
-    mgr = _trajectory_manager()
-    mgr.route_reference_mode = "absolute"
-    mgr.history_length = 1
-    mgr.stream_generator.history_length = 1
-    mgr._root_timeline = _timeline(2)
-    mgr.stream_generator.timeline = mgr._root_timeline
-    mgr.model.commit_index = 2
-    mgr.model.chunk_size = 1
-    old_active_root_plan = _plan(source="old_active")
-    old_active_root_plan.waypoints_local_7d[:, 0] = 100.0
-    mgr.stream_generator.active_root_plan = old_active_root_plan
-    mgr.active_traj_plan = _route(version=1, start_commit_index=0, end_x=0.0)
-    mgr.pending_update_event = SimpleNamespace(
-        old_route=mgr.active_traj_plan,
-        new_route=_route(version=2, start_commit_index=0, end_x=10.0),
-        edit_commit_index=0,
-        effective_commit_index=0,
-        delay_tokens=0,
-        blend_tokens=4,
-        version=2,
-    )
-
-    payload = mgr._build_stream_traj_input()
-
-    assert payload is not None
-    assert payload["trajectory_state"] == "blend"
-    assert payload["model_traj_plan_version"] == "blend:1->2"
-    assert mgr.stream_generator.active_root_plan is old_active_root_plan
-    assert not torch.allclose(
-        payload["traj_cond_7d_frame"][0, :, 0],
-        torch.full_like(payload["traj_cond_7d_frame"][0, :, 0], 100.0),
-    )
+    assert not hasattr(mgr.stream_generator, "active_root_plan")
+    assert not hasattr(mgr.stream_generator, "active_root_source_proposal")
 
 
 def test_load_stream_generator_rejects_normalized_root_refiner_config(tmp_path):

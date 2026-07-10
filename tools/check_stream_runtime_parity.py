@@ -8,6 +8,7 @@ import gc
 import json
 import random
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -63,8 +64,16 @@ def _traj_cfg(config_path: str) -> dict:
     elif isinstance(raw_cfg, dict):
         raw = raw_cfg
     else:
-        return dict(cfg.get("traj_mask", {}) or {})
-    return dict((raw or {}).get("traj_mask", {}) or {})
+        traj_cfg = dict(cfg.get("traj_mask", {}) or {})
+        root_refiner = dict(traj_cfg.get("root_refiner", {}) or {})
+        root_refiner["enabled"] = False
+        traj_cfg["root_refiner"] = root_refiner
+        return traj_cfg
+    traj_cfg = dict((raw or {}).get("traj_mask", {}) or {})
+    root_refiner = dict(traj_cfg.get("root_refiner", {}) or {})
+    root_refiner["enabled"] = False
+    traj_cfg["root_refiner"] = root_refiner
+    return traj_cfg
 
 
 def _straight_proposal(num_frames: int = 512) -> RootSourceProposal:
@@ -125,8 +134,8 @@ def _equal(left: Any, right: Any, path: str = "event") -> str | None:
         if not (torch.is_tensor(left) and torch.is_tensor(right)):
             return path
         return None if torch.equal(left.cpu(), right.cpu()) else path
-    if isinstance(left, dict) or isinstance(right, dict):
-        if not (isinstance(left, dict) and isinstance(right, dict)):
+    if isinstance(left, Mapping) or isinstance(right, Mapping):
+        if not (isinstance(left, Mapping) and isinstance(right, Mapping)):
             return path
         if set(left) != set(right):
             return f"{path}.keys"

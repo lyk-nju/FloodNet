@@ -6,7 +6,6 @@ import pytest
 import torch
 from torch import nn
 
-from utils.inference.stream_execution import RootFeedbackConfig
 from utils.inference.stream_generator import StreamGenerator
 
 
@@ -57,12 +56,10 @@ def test_execute_step_rejects_hidden_per_step_state_changes():
         generator.execute_step(num_denoise_steps=10)
 
 
-def test_configure_execution_updates_root_feedback_policy_during_migration():
+def test_stream_generator_has_no_duplicate_execution_or_route_state():
     generator = _generator()
 
-    generator.configure_execution(
-        root_feedback=RootFeedbackConfig(enabled=True, xz_blend_alpha=0.25)
-    )
-
-    assert generator.root_feedback_config.enabled is True
-    assert generator.root_feedback_config.xz_blend_alpha == 0.25
+    assert not hasattr(generator, "_legacy_execute_step")
+    assert not hasattr(generator, "_generated_root_5d")
+    assert not hasattr(generator, "_active_root_source_tracker")
+    assert not hasattr(generator, "active_root_source_proposal")

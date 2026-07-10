@@ -86,7 +86,7 @@ from tools.run_stream_turn_update_debug import (
 from utils.initialize import load_config
 from utils.inference.root_plan import RootPlan
 from utils.inference.stream_generator import StreamGenerator
-from utils.inference.timeline import RootFrameState
+from utils.inference.timeline import RootFrameState, RootTimeline
 from utils.local_frame import canonicalize_7d
 from utils.motion_process import (
     StreamJointRecovery263,
@@ -859,7 +859,7 @@ def _run_ldf_direct_multi_update_one(
         frames_per_token=frames_per_token,
         device=device,
     )
-    stream_conditioner.timeline = stream.timeline
+    stream_conditioner.timeline = RootTimeline(initial_state)
     stream_conditioner.root_plan = first_plan
     stream_conditioner._anchor_xz = initial_state.world_xz.clone()
     stream_conditioner._anchor_yaw = initial_state.world_yaw.clone()
@@ -1219,7 +1219,6 @@ def _run_ldf_direct_multi_update_one(
                 commit_idx=int(commit_index) + 1,
                 recovery=stream_recovery,
             )
-            stream.timeline = stream_conditioner.timeline
             if generated_frames >= target_total_frames:
                 break
     finally:

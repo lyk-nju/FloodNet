@@ -41,12 +41,10 @@ from utils.inference.route_condition import (
 )
 from utils.inference.timeline import (
     RootFrameState,
-    RootTimeline,
 )
 from utils.token_frame import commit_boundary_frame, num_frames_for_tokens, token_start_frame
 from utils.inference.geometry import (
     assign_uniform_timestamps,
-    blend_future_trajs,
     build_remaining_polyline,
     dedupe_polyline,
     ensure_xyz,
@@ -69,7 +67,6 @@ from web_demo.runtime.model_loader import (
     reject_normalized_root_refiner_config,
     resolve_repo_path,
 )
-from web_demo.runtime.rootplan_controller import RootPlanController
 from web_demo.runtime.state import GenerationState
 from web_demo.runtime.trajectory_controller import TrajectoryController
 from web_demo.runtime.web_runtime import WebRuntime
@@ -106,7 +103,6 @@ class ModelManager(WebRuntime):
             self.runtime_session.command_queue.pending_versions,
             default=0,
         )
-        self.rootplan_controller = RootPlanController(self.stream_generator)
         
         # Frame buffer
         self.frame_buffer = FrameBuffer(target_buffer_size=4)
@@ -586,6 +582,9 @@ class ModelManager(WebRuntime):
             times=times,
             mode=mode,
         )
+        # The session applies this proposal at ``effective_commit``. Display
+        # blending remains a Web concern; it no longer constructs model payloads.
+        self._activate_root_plan_from_stream_plan(new_plan)
 
         print(
             f"Trajectory updated: {len(points)} points, source={source}, "
@@ -727,11 +726,11 @@ class ModelManager(WebRuntime):
 
     @property
     def _model_traj_plan_version(self):
-        return self._rootplan_controller().model_plan_version
+        return getattr(self, "_model_plan_version", None)
 
     @_model_traj_plan_version.setter
     def _model_traj_plan_version(self, value):
-        self._rootplan_controller().model_plan_version = value
+        self._model_plan_version = value
 
     def _get_current_root_xyz(self) -> np.ndarray:
         root_xyz = np.zeros(3, dtype=np.float32)
@@ -760,13 +759,6 @@ class ModelManager(WebRuntime):
         self.route_reference_mode = mode
         return mode
 
-    def _rootplan_controller(self) -> RootPlanController:
-        controller = getattr(self, "rootplan_controller", None)
-        if controller is None:
-            controller = RootPlanController(self.stream_generator)
-            self.rootplan_controller = controller
-        return controller
-
     def _generation_worker(self) -> GenerationWorker:
         worker = getattr(self, "generation_worker", None)
         if worker is None:
@@ -776,7 +768,7 @@ class ModelManager(WebRuntime):
 
     def _clear_runtime_route_state(self) -> None:
         self._trajectory_controller().clear()
-        self._rootplan_controller().model_plan_version = None
+        self._model_traj_plan_version = None
         if getattr(self, "runtime_session", None) is not None:
             self._submit_runtime_command(ClearRootSource)
 
@@ -923,13 +915,20 @@ class ModelManager(WebRuntime):
         return int(getattr(self, "_absolute_commit_index", getattr(self.model, "commit_index", 0)))
 
     def _get_root_refiner_history_5d(self, anchor_commit: int):
-        if bool(getattr(self, "use_owned_stream_execution", False)):
-            generated = self.stream_generator.generated_history_traj7
+        runtime_session = getattr(self, "runtime_session", None)
+        if runtime_session is not None:
+            generated = runtime_session.generated_history
             anchor_frame = commit_boundary_frame(max(0, int(anchor_commit)))
-            end = min(int(generated.shape[0]), anchor_frame + 1)
-            if end <= 0:
+            stop = min(generated.next_frame_abs, anchor_frame + 1)
+            if stop <= generated.base_frame_abs:
                 return None
-            return generated[:end, :5].detach().cpu().numpy().astype(np.float32)
+            return (
+                generated.slice_abs(generated.base_frame_abs, stop)[:, :5]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32)
+            )
         history = getattr(self, "root_5d_history", None)
         if not history:
             return None
@@ -942,15 +941,6 @@ class ModelManager(WebRuntime):
         if not frames:
             return None
         return np.stack(frames, axis=0).astype(np.float32)
-
-    def _reset_root_timeline(self):
-        self._session_anchor_state = RootFrameState.initial(
-            device=self.device,
-            dtype=torch.float32,
-        )
-        self._root_timeline = RootTimeline(self._session_anchor_state)
-        if getattr(self, "stream_generator", None) is not None:
-            self.stream_generator.timeline = self._root_timeline
 
     def _stream_plan_to_root_plan(
         self,
@@ -1073,210 +1063,9 @@ class ModelManager(WebRuntime):
             space_contract=contract,
             requested_commit_abs=max(anchor_commit, self._runtime_commit_abs()),
         )
-        self._rootplan_controller().model_plan_version = int(plan.version)
+        self._model_traj_plan_version = int(plan.version)
         return True
 
-    def _build_temporary_rootplan_payload(
-        self,
-        plan: RoutePlan,
-        *,
-        model_traj_plan_version,
-    ):
-        timeline = getattr(self, "_root_timeline", None)
-        if timeline is None:
-            return None
-        anchor_commit = int(plan.start_commit_index)
-        if not timeline.has_exact_state(anchor_commit):
-            return None
-        anchor_state = timeline.at_commit(anchor_commit)
-        root_plan = self._build_root_plan_from_stream_plan(plan, anchor_state)
-        root_source = root_plan_to_proposal(
-            root_plan,
-            source_id=f"{plan.source}:temporary:{int(plan.version)}",
-            version=int(plan.version),
-            source_kind=str(plan.source),
-            metadata={"route_plan_version": int(plan.version)},
-        )
-        with self._rootplan_controller().temporarily_active_source(
-            root_source,
-            contract="absolute_route",
-            model_plan_version=model_traj_plan_version,
-        ):
-            return self._build_rootplan_stream_traj_input()
-
-    def _build_rootplan_stream_traj_input(self):
-        """Build direct 7D stream payload from active RootPlan, if available.
-
-        This is the RootPlan/7D main-path bridge. It produces a payload that
-        covers the largest latent window stream_generate_step may use during the
-        current one-token commit. The model-side direct 7D helper then slices it
-        per denoise sub-step.
-        """
-        timeline = getattr(self, "_root_timeline", None)
-        if (
-            timeline is None
-            or (
-                self._rootplan_controller().active_plan is None
-                and self._rootplan_controller().active_source is None
-            )
-        ):
-            return None
-
-        absolute_commit = self._get_commit_index()
-        local_commit = int(getattr(self.model, "commit_index", absolute_commit))
-        self.stream_generator.timeline = timeline
-        return self.stream_generator.build_root_plan_stream_payload(
-            local_commit_index=local_commit,
-            absolute_commit_index=absolute_commit,
-            generated_history_traj7=(
-                self.stream_generator.generated_history_traj7
-                if bool(getattr(self, "use_owned_stream_execution", False))
-                else None
-            ),
-        )
-
-    def _build_stream_traj_input(self):
-        current_commit = self._get_commit_index()
-        current_root = self._get_current_root_xyz()
-
-        event, plan = self._trajectory_controller().snapshot()
-
-        if plan is None and event is None:
-            rootplan_payload = self._build_rootplan_stream_traj_input()
-            if rootplan_payload is not None:
-                self._trajectory_state = "active_7d"
-                return rootplan_payload
-            self._trajectory_state = "none"
-            return None
-
-        # ── No pending update: sample from active plan ──────────────────
-        if event is None:
-            if (
-                plan is not None
-                and self._rootplan_controller().active_plan is None
-                and self._rootplan_controller().active_source is None
-            ):
-                self._activate_root_plan_from_stream_plan(plan)
-            future = sample_route_future(
-                plan,
-                current_commit=current_commit,
-                current_root_xyz=current_root,
-                horizon_tokens=self.traj_horizon_tokens,
-                token_dt=self.token_dt,
-                reanchor_to_current_root=(
-                    self.route_reference_mode == RouteReferenceMode.RELATIVE_TO_ACTOR.value
-                ),
-            )
-            self._trajectory_state = "active"
-            self._trajectory_controller().set_display(future)
-            rootplan_payload = self._build_rootplan_stream_traj_input()
-            if rootplan_payload is not None:
-                self._trajectory_state = "active_7d"
-                rootplan_payload.update({
-                    "traj_mode": self.current_traj_mode,
-                    "traj_plan_version": plan.version if plan else 0,
-                    "model_traj_plan_version": self._model_traj_plan_version,
-                })
-                return rootplan_payload
-            self._trajectory_state = "active_7d_unavailable"
-            return None
-
-        # ── Pending update: compute blend weight ────────────────────────
-        offset = current_commit - event.edit_commit_index
-        delay = event.delay_tokens
-        blend = event.blend_tokens
-        raw_w = 0.0
-        if offset >= delay + blend:
-            raw_w = 1.0
-        elif offset >= delay and blend > 0:
-            raw_w = smoothstep01((offset - delay) / blend)
-        w = float(raw_w)
-
-        # Sample old and new futures using plan-local time.
-        old_future = None
-        if event.old_route is not None:
-            old_future = sample_route_future(
-                event.old_route,
-                current_commit=current_commit,
-                current_root_xyz=current_root,
-                horizon_tokens=self.traj_horizon_tokens,
-                token_dt=self.token_dt,
-                reanchor_to_current_root=(
-                    self.route_reference_mode == RouteReferenceMode.RELATIVE_TO_ACTOR.value
-                ),
-            )
-        new_future = sample_route_future(
-            event.new_route,
-            current_commit=current_commit,
-            current_root_xyz=current_root,
-            horizon_tokens=self.traj_horizon_tokens,
-            token_dt=self.token_dt,
-            reanchor_to_current_root=(
-                self.route_reference_mode == RouteReferenceMode.RELATIVE_TO_ACTOR.value
-            ),
-        )
-
-        future = blend_future_trajs(
-            old_future if old_future is not None else new_future,
-            new_future, w,
-        )
-
-        # ── Transition management ───────────────────────────────────────
-        rootplan_payload = None
-        model_plan_version = getattr(self, "_model_traj_plan_version", None)
-        if w <= 0.0:
-            self._trajectory_state = "delay"
-            if (
-                event.old_route is not None
-                and self._rootplan_controller().active_plan is None
-                and self._rootplan_controller().active_source is None
-            ):
-                self._activate_root_plan_from_stream_plan(event.old_route)
-            rootplan_payload = self._build_rootplan_stream_traj_input()
-            model_plan_version = getattr(self, "_model_traj_plan_version", None)
-        elif w < 1.0:
-            self._trajectory_state = "blend"
-            blend_route = RoutePlan(
-                times=(
-                    np.arange(len(future), dtype=np.float32)
-                    * np.float32(self.token_dt)
-                ),
-                points_xyz=future.astype(np.float32),
-                start_commit_index=int(current_commit),
-                version=int(event.version),
-                source="blend",
-            )
-            old_version = (
-                int(event.old_route.version)
-                if event.old_route is not None
-                else int(event.version)
-            )
-            model_plan_version = f"blend:{old_version}->{int(event.version)}"
-            rootplan_payload = self._build_temporary_rootplan_payload(
-                blend_route,
-                model_traj_plan_version=model_plan_version,
-            )
-        else:
-            self._trajectory_state = "replaced"
-            self._trajectory_controller().replace_with_pending(event)
-            self._rootplan_controller().clear()
-            self._activate_root_plan_from_stream_plan(event.new_route)
-            rootplan_payload = self._build_rootplan_stream_traj_input()
-            model_plan_version = getattr(self, "_model_traj_plan_version", None)
-
-        self._trajectory_controller().set_display(future)
-        if rootplan_payload is not None:
-            rootplan_payload.update({
-                "traj_mode": self.current_traj_mode,
-                "traj_plan_version": event.version,
-                "model_traj_plan_version": model_plan_version,
-                "traj_update_blend_weight": w,
-                "trajectory_state": self._trajectory_state,
-            })
-            return rootplan_payload
-        self._trajectory_state = f"{self._trajectory_state}_7d_unavailable"
-        return None
-    
     def pause_generation(self, *, target_state=GenerationState.PAUSED):
         """Pause generation (keeps all state)"""
         worker = self._generation_worker()
@@ -1346,7 +1135,7 @@ class ModelManager(WebRuntime):
         self.root_xz_history.clear()
         self.root_5d_history.clear()
         self._trajectory_controller().clear()
-        self._rootplan_controller().model_plan_version = None
+        self._model_traj_plan_version = None
         
         if history_length is not None:
             self.history_length = history_length

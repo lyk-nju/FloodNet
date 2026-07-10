@@ -9,6 +9,7 @@ from torch_ema import ExponentialMovingAverage
 
 from utils.inference.condition_manager import ConditionManager
 from utils.inference.stream_generator import StreamGenerator
+from utils.inference.timeline import RootFrameState, RootTimeline
 from utils.inference.stream_runtime import (
     ConditionComposer,
     GeneratedRootHistory,
@@ -211,8 +212,10 @@ def build_runtime_session(
         joints_num=22,
         smoothing_alpha=float(traj_mask_cfg.get("smoothing_alpha", 0.5)),
     )
-    timeline = stream_generator.timeline
     device = torch.device(getattr(stream_generator, "device", "cpu"))
+    timeline = RootTimeline(
+        RootFrameState.initial(device=device, dtype=torch.float32)
+    )
     initial_config = RuntimeStepConfig(
         text="",
         text_guidance_scale=float(getattr(model, "cfg_scale_text", 1.0)),

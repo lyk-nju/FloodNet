@@ -172,3 +172,9 @@ def test_generate_once_only_consumes_authoritative_session_event():
         torch.as_tensor(manager.frame_buffer.frames[-1]),
         event.joint_frames[-1],
     )
+
+
+def test_web_manager_has_no_legacy_payload_execution_api():
+    assert not hasattr(ModelManager, "_build_stream_traj_input")
+    assert not hasattr(ModelManager, "_build_rootplan_stream_traj_input")
+    assert not hasattr(ModelManager, "_build_temporary_rootplan_payload")
