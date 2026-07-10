@@ -354,6 +354,52 @@ def test_one_frame_route_emits_terminal_frame_before_exhaustion():
     assert first.route_status is RouteStatus.ACTIVE
 
 
+def test_world_terminal_projection_emits_once_then_committed_terminal_exhausts():
+    route = _traj7([(0.0, float(index)) for index in range(5)])
+    activated = _activated(
+        route,
+        space_contract=SpaceContract.WORLD_ROUTE,
+        boundary_xz=(0.0, 4.0),
+    )
+    composer = ConditionComposer()
+
+    first = composer.compose(
+        activated,
+        _empty_history(),
+        activated.boundary_state,
+        0,
+        RouteProgressState.initial(),
+        1,
+        bridge_frames=0,
+    )
+    history = GeneratedRootHistory(
+        base_frame_abs=0,
+        frames_7d=first.world_condition_7d.clone(),
+    )
+
+    second = composer.compose(
+        activated,
+        history,
+        activated.boundary_state,
+        1,
+        first.proposed_route_progress,
+        3,
+        bridge_frames=0,
+    )
+
+    assert first.proposed_route_progress.route_index == 4
+    assert first.route_status is RouteStatus.ACTIVE
+    assert first.frame_mask[0]
+    assert torch.equal(first.world_condition_7d[0, :5], route[-1, :5])
+    assert second.route_status is RouteStatus.EXHAUSTED
+    assert not second.frame_mask[1:].any()
+    assert second.segment_labels[1:].eq(SegmentLabel.PADDING.value).all()
+    assert torch.equal(
+        second.world_condition_7d[1:],
+        first.world_condition_7d[0].expand(3, -1),
+    )
+
+
 def test_exhaustion_holds_last_composed_history_pose_not_current_boundary():
     route = _traj7([(4.0, 9.0)])
     activated = _activated(

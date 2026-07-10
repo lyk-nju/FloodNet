@@ -249,7 +249,13 @@ class ConditionComposer:
             terminal_frame_abs = (
                 activated.first_future_frame_abs + valid_prefix - 1
             )
-            route_exhausted = future_start > terminal_frame_abs
+            committed_terminal = (
+                valid_prefix > 1
+                and previous_progress.route_index >= valid_prefix - 1
+            )
+            route_exhausted = (
+                committed_terminal or future_start > terminal_frame_abs
+            )
             fallback_y = route_7d[route_index, 1]
 
         boundary_xz = torch.as_tensor(
