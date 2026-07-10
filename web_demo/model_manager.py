@@ -27,7 +27,19 @@ from utils.motion_process import (
 )
 from utils.inference.root_plan import RootPlan
 from utils.inference.stream_execution import RootFeedbackConfig
-from utils.inference.runtime_update import RootSourceProposal
+from utils.inference.runtime_update import RootSourceProposal as LegacyRootSourceProposal
+from utils.inference.stream_runtime import (
+    ClearRootSource,
+    ResetSession,
+    RootSourceProposal,
+    SessionResetEvent,
+    SetGuidance,
+    SetRootFeedback,
+    SetRootSource,
+    SetRuntimeControls,
+    SetText,
+    SpaceContract,
+)
 from utils.inference.route_condition import (
     RoutePlan,
     RouteReferenceMode,
@@ -98,6 +110,11 @@ class ModelManager(WebRuntime):
         self.model = bundle.ldf_model
         self.cfg = bundle.cfg
         self.stream_generator = bundle.stream_generator
+        self.runtime_session = bundle.runtime_session
+        self._runtime_command_version = max(
+            self.runtime_session.command_queue.pending_versions,
+            default=0,
+        )
         self.rootplan_controller = RootPlanController(self.stream_generator)
         
         # Frame buffer
@@ -105,8 +122,9 @@ class ModelManager(WebRuntime):
         
         # Stream joint recovery with smoothing
         self.smoothing_alpha = 0.5  # Default: medium smoothing
-        self.stream_recovery = StreamJointRecovery263(joints_num=22, smoothing_alpha=self.smoothing_alpha)
-        self._reset_root_timeline()
+        self.stream_recovery = self.runtime_session.recovery
+        self._root_timeline = self.runtime_session.timeline
+        self._session_anchor_state = self.runtime_session.session_anchor_state
         self.root_feedback_enabled = bool(traj_mask_cfg.get("root_feedback_enabled", False))
         self.root_feedback_xz_blend_alpha = self._coerce_root_feedback_alpha(
             traj_mask_cfg.get("root_feedback_xz_blend_alpha", 0.5)
@@ -218,6 +236,51 @@ class ModelManager(WebRuntime):
             self.root_feedback_xz_blend_alpha = self._coerce_root_feedback_alpha(
                 xz_blend_alpha
             )
+        if (
+            getattr(self, "runtime_session", None) is not None
+            and (enabled is not None or xz_blend_alpha is not None)
+        ):
+            self._submit_runtime_command(
+                SetRootFeedback,
+                enabled=(None if enabled is None else self.root_feedback_enabled),
+                xz_blend_alpha=(
+                    None
+                    if xz_blend_alpha is None
+                    else self.root_feedback_xz_blend_alpha
+                ),
+            )
+
+    def update_guidance(
+        self,
+        *,
+        text_guidance_scale=None,
+        trajectory_guidance_scale=None,
+    ):
+        """Queue guidance changes for the next real commit boundary."""
+        return self._submit_runtime_command(
+            SetGuidance,
+            text_guidance_scale=text_guidance_scale,
+            trajectory_guidance_scale=trajectory_guidance_scale,
+        )
+
+    def update_runtime_controls(
+        self,
+        *,
+        history_tokens=None,
+        horizon_tokens=None,
+        num_denoise_steps=None,
+    ):
+        """Queue non-guidance generation controls for the next boundary."""
+        kwargs = {}
+        if history_tokens is not None:
+            kwargs["history_tokens"] = int(history_tokens)
+        if horizon_tokens is not None:
+            kwargs["horizon_tokens"] = int(horizon_tokens)
+        if num_denoise_steps is not None:
+            kwargs["num_denoise_steps"] = int(num_denoise_steps)
+        if not kwargs:
+            return None
+        return self._submit_runtime_command(SetRuntimeControls, **kwargs)
 
     def _configure_owned_stream_execution(self) -> None:
         self.stream_generator.configure_execution(
@@ -429,6 +492,47 @@ class ModelManager(WebRuntime):
             vae=getattr(self, "vae", None),
         )
 
+    def _next_runtime_command_version(self) -> int:
+        current = int(getattr(self, "_runtime_command_version", 0)) + 1
+        self._runtime_command_version = current
+        return current
+
+    def _runtime_commit_abs(self) -> int:
+        return int(self.runtime_session.timeline.head.commit_idx)
+
+    def _submit_runtime_command(
+        self,
+        command_type,
+        *,
+        requested_commit_abs=None,
+        **kwargs,
+    ):
+        command = command_type(
+            version=self._next_runtime_command_version(),
+            requested_commit_abs=(
+                self._runtime_commit_abs()
+                if requested_commit_abs is None
+                else int(requested_commit_abs)
+            ),
+            **kwargs,
+        )
+        self.runtime_session.submit(command)
+        return command
+
+    def _submit_root_source(
+        self,
+        proposal: RootSourceProposal,
+        *,
+        space_contract: SpaceContract,
+        requested_commit_abs=None,
+    ):
+        return self._submit_runtime_command(
+            SetRootSource,
+            requested_commit_abs=requested_commit_abs,
+            proposal=proposal,
+            space_contract=space_contract,
+        )
+
     @staticmethod
     def _reject_normalized_root_refiner_config(cfg) -> None:
         return reject_normalized_root_refiner_config(cfg)
@@ -477,10 +581,7 @@ class ModelManager(WebRuntime):
         if text != self.current_text:
             old_text = self.current_text
             self.current_text = text
-            self.stream_generator.condition_manager.update_text(
-                text,
-                commit_idx=self._get_commit_index(),
-            )
+            self._submit_runtime_command(SetText, text=text)
             # Don't reset first_chunk, stream_recovery, or vae cache
             # This allows continuous generation with text changes
             print(f"Text updated: '{old_text}' -> '{text}' (continuous generation)")
@@ -665,9 +766,8 @@ class ModelManager(WebRuntime):
         self.traj_update_delay_tokens = controls.delay_tokens
         self.traj_update_blend_enabled = controls.blend_enabled
         self.traj_update_blend_tokens = controls.blend_tokens
-        stream_generator = getattr(self, "stream_generator", None)
-        if stream_generator is not None:
-            stream_generator.traj_horizon_tokens = controls.horizon_tokens
+        if getattr(self, "runtime_session", None) is not None:
+            self.update_runtime_controls(horizon_tokens=controls.horizon_tokens)
         return (
             controls.horizon_tokens,
             controls.delay_enabled,
@@ -806,7 +906,6 @@ class ModelManager(WebRuntime):
             route_mode or getattr(self, "route_reference_mode", "relative_to_actor")
         ).value
         self.route_reference_mode = mode
-        self.stream_generator.condition_manager.set_route_mode(mode)
         return mode
 
     def _rootplan_controller(self) -> RootPlanController:
@@ -825,9 +924,9 @@ class ModelManager(WebRuntime):
 
     def _clear_runtime_route_state(self) -> None:
         self._trajectory_controller().clear()
-        if getattr(self, "stream_generator", None) is not None:
-            self._rootplan_controller().clear()
-            self.stream_generator.condition_manager.route.clear()
+        self._rootplan_controller().model_plan_version = None
+        if getattr(self, "runtime_session", None) is not None:
+            self._submit_runtime_command(ClearRootSource)
 
     def _prepare_manual_route_points(
         self,
@@ -1118,22 +1217,42 @@ class ModelManager(WebRuntime):
         if timeline is None:
             return False
         anchor_commit = int(plan.start_commit_index)
-        if not timeline.has_exact_state(anchor_commit):
-            return False
-        anchor_state = timeline.at_commit(anchor_commit)
+        anchor_state = (
+            timeline.at_commit(anchor_commit)
+            if timeline.has_exact_state(anchor_commit)
+            else timeline.head
+        )
         root_plan = self._build_root_plan_from_stream_plan(plan, anchor_state)
-        root_source = RootSourceProposal.from_root_plan(
+        legacy_source = LegacyRootSourceProposal.from_root_plan(
             root_plan,
             name=f"{plan.source}:root_source",
             source_kind=str(plan.source),
             metadata={"route_plan_version": int(plan.version)},
         )
-        self._rootplan_controller().set_active_source(
-            root_source,
-            contract="absolute_route",
-            model_plan_version=int(plan.version),
+        world = legacy_source.proposal_traj7.detach().cpu().float()
+        future = world[1:] if int(world.shape[0]) > 1 else world
+        root_source = RootSourceProposal(
+            future_traj7=future,
+            future_frame_mask=torch.ones(future.shape[0], dtype=torch.bool),
+            source_id=f"{plan.source}:{int(plan.version)}",
+            version=int(plan.version),
+            metadata={
+                "source_kind": str(plan.source),
+                "route_plan_version": int(plan.version),
+            },
         )
-        self.stream_generator.timeline = timeline
+        contract = (
+            SpaceContract.RELATIVE_ROUTE
+            if getattr(self, "route_reference_mode", "relative_to_actor")
+            == RouteReferenceMode.RELATIVE_TO_ACTOR.value
+            else SpaceContract.WORLD_ROUTE
+        )
+        self._submit_root_source(
+            root_source,
+            space_contract=contract,
+            requested_commit_abs=max(anchor_commit, self._runtime_commit_abs()),
+        )
+        self._rootplan_controller().model_plan_version = int(plan.version)
         return True
 
     def _build_temporary_rootplan_payload(
@@ -1150,7 +1269,7 @@ class ModelManager(WebRuntime):
             return None
         anchor_state = timeline.at_commit(anchor_commit)
         root_plan = self._build_root_plan_from_stream_plan(plan, anchor_state)
-        root_source = RootSourceProposal.from_root_plan(
+        root_source = LegacyRootSourceProposal.from_root_plan(
             root_plan,
             name=f"{plan.source}:temporary_root_source",
             source_kind=str(plan.source),
@@ -1398,15 +1517,14 @@ class ModelManager(WebRuntime):
                 return False
         self.reset_pending = False
 
-        # Clear everything
+        # Web-owned presentation state may be cleared directly once the worker
+        # is quiescent. Model/VAE/recovery/timeline state is reset by the
+        # authoritative session transaction below.
         self.frame_buffer.clear()
-        self.vae.clear_cache()
-        self.first_chunk = True
         self.root_xz_history.clear()
         self.root_5d_history.clear()
-        self._generated_frame_count = 0
-        self._absolute_commit_index = 0
-        self._clear_runtime_route_state()
+        self._trajectory_controller().clear()
+        self._rootplan_controller().model_plan_version = None
         
         if history_length is not None:
             self.history_length = history_length
@@ -1419,36 +1537,45 @@ class ModelManager(WebRuntime):
             self.denoise_steps = int(np.round(denoise_steps / chunk_size) * chunk_size)
             print(f"Denoising steps updated to: {self.denoise_steps} (must be multiple of {chunk_size})")
         
-        # Update smoothing alpha if provided and recreate stream recovery
+        # Smoothing is a recovery implementation parameter and can only change
+        # while execution is quiescent.
         if smoothing_alpha is not None:
             self.smoothing_alpha = np.clip(smoothing_alpha, 0.0, 1.0)
+            if hasattr(self.runtime_session.recovery, "smoothing_alpha"):
+                self.runtime_session.recovery.smoothing_alpha = float(
+                    self.smoothing_alpha
+                )
             print(f"Smoothing alpha updated to: {self.smoothing_alpha}")
 
+        reset_command = self._submit_runtime_command(ResetSession)
+        reset_event = self.runtime_session.step()
+        if not isinstance(reset_event, SessionResetEvent):
+            raise RuntimeError(
+                "quiescent reset must produce SessionResetEvent, got "
+                f"{type(reset_event).__name__}"
+            )
+        if reset_event.applied_command_version != reset_command.version:
+            raise RuntimeError("runtime reset acknowledged the wrong command version")
+
+        self.stream_recovery = self.runtime_session.recovery
+        self._root_timeline = self.runtime_session.timeline
+        self._session_anchor_state = self.runtime_session.session_anchor_state
+        self.first_chunk = self.runtime_session.first_chunk
+        self._generated_frame_count = self.runtime_session.generated_history.next_frame_abs
+        self._absolute_commit_index = self.runtime_session.timeline.head.commit_idx
+
+        self.update_runtime_controls(
+            history_tokens=self.history_length,
+            horizon_tokens=self.traj_horizon_tokens,
+            num_denoise_steps=self.denoise_steps,
+        )
         self._set_root_feedback_controls(
             enabled=root_feedback_enabled,
             xz_blend_alpha=root_feedback_xz_blend_alpha,
         )
-        print(
-            "Root feedback controls: "
-            f"enabled={self.root_feedback_enabled}, "
-            f"xz_alpha={self.root_feedback_xz_blend_alpha:.2f}"
-        )
-        
-        # Recreate stream recovery with new smoothing alpha
-        self.stream_recovery = StreamJointRecovery263(
-            joints_num=22, 
-            smoothing_alpha=self.smoothing_alpha
-        )
-        self._reset_root_timeline()
-        if bool(getattr(self, "use_owned_stream_execution", False)):
-            self._reset_owned_stream_execution()
-        
-        # Initialize model with denoise steps
-        self.stream_generator.init_ldf_generation(
-            history_length=self.history_length,
-            batch_size=1,
-            num_denoise_steps=self.denoise_steps,
-        )
+        current_text = str(getattr(self, "current_text", ""))
+        if current_text:
+            self._submit_runtime_command(SetText, text=current_text)
         self.generation_state = GenerationState.IDLE
         print(
             f"Model reset - history: {self.history_length}, "

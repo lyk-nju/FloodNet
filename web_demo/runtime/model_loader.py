@@ -9,7 +9,17 @@ from torch_ema import ExponentialMovingAverage
 
 from utils.inference.condition_manager import ConditionManager
 from utils.inference.stream_generator import StreamGenerator
+from utils.inference.stream_runtime import (
+    ConditionComposer,
+    GeneratedRootHistory,
+    PayloadBuilder,
+    RootSourceManager,
+    RuntimeCommandQueue,
+    RuntimeStepConfig,
+    StreamRuntimeSession,
+)
 from utils.initialize import instantiate, load_config
+from utils.motion_process import StreamJointRecovery263
 from utils.training.ldf.model_factory import instantiate_ldf_model
 
 from .model_bundle import ModelBundle
@@ -188,6 +198,54 @@ def build_stream_generator(
     )
 
 
+def build_runtime_session(
+    stream_generator,
+    vae,
+    *,
+    traj_mask_cfg=None,
+) -> StreamRuntimeSession:
+    """Construct and attach the single authoritative runtime session."""
+    traj_mask_cfg = traj_mask_cfg or {}
+    model = stream_generator.ldf_model
+    recovery = StreamJointRecovery263(
+        joints_num=22,
+        smoothing_alpha=float(traj_mask_cfg.get("smoothing_alpha", 0.5)),
+    )
+    timeline = stream_generator.timeline
+    device = torch.device(getattr(stream_generator, "device", "cpu"))
+    initial_config = RuntimeStepConfig(
+        text="",
+        text_guidance_scale=float(getattr(model, "cfg_scale_text", 1.0)),
+        trajectory_guidance_scale=float(getattr(model, "cfg_scale_traj", 1.0)),
+        root_feedback_enabled=bool(
+            traj_mask_cfg.get("root_feedback_enabled", False)
+        ),
+        root_feedback_xz_blend_alpha=float(
+            traj_mask_cfg.get("root_feedback_xz_blend_alpha", 0.5)
+        ),
+        history_tokens=int(getattr(stream_generator, "history_length", 30)),
+        horizon_tokens=int(
+            getattr(stream_generator, "traj_horizon_tokens", 20)
+        ),
+        num_denoise_steps=traj_mask_cfg.get("denoise_steps"),
+    )
+    session = StreamRuntimeSession(
+        kernel=stream_generator,
+        vae=vae,
+        recovery=recovery,
+        timeline=timeline,
+        generated_history=GeneratedRootHistory.empty(device=device),
+        command_queue=RuntimeCommandQueue(),
+        source_manager=RootSourceManager(),
+        composer=ConditionComposer(),
+        payload_builder=PayloadBuilder(),
+        initial_config=initial_config,
+        bridge_frames=int(traj_mask_cfg.get("bridge_frames", 8)),
+    )
+    stream_generator.attach_runtime_session(session)
+    return session
+
+
 def load_model_bundle(config_path, traj_mask_cfg=None, device="cpu") -> ModelBundle:
     vae, ldf_model, cfg = load_ldf_models(config_path, device)
     stream_generator = build_stream_generator(
@@ -196,18 +254,25 @@ def load_model_bundle(config_path, traj_mask_cfg=None, device="cpu") -> ModelBun
         traj_mask_cfg=traj_mask_cfg,
         vae=vae,
     )
+    runtime_session = build_runtime_session(
+        stream_generator,
+        vae,
+        traj_mask_cfg=traj_mask_cfg,
+    )
     return ModelBundle(
         vae=vae,
         ldf_model=ldf_model,
         cfg=cfg,
         device=device,
         stream_generator=stream_generator,
+        runtime_session=runtime_session,
         root_refiner=stream_generator.root_refiner,
         root_text_encoder=stream_generator.root_text_encoder,
     )
 
 
 __all__ = [
+    "build_runtime_session",
     "build_stream_generator",
     "load_ldf_models",
     "load_model_bundle",

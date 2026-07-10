@@ -13,6 +13,7 @@ class ModelBundle:
     cfg: Any
     device: str
     stream_generator: Any
+    runtime_session: Any
     root_refiner: Any | None = None
     root_text_encoder: Any | None = None
 

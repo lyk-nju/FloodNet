@@ -16,6 +16,7 @@ from utils.inference.timeline import RootFrameState, RootTimeline
 from utils.token_frame import token_range_to_frame_slice, token_start_frame
 from web_demo.model_manager import ModelManager
 from web_demo.runtime.model_bundle import ModelBundle
+from web_demo.runtime.model_loader import build_runtime_session
 from web_demo.runtime.state import GenerationState
 
 
@@ -101,17 +102,22 @@ def test_load_model_bundle_builds_one_stream_generator_with_root_modules(monkeyp
     assert bundle.root_refiner is fake_refiner
     assert bundle.stream_generator.root_text_encoder is fake_text_encoder
     assert bundle.root_text_encoder is fake_text_encoder
+    assert bundle.runtime_session.kernel is bundle.stream_generator
+    assert bundle.runtime_session.vae is fake_vae
 
 
 def test_model_manager_init_uses_model_bundle_not_stream_generator_helper(monkeypatch):
     fake_model = _DummyModel()
     fake_stream_generator = StreamGenerator(ldf_model=fake_model, device="cpu")
+    fake_vae = SimpleNamespace()
+    runtime_session = build_runtime_session(fake_stream_generator, fake_vae)
     fake_bundle = ModelBundle(
-        vae=SimpleNamespace(),
+        vae=fake_vae,
         ldf_model=fake_model,
         cfg=SimpleNamespace(name="cfg"),
         device="cpu",
         stream_generator=fake_stream_generator,
+        runtime_session=runtime_session,
     )
 
     def fake_load_model_bundle(self, config_path, traj_mask_cfg):
@@ -286,6 +292,12 @@ def _manager():
         token_dt=mgr.token_dt,
     )
     mgr.stream_generator.timeline = mgr._root_timeline
+    mgr.runtime_session = build_runtime_session(
+        mgr.stream_generator,
+        SimpleNamespace(),
+    )
+    mgr.runtime_session.timeline = mgr._root_timeline
+    mgr._runtime_command_version = 0
     mgr.stream_generator.active_root_plan = _plan()
     mgr.stream_recovery = SimpleNamespace(r_pos_accum=np.zeros(3, dtype=np.float32))
     return mgr
@@ -467,12 +479,13 @@ def test_owned_stream_step_buffers_event_and_syncs_compatibility_state():
     assert mgr._absolute_commit_index == 3
 
 
-def test_activate_root_plan_from_route_sets_stream_generator_active_root_source():
+def test_activate_root_plan_from_route_queues_runtime_root_source():
     mgr = _manager()
     mgr.model.commit_index = 0
     mgr.current_text = "turn right"
     mgr._root_timeline = _timeline(0)
     mgr.stream_generator.timeline = mgr._root_timeline
+    mgr.runtime_session.timeline = mgr._root_timeline
     mgr.stream_generator.root_refiner = None
 
     route = RoutePlan(
@@ -486,9 +499,11 @@ def test_activate_root_plan_from_route_sets_stream_generator_active_root_source(
     ok = mgr._activate_root_plan_from_stream_plan(route)
 
     assert ok is True
-    assert mgr.stream_generator.active_root_plan is None
-    assert mgr.stream_generator.active_root_source_proposal is not None
-    assert mgr.stream_generator.active_root_source_proposal.source_kind == "manual"
+    assert mgr.stream_generator.active_root_plan.source == "test"
+    assert mgr.stream_generator.active_root_source_proposal is None
+    assert mgr.runtime_session.source_manager.active is None
+    command = mgr.runtime_session.command_queue.snapshot()[-1]
+    assert command.proposal.metadata["source_kind"] == "manual"
 
 
 def test_update_trajectory_second_edit_uses_route_update_contract():
@@ -502,7 +517,13 @@ def test_update_trajectory_second_edit_uses_route_update_contract():
     assert mgr.pending_update_event is not None
     assert mgr.pending_update_event.old_route is not None
     assert mgr.pending_update_event.new_route is not None
-    assert mgr.stream_generator.condition_manager.route.mode.value == "relative_to_actor"
+    assert mgr.route_reference_mode == "relative_to_actor"
+    root_commands = [
+        command
+        for command in mgr.runtime_session.command_queue.snapshot()
+        if type(command).__name__ == "SetRootSource"
+    ]
+    assert root_commands[0].space_contract.value == "relative_route"
 
 
 def test_update_trajectory_accepts_per_update_horizon_delay_blend_controls():
@@ -575,6 +596,7 @@ def test_first_update_trajectory_returns_display_preview_immediately():
     mgr = _trajectory_manager()
     mgr._root_timeline = RootTimeline(_state(0, xz=(2.0, 3.0)))
     mgr.stream_generator.timeline = mgr._root_timeline
+    mgr.runtime_session.timeline = mgr._root_timeline
     route = np.array([[0.0, 0.0], [0.0, 2.0]], dtype=np.float32)
 
     preview = mgr.update_trajectory(route, source="manual", route_mode="relative_to_actor")
@@ -612,9 +634,8 @@ def test_reset_clears_model_manager_and_stream_generator_route_state():
     assert mgr.active_traj_plan is None
     assert mgr.pending_update_event is None
     assert mgr.get_display_traj() is None
-    assert mgr.stream_generator.active_root_plan is None
-    assert mgr.stream_generator.condition_manager.route.route is None
-    assert mgr.stream_generator.condition_manager.route.pending_update is None
+    assert mgr.runtime_session.timeline.head.commit_idx == 0
+    assert mgr.runtime_session.source_manager.active is None
 
 
 def test_reset_accepts_root_feedback_runtime_controls():
@@ -670,11 +691,10 @@ def test_owned_reset_rewires_current_recovery_and_shared_timeline():
 
     assert mgr.reset() is True
 
-    assert mgr.stream_generator.vae is mgr.vae
-    assert mgr.stream_generator.motion_recovery is mgr.stream_recovery
-    assert mgr.stream_generator.timeline is mgr._root_timeline
-    assert mgr.stream_generator.generated_frame_count == 0
-    assert mgr.stream_generator.first_chunk is True
+    assert mgr.runtime_session.recovery is mgr.stream_recovery
+    assert mgr.runtime_session.timeline is mgr._root_timeline
+    assert mgr.runtime_session.generated_history.next_frame_abs == 0
+    assert mgr.runtime_session.first_chunk is True
 
 
 def test_stream_recovery_append_uses_session_anchor_after_timeline_trim():
@@ -697,28 +717,25 @@ def test_stream_recovery_append_uses_session_anchor_after_timeline_trim():
     )
 
 
-def test_build_stream_traj_input_retries_activation_after_anchor_state_arrives():
+def test_future_route_activation_is_queued_for_requested_boundary():
     mgr = _trajectory_manager()
     mgr.route_reference_mode = "absolute"
     mgr.history_length = 1
     mgr.stream_generator.history_length = 1
     mgr._root_timeline = _timeline(2)
     mgr.stream_generator.timeline = mgr._root_timeline
+    mgr.runtime_session.timeline = mgr._root_timeline
     mgr.stream_generator.active_root_plan = None
     mgr.model.commit_index = 3
     mgr.model.chunk_size = 1
     mgr.active_traj_plan = _route(version=1, start_commit_index=3, end_z=4.0)
     mgr._absolute_commit_index = 3
 
-    assert mgr._activate_root_plan_from_stream_plan(mgr.active_traj_plan) is False
-    mgr._root_timeline.append(_state(3))
-
-    payload = mgr._build_stream_traj_input()
-
-    assert payload is not None
+    assert mgr._activate_root_plan_from_stream_plan(mgr.active_traj_plan) is True
+    command = mgr.runtime_session.command_queue.snapshot()[-1]
+    assert command.requested_commit_abs == 3
     assert mgr.stream_generator.active_root_plan is None
-    assert mgr.stream_generator.active_root_source_proposal is not None
-    assert mgr._trajectory_state == "active_7d"
+    assert mgr.stream_generator.active_root_source_proposal is None
 
 
 def test_pending_route_blend_payload_uses_temporary_blended_root_plan():
