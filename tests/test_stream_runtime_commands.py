@@ -11,8 +11,10 @@ import torch
 from utils.inference.stream_runtime import (
     ClearRootSource,
     PreparedCommandBatch,
+    PreparedRuntimeTransition,
     ResetSession,
     RootSourceProposal,
+    RuntimeCommand,
     RuntimeCommandQueue,
     RuntimeStepConfig,
     SetGuidance,
@@ -51,6 +53,46 @@ def test_prepare_is_non_destructive_and_ack_removes_exact_versions():
     assert [command.version for command in queue.prepare_due(0).commands] == [2]
 
 
+def test_ack_rejects_a_caller_constructed_batch_without_removing_future_commands():
+    queue = RuntimeCommandQueue()
+    queue.submit(SetText(version=1, requested_commit_abs=5, text="future"))
+    forged = PreparedCommandBatch(
+        commands=(SetText(version=1, requested_commit_abs=0, text="forged"),)
+    )
+
+    with pytest.raises(ValueError, match="issued"):
+        queue.ack(forged)
+
+    assert [command.version for command in queue.snapshot()] == [1]
+
+
+def test_ack_rejects_a_batch_issued_by_a_different_queue():
+    source = RuntimeCommandQueue()
+    other = RuntimeCommandQueue()
+    source.submit(SetText(version=1, requested_commit_abs=0, text="walk"))
+    batch = source.prepare_due(0)
+
+    with pytest.raises(ValueError, match="issued"):
+        other.ack(batch)
+
+    assert source.pending_versions == (1,)
+
+
+def test_ack_rejects_stale_and_double_acknowledgements():
+    queue = RuntimeCommandQueue()
+    queue.submit(SetText(version=1, requested_commit_abs=0, text="walk"))
+    first = queue.prepare_due(0)
+    overlapping = queue.prepare_due(0)
+
+    queue.ack(first)
+
+    with pytest.raises(ValueError, match="issued"):
+        queue.ack(first)
+    with pytest.raises(ValueError, match="issued"):
+        queue.ack(overlapping)
+    assert queue.pending_versions == ()
+
+
 def test_submit_between_prepare_and_ack_remains_pending_without_timing_sleep():
     queue = RuntimeCommandQueue()
     queue.submit(SetText(version=1, requested_commit_abs=0, text="walk"))
@@ -79,6 +121,21 @@ def test_queue_requires_strictly_increasing_global_versions():
         queue.submit(SetGuidance(version=4, requested_commit_abs=0, text_guidance_scale=2.0))
     with pytest.raises(ValueError, match="strictly increasing"):
         queue.submit(SetText(version=3, requested_commit_abs=0, text="run"))
+
+
+def test_queue_and_batches_reject_base_and_unknown_runtime_commands():
+    class UnknownRuntimeCommand(RuntimeCommand):
+        pass
+
+    queue = RuntimeCommandQueue()
+    base = RuntimeCommand(version=1, requested_commit_abs=0)
+    unknown = UnknownRuntimeCommand(version=2, requested_commit_abs=0)
+
+    for command in (base, unknown):
+        with pytest.raises(TypeError, match="supported runtime command"):
+            queue.submit(command)
+        with pytest.raises(TypeError, match="supported runtime command"):
+            PreparedCommandBatch(commands=(command,))
 
 
 def test_replace_clear_replace_reduces_by_global_version():
@@ -180,3 +237,14 @@ def test_final_reset_is_exclusive_but_later_commands_apply_in_the_new_epoch():
     assert later_text.proposed_config.text == "run"
     assert later_text.proposed_config.text_guidance_scale == 1.0
     assert later_text.superseded_versions == (1,)
+
+
+def test_prepared_transition_requires_a_reset_session_for_reset_intent():
+    with pytest.raises(TypeError, match="reset_intent must be ResetSession"):
+        PreparedRuntimeTransition(
+            proposed_config=RuntimeStepConfig.default(),
+            root_source_command=None,
+            superseded_versions=(),
+            diagnostics={},
+            reset_intent=SetText(version=1, requested_commit_abs=0, text="walk"),
+        )

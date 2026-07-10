@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from threading import Lock
-from typing import TypeAlias
+from typing import Any, Mapping, TypeAlias
 
 from utils.inference.timeline import RootFrameState
 
 from .contracts import (
-    PreparedRuntimeTransition,
     RootSourceCommand,
     RootSourceProposal,
     RuntimeStepConfig,
     SpaceContract,
+    _clone_value,
 )
 
 
@@ -140,6 +140,54 @@ class ResetSession(RuntimeCommand):
     """Request a new runtime session epoch at a worker boundary."""
 
 
+@dataclass(frozen=True)
+class PreparedRuntimeTransition:
+    """Pure command reduction result awaiting a successful runtime commit."""
+
+    proposed_config: RuntimeStepConfig
+    root_source_command: RootSourceCommand | None
+    superseded_versions: tuple[int, ...]
+    diagnostics: Mapping[str, Any]
+    reset_intent: ResetSession | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.proposed_config, RuntimeStepConfig):
+            raise TypeError("proposed_config must be RuntimeStepConfig")
+        if self.root_source_command is not None and not isinstance(
+            self.root_source_command, RootSourceCommand
+        ):
+            raise TypeError("root_source_command must be RootSourceCommand or None")
+        versions = tuple(int(version) for version in self.superseded_versions)
+        if any(version < 0 for version in versions):
+            raise ValueError("superseded_versions must be >= 0")
+        if len(set(versions)) != len(versions):
+            raise ValueError("superseded_versions must not contain duplicates")
+        if not isinstance(self.diagnostics, Mapping):
+            raise TypeError("diagnostics must be a mapping")
+        if self.reset_intent is not None and not isinstance(
+            self.reset_intent, ResetSession
+        ):
+            raise TypeError("reset_intent must be ResetSession or None")
+        object.__setattr__(self, "superseded_versions", versions)
+        object.__setattr__(self, "diagnostics", _clone_value(self.diagnostics))
+
+    @property
+    def reset_command(self) -> ResetSession | None:
+        """Compatibility name for consumers that treat reset as a command."""
+        return self.reset_intent
+
+
+_RUNTIME_COMMAND_TYPES = (
+    SetRootSource,
+    ClearRootSource,
+    SetText,
+    SetGuidance,
+    SetRootFeedback,
+    SetRuntimeControls,
+    ResetSession,
+)
+
+
 RuntimeCommandEnvelope: TypeAlias = (
     SetRootSource
     | ClearRootSource
@@ -151,17 +199,22 @@ RuntimeCommandEnvelope: TypeAlias = (
 )
 
 
+def _is_runtime_command_envelope(command: object) -> bool:
+    return type(command) in _RUNTIME_COMMAND_TYPES
+
+
 @dataclass(frozen=True)
 class PreparedCommandBatch:
     """An immutable due-command snapshot that can be acknowledged exactly."""
 
     commands: tuple[RuntimeCommandEnvelope, ...]
+    _ack_token: object | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.commands, tuple):
             raise TypeError("commands must be a tuple")
-        if not all(isinstance(command, RuntimeCommand) for command in self.commands):
-            raise TypeError("commands must contain RuntimeCommand instances")
+        if not all(_is_runtime_command_envelope(command) for command in self.commands):
+            raise TypeError("commands must contain supported runtime commands")
         versions = tuple(command.version for command in self.commands)
         if any(current <= previous for previous, current in zip(versions, versions[1:])):
             raise ValueError("commands must be strictly increasing by version")
@@ -178,6 +231,7 @@ class RuntimeCommandQueue:
         self._lock = Lock()
         self._pending: list[RuntimeCommandEnvelope] = []
         self._last_submitted_version = -1
+        self._issued_batches: dict[object, PreparedCommandBatch] = {}
 
     @property
     def pending_versions(self) -> tuple[int, ...]:
@@ -189,8 +243,8 @@ class RuntimeCommandQueue:
             return tuple(self._pending)
 
     def submit(self, command: RuntimeCommandEnvelope) -> int:
-        if not isinstance(command, RuntimeCommand):
-            raise TypeError("command must be a RuntimeCommand")
+        if not _is_runtime_command_envelope(command):
+            raise TypeError("command must be a supported runtime command")
         with self._lock:
             if command.version <= self._last_submitted_version:
                 raise ValueError("command versions must be strictly increasing globally")
@@ -208,16 +262,31 @@ class RuntimeCommandQueue:
                 for command in self._pending
                 if command.requested_commit_abs <= commit_abs
             )
-        return PreparedCommandBatch(commands=commands)
+            batch = PreparedCommandBatch(commands=commands)
+            token = object()
+            object.__setattr__(batch, "_ack_token", token)
+            self._issued_batches[token] = batch
+        return batch
 
     def ack(self, batch: PreparedCommandBatch) -> None:
         if not isinstance(batch, PreparedCommandBatch):
             raise TypeError("batch must be PreparedCommandBatch")
-        versions = set(batch.versions)
         with self._lock:
+            token = batch._ack_token
+            issued = self._issued_batches.get(token)
+            if issued is not batch:
+                raise ValueError("batch was not issued by this queue or is no longer valid")
+            versions = set(batch.versions)
+            pending_versions = {command.version for command in self._pending}
+            if not versions.issubset(pending_versions):
+                self._issued_batches.pop(token, None)
+                raise ValueError("batch was not issued by this queue or is no longer valid")
             self._pending = [
                 command for command in self._pending if command.version not in versions
             ]
+            for issued_token, issued_batch in tuple(self._issued_batches.items()):
+                if issued_token is token or versions.intersection(issued_batch.versions):
+                    del self._issued_batches[issued_token]
 
 
 def reduce_commands(
@@ -325,6 +394,7 @@ def reduce_commands(
 __all__ = [
     "ClearRootSource",
     "PreparedCommandBatch",
+    "PreparedRuntimeTransition",
     "ResetSession",
     "RuntimeCommand",
     "RuntimeCommandEnvelope",

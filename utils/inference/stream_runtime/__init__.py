@@ -4,7 +4,6 @@ from .contracts import (
     ActivatedRootSource,
     ComposeResult,
     KernelStepResult,
-    PreparedRuntimeTransition,
     RootSourceCommand,
     RootSourceProposal,
     RouteProgressState,
@@ -19,6 +18,7 @@ from .contracts import (
 from .commands import (
     ClearRootSource,
     PreparedCommandBatch,
+    PreparedRuntimeTransition,
     ResetSession,
     RuntimeCommand,
     RuntimeCommandQueue,

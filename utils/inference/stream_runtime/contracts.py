@@ -339,43 +339,6 @@ class RuntimeStepConfig:
 
 
 @dataclass(frozen=True)
-class PreparedRuntimeTransition:
-    """Pure command reduction result awaiting a successful runtime commit."""
-
-    proposed_config: RuntimeStepConfig
-    root_source_command: RootSourceCommand | None
-    superseded_versions: tuple[int, ...]
-    diagnostics: Mapping[str, Any]
-    reset_intent: Any | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.proposed_config, RuntimeStepConfig):
-            raise TypeError("proposed_config must be RuntimeStepConfig")
-        if self.root_source_command is not None and not isinstance(
-            self.root_source_command, RootSourceCommand
-        ):
-            raise TypeError("root_source_command must be RootSourceCommand or None")
-        versions = tuple(int(version) for version in self.superseded_versions)
-        if any(version < 0 for version in versions):
-            raise ValueError("superseded_versions must be >= 0")
-        if len(set(versions)) != len(versions):
-            raise ValueError("superseded_versions must not contain duplicates")
-        if not isinstance(self.diagnostics, Mapping):
-            raise TypeError("diagnostics must be a mapping")
-        if self.reset_intent is not None:
-            version = getattr(self.reset_intent, "version", None)
-            if version is None or int(version) < 0:
-                raise TypeError("reset_intent must carry a non-negative version")
-        object.__setattr__(self, "superseded_versions", versions)
-        object.__setattr__(self, "diagnostics", _clone_value(self.diagnostics))
-
-    @property
-    def reset_command(self) -> Any | None:
-        """Compatibility name for consumers that treat reset as a command."""
-        return self.reset_intent
-
-
-@dataclass(frozen=True)
 class KernelStepResult:
     """LDF-kernel output without decoded, recovered, or timeline state."""
 
@@ -535,7 +498,6 @@ __all__ = [
     "KernelStepResult",
     "RootSourceCommand",
     "RootSourceProposal",
-    "PreparedRuntimeTransition",
     "RouteProgressState",
     "RouteStatus",
     "RuntimeEvent",
