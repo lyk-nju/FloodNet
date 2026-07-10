@@ -361,7 +361,9 @@ class KernelStepResult:
         if self.actual_payload is not None and not isinstance(self.actual_payload, Mapping):
             raise TypeError("actual_payload must be a mapping or None")
         object.__setattr__(self, "raw_latent", _clone_tensor(self.raw_latent, name="raw_latent"))
-        object.__setattr__(self, "actual_payload", _clone_value(self.actual_payload))
+        # The kernel result is internal, so downstream commit publication can
+        # observe the exact payload passed to the model without device copies.
+        object.__setattr__(self, "actual_payload", self.actual_payload)
         object.__setattr__(self, "local_commit_before", local_before)
         object.__setattr__(self, "local_commit_after", local_after)
         object.__setattr__(self, "latent_buffer_start_commit_abs", buffer_start)
@@ -412,6 +414,8 @@ class StreamCommitEvent:
             raise ValueError("source_version must be >= 0 when set")
         if self.actual_activation_commit is not None and int(self.actual_activation_commit) < 0:
             raise ValueError("actual_activation_commit must be >= 0 when set")
+        if not isinstance(self.lifecycle_events, tuple):
+            raise TypeError("lifecycle_events must be a tuple")
         if not isinstance(self.route_status, RouteStatus):
             raise TypeError("route_status must be RouteStatus")
         if not isinstance(self.root_feedback_diagnostics, Mapping):
@@ -424,6 +428,19 @@ class StreamCommitEvent:
             raise ValueError("root_frames must have shape [num_frames, 7]")
         if int(root_frames.shape[0]) != int(joint_frames.shape[0]):
             raise ValueError("root_frames and joint_frames must have the same frame count")
+        expected_root_start = first_future_frame_abs(absolute_before)
+        expected_frame_count = (
+            first_future_frame_abs(absolute_after) - expected_root_start
+        )
+        if root_start != expected_root_start:
+            raise ValueError(
+                "root_frames_start_abs must equal first_future_frame_abs("
+                "absolute_commit_before)"
+            )
+        if int(root_frames.shape[0]) != expected_frame_count:
+            raise ValueError(
+                "root_frames and joint_frames must match the causal frame span"
+            )
         timeline_state = _clone_root_frame_state(self.timeline_state, name="timeline_state")
         if timeline_state.commit_idx != absolute_after:
             raise ValueError("timeline_state.commit_idx must equal absolute_commit_after")
