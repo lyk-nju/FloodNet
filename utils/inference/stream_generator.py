@@ -31,6 +31,7 @@ from utils.inference.stream_execution import (
     snapshot_recovery_state,
     snapshot_vae_stream_state,
 )
+from utils.inference.stream_runtime import KernelStepResult
 from utils.local_frame import canonicalize_5d
 from utils.motion_process import build_physical_7d_from_5d
 from utils.token_frame import (
@@ -515,6 +516,93 @@ class StreamGenerator:
             step_input,
             first_chunk=(int(getattr(self.ldf_model, "commit_index", 0)) == 0),
             condition=provider,
+        )
+
+    def generate_token(
+        self,
+        text: str,
+        payload: dict | None,
+        *,
+        first_chunk: bool,
+        num_denoise_steps: int | None = None,
+    ) -> KernelStepResult:
+        """Generate one latent token from an already-built model payload.
+
+        Route selection, absolute slicing, VAE decoding, recovery, and timeline
+        ownership deliberately live outside this kernel boundary.
+        """
+        model = self.ldf_model
+        if num_denoise_steps is not None:
+            model.num_denoise_steps = int(num_denoise_steps)
+
+        pre_metadata = (
+            model.stream_buffer_metadata()
+            if hasattr(model, "stream_buffer_metadata")
+            else None
+        )
+        pre_start_abs = int(
+            getattr(
+                pre_metadata,
+                "start_commit_abs",
+                getattr(model, "latent_buffer_start_commit_abs", 0),
+            )
+        )
+        model_local_before = int(getattr(model, "commit_index", 0))
+        absolute_commit_before = pre_start_abs + model_local_before
+
+        step_input = self.build_step_input(text=str(text), traj_input=payload)
+        provider = self.build_ldf_condition_provider(
+            step_input,
+            first_chunk=bool(first_chunk),
+            device=self.device,
+        )
+        output = model.stream_generate_step(
+            step_input,
+            first_chunk=bool(first_chunk),
+            condition=provider,
+        )
+        generated = output.get("generated") if isinstance(output, dict) else None
+        if not torch.is_tensor(generated) or generated.dim() != 3:
+            raise ValueError(
+                "stream_generate_step must return generated [B,T,C], got "
+                f"{None if generated is None else tuple(generated.shape)}"
+            )
+        if int(generated.shape[1]) != 1:
+            raise ValueError(
+                "generate_token requires exactly one committed token; "
+                f"got {int(generated.shape[1])}"
+            )
+
+        post_metadata = (
+            model.stream_buffer_metadata()
+            if hasattr(model, "stream_buffer_metadata")
+            else None
+        )
+        post_start_abs = int(
+            getattr(
+                post_metadata,
+                "start_commit_abs",
+                getattr(model, "latent_buffer_start_commit_abs", 0),
+            )
+        )
+        post_epoch = int(
+            getattr(
+                post_metadata,
+                "epoch",
+                getattr(model, "latent_buffer_epoch", 0),
+            )
+        )
+        local_after = int(getattr(model, "commit_index", model_local_before + 1))
+        # Express both indices in the post-step buffer coordinate system. This
+        # preserves the one-step relation even when this token triggers a roll.
+        local_before = absolute_commit_before - post_start_abs
+        return KernelStepResult(
+            raw_latent=generated[0],
+            actual_payload=payload,
+            local_commit_before=local_before,
+            local_commit_after=local_after,
+            latent_buffer_start_commit_abs=post_start_abs,
+            latent_buffer_epoch=post_epoch,
         )
 
     @staticmethod
