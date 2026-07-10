@@ -24,6 +24,10 @@ model:
 # model checkpoint, CFG scales, debug preset, and interactive trajectory policy
 # are always reviewed together.
 traj_mask:
+    runtime:
+        # Gradual migration switch. False preserves the legacy web execution loop.
+        use_owned_stream_execution: false
+
     # User-drawn waypoints are treated as a HumanML3D-style 20 FPS root path
     # unless explicit timestamps are provided as [t, x, y, z].
     enabled: false

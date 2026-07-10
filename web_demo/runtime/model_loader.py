@@ -160,7 +160,13 @@ def load_root_refiner_modules(root_cfg: dict):
     return module.refiner, module.text_encoder, sparse_point_range
 
 
-def build_stream_generator(ldf_model, device: str, traj_mask_cfg=None, history_length: int = 30):
+def build_stream_generator(
+    ldf_model,
+    device: str,
+    traj_mask_cfg=None,
+    history_length: int = 30,
+    vae=None,
+):
     traj_mask_cfg = traj_mask_cfg or {}
     root_cfg = (traj_mask_cfg.get("root_refiner", {}) or {})
     refiner, text_encoder, sparse_point_range = load_root_refiner_modules(root_cfg)
@@ -178,6 +184,7 @@ def build_stream_generator(ldf_model, device: str, traj_mask_cfg=None, history_l
         token_dt=float(traj_mask_cfg.get("token_dt", 0.20)),
         history_length=int(history_length),
         traj_horizon_tokens=int(traj_mask_cfg.get("horizon_tokens", 20)),
+        vae=vae,
     )
 
 
@@ -187,6 +194,7 @@ def load_model_bundle(config_path, traj_mask_cfg=None, device="cpu") -> ModelBun
         ldf_model,
         device,
         traj_mask_cfg=traj_mask_cfg,
+        vae=vae,
     )
     return ModelBundle(
         vae=vae,

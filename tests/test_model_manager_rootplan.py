@@ -10,6 +10,7 @@ import threading
 
 from utils.inference.root_plan import RootPlan
 from utils.inference.route_condition import RoutePlan
+from utils.inference.stream_execution import StreamCommitEvent
 from utils.inference.stream_generator import StreamGenerator
 from utils.inference.timeline import RootFrameState, RootTimeline
 from utils.token_frame import token_range_to_frame_slice, token_start_frame
@@ -95,6 +96,7 @@ def test_load_model_bundle_builds_one_stream_generator_with_root_modules(monkeyp
     assert bundle.ldf_model is fake_ldf
     assert bundle.cfg is fake_cfg
     assert bundle.stream_generator.ldf_model is fake_ldf
+    assert bundle.stream_generator.vae is fake_vae
     assert bundle.stream_generator.root_refiner is fake_refiner
     assert bundle.root_refiner is fake_refiner
     assert bundle.stream_generator.root_text_encoder is fake_text_encoder
@@ -134,6 +136,9 @@ def test_model_manager_init_uses_model_bundle_not_stream_generator_helper(monkey
     assert mgr.cfg is fake_bundle.cfg
     assert mgr.stream_generator is fake_stream_generator
     assert mgr.rootplan_controller.stream_generator is fake_stream_generator
+    assert mgr.use_owned_stream_execution is False
+    assert mgr.stream_generator.vae is fake_bundle.vae
+    assert mgr.stream_generator.motion_recovery is mgr.stream_recovery
 
 
 def test_pause_generation_can_preserve_resetting_state():
@@ -314,12 +319,16 @@ class _FakeFrameBuffer:
 
     def __init__(self):
         self.cleared = False
+        self.frames = []
 
     def clear(self):
         self.cleared = True
 
     def size(self):
-        return 0
+        return len(self.frames)
+
+    def add_frame(self, frame):
+        self.frames.append(frame)
 
 
 class _FakeVae:
@@ -356,6 +365,106 @@ def test_rootplan_stream_payload_uses_body_window_left_commit():
     assert float(payload["traj_cond_7d_frame"][0, 0, 0]) == float(
         token_start_frame(start_token)
     )
+
+
+def test_owned_rootplan_payload_uses_generator_frame_history(monkeypatch):
+    mgr = _manager()
+    mgr.use_owned_stream_execution = True
+    history = torch.zeros(9, 7)
+    history[:, 3] = 1.0
+    mgr.stream_generator._generated_root_5d = history[:, :5]
+    seen = {}
+
+    def build_payload(**kwargs):
+        seen.update(kwargs)
+        return {"payload": True}
+
+    monkeypatch.setattr(
+        mgr.stream_generator,
+        "build_root_plan_stream_payload",
+        build_payload,
+    )
+
+    assert mgr._build_rootplan_stream_traj_input() == {"payload": True}
+    assert torch.equal(
+        seen["generated_history_traj7"],
+        mgr.stream_generator.generated_history_traj7,
+    )
+
+
+def test_owned_root_refiner_history_ends_at_commit_boundary_frame():
+    mgr = _manager()
+    mgr.use_owned_stream_execution = True
+    history_5d = torch.zeros(12, 5)
+    history_5d[:, 0] = torch.arange(12, dtype=torch.float32)
+    history_5d[:, 3] = 1.0
+    mgr.stream_generator._generated_root_5d = history_5d
+
+    history = mgr._get_root_refiner_history_5d(anchor_commit=2)
+
+    assert history.shape == (5, 5)
+    assert history[-1, 0] == 4.0
+
+
+def test_owned_stream_step_buffers_event_and_syncs_compatibility_state():
+    class _OwnedGenerator:
+        def __init__(self):
+            self.timeline = RootTimeline(_state(3))
+            self.first_chunk = False
+            self.generated_frame_count = 12
+            self.motion_recovery = object()
+            self.configured = None
+            self.called = None
+
+        def configure_execution(self, **kwargs):
+            self.configured = kwargs
+
+        def execute_step(self, **kwargs):
+            self.called = kwargs
+            joints = np.stack(
+                [
+                    np.full((22, 3), 1.0, dtype=np.float32),
+                    np.full((22, 3), 2.0, dtype=np.float32),
+                ]
+            )
+            return StreamCommitEvent(
+                local_commit_before=2,
+                absolute_commit_before=2,
+                absolute_commit_after=3,
+                latent_token=torch.zeros(1, 2),
+                decoded_motion_chunk=torch.zeros(2, 263),
+                joint_frames=joints,
+                generated_root_traj7=torch.zeros(12, 7),
+                timeline_state=self.timeline.head,
+                traj_payload={"condition": True},
+                root_feedback_applied=False,
+            )
+
+    mgr = ModelManager.__new__(ModelManager)
+    mgr.stream_generator = _OwnedGenerator()
+    mgr.vae = object()
+    mgr.stream_recovery = object()
+    mgr.root_feedback_enabled = True
+    mgr.root_feedback_xz_blend_alpha = 0.25
+    mgr.current_text = "walk"
+    mgr.frame_buffer = _FakeFrameBuffer()
+    mgr._build_stream_traj_input = lambda: {"condition": True}
+
+    event = mgr._execute_owned_stream_step()
+
+    assert event.absolute_commit_after == 3
+    assert mgr.stream_generator.called == {
+        "text": "walk",
+        "traj_input": {"condition": True},
+    }
+    assert len(mgr.frame_buffer.frames) == 2
+    np.testing.assert_allclose(mgr.frame_buffer.frames[0], 1.0)
+    np.testing.assert_allclose(mgr.frame_buffer.frames[1], 2.0)
+    assert mgr._root_timeline is mgr.stream_generator.timeline
+    assert mgr.stream_recovery is mgr.stream_generator.motion_recovery
+    assert mgr.first_chunk is False
+    assert mgr._generated_frame_count == 12
+    assert mgr._absolute_commit_index == 3
 
 
 def test_activate_root_plan_from_route_sets_stream_generator_active_root_source():
@@ -540,6 +649,32 @@ def test_reset_accepts_root_feedback_runtime_controls():
     status = mgr.get_buffer_status()
     assert status["root_feedback_enabled"] is True
     assert status["root_feedback_xz_blend_alpha"] == 0.75
+
+
+def test_owned_reset_rewires_current_recovery_and_shared_timeline():
+    mgr = _trajectory_manager()
+    mgr.use_owned_stream_execution = True
+    mgr.frame_buffer = _FakeFrameBuffer()
+    mgr.vae = _FakeVae()
+    mgr.first_chunk = False
+    mgr.root_xz_history = []
+    mgr.root_5d_history = []
+    mgr._generated_frame_count = 9
+    mgr._absolute_commit_index = 3
+    mgr.is_generating = False
+    mgr.reset_pending = False
+    mgr.smoothing_alpha = 0.5
+    mgr.denoise_steps = 10
+    mgr.root_feedback_enabled = False
+    mgr.root_feedback_xz_blend_alpha = 0.5
+
+    assert mgr.reset() is True
+
+    assert mgr.stream_generator.vae is mgr.vae
+    assert mgr.stream_generator.motion_recovery is mgr.stream_recovery
+    assert mgr.stream_generator.timeline is mgr._root_timeline
+    assert mgr.stream_generator.generated_frame_count == 0
+    assert mgr.stream_generator.first_chunk is True
 
 
 def test_stream_recovery_append_uses_session_anchor_after_timeline_trim():

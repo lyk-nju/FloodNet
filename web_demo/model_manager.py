@@ -26,6 +26,7 @@ from utils.motion_process import (
     replace_root_channels_263_window_from_7d,
 )
 from utils.inference.root_plan import RootPlan
+from utils.inference.stream_execution import RootFeedbackConfig
 from utils.inference.runtime_update import RootSourceProposal
 from utils.inference.route_condition import (
     RoutePlan,
@@ -39,7 +40,7 @@ from utils.inference.timeline import (
     RootTimeline,
     append_timeline_state_at_token_start_frame,
 )
-from utils.token_frame import num_frames_for_tokens, token_start_frame
+from utils.token_frame import commit_boundary_frame, num_frames_for_tokens, token_start_frame
 from utils.inference.geometry import (
     assign_uniform_timestamps,
     blend_future_trajs,
@@ -78,6 +79,10 @@ class ModelManager(WebRuntime):
         print(f"Using device: {self.device}")
 
         traj_mask_cfg = traj_mask_cfg or {}
+        runtime_cfg = traj_mask_cfg.get("runtime", {}) or {}
+        self.use_owned_stream_execution = bool(
+            runtime_cfg.get("use_owned_stream_execution", False)
+        )
         self.traj_mask_enabled = bool(traj_mask_cfg.get("enabled", False))
         self.traj_mask_keep_ratio_min = float(traj_mask_cfg.get("keep_ratio_min", 0.2))
         self.traj_mask_keep_ratio_max = float(traj_mask_cfg.get("keep_ratio_max", 0.3))
@@ -106,6 +111,7 @@ class ModelManager(WebRuntime):
         self.root_feedback_xz_blend_alpha = self._coerce_root_feedback_alpha(
             traj_mask_cfg.get("root_feedback_xz_blend_alpha", 0.5)
         )
+        self._configure_owned_stream_execution()
         
         # Generation state
         self.current_text = ""
@@ -212,6 +218,45 @@ class ModelManager(WebRuntime):
             self.root_feedback_xz_blend_alpha = self._coerce_root_feedback_alpha(
                 xz_blend_alpha
             )
+
+    def _configure_owned_stream_execution(self) -> None:
+        self.stream_generator.configure_execution(
+            vae=self.vae,
+            motion_recovery=self.stream_recovery,
+            root_feedback=RootFeedbackConfig(
+                enabled=bool(self.root_feedback_enabled),
+                xz_blend_alpha=float(self.root_feedback_xz_blend_alpha),
+            ),
+        )
+
+    def _sync_owned_stream_execution_state(self) -> None:
+        self._root_timeline = self.stream_generator.timeline
+        self.stream_recovery = self.stream_generator.motion_recovery
+        self.first_chunk = bool(self.stream_generator.first_chunk)
+        self._generated_frame_count = int(
+            self.stream_generator.generated_frame_count
+        )
+        self._absolute_commit_index = int(
+            self.stream_generator.timeline.head.commit_idx
+        )
+
+    def _reset_owned_stream_execution(self) -> None:
+        self._configure_owned_stream_execution()
+        self.stream_generator.reset_execution_state(
+            initial_state=self._session_anchor_state,
+        )
+        self._sync_owned_stream_execution_state()
+
+    def _execute_owned_stream_step(self):
+        self._configure_owned_stream_execution()
+        event = self.stream_generator.execute_step(
+            text=self.current_text,
+            traj_input=self._build_stream_traj_input(),
+        )
+        for joints in event.joint_frames:
+            self.frame_buffer.add_frame(joints)
+        self._sync_owned_stream_execution_state()
+        return event
 
     def _root_feedback_target_from_payload(self, traj_input, decoded_chunk):
         if not bool(getattr(self, "root_feedback_enabled", False)):
@@ -381,6 +426,7 @@ class ModelManager(WebRuntime):
             self.device,
             traj_mask_cfg=traj_mask_cfg,
             history_length=int(getattr(self, "history_length", 30)),
+            vae=getattr(self, "vae", None),
         )
 
     @staticmethod
@@ -416,6 +462,8 @@ class ModelManager(WebRuntime):
                 batch_size=1,
                 num_denoise_steps=self.denoise_steps,
             )
+            if bool(getattr(self, "use_owned_stream_execution", False)):
+                self._reset_owned_stream_execution()
             self.stream_generator.condition_manager.update_text(text, commit_idx=0)
             print(f"Model initialized with history length: {self.history_length}, denoise steps: {self.denoise_steps}")
             
@@ -924,6 +972,13 @@ class ModelManager(WebRuntime):
         return int(getattr(self, "_absolute_commit_index", getattr(self.model, "commit_index", 0)))
 
     def _get_root_refiner_history_5d(self, anchor_commit: int):
+        if bool(getattr(self, "use_owned_stream_execution", False)):
+            generated = self.stream_generator.generated_history_traj7
+            anchor_frame = commit_boundary_frame(max(0, int(anchor_commit)))
+            end = min(int(generated.shape[0]), anchor_frame + 1)
+            if end <= 0:
+                return None
+            return generated[:end, :5].detach().cpu().numpy().astype(np.float32)
         history = getattr(self, "root_5d_history", None)
         if not history:
             return None
@@ -1132,6 +1187,11 @@ class ModelManager(WebRuntime):
         return self.stream_generator.build_root_plan_stream_payload(
             local_commit_index=local_commit,
             absolute_commit_index=absolute_commit,
+            generated_history_traj7=(
+                self.stream_generator.generated_history_traj7
+                if bool(getattr(self, "use_owned_stream_execution", False))
+                else None
+            ),
         )
 
     def _build_stream_traj_input(self):
@@ -1380,6 +1440,8 @@ class ModelManager(WebRuntime):
             smoothing_alpha=self.smoothing_alpha
         )
         self._reset_root_timeline()
+        if bool(getattr(self, "use_owned_stream_execution", False)):
+            self._reset_owned_stream_execution()
         
         # Initialize model with denoise steps
         self.stream_generator.init_ldf_generation(
@@ -1415,6 +1477,24 @@ class ModelManager(WebRuntime):
                 if self.frame_buffer.needs_generation():
                     try:
                         step_start = time.time()
+
+                        if bool(getattr(self, "use_owned_stream_execution", False)):
+                            event = self._execute_owned_stream_step()
+                            decoded = event.decoded_motion_chunk
+                            step_time = time.time() - step_start
+                            total_gen_time += step_time
+                            step_count += 1
+                            if step_count % 10 == 0:
+                                avg_time = total_gen_time / step_count
+                                fps = decoded.shape[0] / avg_time
+                                print(
+                                    f"[Generation] Step {step_count}: "
+                                    f"{step_time*1000:.1f}ms, "
+                                    f"Avg: {avg_time*1000:.1f}ms, "
+                                    f"FPS: {fps:.1f}, "
+                                    f"Buffer: {self.frame_buffer.size()}"
+                                )
+                            continue
                         
                         # Generate one token (produces 4 frames from VAE)
                         traj_input = self._build_stream_traj_input()
