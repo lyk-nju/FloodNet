@@ -96,6 +96,37 @@ def test_active_window_segment_starts_at_current_root_and_points_forward():
     assert float(torch.linalg.norm(xz[1] - xz[0]).item()) < 0.08
 
 
+def test_active_window_segment_separates_generated_absolute_and_route_local_frames():
+    route_xz = torch.stack(
+        [torch.zeros(30), torch.linspace(0.0, 2.9, 30)], dim=-1
+    )
+    route = _traj7_from_xz_yaw(route_xz, torch.zeros(30))
+    generated_xz = torch.stack(
+        [torch.zeros(50), torch.linspace(-3.7, 1.2, 50)], dim=-1
+    )
+    generated = _traj7_from_xz_yaw(generated_xz, torch.zeros(50))
+
+    result = compose_active_window_segment(
+        route,
+        generated,
+        current_frame=37,
+        route_frame_local=0,
+        current_yaw=torch.tensor(0.0),
+        target_end_frame=29,
+        lookahead_m=0.20,
+        bridge_frames=8,
+    )
+
+    assert result.current_frame == 37
+    assert result.route_index <= 2
+    assert torch.allclose(
+        result.segment_traj7[0, [0, 2]],
+        generated[37, [0, 2]],
+        atol=1e-6,
+    )
+    assert result.segment_traj7.shape[0] == 30
+
+
 def test_active_window_segment_can_pin_route_progress_to_update_boundary():
     xz = torch.stack([torch.zeros(120), torch.linspace(0.0, 6.0, 120)], dim=-1)
     route = _traj7_from_xz_yaw(xz, torch.zeros(120))
@@ -239,6 +270,49 @@ def test_active_window_world_condition_keeps_render_and_feedback_route_continuou
         atol=0.08,
     )
     assert float(speed.max().item()) < 0.12
+    recomputed = build_physical_7d_from_5d(world_condition[:, :5])
+    assert torch.allclose(world_condition[:, 5:7], recomputed[:, 5:7], atol=1e-6)
+
+
+def test_active_window_world_condition_materializes_anchor_relative_route():
+    route_xz = torch.stack(
+        [torch.zeros(30), torch.linspace(0.0, 2.9, 30)], dim=-1
+    )
+    route = _traj7_from_xz_yaw(route_xz, torch.zeros(30))
+    generated_xz = torch.stack(
+        [torch.zeros(38), torch.linspace(-3.7, 0.0, 38)], dim=-1
+    )
+    generated = _traj7_from_xz_yaw(generated_xz, torch.zeros(38))
+    segment = compose_active_window_segment(
+        route,
+        generated,
+        current_frame=37,
+        route_frame_local=0,
+        current_yaw=torch.tensor(0.0),
+        target_end_frame=29,
+        lookahead_m=0.20,
+        bridge_frames=8,
+    )
+
+    world_condition = compose_active_window_world_condition(
+        route,
+        generated,
+        segment,
+        current_frame=37,
+        route_start_frame_abs=37,
+    )
+
+    assert world_condition.shape[0] == 37 + route.shape[0]
+    assert torch.allclose(world_condition[:38, :5], generated[:38, :5], atol=1e-6)
+    assert torch.allclose(
+        world_condition[37, [0, 2]],
+        segment.segment_traj7[0, [0, 2]],
+        atol=1e-6,
+    )
+    speed = torch.linalg.norm(
+        world_condition[1:, [0, 2]] - world_condition[:-1, [0, 2]], dim=-1
+    )
+    assert float(speed.max().item()) < 0.15
     recomputed = build_physical_7d_from_5d(world_condition[:, :5])
     assert torch.allclose(world_condition[:, 5:7], recomputed[:, 5:7], atol=1e-6)
 

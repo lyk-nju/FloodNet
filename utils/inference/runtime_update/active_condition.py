@@ -95,6 +95,7 @@ def compose_active_window_segment(
     generated_traj7: torch.Tensor,
     *,
     current_frame: int,
+    route_frame_local: int | None = None,
     current_yaw: torch.Tensor | float | None = None,
     target_end_frame: int | None = None,
     lookahead_m: float = 0.25,
@@ -104,10 +105,10 @@ def compose_active_window_segment(
 ) -> ActiveWindowSegment:
     """Compose a continuous world-frame update segment from generated root to route.
 
-    The returned segment starts exactly at ``generated_traj7[current_frame]`` and
-    then bridges to a lookahead point on the monotonic route before appending the
-    remaining route. This is intentionally world-frame; payload canonicalization
-    is handled separately.
+    The returned segment starts exactly at ``generated_traj7[current_frame]``.
+    ``current_frame`` belongs to the absolute generated timeline, while
+    ``route_frame_local`` belongs to the proposal-local route timeline. The
+    latter defaults to ``current_frame`` for legacy full-timeline routes.
     """
     route = route_traj7.detach().cpu().float()
     generated = generated_traj7.detach().cpu().float()
@@ -117,10 +118,21 @@ def compose_active_window_segment(
         raise ValueError(
             f"generated_traj7 must be [T,>=5], got {tuple(generated.shape)}"
         )
-    cur = max(0, min(int(current_frame), int(generated.shape[0]) - 1))
+    cur = int(current_frame)
+    if cur < 0 or cur >= int(generated.shape[0]):
+        raise ValueError(
+            f"current_frame {cur} is outside generated trajectory range "
+            f"[0, {int(generated.shape[0]) - 1}]"
+        )
+    route_cur = cur if route_frame_local is None else int(route_frame_local)
+    if route_cur < 0 or route_cur >= int(route.shape[0]):
+        raise ValueError(
+            f"route_frame_local {route_cur} is outside route range "
+            f"[0, {int(route.shape[0]) - 1}]"
+        )
     route_end = int(route.shape[0]) - 1 if target_end_frame is None else int(target_end_frame)
     route_end = max(1, min(route_end, int(route.shape[0]) - 1))
-    desired_frame_count = max(1, int(route_end) - int(cur) + 1)
+    desired_frame_count = max(1, int(route_end) - int(route_cur) + 1)
     if current_yaw is None:
         current_yaw_t = _yaw_from_7d(generated[cur : cur + 1])[0]
     else:
@@ -129,7 +141,7 @@ def compose_active_window_segment(
     progress = active_tracker.project(
         current_xz=generated[cur, [0, 2]],
         current_yaw=current_yaw_t,
-        min_index=(cur if min_route_index is None else int(min_route_index)),
+        min_index=(route_cur if min_route_index is None else int(min_route_index)),
     )
     route_idx = min(int(progress.route_index), int(route.shape[0]) - 2)
     route_end = min(int(route.shape[0]) - 1, route_idx + int(desired_frame_count) - 1)
@@ -194,6 +206,7 @@ def compose_active_window_world_condition(
     segment: ActiveWindowSegment,
     *,
     current_frame: int | None = None,
+    route_start_frame_abs: int = 0,
 ) -> torch.Tensor:
     """Build a continuous world condition for active-window display/feedback.
 
@@ -217,14 +230,32 @@ def compose_active_window_world_condition(
         return route
     if int(history.shape[0]) == 0 or int(seg.shape[0]) == 0:
         return route
+    route_start = int(route_start_frame_abs)
+    if route_start < 0:
+        raise ValueError(
+            f"route_start_frame_abs must be >= 0, got {route_start_frame_abs}"
+        )
     frame = int(segment.current_frame if current_frame is None else current_frame)
-    frame = max(0, min(frame, int(route.shape[0]) - 1, int(history.shape[0]) - 1))
-    out = route.clone()
-    out[: frame + 1] = history[: frame + 1]
-    patch_end = min(int(out.shape[0]), frame + int(seg.shape[0]))
+    if frame < 0 or frame >= int(history.shape[0]):
+        raise ValueError(
+            f"current_frame {frame} is outside generated history range "
+            f"[0, {int(history.shape[0]) - 1}]"
+        )
+    route_stop = route_start + int(route.shape[0])
+    total_frames = max(
+        route_stop,
+        int(history.shape[0]),
+        frame + int(seg.shape[0]),
+    )
+    out_5d = route[:1, :5].expand(total_frames, -1).clone()
+    out_5d[route_start:route_stop] = route[:, :5]
+    if route_stop < total_frames:
+        out_5d[route_stop:] = route[-1, :5]
+    out_5d[: frame + 1] = history[: frame + 1, :5]
+    patch_end = min(total_frames, frame + int(seg.shape[0]))
     if patch_end > frame:
-        out[frame:patch_end] = seg[: patch_end - frame].to(dtype=out.dtype)
-    return build_physical_7d_from_5d(out[:, :5])
+        out_5d[frame:patch_end] = seg[: patch_end - frame, :5].to(dtype=out_5d.dtype)
+    return build_physical_7d_from_5d(out_5d)
 
 
 __all__ = [
