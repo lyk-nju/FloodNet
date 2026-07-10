@@ -16,6 +16,7 @@ from utils.inference.stream_runtime import (
     WorldRouteProgressPolicy,
 )
 from utils.inference.timeline import RootFrameState
+from utils.token_frame import first_future_frame_abs
 
 
 def _route(points: list[tuple[float, float]], yaws: list[float] | None = None) -> torch.Tensor:
@@ -28,7 +29,11 @@ def _route(points: list[tuple[float, float]], yaws: list[float] | None = None) -
     return route
 
 
-def _activated(route: torch.Tensor) -> ActivatedRootSource:
+def _activated(
+    route: torch.Tensor,
+    *,
+    activation_commit: int = 0,
+) -> ActivatedRootSource:
     proposal = RootSourceProposal(
         future_traj7=route,
         future_frame_mask=torch.ones(route.shape[0], dtype=torch.bool),
@@ -38,10 +43,15 @@ def _activated(route: torch.Tensor) -> ActivatedRootSource:
     )
     return ActivatedRootSource(
         proposal=proposal,
-        requested_activation_commit=0,
-        actual_activation_commit=0,
-        boundary_state=RootFrameState.initial(dtype=torch.float32),
-        first_future_frame_abs=0,
+        requested_activation_commit=activation_commit,
+        actual_activation_commit=activation_commit,
+        boundary_state=RootFrameState(
+            commit_idx=activation_commit,
+            world_xz=torch.zeros(2),
+            world_yaw=torch.zeros(()),
+            source="activation",
+        ),
+        first_future_frame_abs=first_future_frame_abs(activation_commit),
         space_contract=SpaceContract.RELATIVE_ROUTE,
         progress=RouteProgressState.initial(),
     )
@@ -104,6 +114,23 @@ def test_relative_policy_advances_by_absolute_future_phase_not_world_projection(
     assert not hasattr(policy, "_last_index")
     with pytest.raises(FrozenInstanceError):
         policy.lookahead_m = 1.0
+
+
+def test_relative_policy_subtracts_nonzero_activation_frame_base():
+    activated = _activated(
+        _route([(100.0, float(index)) for index in range(12)]),
+        activation_commit=10,
+    )
+
+    projection = RelativeRouteProgressPolicy(lookahead_m=0.25).project(
+        activated,
+        current_first_future_frame_abs=45,
+        previous_progress=RouteProgressState.initial(),
+    )
+
+    assert activated.first_future_frame_abs == 37
+    assert projection.route_index == 8
+    assert projection.proposed_progress.route_index == 8
 
 
 @pytest.mark.parametrize(

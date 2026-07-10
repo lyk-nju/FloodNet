@@ -30,6 +30,7 @@ from .commands import (
     reduce_commands,
 )
 from .history import GeneratedRootHistory
+from .composer import ConditionComposer
 from .progress import (
     RelativeRouteProgressPolicy,
     RouteProjection,
@@ -39,6 +40,7 @@ from .progress import (
 __all__ = [
     "ActivatedRootSource",
     "ComposeResult",
+    "ConditionComposer",
     "ClearRootSource",
     "GeneratedRootHistory",
     "KernelStepResult",
