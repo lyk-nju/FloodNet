@@ -30,6 +30,11 @@ from .commands import (
     reduce_commands,
 )
 from .history import GeneratedRootHistory
+from .progress import (
+    RelativeRouteProgressPolicy,
+    RouteProjection,
+    WorldRouteProgressPolicy,
+)
 
 __all__ = [
     "ActivatedRootSource",
@@ -43,6 +48,7 @@ __all__ = [
     "RootSourceCommand",
     "RootSourceProposal",
     "RouteProgressState",
+    "RouteProjection",
     "RouteStatus",
     "RuntimeEvent",
     "RuntimeCommand",
@@ -57,5 +63,7 @@ __all__ = [
     "SetText",
     "SpaceContract",
     "StreamCommitEvent",
+    "RelativeRouteProgressPolicy",
+    "WorldRouteProgressPolicy",
     "reduce_commands",
 ]
