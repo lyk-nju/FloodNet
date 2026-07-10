@@ -9,6 +9,10 @@ from tools.run_ldf_condition_update_eval import (
     resolve_effective_update_commit,
 )
 from eval.ldf.runtime_update.root_source import RootSourceProposal
+from utils.inference.runtime_update import (
+    condition_scenario_to_proposal,
+    proposal_to_world_traj7,
+)
 from utils.motion_process import build_physical_7d_from_5d
 from utils.token_frame import commit_boundary_frame
 
@@ -94,7 +98,7 @@ def test_condition_update_cli_accepts_absolute_route_contract(monkeypatch):
 
     args = _parse_args()
 
-    assert args.runtime_update_contract == "absolute_route"
+    assert args.runtime_update_contract == "world_route"
 
 
 def test_condition_update_cli_accepts_root_source_refiner_options(monkeypatch):
@@ -264,28 +268,31 @@ def test_condition_scenario_is_normalized_to_root_source_proposal():
         caption_index=0,
     )
 
-    proposal = RootSourceProposal.from_condition_scenario(
+    proposal = condition_scenario_to_proposal(
         scenario,
         source_kind="repeat_splice",
     )
 
-    assert proposal.source_kind == "repeat_splice"
-    assert proposal.name == scenario.name
-    assert torch.allclose(proposal.proposal_traj7, scenario.condition_traj7)
-    assert proposal.update_frames == scenario.update_frames
-    assert proposal.base_sample_name == "001168"
-    assert proposal.metadata["runtime_role"] == "root_source_proposal"
+    assert proposal.metadata["source_kind"] == "repeat_splice"
+    assert proposal.source_id == scenario.name
+    assert torch.allclose(proposal.future_traj7, scenario.condition_traj7[1:])
+    assert proposal.metadata["update_frames"] == tuple(scenario.update_frames)
+    assert proposal.metadata["base_sample_name"] == "001168"
 
 
 def test_root_source_refinement_preserves_proposal_time_origin(monkeypatch):
     route = _line_traj7(12)
     proposal = RootSourceProposal(
-        name="anchored_source",
-        proposal_traj7=route,
-        source_kind="root_refiner",
-        start_frame_abs=commit_boundary_frame(5),
-        start_commit_abs=5,
-        timeline_mode="anchor_relative",
+        future_traj7=route[1:],
+        future_frame_mask=torch.ones(11, dtype=torch.bool),
+        source_id="anchored_source",
+        version=5,
+        metadata={
+            "source_kind": "root_refiner",
+            "anchor_commit_abs": 5,
+            "anchor_frame_7d": route[0],
+            "update_frames": (),
+        },
     )
     monkeypatch.setattr(
         "tools.run_ldf_condition_update_eval._clamp_refiner_future_frames",
@@ -309,6 +316,6 @@ def test_root_source_refinement_preserves_proposal_time_origin(monkeypatch):
         heading_override="none",
     )
 
-    assert refined.start_frame_abs == proposal.start_frame_abs
-    assert refined.start_commit_abs == proposal.start_commit_abs
-    assert refined.timeline_mode == proposal.timeline_mode
+    assert refined.version == proposal.version
+    assert refined.metadata["anchor_commit_abs"] == 5
+    assert torch.allclose(proposal_to_world_traj7(refined), route)

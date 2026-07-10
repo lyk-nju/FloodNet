@@ -18,7 +18,7 @@ from utils.motion_process import (
     append_traj_deltas_5d_to_7d,
 )
 from utils.inference.root_plan import RootPlan
-from utils.inference.runtime_update import RootSourceProposal as LegacyRootSourceProposal
+from utils.inference.runtime_update import root_plan_to_proposal
 from utils.inference.stream_runtime import (
     ClearRootSource,
     ResetSession,
@@ -1055,23 +1055,12 @@ class ModelManager(WebRuntime):
             else timeline.head
         )
         root_plan = self._build_root_plan_from_stream_plan(plan, anchor_state)
-        legacy_source = LegacyRootSourceProposal.from_root_plan(
+        root_source = root_plan_to_proposal(
             root_plan,
-            name=f"{plan.source}:root_source",
-            source_kind=str(plan.source),
-            metadata={"route_plan_version": int(plan.version)},
-        )
-        world = legacy_source.proposal_traj7.detach().cpu().float()
-        future = world[1:] if int(world.shape[0]) > 1 else world
-        root_source = RootSourceProposal(
-            future_traj7=future,
-            future_frame_mask=torch.ones(future.shape[0], dtype=torch.bool),
             source_id=f"{plan.source}:{int(plan.version)}",
             version=int(plan.version),
-            metadata={
-                "source_kind": str(plan.source),
-                "route_plan_version": int(plan.version),
-            },
+            source_kind=str(plan.source),
+            metadata={"route_plan_version": int(plan.version)},
         )
         contract = (
             SpaceContract.RELATIVE_ROUTE
@@ -1101,9 +1090,10 @@ class ModelManager(WebRuntime):
             return None
         anchor_state = timeline.at_commit(anchor_commit)
         root_plan = self._build_root_plan_from_stream_plan(plan, anchor_state)
-        root_source = LegacyRootSourceProposal.from_root_plan(
+        root_source = root_plan_to_proposal(
             root_plan,
-            name=f"{plan.source}:temporary_root_source",
+            source_id=f"{plan.source}:temporary:{int(plan.version)}",
+            version=int(plan.version),
             source_kind=str(plan.source),
             metadata={"route_plan_version": int(plan.version)},
         )

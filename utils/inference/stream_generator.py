@@ -174,7 +174,7 @@ class StreamGenerator:
         self.active_root_source_proposal = proposal
         self.active_root_source_contract = contract
         self._active_root_source_tracker = (
-            RouteProgressTracker(proposal.proposal_traj7)
+            RouteProgressTracker(proposal.future_traj7)
             if contract == "active_window"
             else None
         )
@@ -244,17 +244,17 @@ class StreamGenerator:
             if absolute_commit_index is None
             else int(absolute_commit_index)
         )
-        route_traj7 = proposal.proposal_traj7.to(
+        route_traj7 = proposal.future_traj7.to(
             device=self.device,
             dtype=torch.float32,
         )
         current_frame_abs = commit_boundary_frame(int(absolute_commit))
-        route_frame_local = proposal.absolute_to_local_frame(current_frame_abs)
+        route_frame_local = min(
+            max(0, int(current_frame_abs)),
+            max(0, int(route_traj7.shape[0]) - 1),
+        )
         if self.active_root_source_contract == "absolute_route":
-            world_condition = proposal.to_absolute_timeline().to(
-                device=self.device,
-                dtype=torch.float32,
-            )
+            world_condition = route_traj7
         elif self.active_root_source_contract == "active_window":
             if generated_history_traj7 is None:
                 raise ValueError(
@@ -278,7 +278,7 @@ class StreamGenerator:
                 generated_history,
                 segment,
                 current_frame=current_frame_abs,
-                route_start_frame_abs=int(proposal.start_frame_abs),
+                route_start_frame_abs=0,
             ).to(device=self.device, dtype=torch.float32)
         else:
             raise ValueError(

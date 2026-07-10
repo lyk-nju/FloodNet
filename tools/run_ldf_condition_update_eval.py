@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import warnings
 import json
 import os
 import sys
@@ -45,7 +46,12 @@ from utils.inference.runtime_update.payload_builder import (
     build_world_condition_stream_payload,
 )
 from utils.inference.runtime_update.route_tracker import RouteProgressTracker
-from utils.inference.runtime_update.root_source import RootSourceProposal
+from utils.inference.runtime_update.root_source import (
+    RootSourceProposal,
+    condition_scenario_to_proposal,
+    proposal_to_world_traj7,
+    world_traj7_to_proposal,
+)
 from eval.ldf.stream_generation import (
     StreamTextRolloutController,
     _decode_latent_chunk,
@@ -149,13 +155,18 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--runtime_update_contract",
-        choices=["legacy_reanchor", "active_window", "absolute_route"],
+        choices=[
+            "legacy_reanchor",
+            "world_route",
+            "relative_route",
+            "absolute_route",
+            "active_window",
+        ],
         default="legacy_reanchor",
         help=(
             "Runtime trajectory update contract. legacy_reanchor keeps the old "
-            "segment-source path; active_window composes a generated-history-"
-            "anchored world segment before building the RootPlan payload; "
-            "absolute_route keeps the authored world route fixed across runs "
+            "segment-source path; relative_route composes a generated-history-"
+            "anchored route; world_route keeps the authored world route fixed "
             "so alpha variants share the same future target."
         ),
     )
@@ -426,7 +437,23 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num_denoise_steps", type=int, default=None)
     parser.add_argument("--frames_per_token", type=int, default=4)
     parser.add_argument("--token_dt", type=float, default=0.20)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.runtime_update_contract == "absolute_route":
+        warnings.warn(
+            "absolute_route is deprecated; use world_route",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        args.runtime_update_contract = "world_route"
+    elif args.runtime_update_contract == "active_window":
+        warnings.warn(
+            "active_window was spatially ambiguous and now maps explicitly to "
+            "relative_route; use relative_route or world_route",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        args.runtime_update_contract = "relative_route"
+    return args
 
 
 def _parse_alphas(raw: str) -> list[float]:
@@ -568,13 +595,13 @@ def _refine_root_source_proposal_segments(
     heading_override: str,
 ) -> RootSourceProposal:
     """Run RootRefiner over each root-source segment, preserving update frames."""
-    route = root_source.proposal_traj7.detach().cpu().float()
+    route = proposal_to_world_traj7(root_source)
     total = int(route.shape[0])
     if total <= 1:
         return root_source
     update_frames = [
         max(1, min(int(frame), total - 1))
-        for frame in root_source.update_frames
+        for frame in root_source.metadata.get("update_frames", ())
     ]
     update_frames = sorted(set(update_frames))
     segment_starts = [0] + update_frames
@@ -626,17 +653,26 @@ def _refine_root_source_proposal_segments(
         "root_source_refiner_segments": segment_debug,
         "root_source_refiner_heading_override": str(heading_override),
     }
-    return RootSourceProposal(
-        name=f"root_refiner:{root_source.name}",
-        proposal_traj7=refined,
-        source_kind=f"{root_source.source_kind}+root_refiner",
-        start_frame_abs=int(root_source.start_frame_abs),
-        start_commit_abs=int(root_source.start_commit_abs),
-        timeline_mode=root_source.timeline_mode,
-        update_frames=update_frames,
-        visual_mask=root_source.visual_mask,
-        base_sample_name=root_source.base_sample_name,
-        caption_index=root_source.caption_index,
+    metadata.update(
+        {
+            "source_kind": (
+                f"{root_source.metadata.get('source_kind', 'unknown')}+root_refiner"
+            ),
+            "update_frames": tuple(update_frames),
+            "anchor_frame_7d": refined[0].detach().cpu(),
+        }
+    )
+    return world_traj7_to_proposal(
+        refined,
+        source_id=f"root_refiner:{root_source.source_id}",
+        version=root_source.version,
+        frame_mask=torch.cat(
+            [
+                torch.ones(1, dtype=torch.bool),
+                root_source.future_frame_mask,
+            ]
+        ),
+        strip_anchor=True,
         metadata=metadata,
     )
 
@@ -896,7 +932,7 @@ def _run_ldf_direct_multi_update_one(
                             tangent_frames=int(args.dynamic_reanchor_tangent_frames),
                         )
                     segment_end = segment_ends[next_update_idx + 1]
-                    if str(args.runtime_update_contract) == "active_window":
+                    if str(args.runtime_update_contract) == "relative_route":
                         if history_5d is not None and int(history_5d.shape[0]) > 0:
                             generated_history_traj7 = build_physical_7d_from_5d(
                                 history_5d.detach().cpu().float()[:, :5]
@@ -941,7 +977,7 @@ def _run_ldf_direct_multi_update_one(
                             "future_index": int(active_segment.future_index),
                             "bridge_frames": int(active_segment.bridge_frames),
                         }
-                    elif str(args.runtime_update_contract) == "absolute_route":
+                    elif str(args.runtime_update_contract) == "world_route":
                         boundary = max(
                             0,
                             min(int(condition_switch_frame), int(route_traj7.shape[0]) - 1),
@@ -967,14 +1003,14 @@ def _run_ldf_direct_multi_update_one(
                             anchor_world_y=anchor_y,
                             reanchor_mode=str(args.dynamic_reanchor_mode),
                         )
-                    if str(args.runtime_update_contract) == "active_window":
+                    if str(args.runtime_update_contract) == "relative_route":
                         condition_traj7 = compose_active_window_world_condition(
                             route_traj7.detach().cpu().float(),
                             generated_history_traj7.detach().cpu().float(),
                             active_segment,
                             current_frame=int(current_frame),
                         ).to(device=condition_traj7.device, dtype=condition_traj7.dtype)
-                    elif str(args.runtime_update_contract) == "absolute_route":
+                    elif str(args.runtime_update_contract) == "world_route":
                         condition_traj7 = route_traj7.to(
                             device=condition_traj7.device,
                             dtype=condition_traj7.dtype,
@@ -1031,7 +1067,7 @@ def _run_ldf_direct_multi_update_one(
             current_text = text_rollout.get_text_for_commit_index(commit_index)
             local_commit_index = int(getattr(model, "commit_index", commit_index))
             chunk_size = int(getattr(model, "chunk_size", 1))
-            if str(args.runtime_update_contract) in {"active_window", "absolute_route"}:
+            if str(args.runtime_update_contract) in {"relative_route", "world_route"}:
                 payload_history_5d = _generated_history_world_5d(decoded_chunks, device)
                 payload_history_traj7 = (
                     None
@@ -1042,7 +1078,7 @@ def _run_ldf_direct_multi_update_one(
                 )
                 payload_condition_traj7 = condition_traj7.to(device=device, dtype=torch.float32)
                 if (
-                    str(args.runtime_update_contract) == "active_window"
+                    str(args.runtime_update_contract) == "relative_route"
                     and
                     payload_history_traj7 is not None
                     and int(payload_history_traj7.shape[0]) > 0
@@ -1282,7 +1318,7 @@ def main() -> int:
         sample_name=sample_name,
         caption_index=caption_index,
     )
-    root_source = RootSourceProposal.from_condition_scenario(
+    root_source = condition_scenario_to_proposal(
         scenario,
         source_kind=str(args.condition_source),
     )
@@ -1321,7 +1357,15 @@ def main() -> int:
             heading_override=str(args.root_source_refiner_heading_override),
         )
 
-    condition_traj7 = root_source.proposal_traj7.detach().cpu().float()
+    condition_traj7 = proposal_to_world_traj7(root_source)
+    root_source_update_frames = [
+        int(frame) for frame in root_source.metadata.get("update_frames", ())
+    ]
+    root_source_kind = str(root_source.metadata.get("source_kind", "unknown"))
+    root_source_name = str(
+        root_source.metadata.get("scenario_name", root_source.source_id)
+    )
+    root_source_visual_mask = root_source.metadata.get("visual_mask")
     condition_batch = apply_updated_traj_to_sample_batch(sample_batch, condition_traj7)
     model_condition_sent = condition_batch["traj_cond_7d"][0].detach().cpu().float()
     artifacts_dir = out_dir / "artifacts"
@@ -1331,7 +1375,7 @@ def main() -> int:
             "original_gt": original_traj7[:original_frames],
             "root_source_proposal": condition_traj7,
         },
-        update_frames=root_source.update_frames,
+        update_frames=root_source_update_frames,
         title=f"{scenario.name}: root-source world route proposal",
     )
     model_condition_plot = plot_7d_xz_heading(
@@ -1340,7 +1384,7 @@ def main() -> int:
             "root_source_proposal": condition_traj7,
             "model_condition_sent": model_condition_sent,
         },
-        update_frames=root_source.update_frames,
+        update_frames=root_source_update_frames,
         title=f"{scenario.name}: root-source proposal after sample batching",
     )
     if bool(args.preview_only):
@@ -1352,7 +1396,7 @@ def main() -> int:
                 "condition": condition_traj7[:, [0, 2]],
             },
             title=f"{scenario.name} condition preview",
-            boundary_frames=root_source.update_frames + [original_frames],
+            boundary_frames=root_source_update_frames + [original_frames],
         )
         summary = {
             "sample_name": sample_name,
@@ -1365,14 +1409,14 @@ def main() -> int:
             "num_runs": 0,
             "preview_only": True,
             "condition_source": str(args.condition_source),
-            "root_source_kind": root_source.source_kind,
-            "root_source_name": root_source.name,
+            "root_source_kind": root_source_kind,
+            "root_source_name": root_source_name,
             "condition_scenario": scenario.name,
             "condition_metadata": scenario.metadata,
             "root_source_metadata": root_source.metadata,
             "dynamic_updates": bool(args.dynamic_updates),
             "condition_traj_display": str(args.condition_traj_display),
-            "update_frames": [int(frame) for frame in root_source.update_frames],
+            "update_frames": root_source_update_frames,
             "original_frames": int(original_frames),
             "condition_frames": int(condition_traj7.shape[0]),
             "trajectory_plot": str(plot_path),
@@ -1411,13 +1455,13 @@ def main() -> int:
     dynamic_condition_series = {}
     for run_idx in range(max(1, int(args.num_runs))):
         for alpha in [None] + _parse_alphas(args.alphas):
-            if bool(args.dynamic_updates) and root_source.update_frames:
+            if bool(args.dynamic_updates) and root_source_update_frames:
                 run_out, metrics, elapsed, seed = _run_ldf_direct_multi_update_one(
                     model,
                     vae,
                     sample_batch,
                     route_traj7=condition_traj7,
-                    update_frames=root_source.update_frames,
+                    update_frames=root_source_update_frames,
                     args=args,
                     device=device,
                     alpha=alpha,
@@ -1442,12 +1486,12 @@ def main() -> int:
             )
             video_path = videos_dir / _video_name_for_alpha(alpha, run_idx=run_idx)
             condition_mask = (
-                    root_source.visual_mask
-                    if root_source.visual_mask is not None
+                    root_source_visual_mask
+                    if root_source_visual_mask is not None
                     else condition_visual_mask(
                         int(render_condition_traj7.shape[0]),
                         str(args.condition_traj_display),
-                        run_out.get("switch_frames", root_source.update_frames),
+                        run_out.get("switch_frames", root_source_update_frames),
                     )
                 )
             label = "no_feedback" if alpha is None else f"alpha_{float(alpha):.2f}"
@@ -1590,7 +1634,7 @@ def main() -> int:
                         "model_condition": model_condition_traj7,
                         "generated": generated_traj7,
                     },
-                    update_frames=run_out.get("switch_frames", root_source.update_frames),
+                    update_frames=run_out.get("switch_frames", root_source_update_frames),
                     title=f"{scenario.name}: {label} run{run_idx} route/condition/generated",
                 )
             decoded_series[f"{label}_run{run_idx}"] = _root_xz(decoded)
@@ -1665,7 +1709,7 @@ def main() -> int:
             **decoded_series,
         },
         title=f"{scenario.name} condition update",
-        boundary_frames=root_source.update_frames + [original_frames],
+        boundary_frames=root_source_update_frames + [original_frames],
     )
     summary = {
         "sample_name": sample_name,
@@ -1677,8 +1721,8 @@ def main() -> int:
         "horizon_tokens": int(args.horizon_tokens),
         "num_runs": max(1, int(args.num_runs)),
         "condition_source": str(args.condition_source),
-        "root_source_kind": root_source.source_kind,
-        "root_source_name": root_source.name,
+        "root_source_kind": root_source_kind,
+        "root_source_name": root_source_name,
         "condition_scenario": scenario.name,
         "condition_metadata": scenario.metadata,
         "root_source_metadata": root_source.metadata,
@@ -1690,7 +1734,7 @@ def main() -> int:
         "dynamic_reanchor_yaw_source": str(args.dynamic_reanchor_yaw_source),
         "dynamic_reanchor_tangent_frames": int(args.dynamic_reanchor_tangent_frames),
         "condition_traj_display": str(args.condition_traj_display),
-        "update_frames": [int(frame) for frame in root_source.update_frames],
+        "update_frames": root_source_update_frames,
         "original_frames": int(original_frames),
         "condition_frames": int(condition_traj7.shape[0]),
         "trajectory_plot": str(plot_path),

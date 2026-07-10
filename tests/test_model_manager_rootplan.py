@@ -174,9 +174,11 @@ def test_rootplan_controller_clears_active_root_source_when_setting_root_plan():
     source[:, 3] = 1.0
     generator.set_active_root_source_proposal(
         RootSourceProposal(
-            name="stale_source",
-            proposal_traj7=source,
-            source_kind="synthetic",
+            future_traj7=source,
+            future_frame_mask=torch.ones(8, dtype=torch.bool),
+            source_id="stale_source",
+            version=1,
+            metadata={"source_kind": "synthetic"},
         ),
         contract="absolute_route",
     )
@@ -199,9 +201,11 @@ def test_rootplan_controller_can_temporarily_activate_root_source():
     source = torch.zeros(8, 7)
     source[:, 3] = 1.0
     proposal = RootSourceProposal(
-        name="temporary_source",
-        proposal_traj7=source,
-        source_kind="synthetic",
+        future_traj7=source,
+        future_frame_mask=torch.ones(8, dtype=torch.bool),
+        source_id="temporary_source",
+        version=1,
+        metadata={"source_kind": "synthetic"},
     )
 
     with controller.temporarily_active_source(proposal, contract="absolute_route"):
@@ -221,9 +225,11 @@ def test_temporary_root_plan_restores_source_contract_progress_and_version():
     source[:, 2] = torch.arange(12, dtype=torch.float32) * 0.1
     source[:, 3] = 1.0
     proposal = RootSourceProposal(
-        name="existing",
-        proposal_traj7=source,
-        source_kind="synthetic",
+        future_traj7=source,
+        future_frame_mask=torch.ones(12, dtype=torch.bool),
+        source_id="existing",
+        version=1,
+        metadata={"source_kind": "synthetic"},
     )
     controller = RootPlanController(generator)
     controller.set_active_source(
