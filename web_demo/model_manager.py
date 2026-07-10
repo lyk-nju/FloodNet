@@ -13,20 +13,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import numpy as np
-from eval.ldf.stream_generation import (
-    _decode_latent_chunk,
-    _decode_raw_chunk_preserving_feedback_cache,
-    _encode_corrected_chunk_token,
-    _write_committed_latent_to_model,
-)
 from utils.motion_process import (
     StreamJointRecovery263,
     append_traj_deltas_5d_to_7d,
-    recover_root_rot_pos,
-    replace_root_channels_263_window_from_7d,
 )
 from utils.inference.root_plan import RootPlan
-from utils.inference.stream_execution import RootFeedbackConfig
 from utils.inference.runtime_update import RootSourceProposal as LegacyRootSourceProposal
 from utils.inference.stream_runtime import (
     ClearRootSource,
@@ -39,6 +30,7 @@ from utils.inference.stream_runtime import (
     SetRuntimeControls,
     SetText,
     SpaceContract,
+    StreamCommitEvent,
 )
 from utils.inference.route_condition import (
     RoutePlan,
@@ -50,7 +42,6 @@ from utils.inference.route_condition import (
 from utils.inference.timeline import (
     RootFrameState,
     RootTimeline,
-    append_timeline_state_at_token_start_frame,
 )
 from utils.token_frame import commit_boundary_frame, num_frames_for_tokens, token_start_frame
 from utils.inference.geometry import (
@@ -129,7 +120,6 @@ class ModelManager(WebRuntime):
         self.root_feedback_xz_blend_alpha = self._coerce_root_feedback_alpha(
             traj_mask_cfg.get("root_feedback_xz_blend_alpha", 0.5)
         )
-        self._configure_owned_stream_execution()
         
         # Generation state
         self.current_text = ""
@@ -282,134 +272,8 @@ class ModelManager(WebRuntime):
             return None
         return self._submit_runtime_command(SetRuntimeControls, **kwargs)
 
-    def _configure_owned_stream_execution(self) -> None:
-        self.stream_generator.configure_execution(
-            vae=self.vae,
-            motion_recovery=self.stream_recovery,
-            root_feedback=RootFeedbackConfig(
-                enabled=bool(self.root_feedback_enabled),
-                xz_blend_alpha=float(self.root_feedback_xz_blend_alpha),
-            ),
-        )
-
-    def _sync_owned_stream_execution_state(self) -> None:
-        self._root_timeline = self.stream_generator.timeline
-        self.stream_recovery = self.stream_generator.motion_recovery
-        self.first_chunk = bool(self.stream_generator.first_chunk)
-        self._generated_frame_count = int(
-            self.stream_generator.generated_frame_count
-        )
-        self._absolute_commit_index = int(
-            self.stream_generator.timeline.head.commit_idx
-        )
-
-    def _reset_owned_stream_execution(self) -> None:
-        self._configure_owned_stream_execution()
-        self.stream_generator.reset_execution_state(
-            initial_state=self._session_anchor_state,
-        )
-        self._sync_owned_stream_execution_state()
-
     def _execute_owned_stream_step(self):
-        self._configure_owned_stream_execution()
-        event = self.stream_generator.execute_step(
-            text=self.current_text,
-            traj_input=self._build_stream_traj_input(),
-        )
-        for joints in event.joint_frames:
-            self.frame_buffer.add_frame(joints)
-        self._sync_owned_stream_execution_state()
-        return event
-
-    def _root_feedback_target_from_payload(self, traj_input, decoded_chunk):
-        if not bool(getattr(self, "root_feedback_enabled", False)):
-            return None
-        if not isinstance(traj_input, dict):
-            return None
-        cond = traj_input.get("traj_cond_7d_frame")
-        if cond is None:
-            return None
-        if torch.is_tensor(cond):
-            traj = cond[0] if cond.dim() == 3 else cond
-        else:
-            traj = torch.as_tensor(cond, dtype=torch.float32)
-        if traj.dim() != 2 or traj.shape[-1] < 5 or int(traj.shape[0]) <= 0:
-            return None
-
-        abs_start_token = int(
-            traj_input.get(
-                "traj_abs_start_token",
-                traj_input.get("body_anchor_abs_token", 0),
-            )
-        )
-        abs_start_frame = token_start_frame(abs_start_token)
-        local_start = max(0, int(self._generated_frame_count) - int(abs_start_frame))
-        need = local_start + int(decoded_chunk.shape[0]) + 1
-        target = traj.to(device=decoded_chunk.device, dtype=decoded_chunk.dtype)
-        if int(target.shape[0]) < need:
-            tail = target[-1:].expand(need - int(target.shape[0]), -1)
-            target = torch.cat([target, tail], dim=0)
-        target = target[local_start:need].clone()
-        if int(target.shape[0]) < 2:
-            return None
-
-        alpha = float(getattr(self, "root_feedback_xz_blend_alpha", 1.0))
-        alpha = float(np.clip(alpha, 0.0, 1.0))
-        if alpha < 1.0:
-            dummy_tail = decoded_chunk.new_zeros((1, decoded_chunk.shape[-1]))
-            generated_prefix = torch.cat([decoded_chunk, dummy_tail], dim=0)
-            _, generated_xyz = recover_root_rot_pos(generated_prefix.unsqueeze(0))
-            generated_xyz = generated_xyz[0, : int(target.shape[0])]
-            target_xz = target[:, [0, 2]].clone()
-            target_xz = target_xz - target_xz[:1] + generated_xyz[:1, [0, 2]]
-            target[:, [0, 2]] = (
-                (1.0 - alpha) * generated_xyz[:, [0, 2]]
-                + alpha * target_xz
-            )
-        return target
-
-    def _apply_root_feedback_to_latent(
-        self,
-        *,
-        generated,
-        decoded_raw,
-        traj_input,
-        local_commit_index: int,
-    ):
-        device = next(self.model.parameters()).device
-        target = self._root_feedback_target_from_payload(traj_input, decoded_raw)
-        if target is None:
-            latent_token = generated[0].detach()
-            decoded = _decode_latent_chunk(
-                self.vae,
-                latent_token,
-                first_chunk=self.first_chunk,
-                device=device,
-            )
-            return latent_token.detach().cpu(), decoded
-        corrected = replace_root_channels_263_window_from_7d(
-            decoded_raw,
-            target,
-            start_frame=0,
-        )
-        corrected_latent = _encode_corrected_chunk_token(
-            self.vae,
-            corrected,
-            first_chunk=self.first_chunk,
-            device=device,
-        )
-        _decode_latent_chunk(
-            self.vae,
-            corrected_latent,
-            first_chunk=self.first_chunk,
-            device=device,
-        )
-        _write_committed_latent_to_model(
-            self.model,
-            corrected_latent,
-            int(local_commit_index),
-        )
-        return corrected_latent, corrected
+        return self._generate_once()
 
     def _sample_waypoint_mask(self, waypoint_len: int) -> np.ndarray:
         """Sample traj_mask over user waypoints (length n), with keep ratio randomly sampled."""
@@ -544,31 +408,19 @@ class ModelManager(WebRuntime):
         does not clear route/rootplan state so debug presets can install a
         route before starting generation.
         """
-        self.current_text = text
-        
+        self.current_text = str(text)
         if history_length is not None:
-            self.history_length = history_length
+            self.history_length = int(history_length)
         
         if not self.is_generating:
             self.generation_state = GenerationState.LOADING
-            # Reset state before starting (only once at the beginning)
             self.frame_buffer.clear()
-            self.stream_recovery.reset()
-            self._reset_root_timeline()
-            self.vae.clear_cache()
-            self.first_chunk = True
-            self.root_xz_history.clear()
-            self.root_5d_history.clear()
-            self._generated_frame_count = 0
-            self._absolute_commit_index = 0
-            self.stream_generator.init_ldf_generation(
-                history_length=self.history_length,
-                batch_size=1,
+            self._submit_runtime_command(SetText, text=self.current_text)
+            self.update_runtime_controls(
+                history_tokens=self.history_length,
+                horizon_tokens=self.traj_horizon_tokens,
                 num_denoise_steps=self.denoise_steps,
             )
-            if bool(getattr(self, "use_owned_stream_execution", False)):
-                self._reset_owned_stream_execution()
-            self.stream_generator.condition_manager.update_text(text, commit_idx=0)
             print(f"Model initialized with history length: {self.history_length}, denoise steps: {self.denoise_steps}")
             
             # Start generation thread
@@ -1100,26 +952,6 @@ class ModelManager(WebRuntime):
         if getattr(self, "stream_generator", None) is not None:
             self.stream_generator.timeline = self._root_timeline
 
-    def _append_root_state_from_stream_recovery(self, *, frame_idx: int) -> bool:
-        timeline = getattr(self, "_root_timeline", None)
-        if timeline is None:
-            self._reset_root_timeline()
-            timeline = self._root_timeline
-
-        appended = append_timeline_state_at_token_start_frame(
-            timeline,
-            frame_idx=frame_idx,
-            recovery=self.stream_recovery,
-            session_anchor_state=getattr(self, "_session_anchor_state", None),
-            source="stream_recovery",
-        )
-        if appended:
-            history_length = int(getattr(self, "history_length", 0))
-            if history_length > 0:
-                keep_from = max(0, timeline.head.commit_idx - history_length * 2)
-                timeline.trim_before(keep_from)
-        return appended
-
     def _stream_plan_to_root_plan(
         self,
         plan: RoutePlan,
@@ -1605,97 +1437,10 @@ class ModelManager(WebRuntime):
                     try:
                         step_start = time.time()
 
-                        if bool(getattr(self, "use_owned_stream_execution", False)):
-                            event = self._execute_owned_stream_step()
-                            decoded = event.decoded_motion_chunk
-                            step_time = time.time() - step_start
-                            total_gen_time += step_time
-                            step_count += 1
-                            if step_count % 10 == 0:
-                                avg_time = total_gen_time / step_count
-                                fps = decoded.shape[0] / avg_time
-                                print(
-                                    f"[Generation] Step {step_count}: "
-                                    f"{step_time*1000:.1f}ms, "
-                                    f"Avg: {avg_time*1000:.1f}ms, "
-                                    f"FPS: {fps:.1f}, "
-                                    f"Buffer: {self.frame_buffer.size()}"
-                                )
+                        event = self._generate_once()
+                        if isinstance(event, SessionResetEvent):
                             continue
-                        
-                        # Generate one token (produces 4 frames from VAE)
-                        traj_input = self._build_stream_traj_input()
-                        x = self.stream_generator.build_step_input(
-                            self.current_text, traj_input=traj_input
-                        )
-                        condition_provider = self.stream_generator.build_ldf_condition_provider(
-                            x,
-                            first_chunk=self.first_chunk,
-                            device=next(self.model.parameters()).device,
-                        )
-                        
-                        # Generate from model (1 token)
-                        # Note: denoise_steps is set in init_generated, not here
-                        local_commit_index = int(
-                            getattr(
-                                self.model,
-                                "commit_index",
-                                getattr(self, "_absolute_commit_index", 0),
-                            )
-                        )
-                        output = self.model.stream_generate_step(
-                            x,
-                            first_chunk=self.first_chunk,
-                            condition=condition_provider,
-                        )
-                        generated = output["generated"]
-                        self._absolute_commit_index = (
-                            int(getattr(self, "_absolute_commit_index", 0))
-                            + int(generated.shape[1])
-                        )
-                        
-                        latent_token = generated[0].detach()
-                        if bool(getattr(self, "root_feedback_enabled", False)):
-                            decoded_raw = _decode_raw_chunk_preserving_feedback_cache(
-                                self.vae,
-                                latent_token,
-                                first_chunk=self.first_chunk,
-                                device=next(self.model.parameters()).device,
-                            )
-                            latent_token, decoded = self._apply_root_feedback_to_latent(
-                                generated=generated,
-                                decoded_raw=decoded_raw,
-                                traj_input=traj_input,
-                                local_commit_index=local_commit_index,
-                            )
-                        else:
-                            # Decode with VAE (1 token -> 4 frames)
-                            decoded = self.vae.stream_decode(
-                                latent_token.to(next(self.model.parameters()).device)[None, :],
-                                first_chunk=self.first_chunk,
-                            )[0].float().detach().cpu()
-                        
-                        self.first_chunk = False
-                        
-                        # Convert each frame to joints
-                        for i in range(decoded.shape[0]):
-                            frame_data = decoded[i].cpu().numpy()
-                            joints = self.stream_recovery.process_frame(frame_data)
-                            self.root_xz_history.append(
-                                self.stream_recovery.r_pos_accum[[0, 2]].astype(np.float32).copy()
-                            )
-                            root = self.stream_recovery.r_pos_accum.astype(np.float32).copy()
-                            yaw = -2.0 * float(self.stream_recovery.r_rot_ang_accum)
-                            root5d = np.array(
-                                [root[0], root[1], root[2], np.cos(yaw), np.sin(yaw)],
-                                dtype=np.float32,
-                            )
-                            self.root_5d_history.append((int(self._generated_frame_count), root5d))
-                            self._append_root_state_from_stream_recovery(
-                                frame_idx=int(self._generated_frame_count)
-                            )
-                            self._generated_frame_count += 1
-                            self.frame_buffer.add_frame(joints)
+                        decoded = event.decoded_chunk
                         
                         step_time = time.time() - step_start
                         total_gen_time += step_time
@@ -1720,6 +1465,40 @@ class ModelManager(WebRuntime):
                     time.sleep(0.01)
         
         print("Generation loop stopped")
+
+    def _generate_once(self):
+        """Execute one authoritative runtime transaction and publish its event."""
+        event = self.runtime_session.step()
+        if isinstance(event, SessionResetEvent):
+            self._root_timeline = self.runtime_session.timeline
+            self._session_anchor_state = self.runtime_session.session_anchor_state
+            self.stream_recovery = self.runtime_session.recovery
+            self.first_chunk = self.runtime_session.first_chunk
+            self._generated_frame_count = (
+                self.runtime_session.generated_history.next_frame_abs
+            )
+            self._absolute_commit_index = self.runtime_session.timeline.head.commit_idx
+            return event
+        if not isinstance(event, StreamCommitEvent):
+            raise TypeError(f"unexpected runtime event: {type(event).__name__}")
+
+        for offset, (joints, root7) in enumerate(
+            zip(event.joint_frames, event.root_frames)
+        ):
+            root_np = root7.detach().cpu().numpy().astype(np.float32)
+            self.root_xz_history.append(root_np[[0, 2]].copy())
+            self.root_5d_history.append(
+                (int(event.root_frames_start_abs + offset), root_np[:5].copy())
+            )
+            self.frame_buffer.add_frame(joints.detach().cpu().numpy())
+
+        self._root_timeline = self.runtime_session.timeline
+        self._session_anchor_state = self.runtime_session.session_anchor_state
+        self.stream_recovery = self.runtime_session.recovery
+        self.first_chunk = self.runtime_session.first_chunk
+        self._generated_frame_count = self.runtime_session.generated_history.next_frame_abs
+        self._absolute_commit_index = event.absolute_commit_after
+        return event
     
     def get_display_traj(self):
         """Return a copy of the latest world-space trajectory for frontend viz, or None."""

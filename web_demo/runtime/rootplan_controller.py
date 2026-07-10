@@ -61,18 +61,45 @@ class RootPlanController:
             model_plan_version,
         )
 
+    def snapshot_state(self):
+        stream = self.stream_generator
+        tracker = getattr(stream, "_active_root_source_tracker", None)
+        return {
+            "plan": stream.active_root_plan,
+            "source": getattr(stream, "active_root_source_proposal", None),
+            "contract": getattr(
+                stream, "active_root_source_contract", "absolute_route"
+            ),
+            "progress": None if tracker is None else int(tracker.last_index),
+            "version": self.model_plan_version,
+        }
+
+    def restore_state(self, state) -> None:
+        stream = self.stream_generator
+        stream.active_root_plan = state["plan"]
+        source = state["source"]
+        if source is None:
+            stream.clear_active_root_source()
+        else:
+            stream.set_active_root_source_proposal(
+                source,
+                contract=state["contract"],
+            )
+            tracker = getattr(stream, "_active_root_source_tracker", None)
+            if tracker is not None and state["progress"] is not None:
+                tracker._last_index = int(state["progress"])
+        self.model_plan_version = state["version"]
+
 
 class _TemporaryRootPlan:
     def __init__(self, controller: RootPlanController, root_plan, model_plan_version):
         self.controller = controller
         self.root_plan = root_plan
         self.model_plan_version = model_plan_version
-        self.previous = None
-        self.previous_version = None
+        self.previous_state = None
 
     def __enter__(self):
-        self.previous = self.controller.active_plan
-        self.previous_version = self.controller.model_plan_version
+        self.previous_state = self.controller.snapshot_state()
         self.controller.set_active(
             self.root_plan,
             model_plan_version=self.model_plan_version,
@@ -80,10 +107,7 @@ class _TemporaryRootPlan:
         return self.root_plan
 
     def __exit__(self, exc_type, exc, tb):
-        self.controller.set_active(
-            self.previous,
-            model_plan_version=self.previous_version,
-        )
+        self.controller.restore_state(self.previous_state)
         return False
 
 
@@ -99,21 +123,10 @@ class _TemporaryRootSource:
         self.root_source_proposal = root_source_proposal
         self.contract = str(contract)
         self.model_plan_version = model_plan_version
-        self.previous_plan = None
-        self.previous_source = None
-        self.previous_contract = None
-        self.previous_version = None
+        self.previous_state = None
 
     def __enter__(self):
-        stream = self.controller.stream_generator
-        self.previous_plan = stream.active_root_plan
-        self.previous_source = getattr(stream, "active_root_source_proposal", None)
-        self.previous_contract = getattr(
-            stream,
-            "active_root_source_contract",
-            "absolute_route",
-        )
-        self.previous_version = self.controller.model_plan_version
+        self.previous_state = self.controller.snapshot_state()
         self.controller.set_active_source(
             self.root_source_proposal,
             contract=self.contract,
@@ -122,16 +135,7 @@ class _TemporaryRootSource:
         return self.root_source_proposal
 
     def __exit__(self, exc_type, exc, tb):
-        stream = self.controller.stream_generator
-        stream.active_root_plan = self.previous_plan
-        if self.previous_source is None:
-            stream.clear_active_root_source()
-        else:
-            stream.set_active_root_source_proposal(
-                self.previous_source,
-                contract=self.previous_contract,
-            )
-        self.controller.model_plan_version = self.previous_version
+        self.controller.restore_state(self.previous_state)
         return False
 
 

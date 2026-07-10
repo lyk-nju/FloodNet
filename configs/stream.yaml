@@ -26,7 +26,7 @@ model:
 traj_mask:
     runtime:
         # Gradual migration switch. False preserves the legacy web execution loop.
-        use_owned_stream_execution: false
+        use_owned_stream_execution: true
 
     # User-drawn waypoints are treated as a HumanML3D-style 20 FPS root path
     # unless explicit timestamps are provided as [t, x, y, z].

@@ -143,8 +143,8 @@ def test_model_manager_init_uses_model_bundle_not_stream_generator_helper(monkey
     assert mgr.stream_generator is fake_stream_generator
     assert mgr.rootplan_controller.stream_generator is fake_stream_generator
     assert mgr.use_owned_stream_execution is False
-    assert mgr.stream_generator.vae is fake_bundle.vae
-    assert mgr.stream_generator.motion_recovery is mgr.stream_recovery
+    assert mgr.runtime_session.vae is fake_bundle.vae
+    assert mgr.runtime_session.recovery is mgr.stream_recovery
 
 
 def test_pause_generation_can_preserve_resetting_state():
@@ -210,6 +210,36 @@ def test_rootplan_controller_can_temporarily_activate_root_source():
 
     assert controller.active_plan is old_plan
     assert generator.active_root_source_proposal is None
+
+
+def test_temporary_root_plan_restores_source_contract_progress_and_version():
+    from utils.inference.runtime_update import RootSourceProposal
+    from web_demo.runtime.rootplan_controller import RootPlanController
+
+    generator = StreamGenerator(ldf_model=_DummyModel(), device="cpu")
+    source = torch.zeros(12, 7)
+    source[:, 2] = torch.arange(12, dtype=torch.float32) * 0.1
+    source[:, 3] = 1.0
+    proposal = RootSourceProposal(
+        name="existing",
+        proposal_traj7=source,
+        source_kind="synthetic",
+    )
+    controller = RootPlanController(generator)
+    controller.set_active_source(
+        proposal,
+        contract="active_window",
+        model_plan_version=7,
+    )
+    generator._active_root_source_tracker._last_index = 5
+
+    with controller.temporarily_active(_plan(source="temporary")):
+        assert controller.active_plan.source == "temporary"
+
+    assert controller.active_source is proposal
+    assert generator.active_root_source_contract == "active_window"
+    assert generator._active_root_source_tracker.last_index == 5
+    assert controller.model_plan_version == 7
 
 
 class _DummyModel(nn.Module):
@@ -416,67 +446,6 @@ def test_owned_root_refiner_history_ends_at_commit_boundary_frame():
 
     assert history.shape == (5, 5)
     assert history[-1, 0] == 4.0
-
-
-def test_owned_stream_step_buffers_event_and_syncs_compatibility_state():
-    class _OwnedGenerator:
-        def __init__(self):
-            self.timeline = RootTimeline(_state(3))
-            self.first_chunk = False
-            self.generated_frame_count = 12
-            self.motion_recovery = object()
-            self.configured = None
-            self.called = None
-
-        def configure_execution(self, **kwargs):
-            self.configured = kwargs
-
-        def execute_step(self, **kwargs):
-            self.called = kwargs
-            joints = np.stack(
-                [
-                    np.full((22, 3), 1.0, dtype=np.float32),
-                    np.full((22, 3), 2.0, dtype=np.float32),
-                ]
-            )
-            return StreamCommitEvent(
-                local_commit_before=2,
-                absolute_commit_before=2,
-                absolute_commit_after=3,
-                latent_token=torch.zeros(1, 2),
-                decoded_motion_chunk=torch.zeros(2, 263),
-                joint_frames=joints,
-                generated_root_traj7=torch.zeros(12, 7),
-                timeline_state=self.timeline.head,
-                traj_payload={"condition": True},
-                root_feedback_applied=False,
-            )
-
-    mgr = ModelManager.__new__(ModelManager)
-    mgr.stream_generator = _OwnedGenerator()
-    mgr.vae = object()
-    mgr.stream_recovery = object()
-    mgr.root_feedback_enabled = True
-    mgr.root_feedback_xz_blend_alpha = 0.25
-    mgr.current_text = "walk"
-    mgr.frame_buffer = _FakeFrameBuffer()
-    mgr._build_stream_traj_input = lambda: {"condition": True}
-
-    event = mgr._execute_owned_stream_step()
-
-    assert event.absolute_commit_after == 3
-    assert mgr.stream_generator.called == {
-        "text": "walk",
-        "traj_input": {"condition": True},
-    }
-    assert len(mgr.frame_buffer.frames) == 2
-    np.testing.assert_allclose(mgr.frame_buffer.frames[0], 1.0)
-    np.testing.assert_allclose(mgr.frame_buffer.frames[1], 2.0)
-    assert mgr._root_timeline is mgr.stream_generator.timeline
-    assert mgr.stream_recovery is mgr.stream_generator.motion_recovery
-    assert mgr.first_chunk is False
-    assert mgr._generated_frame_count == 12
-    assert mgr._absolute_commit_index == 3
 
 
 def test_activate_root_plan_from_route_queues_runtime_root_source():
@@ -697,24 +666,8 @@ def test_owned_reset_rewires_current_recovery_and_shared_timeline():
     assert mgr.runtime_session.first_chunk is True
 
 
-def test_stream_recovery_append_uses_session_anchor_after_timeline_trim():
-    mgr = _trajectory_manager()
-    mgr._session_anchor_state = _state(0, xz=(0.0, 0.0))
-    timeline = RootTimeline(_state(5, xz=(100.0, 0.0)))
-    mgr._root_timeline = timeline
-    mgr.stream_generator.timeline = timeline
-    mgr.stream_recovery = SimpleNamespace(
-        r_pos_accum=np.array([1.0, 0.0, 0.0], dtype=np.float32),
-        r_rot_ang_accum=0.0,
-    )
-
-    assert mgr._append_root_state_from_stream_recovery(frame_idx=token_start_frame(6)) is True
-
-    assert mgr._root_timeline.head.commit_idx == 6
-    assert torch.allclose(
-        mgr._root_timeline.head.world_xz,
-        torch.tensor([1.0, 0.0]),
-    )
+def test_web_manager_has_no_legacy_timeline_append_api():
+    assert not hasattr(ModelManager, "_append_root_state_from_stream_recovery")
 
 
 def test_future_route_activation_is_queued_for_requested_boundary():
