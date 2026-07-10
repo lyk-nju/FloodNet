@@ -246,7 +246,10 @@ class ConditionComposer:
             route_index = projection.route_index
             future_index = projection.future_index
             proposed_progress = projection.proposed_progress
-            route_exhausted = route_index >= valid_prefix - 1
+            terminal_frame_abs = (
+                activated.first_future_frame_abs + valid_prefix - 1
+            )
+            route_exhausted = future_start > terminal_frame_abs
             fallback_y = route_7d[route_index, 1]
 
         boundary_xz = torch.as_tensor(
@@ -272,8 +275,15 @@ class ConditionComposer:
             ]
         )
 
+        if not route_exhausted and bridge_count > horizon:
+            raise ValueError(
+                "horizon_frames must be >= bridge_frames when an active bridge "
+                "is requested"
+            )
+
         if route_exhausted:
-            future_5d = boundary_5d[None, :].expand(horizon, -1).clone()
+            hold_5d = history_5d[-1] if int(history_5d.shape[0]) else boundary_5d
+            future_5d = hold_5d[None, :].expand(horizon, -1).clone()
             future_mask = torch.zeros(horizon, dtype=torch.bool, device=device)
             future_labels = torch.full(
                 (horizon,),

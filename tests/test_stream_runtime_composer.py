@@ -329,14 +329,13 @@ def test_relative_route_preserves_generated_boundary_y_and_recomputes_deltas():
     assert torch.allclose(result.world_condition_7d, expected, atol=1e-6)
 
 
-def test_route_end_holds_value_with_false_mask_and_pure_exhaustion_proposal():
-    route = _traj7([(0.0, float(index)) for index in range(3)])
+def test_one_frame_route_emits_terminal_frame_before_exhaustion():
+    route = _traj7([(4.0, 9.0)])
     activated = _activated(
         route,
         space_contract=SpaceContract.WORLD_ROUTE,
-        boundary_xz=(0.0, 2.0),
+        boundary_xz=(-3.0, -5.0),
     )
-    progress_at_end = RouteProgressState(route_index=2, route_arc_length=2.0)
     composer = ConditionComposer()
 
     first = composer.compose(
@@ -344,26 +343,62 @@ def test_route_end_holds_value_with_false_mask_and_pure_exhaustion_proposal():
         _empty_history(),
         activated.boundary_state,
         0,
-        progress_at_end,
-        20,
+        RouteProgressState.initial(),
+        4,
+        bridge_frames=0,
     )
-    second = composer.compose(
+
+    assert torch.equal(first.world_condition_7d[0, :5], route[0, :5])
+    assert first.frame_mask[0]
+    assert first.segment_labels[0] == SegmentLabel.ROUTE.value
+    assert first.route_status is RouteStatus.ACTIVE
+
+
+def test_exhaustion_holds_last_composed_history_pose_not_current_boundary():
+    route = _traj7([(4.0, 9.0)])
+    activated = _activated(
+        route,
+        space_contract=SpaceContract.WORLD_ROUTE,
+        boundary_xz=(-3.0, -5.0),
+    )
+    first = ConditionComposer().compose(
         activated,
         _empty_history(),
         activated.boundary_state,
         0,
-        progress_at_end,
-        20,
+        RouteProgressState.initial(),
+        1,
+        bridge_frames=0,
+    )
+    history = GeneratedRootHistory(
+        base_frame_abs=0,
+        frames_7d=first.world_condition_7d.clone(),
     )
 
-    assert torch.equal(first.world_condition_7d[-1], first.world_condition_7d[-2])
-    assert not first.frame_mask.any()
-    assert first.segment_labels.eq(SegmentLabel.PADDING.value).all()
-    assert first.route_status is RouteStatus.EXHAUSTED
-    assert first.proposed_route_progress == progress_at_end
+    result = ConditionComposer().compose(
+        activated,
+        history,
+        RootFrameState(
+            commit_idx=1,
+            world_xz=torch.tensor([-20.0, 30.0]),
+            world_yaw=torch.tensor(torch.pi / 2),
+            source="drifted-boundary",
+        ),
+        1,
+        first.proposed_route_progress,
+        4,
+        bridge_frames=0,
+    )
+
+    assert torch.equal(
+        result.world_condition_7d[1:],
+        first.world_condition_7d[0].expand(4, -1),
+    )
+    assert not result.frame_mask[1:].any()
+    assert result.segment_labels[1:].eq(SegmentLabel.PADDING.value).all()
+    assert result.route_status is RouteStatus.EXHAUSTED
     assert activated.progress == RouteProgressState.initial()
-    assert "lifecycle_events" not in first.diagnostics
-    assert torch.equal(first.world_condition_7d, second.world_condition_7d)
+    assert "lifecycle_events" not in result.diagnostics
 
 
 def test_terminal_proposal_mask_holds_last_valid_pose_as_padding():
@@ -391,33 +426,17 @@ def test_terminal_proposal_mask_holds_last_valid_pose_as_padding():
     assert torch.equal(result.world_condition_7d[-1, :5], route[1, :5])
 
 
-@pytest.mark.parametrize(("route_length", "current_frame_abs"), [(1, 0), (3, 40)])
-def test_one_frame_and_past_end_sources_exhaust_without_invalid_geometry(
-    route_length: int,
-    current_frame_abs: int,
-):
-    route = _traj7([(0.0, float(index)) for index in range(route_length)])
-    activated = _activated(route, space_contract=SpaceContract.RELATIVE_ROUTE)
-    history = GeneratedRootHistory(
-        base_frame_abs=current_frame_abs,
-        frames_7d=torch.empty((0, 7)),
-    )
+def test_active_bridge_requires_horizon_to_cover_its_exact_span():
+    route = _traj7([(0.0, float(index)) for index in range(3)])
+    activated = _activated(route, space_contract=SpaceContract.WORLD_ROUTE)
 
-    result = ConditionComposer().compose(
-        activated,
-        history,
-        RootFrameState(
-            commit_idx=10,
-            world_xz=torch.tensor([0.0, float(max(0, route_length - 1))]),
-            world_yaw=torch.tensor(0.0),
-            source="commit",
-        ),
-        current_frame_abs,
-        RouteProgressState(route_index=route_length - 1),
-        4,
-    )
-
-    assert result.world_condition_7d.shape == (4, 7)
-    assert torch.isfinite(result.world_condition_7d).all()
-    assert result.route_status is RouteStatus.EXHAUSTED
-    assert not result.frame_mask.any()
+    with pytest.raises(ValueError, match="horizon_frames.*bridge_frames"):
+        ConditionComposer().compose(
+            activated,
+            _empty_history(),
+            activated.boundary_state,
+            0,
+            RouteProgressState.initial(),
+            1,
+            bridge_frames=2,
+        )
