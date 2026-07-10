@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 
 import numpy as np
@@ -18,6 +19,18 @@ from utils.inference.runtime_update import build_world_condition_stream_payload
 from utils.inference.runtime_update import compose_active_window_segment
 from utils.inference.runtime_update import compose_active_window_world_condition
 from utils.inference.timeline import RootFrameState, RootTimeline
+from utils.inference.timeline import recovery_root_state_to_world
+from utils.inference.stream_execution import (
+    RootFeedbackConfig,
+    StreamCommitEvent,
+    decode_token_with_root_feedback,
+    restore_ldf_stream_state,
+    restore_recovery_state,
+    restore_vae_stream_state,
+    snapshot_ldf_stream_state,
+    snapshot_recovery_state,
+    snapshot_vae_stream_state,
+)
 from utils.local_frame import canonicalize_5d
 from utils.motion_process import build_physical_7d_from_5d
 from utils.token_frame import (
@@ -65,6 +78,9 @@ class StreamGenerator:
         history_length: int = 30,
         traj_horizon_tokens: int = 20,
         default_anchor_y: float = 1.0,
+        vae=None,
+        motion_recovery=None,
+        root_feedback: RootFeedbackConfig | None = None,
     ):
         self.ldf_model = ldf_model
         self.condition_manager = condition_manager or ConditionManager()
@@ -84,6 +100,13 @@ class StreamGenerator:
         self.active_root_source_proposal: RootSourceProposal | None = None
         self.active_root_source_contract: str = "absolute_route"
         self._active_root_source_tracker: RouteProgressTracker | None = None
+        self.vae = vae
+        self.motion_recovery = motion_recovery
+        self.root_feedback_config = root_feedback or RootFeedbackConfig()
+        self.first_chunk = True
+        self.generated_frame_count = 0
+        self.session_anchor_state = self.timeline.earliest
+        self._generated_root_5d = self._initial_root_history(self.session_anchor_state)
 
     @property
     def batch_size(self) -> int:
@@ -164,6 +187,7 @@ class StreamGenerator:
         *,
         local_commit_index: int | None = None,
         absolute_commit_index: int | None = None,
+        generated_history_traj7: torch.Tensor | None = None,
     ) -> dict | None:
         local_commit = (
             int(getattr(self.ldf_model, "commit_index", 0))
@@ -178,6 +202,7 @@ class StreamGenerator:
         root_source_payload = self.build_root_source_stream_payload(
             local_commit_index=local_commit,
             absolute_commit_index=absolute_commit,
+            generated_history_traj7=generated_history_traj7,
         )
         if root_source_payload is not None:
             return root_source_payload
@@ -491,6 +516,214 @@ class StreamGenerator:
             first_chunk=(int(getattr(self.ldf_model, "commit_index", 0)) == 0),
             condition=provider,
         )
+
+    @staticmethod
+    def _initial_root_history(state: RootFrameState, y: float = 1.0) -> torch.Tensor:
+        yaw = state.world_yaw.detach().cpu().float().reshape(())
+        xz = state.world_xz.detach().cpu().float()
+        return torch.tensor(
+            [[
+                float(xz[0].item()),
+                float(y),
+                float(xz[1].item()),
+                float(torch.cos(yaw).item()),
+                float(torch.sin(yaw).item()),
+            ]],
+            dtype=torch.float32,
+        )
+
+    @property
+    def generated_history_traj7(self) -> torch.Tensor:
+        return build_physical_7d_from_5d(self._generated_root_5d.detach().clone())
+
+    def configure_execution(
+        self,
+        *,
+        vae=None,
+        motion_recovery=None,
+        root_feedback: RootFeedbackConfig | None = None,
+    ) -> None:
+        if vae is not None:
+            self.vae = vae
+        if motion_recovery is not None:
+            self.motion_recovery = motion_recovery
+        if root_feedback is not None:
+            if not isinstance(root_feedback, RootFeedbackConfig):
+                raise TypeError(
+                    "root_feedback must be RootFeedbackConfig, got "
+                    f"{type(root_feedback).__name__}"
+                )
+            self.root_feedback_config = root_feedback
+
+    def reset_execution_state(
+        self,
+        initial_state: RootFrameState | None = None,
+        *,
+        clear_vae_cache: bool = True,
+    ) -> None:
+        anchor = initial_state or self.timeline.earliest
+        self.timeline = RootTimeline(anchor)
+        self.session_anchor_state = anchor
+        self.first_chunk = True
+        self.generated_frame_count = 0
+        self._generated_root_5d = self._initial_root_history(
+            anchor,
+            y=self.default_anchor_y,
+        )
+        if self.motion_recovery is not None and hasattr(self.motion_recovery, "reset"):
+            self.motion_recovery.reset()
+        if clear_vae_cache and self.vae is not None and hasattr(self.vae, "clear_cache"):
+            self.vae.clear_cache()
+
+    def _require_execution_dependencies(self) -> None:
+        missing = []
+        if self.vae is None:
+            missing.append("vae")
+        if self.motion_recovery is None:
+            missing.append("motion_recovery")
+        if missing:
+            raise RuntimeError(
+                "execute_step requires configured execution dependencies: "
+                + ", ".join(missing)
+            )
+
+    def execute_step(
+        self,
+        *,
+        text: str | None = None,
+        traj_input: dict | None = None,
+        num_denoise_steps: int | None = None,
+    ) -> StreamCommitEvent:
+        """Atomically execute and recover one committed LDF token."""
+
+        self._require_execution_dependencies()
+        if num_denoise_steps is not None:
+            self.ldf_model.num_denoise_steps = int(num_denoise_steps)
+
+        ldf_state = snapshot_ldf_stream_state(self.ldf_model)
+        vae_state = snapshot_vae_stream_state(self.vae)
+        recovery_state = snapshot_recovery_state(self.motion_recovery)
+        timeline_states = copy.deepcopy(self.timeline._states)
+        session_anchor = copy.deepcopy(self.session_anchor_state)
+        history_5d = self._generated_root_5d.detach().clone()
+        frame_count = int(self.generated_frame_count)
+        first_chunk = bool(self.first_chunk)
+
+        try:
+            local_commit_before = int(getattr(self.ldf_model, "commit_index", 0))
+            absolute_commit_before = int(self.timeline.head.commit_idx)
+            if traj_input is None:
+                traj_input = self.build_root_plan_stream_payload(
+                    local_commit_index=local_commit_before,
+                    absolute_commit_index=absolute_commit_before,
+                    generated_history_traj7=self.generated_history_traj7,
+                )
+            step_input = self.build_step_input(text=text, traj_input=traj_input)
+            provider = self.build_ldf_condition_provider(
+                step_input,
+                first_chunk=first_chunk,
+                device=self.device,
+            )
+            output = self.ldf_model.stream_generate_step(
+                step_input,
+                first_chunk=first_chunk,
+                condition=provider,
+            )
+            generated = output.get("generated")
+            if not torch.is_tensor(generated) or generated.dim() != 3:
+                raise ValueError(
+                    "stream_generate_step must return generated [B,T,C], got "
+                    f"{None if generated is None else tuple(generated.shape)}"
+                )
+            committed_tokens = int(generated.shape[1])
+            if committed_tokens != 1:
+                raise ValueError(
+                    "execute_step currently requires exactly one committed token; "
+                    f"got {committed_tokens}"
+                )
+            feedback = decode_token_with_root_feedback(
+                model=self.ldf_model,
+                vae=self.vae,
+                latent_token=generated[0].detach(),
+                traj_payload=traj_input,
+                generated_frame_count=frame_count,
+                local_commit_index=local_commit_before,
+                first_chunk=first_chunk,
+                config=self.root_feedback_config,
+                device=self.device,
+            )
+
+            joints = []
+            root_frames = []
+            for frame in feedback.decoded_motion_chunk:
+                frame_np = frame.detach().cpu().numpy()
+                joints.append(self.motion_recovery.process_frame(frame_np))
+                world_root, world_yaw = recovery_root_state_to_world(
+                    self.motion_recovery,
+                    self.session_anchor_state,
+                )
+                root_frames.append(
+                    [
+                        float(world_root[0]),
+                        float(frame[3].detach().cpu().item()),
+                        float(world_root[2]),
+                        float(np.cos(world_yaw)),
+                        float(np.sin(world_yaw)),
+                    ]
+                )
+
+            root_chunk_5d = torch.as_tensor(root_frames, dtype=torch.float32)
+            if frame_count == 0:
+                self._generated_root_5d = root_chunk_5d[:1]
+                if int(root_chunk_5d.shape[0]) > 1:
+                    self._generated_root_5d = torch.cat(
+                        [self._generated_root_5d, root_chunk_5d[1:]], dim=0
+                    )
+            else:
+                self._generated_root_5d = torch.cat(
+                    [self._generated_root_5d, root_chunk_5d], dim=0
+                )
+            self.generated_frame_count = frame_count + int(root_chunk_5d.shape[0])
+
+            absolute_commit_after = absolute_commit_before + committed_tokens
+            last = root_chunk_5d[-1]
+            new_state = RootFrameState(
+                commit_idx=absolute_commit_after,
+                world_xz=last[[0, 2]].to(
+                    device=self.session_anchor_state.world_xz.device,
+                    dtype=self.session_anchor_state.world_xz.dtype,
+                ),
+                world_yaw=torch.atan2(last[4], last[3]).to(
+                    device=self.session_anchor_state.world_yaw.device,
+                    dtype=self.session_anchor_state.world_yaw.dtype,
+                ),
+                source="stream_execute_step",
+            )
+            self.timeline.append(new_state)
+            self.first_chunk = False
+            return StreamCommitEvent(
+                local_commit_before=local_commit_before,
+                absolute_commit_before=absolute_commit_before,
+                absolute_commit_after=absolute_commit_after,
+                latent_token=feedback.latent_token.detach().cpu(),
+                decoded_motion_chunk=feedback.decoded_motion_chunk.detach().cpu(),
+                joint_frames=np.stack(joints, axis=0).astype(np.float32),
+                generated_root_traj7=self.generated_history_traj7,
+                timeline_state=new_state,
+                traj_payload=traj_input,
+                root_feedback_applied=bool(feedback.applied),
+                debug=dict(feedback.debug),
+            )
+        except Exception:
+            restore_ldf_stream_state(self.ldf_model, ldf_state)
+            restore_vae_stream_state(self.vae, vae_state)
+            restore_recovery_state(self.motion_recovery, recovery_state)
+            self.timeline._states = timeline_states
+            self.session_anchor_state = session_anchor
+            self._generated_root_5d = history_5d
+            self.generated_frame_count = frame_count
+            self.first_chunk = first_chunk
+            raise
 
     def _resolve_anchor_y(
         self,
