@@ -5,10 +5,12 @@ import torch
 from tools.run_ldf_condition_update_eval import (
     _build_condition_scenario_from_args,
     _parse_args,
+    _refine_root_source_proposal_segments,
     resolve_effective_update_commit,
 )
 from eval.ldf.runtime_update.root_source import RootSourceProposal
 from utils.motion_process import build_physical_7d_from_5d
+from utils.token_frame import token_start_frame
 
 
 def _line_traj7(num_frames: int) -> torch.Tensor:
@@ -273,3 +275,40 @@ def test_condition_scenario_is_normalized_to_root_source_proposal():
     assert proposal.update_frames == scenario.update_frames
     assert proposal.base_sample_name == "001168"
     assert proposal.metadata["runtime_role"] == "root_source_proposal"
+
+
+def test_root_source_refinement_preserves_proposal_time_origin(monkeypatch):
+    route = _line_traj7(12)
+    proposal = RootSourceProposal(
+        name="anchored_source",
+        proposal_traj7=route,
+        source_kind="root_refiner",
+        start_frame_abs=token_start_frame(5),
+        start_commit_abs=5,
+        timeline_mode="anchor_relative",
+    )
+    monkeypatch.setattr(
+        "tools.run_ldf_condition_update_eval._clamp_refiner_future_frames",
+        lambda _model, requested: int(requested),
+    )
+    monkeypatch.setattr(
+        "tools.run_ldf_condition_update_eval._build_rootrefiner_traj7",
+        lambda **kwargs: (kwargs["route_traj7"].clone(), None),
+    )
+
+    refined = _refine_root_source_proposal_segments(
+        proposal,
+        ldf_model=None,
+        root_refiner=object(),
+        root_text_encoder=None,
+        text="walk",
+        device=torch.device("cpu"),
+        token_dt=0.2,
+        frames_per_token=4,
+        forced_future_frames=None,
+        heading_override="none",
+    )
+
+    assert refined.start_frame_abs == proposal.start_frame_abs
+    assert refined.start_commit_abs == proposal.start_commit_abs
+    assert refined.timeline_mode == proposal.timeline_mode

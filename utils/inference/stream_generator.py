@@ -220,8 +220,13 @@ class StreamGenerator:
             device=self.device,
             dtype=torch.float32,
         )
+        current_frame_abs = token_start_frame(int(absolute_commit))
+        route_frame_local = proposal.absolute_to_local_frame(current_frame_abs)
         if self.active_root_source_contract == "absolute_route":
-            world_condition = route_traj7
+            world_condition = proposal.to_absolute_timeline().to(
+                device=self.device,
+                dtype=torch.float32,
+            )
         elif self.active_root_source_contract == "active_window":
             if generated_history_traj7 is None:
                 raise ValueError(
@@ -233,18 +238,19 @@ class StreamGenerator:
                 device=self.device,
                 dtype=torch.float32,
             )
-            current_frame = token_start_frame(int(absolute_commit))
             segment = compose_active_window_segment(
                 route_traj7,
                 generated_history,
-                current_frame=current_frame,
+                current_frame=current_frame_abs,
+                route_frame_local=route_frame_local,
                 tracker=self._active_root_source_tracker,
             )
             world_condition = compose_active_window_world_condition(
                 route_traj7,
                 generated_history,
                 segment,
-                current_frame=current_frame,
+                current_frame=current_frame_abs,
+                route_start_frame_abs=int(proposal.start_frame_abs),
             ).to(device=self.device, dtype=torch.float32)
         else:
             raise ValueError(

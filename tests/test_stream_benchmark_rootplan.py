@@ -9,6 +9,7 @@ from utils.inference.root_plan import RootPlan, build_root_plan_stream_payload
 from utils.inference.runtime_update import RootSourceProposal
 from utils.inference.stream_generator import StreamGenerator
 from utils.inference.timeline import RootFrameState, RootTimeline
+from utils.token_frame import token_start_frame
 
 
 class _DummyLdf(nn.Module):
@@ -59,6 +60,24 @@ def _root_source(valid_frames: int = 80) -> RootSourceProposal:
         proposal_traj7=proposal,
         source_kind="synthetic",
         update_frames=[12, 24],
+    )
+
+
+def _anchored_root_source(
+    valid_frames: int = 80,
+    *,
+    start_commit_abs: int = 10,
+) -> RootSourceProposal:
+    proposal = torch.zeros(valid_frames, 7)
+    proposal[:, 2] = torch.arange(valid_frames, dtype=torch.float32) * 0.1
+    proposal[:, 3] = 1.0
+    return RootSourceProposal(
+        name="anchored_world_route",
+        proposal_traj7=proposal,
+        source_kind="root_refiner",
+        start_frame_abs=token_start_frame(start_commit_abs),
+        start_commit_abs=start_commit_abs,
+        timeline_mode="anchor_relative",
     )
 
 
@@ -151,3 +170,51 @@ def test_stream_generator_prefers_active_root_source_over_root_plan_payload():
 
     assert payload is not None
     assert payload["traj_cond_7d_frame"][..., 0].abs().max() < 100.0
+
+
+def test_stream_generator_materializes_anchor_relative_absolute_route_at_origin():
+    generator = StreamGenerator(
+        ldf_model=_DummyLdf(),
+        timeline=_timeline(16),
+        history_length=9,
+        traj_horizon_tokens=4,
+        device="cpu",
+    )
+    proposal = _anchored_root_source(start_commit_abs=10)
+    generator.set_active_root_source_proposal(proposal, contract="absolute_route")
+
+    payload = generator.build_root_source_stream_payload(
+        local_commit_index=3,
+        absolute_commit_index=10,
+    )
+
+    assert payload is not None
+    payload_start_frame = token_start_frame(payload["traj_abs_start_token"])
+    origin_offset = proposal.start_frame_abs - payload_start_frame
+    traj = payload["traj_cond_7d_frame"][0]
+    assert origin_offset >= 0
+    assert torch.allclose(traj[origin_offset, [0, 2]], torch.zeros(2), atol=1e-6)
+    assert torch.isclose(traj[origin_offset + 1, 2], torch.tensor(0.1), atol=1e-6)
+
+
+def test_stream_generator_tracks_anchor_relative_route_with_local_frame_index():
+    generator = StreamGenerator(
+        ldf_model=_DummyLdf(),
+        timeline=_timeline(16),
+        history_length=9,
+        traj_horizon_tokens=4,
+        device="cpu",
+    )
+    proposal = _anchored_root_source(start_commit_abs=10)
+    generated = proposal.to_absolute_timeline()
+    generator.set_active_root_source_proposal(proposal, contract="active_window")
+
+    payload = generator.build_root_source_stream_payload(
+        local_commit_index=3,
+        absolute_commit_index=10,
+        generated_history_traj7=generated,
+    )
+
+    assert payload is not None
+    assert generator._active_root_source_tracker is not None
+    assert generator._active_root_source_tracker.last_index <= 2
