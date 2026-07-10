@@ -157,6 +157,105 @@ def test_execute_step_rolls_back_all_owned_state_when_recovery_fails():
     assert torch.equal(generator.generated_history_traj7, history_before)
 
 
+def test_execute_step_rolls_back_when_ldf_generation_fails_after_mutation():
+    generator = _generator()
+    ldf_before = generator.ldf_model.generated.clone()
+    text_before = [list(items) for items in generator.ldf_model.text_condition_list]
+    history_before = generator.generated_history_traj7.clone()
+
+    def fail_after_mutation(step_input, *, first_chunk, condition):
+        del step_input, first_chunk, condition
+        generator.ldf_model.generated.fill_(9.0)
+        generator.ldf_model.commit_index = 1
+        generator.ldf_model.current_step = 7
+        raise RuntimeError("ldf generation failed")
+
+    generator.ldf_model.stream_generate_step = fail_after_mutation
+
+    with pytest.raises(RuntimeError, match="ldf generation failed"):
+        generator.execute_step(text="walk")
+
+    assert generator.ldf_model.commit_index == 0
+    assert generator.ldf_model.current_step == 0
+    assert torch.equal(generator.ldf_model.generated, ldf_before)
+    assert generator.ldf_model.text_condition_list == text_before
+    assert generator.timeline.head.commit_idx == 0
+    assert generator.generated_frame_count == 0
+    assert generator.first_chunk is True
+    assert torch.equal(generator.generated_history_traj7, history_before)
+
+
+def test_execute_step_rolls_back_when_vae_decode_fails_after_cache_mutation():
+    generator = _generator()
+    ldf_before = generator.ldf_model.generated.clone()
+    vae_idx_before = list(generator.vae.model._conv_idx)
+    vae_feat_before = [item.clone() for item in generator.vae.model._feat_map]
+    history_before = generator.generated_history_traj7.clone()
+
+    def fail_after_cache_mutation(latent, first_chunk=True):
+        del latent, first_chunk
+        generator.vae.model._conv_idx[0] += 5
+        generator.vae.model._feat_map[0].add_(5.0)
+        raise RuntimeError("vae decode failed")
+
+    generator.vae.stream_decode = fail_after_cache_mutation
+
+    with pytest.raises(RuntimeError, match="vae decode failed"):
+        generator.execute_step(text="walk")
+
+    assert generator.ldf_model.commit_index == 0
+    assert torch.equal(generator.ldf_model.generated, ldf_before)
+    assert generator.vae.model._conv_idx == vae_idx_before
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(generator.vae.model._feat_map, vae_feat_before)
+    )
+    assert generator.timeline.head.commit_idx == 0
+    assert generator.generated_frame_count == 0
+    assert generator.first_chunk is True
+    assert torch.equal(generator.generated_history_traj7, history_before)
+
+
+def test_execute_step_rolls_back_when_root_feedback_encode_fails():
+    generator = _generator()
+    generator.configure_execution(
+        root_feedback=RootFeedbackConfig(enabled=True, xz_blend_alpha=1.0)
+    )
+    ldf_before = generator.ldf_model.generated.clone()
+    decoder_idx_before = list(generator.vae.model._conv_idx)
+    encoder_idx_before = list(generator.vae.model._enc_conv_idx)
+    history_before = generator.generated_history_traj7.clone()
+    traj = torch.zeros(1, 2, 7)
+    traj[..., 1] = 1.0
+    traj[..., 3] = 1.0
+
+    def fail_after_encoder_cache_mutation(motion, first_chunk=True):
+        del motion, first_chunk
+        generator.vae.model._enc_conv_idx[0] += 5
+        generator.vae.model._enc_feat_map[0].add_(5.0)
+        raise RuntimeError("root feedback encode failed")
+
+    generator.vae.stream_encode = fail_after_encoder_cache_mutation
+
+    with pytest.raises(RuntimeError, match="root feedback encode failed"):
+        generator.execute_step(
+            text="walk",
+            traj_input={
+                "traj_cond_7d_frame": traj,
+                "traj_abs_start_token": 0,
+            },
+        )
+
+    assert generator.ldf_model.commit_index == 0
+    assert torch.equal(generator.ldf_model.generated, ldf_before)
+    assert generator.vae.model._conv_idx == decoder_idx_before
+    assert generator.vae.model._enc_conv_idx == encoder_idx_before
+    assert generator.timeline.head.commit_idx == 0
+    assert generator.generated_frame_count == 0
+    assert generator.first_chunk is True
+    assert torch.equal(generator.generated_history_traj7, history_before)
+
+
 def test_configure_execution_updates_root_feedback_policy():
     generator = _generator()
 
