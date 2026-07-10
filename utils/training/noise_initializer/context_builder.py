@@ -25,6 +25,9 @@ class NoiseInitializerContext:
     frontier_base_zT: torch.Tensor
     frontier_ids: torch.Tensor
     traj_frame_mask: torch.Tensor | None = None
+    history_offsets: torch.Tensor | None = None
+    traj_offsets: torch.Tensor | None = None
+    local_commit_index: int = 0
 
     def as_model_kwargs(self) -> dict[str, torch.Tensor | None]:
         """Return exactly the keyword arguments accepted by ``NoiseInitializer``."""
@@ -39,6 +42,8 @@ class NoiseInitializerContext:
             "traj_frame_mask": self.traj_frame_mask,
             "frontier_offsets": self.frontier_offsets,
             "frontier_base_zT": self.frontier_base_zT,
+            "history_offsets": self.history_offsets,
+            "traj_offsets": self.traj_offsets,
         }
 
 
@@ -72,6 +77,7 @@ def build_noise_initializer_context(
     text_embedding: torch.Tensor,
     traj_local_frames: torch.Tensor,
     traj_frame_mask: torch.Tensor | None = None,
+    traj_offsets: torch.Tensor | None = None,
     history_tokens: int | None = None,
     frontier_tokens: int | None = None,
     traj_start_token: int | torch.Tensor = 0,
@@ -145,8 +151,23 @@ def build_noise_initializer_context(
             frames_per_token=frames_per_token,
         ).squeeze(-1)
 
+    selected_history = _select_history(view.committed_latents, history_tokens)
+    history_count = int(selected_history.shape[1])
+    history_offsets = (
+        view.committed_ids[-history_count:] - int(view.commit_index)
+        if history_count > 0
+        else view.committed_ids[:0]
+    )
+    if traj_offsets is None:
+        traj_start = int(traj_start_token) if not torch.is_tensor(traj_start_token) else int(traj_start_token.reshape(-1)[0].item())
+        traj_offsets = torch.arange(
+            traj_start,
+            traj_start + token_count,
+            device=view.frontier_ids.device,
+            dtype=torch.long,
+        ) - int(view.commit_index)
     return NoiseInitializerContext(
-        history_latents=_select_history(view.committed_latents, history_tokens),
+        history_latents=selected_history,
         active_latents=view.active_latents,
         active_beta=view.active_beta,
         active_offsets=view.active_offsets,
@@ -156,6 +177,9 @@ def build_noise_initializer_context(
         frontier_offsets=view.frontier_offsets[:requested_frontier],
         frontier_base_zT=view.frontier_base_zT[:, :requested_frontier],
         frontier_ids=view.frontier_ids[:requested_frontier],
+        history_offsets=history_offsets,
+        traj_offsets=traj_offsets,
+        local_commit_index=int(view.commit_index),
     )
 
 

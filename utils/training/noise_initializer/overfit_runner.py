@@ -18,7 +18,7 @@ from models.noise_initializer import NoiseInitializer
 from utils.inference.latent_state_view import StreamLatentStateView
 from utils.inference.stream_generator import StreamGenerator
 from utils.motion_process import StreamJointRecovery263
-from utils.token_frame import token_range_to_frame_slice
+from utils.token_frame import token_range_to_frame_slice, token_start_frame
 from utils.training.noise_initializer.context_builder import (
     NoiseInitializerContext,
     build_noise_initializer_context,
@@ -45,6 +45,23 @@ def should_train_commit(commit_index: int, *, optimize_every_tokens: int) -> boo
     if optimize_every_tokens <= 1:
         return True
     return int(commit_index) % optimize_every_tokens == 0
+
+
+def should_apply_initializer(training_cfg: dict, commit_index: int) -> bool:
+    """Match evaluation apply decisions to the checkpoint's training policy."""
+
+    mode = str(training_cfg.get("training_mode", "online_multi_commit"))
+    if mode == "fixed_snapshot_overfit":
+        return int(commit_index) == int(training_cfg.get("fixed_commit_index", 0))
+    if mode != "online_multi_commit":
+        raise ValueError(f"unknown noise initializer training_mode: {mode!r}")
+    interval = int(
+        training_cfg.get(
+            "optimize_every_tokens",
+            training_cfg.get("apply_initializer_every_tokens", 5),
+        )
+    )
+    return should_train_commit(commit_index, optimize_every_tokens=interval)
 
 
 def resolve_training_commit_indices(cfg: dict, *, target_tokens: int) -> list[int]:
@@ -90,6 +107,41 @@ def advance_token_update_count(
             counts[start_index:end_index] += 1
 
 
+def advance_model_token_update_count(
+    model,
+    *,
+    start_step: int,
+    start_commit: int,
+) -> None:
+    """Advance and roll the strict-frontier tracker with the model buffer."""
+
+    end_step = int(
+        (int(start_commit) + int(model.chunk_size))
+        * int(model.num_denoise_steps)
+        / int(model.chunk_size)
+    )
+    advance_token_update_count(
+        model.token_update_count,
+        start_step=int(start_step),
+        end_step=end_step,
+        dt=float(model.dt),
+        chunk_size=int(model.chunk_size),
+    )
+    if int(start_commit) + 1 == int(model.seq_len) * 2:
+        seq_len = int(model.seq_len)
+        model.token_update_count = torch.cat(
+            [
+                model.token_update_count[seq_len:],
+                torch.zeros(
+                    seq_len,
+                    device=model.token_update_count.device,
+                    dtype=model.token_update_count.dtype,
+                ),
+            ],
+            dim=0,
+        )
+
+
 def should_log_train_progress(train_step: int, *, log_every_train_steps: int) -> bool:
     log_every = int(log_every_train_steps)
     step = int(train_step)
@@ -97,7 +149,7 @@ def should_log_train_progress(train_step: int, *, log_every_train_steps: int) ->
 
 
 def format_train_progress_log(*, train_step: int, row: dict) -> dict:
-    return {
+    payload = {
         "event": "noise_initializer_train_progress",
         "train_step": int(train_step),
         "commit_index": int(row["commit_index"]),
@@ -106,6 +158,16 @@ def format_train_progress_log(*, train_step: int, row: dict) -> dict:
         "grad_norm_sum": float(row["grad_norm_sum"]),
         "history_frames": int(row["history_frames"]),
     }
+    for key in (
+        "raw_delta_norm",
+        "clipped_delta_norm",
+        "base_zT_norm",
+        "clipped_to_base_ratio",
+        "delta_scale_mean",
+        "clip_saturation_ratio",
+    ):
+        payload[key] = float(row[key])
+    return payload
 
 
 def encode_initializer_text_embedding(
@@ -170,18 +232,78 @@ def slice_future_traj_frames(
     return window
 
 
+def slice_initializer_traj_payload(
+    traj_payload: dict,
+    *,
+    absolute_commit_index: int,
+    traj_tokens: int,
+    frames_per_token: int,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """Crop a runtime payload to a commit-aligned initializer trajectory window."""
+
+    frames = traj_payload["traj_cond_7d_frame"]
+    if frames.dim() == 2:
+        frames = frames.unsqueeze(0)
+    payload_abs_start = int(
+        traj_payload.get(
+            "traj_abs_start_token",
+            traj_payload.get("traj_start_token", 0),
+        )
+    )
+    desired = token_range_to_frame_slice(
+        int(absolute_commit_index),
+        int(traj_tokens),
+        int(frames_per_token),
+    )
+    payload_origin_frame = token_start_frame(payload_abs_start, int(frames_per_token))
+    payload_stop_frame = payload_origin_frame + int(frames.shape[1])
+    copy_start = max(int(desired.start), payload_origin_frame)
+    copy_stop = min(int(desired.stop), payload_stop_frame)
+    frame_count = int(desired.stop) - int(desired.start)
+    window = frames.new_zeros(int(frames.shape[0]), frame_count, int(frames.shape[2]))
+    if copy_stop > copy_start:
+        src_start = copy_start - payload_origin_frame
+        src_stop = copy_stop - payload_origin_frame
+        dst_start = copy_start - int(desired.start)
+        dst_stop = copy_stop - int(desired.start)
+        window[:, dst_start:dst_stop] = frames[:, src_start:src_stop]
+
+    payload_mask = traj_payload.get(
+        "traj_cond_frame_mask",
+        traj_payload.get("traj_cond_mask"),
+    )
+    window_mask = None
+    if payload_mask is not None:
+        if payload_mask.dim() == 1:
+            payload_mask = payload_mask.unsqueeze(0)
+        window_mask = payload_mask.new_zeros(int(payload_mask.shape[0]), frame_count)
+        if copy_stop > copy_start:
+            window_mask[:, dst_start:dst_stop] = payload_mask[:, src_start:src_stop]
+
+    offsets = torch.arange(
+        int(traj_tokens),
+        device=frames.device,
+        dtype=torch.long,
+    )
+    return window, window_mask, offsets
+
+
 def affected_history_frames(
     context: NoiseInitializerContext,
     *,
-    commit_index: int,
     frames_per_token: int,
 ) -> int:
     """Frames before the first frontier token can affect decoded motion."""
 
     if int(context.frontier_ids.numel()) == 0:
         return 0
-    no_effect_tokens = max(0, int(context.frontier_ids[0].item()) - int(commit_index))
-    return int(no_effect_tokens) * int(frames_per_token)
+    no_effect_tokens = max(0, int(context.frontier_offsets[0].item()))
+    frame_slice = token_range_to_frame_slice(
+        int(context.local_commit_index),
+        int(no_effect_tokens),
+        int(frames_per_token),
+    )
+    return int(frame_slice.stop) - int(frame_slice.start)
 
 
 def append_terminal_hold(
@@ -276,6 +398,9 @@ def apply_initializer_to_stream_state(
     return {
         "applied": True,
         "frontier_ids": [int(v) for v in context.frontier_ids.detach().cpu().tolist()],
+        "frontier_offsets": [
+            int(v) for v in context.frontier_offsets.detach().cpu().tolist()
+        ],
         "raw_delta_norm": float(raw_delta_zT.detach().float().norm().cpu().item()),
         "delta_norm": float(delta_zT.detach().float().norm().cpu().item()),
         "base_zT_norm": float(context.frontier_base_zT.detach().float().norm().cpu().item()),
@@ -398,21 +523,25 @@ def _build_initializer_context_for_commit(
         text_encoder=text_encoder,
     )
     traj_frame_mask = None
+    traj_offsets = None
     if traj_payload is not None and traj_payload.get("traj_cond_7d_frame") is not None:
-        traj_frames = traj_payload["traj_cond_7d_frame"].to(
+        payload = dict(traj_payload)
+        payload["traj_cond_7d_frame"] = payload["traj_cond_7d_frame"].to(
             device=device,
             dtype=torch.float32,
         )
-        if traj_frames.dim() == 2:
-            traj_frames = traj_frames.unsqueeze(0)
-        traj_mask = traj_payload.get(
-            "traj_cond_frame_mask",
-            traj_payload.get("traj_cond_mask"),
+        for mask_key in ("traj_cond_frame_mask", "traj_cond_mask"):
+            if payload.get(mask_key) is not None:
+                payload[mask_key] = payload[mask_key].to(
+                    device=device,
+                    dtype=torch.float32,
+                )
+        traj_frames, traj_frame_mask, traj_offsets = slice_initializer_traj_payload(
+            payload,
+            absolute_commit_index=int(commit_index),
+            traj_tokens=int(traj_horizon_tokens),
+            frames_per_token=int(frames_per_token),
         )
-        if traj_mask is not None:
-            traj_frame_mask = traj_mask.to(device=device, dtype=torch.float32)
-            if traj_frame_mask.dim() == 1:
-                traj_frame_mask = traj_frame_mask.unsqueeze(0)
     else:
         traj_cond_7d = sample_batch["traj_cond_7d"].to(device=device, dtype=torch.float32)
         traj_frames = slice_future_traj_frames(
@@ -429,14 +558,21 @@ def _build_initializer_context_for_commit(
                 traj_horizon_tokens=int(traj_horizon_tokens),
                 frames_per_token=int(frames_per_token),
             ).squeeze(-1)
+        traj_offsets = torch.arange(
+            int(traj_horizon_tokens),
+            device=device,
+            dtype=torch.long,
+        )
     return build_noise_initializer_context(
         view,
         text_embedding=text_embedding,
         traj_local_frames=traj_frames,
         traj_frame_mask=traj_frame_mask,
+        traj_offsets=traj_offsets,
         history_tokens=int(history_tokens),
         frontier_tokens=int(frontier_tokens),
         traj_tokens=int(traj_horizon_tokens),
+        traj_start_token=int(commit_index),
         frames_per_token=int(frames_per_token),
     )
 
@@ -654,7 +790,6 @@ def run_single_sample_overfit(cfg: dict) -> dict:
                     "target_mask": target_mask[target_frame_slice],
                     "history_frames": affected_history_frames(
                         context,
-                        commit_index=commit_index,
                         frames_per_token=frames_per_token,
                     ),
                     "first_chunk": first_chunk,
@@ -672,15 +807,15 @@ def run_single_sample_overfit(cfg: dict) -> dict:
                     if parameter.grad is not None:
                         delta_norm += float(parameter.grad.detach().float().norm().cpu().item())
                 optimizer.step()
-                rows.append(
-                    {
+                row = {
                         "commit_index": int(commit_index),
                         "inner_step": int(inner_step),
                         "loss": float(loss.detach().cpu().item()),
                         "grad_norm_sum": float(delta_norm),
                         "history_frames": int(batch["history_frames"]),
-                    }
-                )
+                }
+                row.update(lightning.last_step_diagnostics)
+                rows.append(row)
                 if should_log_train_progress(
                     len(rows),
                     log_every_train_steps=log_every_train_steps,
@@ -740,17 +875,16 @@ def run_single_sample_overfit(cfg: dict) -> dict:
         )
         with torch.no_grad():
             update_start_step = int(model.current_step)
+            update_start_commit = int(model.commit_index)
             output = model.stream_generate_step(
                 step_payload,
                 first_chunk=first_chunk,
                 condition=condition_provider,
             )
-            advance_token_update_count(
-                model.token_update_count,
+            advance_model_token_update_count(
+                model,
                 start_step=update_start_step,
-                end_step=int(model.current_step),
-                dt=float(model.dt),
-                chunk_size=int(model.chunk_size),
+                start_commit=update_start_commit,
             )
             committed_latent_tokens.append(output["generated"].detach().clone())
             latent_token = output["generated"][0].detach()
@@ -793,6 +927,7 @@ __all__ = [
     "apply_initializer_to_stream_state",
     "affected_history_frames",
     "advance_token_update_count",
+    "advance_model_token_update_count",
     "append_terminal_hold",
     "build_noise_initializer_from_ldf",
     "encode_initializer_text_embedding",
@@ -801,7 +936,9 @@ __all__ = [
     "make_ldf_shadow_rollout_fn",
     "run_single_sample_overfit",
     "should_log_train_progress",
+    "should_apply_initializer",
     "should_train_commit",
     "slice_future_traj_frames",
+    "slice_initializer_traj_payload",
     "sync_vae_decode_cache",
 ]

@@ -20,6 +20,7 @@ RolloutFn = Callable[..., torch.Tensor]
 class ResidualShadowRolloutResult:
     raw_delta_zT: torch.Tensor
     delta_zT: torch.Tensor
+    delta_scale: torch.Tensor
     frontier_zT: torch.Tensor
     injected_generated: torch.Tensor
     shadow_latents: torch.Tensor
@@ -192,7 +193,7 @@ def run_residual_shadow_rollout(
         ):
             context_kwargs["frontier_base_zT"] = context.frontier_base_zT
         raw_delta_zT = initializer(**context_kwargs)
-        delta_zT, _ = clip_delta_to_base_norm(
+        delta_zT, delta_scale = clip_delta_to_base_norm(
             raw_delta_zT,
             context.frontier_base_zT,
             max_delta_norm_ratio=max_delta_norm_ratio,
@@ -219,6 +220,7 @@ def run_residual_shadow_rollout(
     return ResidualShadowRolloutResult(
         raw_delta_zT=raw_delta_zT,
         delta_zT=delta_zT,
+        delta_scale=delta_scale,
         frontier_zT=frontier_zT,
         injected_generated=injected,
         shadow_latents=shadow_latents,

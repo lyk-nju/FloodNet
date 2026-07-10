@@ -162,11 +162,13 @@ class NoiseInitializer(nn.Module):
         self,
         *,
         history_latents: torch.Tensor,
+        history_offsets: torch.Tensor | None,
         active_latents: torch.Tensor,
         active_beta: torch.Tensor,
         active_offsets: torch.Tensor,
         text_embedding: torch.Tensor,
         traj_token_frames: torch.Tensor,
+        traj_offsets: torch.Tensor | None,
         frontier_offsets: torch.Tensor,
         frontier_base_zT: torch.Tensor,
         traj_frame_mask: torch.Tensor | None = None,
@@ -233,24 +235,37 @@ class NoiseInitializer(nn.Module):
                 f"expected {self.frontier_tokens}, got {int(frontier_offsets_t.numel())}"
             )
 
-        def add_position_and_type(features: torch.Tensor, type_index: int) -> torch.Tensor:
+        def add_position_and_type(
+            features: torch.Tensor,
+            type_index: int,
+            offsets: torch.Tensor | None,
+        ) -> torch.Tensor:
             token_count = int(features.shape[1])
             if token_count == 0:
                 return features
-            positions = torch.linspace(
-                -1.0,
-                1.0,
-                token_count,
+            if offsets is None:
+                offsets = torch.arange(
+                    -token_count if type_index == 0 else 0,
+                    0 if type_index == 0 else token_count,
+                    device=device,
+                )
+            offsets_b = _as_batched_scalar_feature(
+                offsets,
+                batch_size=batch_size,
+                token_count=token_count,
                 device=device,
                 dtype=dtype,
-            ).view(1, token_count, 1)
+                name="memory_offsets",
+            )
             return (
                 features
-                + self.position_proj(positions)
+                + self.position_proj((offsets_b / self.offset_scale).unsqueeze(-1))
                 + self.memory_type_embedding[type_index].to(dtype=dtype).view(1, 1, -1)
             )
 
-        history_feat = add_position_and_type(self.history_proj(history_latents), 0)
+        history_feat = add_position_and_type(
+            self.history_proj(history_latents), 0, history_offsets
+        )
         active_input = torch.cat(
             [
                 active_latents,
@@ -259,7 +274,9 @@ class NoiseInitializer(nn.Module):
             ],
             dim=-1,
         )
-        active_feat = add_position_and_type(self.active_proj(active_input), 1)
+        active_feat = add_position_and_type(
+            self.active_proj(active_input), 1, active_offsets_b
+        )
         traj_emb = self.traj_encoder(
             traj_token_frames.to(device=device, dtype=dtype),
             frame_mask=(
@@ -268,7 +285,7 @@ class NoiseInitializer(nn.Module):
                 else traj_frame_mask.to(device=device, dtype=dtype)
             ),
         )
-        traj_feat = add_position_and_type(self.traj_proj(traj_emb), 2)
+        traj_feat = add_position_and_type(self.traj_proj(traj_emb), 2, traj_offsets)
         text_feat = (
             self.text_proj(text_embedding.to(device=device, dtype=dtype)).unsqueeze(1)
             + self.memory_type_embedding[3].to(dtype=dtype).view(1, 1, -1)

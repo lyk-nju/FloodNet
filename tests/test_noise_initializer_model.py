@@ -10,12 +10,14 @@ from models.tools.traj_encoder import TrajectoryEncoder
 def _inputs(batch_size: int = 2, latent_dim: int = 4, text_dim: int = 6):
     return {
         "history_latents": torch.randn(batch_size, 5, latent_dim),
+        "history_offsets": torch.tensor([-5, -4, -3, -2, -1]),
         "active_latents": torch.randn(batch_size, 3, latent_dim),
         "active_beta": torch.rand(batch_size, 3),
         "active_offsets": torch.tensor([0, 1, 2]),
         "text_embedding": torch.randn(batch_size, text_dim),
         "traj_token_frames": torch.randn(batch_size, 7, 4, 7),
         "traj_frame_mask": torch.ones(batch_size, 7, 4),
+        "traj_offsets": torch.tensor([0, 1, 2, 3, 4, 5, 6]),
         "frontier_offsets": torch.tensor([3, 4, 5]),
         "frontier_base_zT": torch.randn(batch_size, 3, latent_dim),
     }

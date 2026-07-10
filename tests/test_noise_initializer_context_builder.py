@@ -47,12 +47,14 @@ def test_context_builder_returns_noise_initializer_kwargs():
     assert torch.equal(context.active_latents, view.active_latents)
     assert torch.equal(context.active_beta, view.active_beta)
     assert torch.equal(context.active_offsets, view.active_offsets)
+    assert torch.equal(context.history_offsets, view.committed_ids[-2:] - view.commit_index)
     assert torch.equal(context.text_embedding, text_embedding)
     assert context.traj_token_frames.shape == (2, 4, 4, 7)
     assert context.traj_frame_mask.shape == (2, 4, 4)
     assert torch.equal(context.frontier_base_zT, view.frontier_base_zT[:, :3])
     assert torch.equal(context.frontier_ids, view.frontier_ids[:3])
     assert torch.equal(context.frontier_offsets, view.frontier_offsets[:3])
+    assert context.traj_offsets.tolist() == [-3, -2, -1, 0]
 
     kwargs = context.as_model_kwargs()
     assert set(kwargs) == {
@@ -65,6 +67,8 @@ def test_context_builder_returns_noise_initializer_kwargs():
         "traj_frame_mask",
         "frontier_offsets",
         "frontier_base_zT",
+        "history_offsets",
+        "traj_offsets",
     }
     assert kwargs["frontier_offsets"].shape == (3,)
     assert torch.equal(kwargs["frontier_base_zT"], context.frontier_base_zT)

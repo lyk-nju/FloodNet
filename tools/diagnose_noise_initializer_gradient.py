@@ -37,7 +37,7 @@ from utils.training.noise_initializer.overfit_runner import (  # noqa: E402
     _build_initializer_context_for_commit,
     _build_runtime_traj_payload,
     _decode_latents_to_root_xz,
-    advance_token_update_count,
+    advance_model_token_update_count,
     affected_history_frames,
     sync_vae_decode_cache,
 )
@@ -151,17 +151,16 @@ def _rollin_to_commit(
         )
         with torch.no_grad():
             update_start_step = int(model.current_step)
+            update_start_commit = int(model.commit_index)
             output = model.stream_generate_step(
                 step_payload,
                 first_chunk=first_chunk,
                 condition=condition_provider,
             )
-            advance_token_update_count(
-                model.token_update_count,
+            advance_model_token_update_count(
+                model,
                 start_step=update_start_step,
-                end_step=int(model.current_step),
-                dt=float(model.dt),
-                chunk_size=int(model.chunk_size),
+                start_commit=update_start_commit,
             )
             latent_token = output["generated"][0].detach()
             decoded_chunk = vae.stream_decode(
@@ -379,7 +378,6 @@ def main() -> int:
         start_frame = commit * frames_per_token
         history_frames = affected_history_frames(
             context,
-            commit_index=commit,
             frames_per_token=frames_per_token,
         )
         generated_anchor_xz = conditioner.timeline.head.world_xz.detach().clone()

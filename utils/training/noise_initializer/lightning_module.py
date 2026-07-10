@@ -108,6 +108,26 @@ class NoiseInitializerLightningModule(pl.LightningModule):
         )
         delta_reg = delta_zT_l2_regularization(result.raw_delta_zT)
         loss = traj_loss + float(loss_cfg.get("lambda_delta", 0.0)) * delta_reg
+        raw_norm = result.raw_delta_zT.detach().float().reshape(
+            int(result.raw_delta_zT.shape[0]), -1
+        ).norm(dim=1)
+        clipped_norm = result.delta_zT.detach().float().reshape(
+            int(result.delta_zT.shape[0]), -1
+        ).norm(dim=1)
+        base_norm = batch["context"].frontier_base_zT.detach().float().reshape(
+            int(result.delta_zT.shape[0]), -1
+        ).norm(dim=1)
+        scale = result.delta_scale.detach().float().reshape(int(result.delta_zT.shape[0]), -1)
+        self.last_step_diagnostics = {
+            "raw_delta_norm": float(raw_norm.mean().cpu().item()),
+            "clipped_delta_norm": float(clipped_norm.mean().cpu().item()),
+            "base_zT_norm": float(base_norm.mean().cpu().item()),
+            "clipped_to_base_ratio": float(
+                (clipped_norm / base_norm.clamp(min=1e-12)).mean().cpu().item()
+            ),
+            "delta_scale_mean": float(scale.mean().cpu().item()),
+            "clip_saturation_ratio": float((scale < 0.999999).float().mean().cpu().item()),
+        }
         if getattr(self, "_trainer", None) is not None:
             self.log("train/loss", loss, prog_bar=True)
             self.log("train/traj_loss", torch.as_tensor(parts["traj_loss"], device=loss.device))

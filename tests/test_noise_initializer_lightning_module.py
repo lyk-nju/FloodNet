@@ -116,6 +116,11 @@ def test_noise_initializer_lightning_training_step_backprops_to_initializer():
     assert initializer.scale.grad is not None
     assert model.weight.grad is None
     assert vae.weight.grad is None
+    diagnostics = module.last_step_diagnostics
+    assert diagnostics["raw_delta_norm"] > 0.0
+    assert diagnostics["clipped_delta_norm"] > 0.0
+    assert diagnostics["base_zT_norm"] > 0.0
+    assert 0.0 <= diagnostics["clip_saturation_ratio"] <= 1.0
 
 
 def test_noise_initializer_lightning_delta_regularization_uses_raw_delta_before_clip():

@@ -41,13 +41,16 @@ from models.noise_initializer import NoiseInitializer  # noqa: E402
 from utils.inference.stream_generator import StreamGenerator  # noqa: E402
 from utils.initialize import load_config  # noqa: E402
 from utils.motion_process import StreamJointRecovery263  # noqa: E402
-from utils.token_frame import num_tokens_for_frame_len  # noqa: E402
+from utils.token_frame import (  # noqa: E402
+    num_tokens_for_frame_len,
+    token_range_to_frame_slice,
+)
 from utils.training.noise_initializer.overfit_runner import (  # noqa: E402
     _build_initializer_context_for_commit,
     _build_runtime_traj_payload,
-    advance_token_update_count,
+    advance_model_token_update_count,
     apply_initializer_to_stream_state,
-    should_train_commit,
+    should_apply_initializer,
 )
 from utils.training.noise_initializer.text_encoder import (  # noqa: E402
     resolve_noise_initializer_text_encoder,
@@ -73,7 +76,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _load_initializer(ckpt_path: Path, cfg: dict, device: torch.device) -> NoiseInitializer:
+def _load_initializer(
+    ckpt_path: Path,
+    cfg: dict,
+    device: torch.device,
+) -> tuple[NoiseInitializer, dict]:
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     ckpt_cfg = checkpoint.get("cfg") or {}
     model_params = dict(((ckpt_cfg.get("model") or {}).get("params") or {}))
@@ -83,7 +90,7 @@ def _load_initializer(ckpt_path: Path, cfg: dict, device: torch.device) -> Noise
     initializer.eval()
     for parameter in initializer.parameters():
         parameter.requires_grad_(False)
-    return initializer
+    return initializer, dict(ckpt_cfg)
 
 
 def _run_stream_variant(
@@ -94,6 +101,7 @@ def _run_stream_variant(
     initializer_text_encoder,
     sample_batch: dict,
     cfg: dict,
+    initializer_training_cfg: dict,
     device: torch.device,
     initial_generated: torch.Tensor,
     alpha: float | None,
@@ -106,8 +114,6 @@ def _run_stream_variant(
         frames_per_token,
     )
     max_commits = min(int(cfg.get("max_commits", target_tokens)), int(target_tokens))
-    optimize_every_tokens = int(cfg.get("optimize_every_tokens", 5))
-    apply_every_tokens = int(cfg.get("apply_initializer_every_tokens", optimize_every_tokens))
     require_zero_update_count = bool(cfg.get("require_zero_update_count", False))
 
     model.init_generated(
@@ -153,7 +159,7 @@ def _run_stream_variant(
         if (
             initializer is not None
             and alpha is not None
-            and should_train_commit(commit_index, optimize_every_tokens=apply_every_tokens)
+            and should_apply_initializer(initializer_training_cfg, commit_index)
         ):
             context = _build_initializer_context_for_commit(
                 model=model,
@@ -192,17 +198,16 @@ def _run_stream_variant(
         )
         with torch.no_grad():
             update_start_step = int(model.current_step)
+            update_start_commit = int(model.commit_index)
             output = model.stream_generate_step(
                 step_payload,
                 first_chunk=first_chunk,
                 condition=condition_provider,
             )
-            advance_token_update_count(
-                model.token_update_count,
+            advance_model_token_update_count(
+                model,
                 start_step=update_start_step,
-                end_step=int(model.current_step),
-                dt=float(model.dt),
-                chunk_size=int(model.chunk_size),
+                start_commit=update_start_commit,
             )
             latent_token = output["generated"][0].detach()
             latents.append(latent_token.cpu())
@@ -233,6 +238,27 @@ def _metrics_for_latents(vae, latents: torch.Tensor, target_xz: torch.Tensor, ma
             mask=mask,
         )
     return feature, xz, metrics
+
+
+def _metrics_for_token_window(
+    pred_xz: torch.Tensor,
+    target_xz: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    start_token: int,
+    num_tokens: int,
+    frames_per_token: int,
+) -> dict:
+    frame_slice = token_range_to_frame_slice(
+        int(start_token),
+        int(num_tokens),
+        int(frames_per_token),
+    )
+    return _masked_metrics(
+        pred_xz[frame_slice],
+        target_xz[frame_slice],
+        mask[frame_slice],
+    )
 
 
 def main() -> int:
@@ -282,7 +308,11 @@ def main() -> int:
         frames_per_token=int(cfg.get("frames_per_token", 4)),
     )
     target_xz, mask = _target_xz_and_mask(sample_batch, device)
-    initializer = _load_initializer(Path(args.initializer_ckpt), cfg, device)
+    initializer, initializer_training_cfg = _load_initializer(
+        Path(args.initializer_ckpt),
+        cfg,
+        device,
+    )
     initializer_text_encoder = resolve_noise_initializer_text_encoder(
         cfg,
         text_emb_dim=int(((cfg.get("model") or {}).get("params") or {}).get("text_dim", 4096)),
@@ -320,6 +350,11 @@ def main() -> int:
         "cfg_traj": float(cfg.get("cfg_traj", 3.0)),
         "max_commits": int(cfg.get("max_commits", 0)),
         "optimize_every_tokens": int(cfg.get("optimize_every_tokens", 5)),
+        "initializer_training_policy": {
+            "training_mode": initializer_training_cfg.get("training_mode"),
+            "fixed_commit_index": initializer_training_cfg.get("fixed_commit_index"),
+            "optimize_every_tokens": initializer_training_cfg.get("optimize_every_tokens"),
+        },
         "variants": {},
     }
     arrays = {
@@ -338,15 +373,61 @@ def main() -> int:
             initializer_text_encoder=initializer_text_encoder,
             sample_batch=sample_batch,
             cfg=cfg,
+            initializer_training_cfg=initializer_training_cfg,
             device=device,
             initial_generated=base_noise.detach(),
             alpha=spec["alpha"],
         )
         feature, xz, metrics = _metrics_for_latents(vae, latents, target_xz, mask, device)
+        affected_windows = []
+        for event in apply_events:
+            offsets = list(event.get("frontier_offsets", []))
+            if not offsets:
+                continue
+            affected_start = int(event["commit_index"]) + int(offsets[0])
+            affected_stop = min(
+                int(cfg.get("max_commits", 0)),
+                int(event["commit_index"]) + int(cfg.get("loss_horizon_tokens", 10)),
+            )
+            if affected_stop <= affected_start:
+                continue
+            affected_windows.append(
+                {
+                    "commit_index": int(event["commit_index"]),
+                    "affected_start_token": affected_start,
+                    "affected_num_tokens": affected_stop - affected_start,
+                    "metrics": _metrics_for_token_window(
+                        xz,
+                        target_xz,
+                        mask,
+                        start_token=affected_start,
+                        num_tokens=affected_stop - affected_start,
+                        frames_per_token=int(cfg.get("frames_per_token", 4)),
+                    ),
+                }
+            )
+        suffix_metrics = None
+        if affected_windows:
+            suffix_start = min(row["affected_start_token"] for row in affected_windows)
+            suffix_tokens = int(cfg.get("max_commits", 0)) - suffix_start
+            if suffix_tokens > 0:
+                suffix_metrics = {
+                    "start_token": suffix_start,
+                    "metrics": _metrics_for_token_window(
+                        xz,
+                        target_xz,
+                        mask,
+                        start_token=suffix_start,
+                        num_tokens=suffix_tokens,
+                        frames_per_token=int(cfg.get("frames_per_token", 4)),
+                    ),
+                }
         result["variants"][name] = {
             "alpha": spec["alpha"],
             "metrics": metrics,
             "apply_events": apply_events,
+            "affected_windows": affected_windows,
+            "suffix_metrics": suffix_metrics,
         }
         arrays[f"{name}_latent"] = latents.detach().cpu().numpy()
         arrays[f"{name}_feature"] = feature.detach().cpu().numpy()
@@ -370,6 +451,47 @@ def main() -> int:
                 for key in ("ade", "fde", "mse", "heading_error_deg", "path_ratio")
                 if key in metrics and key in base_metrics
             }
+            affected_windows = result["variants"][name].get("affected_windows", [])
+            for window in affected_windows:
+                base_window_metrics = _metrics_for_token_window(
+                    xz_by_name["gaussian"],
+                    target_xz,
+                    mask,
+                    start_token=int(window["affected_start_token"]),
+                    num_tokens=int(window["affected_num_tokens"]),
+                    frames_per_token=int(cfg.get("frames_per_token", 4)),
+                )
+                window["delta_vs_gaussian"] = {
+                    key: float(window["metrics"][key] - base_window_metrics[key])
+                    for key in ("ade", "fde", "mse")
+                }
+            suffix = result["variants"][name].get("suffix_metrics")
+            if suffix is not None:
+                suffix_start = int(suffix["start_token"])
+                base_suffix = _metrics_for_token_window(
+                    xz_by_name["gaussian"],
+                    target_xz,
+                    mask,
+                    start_token=suffix_start,
+                    num_tokens=int(cfg.get("max_commits", 0)) - suffix_start,
+                    frames_per_token=int(cfg.get("frames_per_token", 4)),
+                )
+                suffix["delta_vs_gaussian"] = {
+                    key: float(suffix["metrics"][key] - base_suffix[key])
+                    for key in ("ade", "fde", "mse")
+                }
+                if suffix_start > 0:
+                    pre_effect_slice = token_range_to_frame_slice(
+                        0,
+                        suffix_start,
+                        int(cfg.get("frames_per_token", 4)),
+                    )
+                    result["variants"][name]["pre_effect_diff_from_gaussian"] = (
+                        _baseline_optimized_xz_diff(
+                            xz_by_name["gaussian"][pre_effect_slice],
+                            xz[pre_effect_slice],
+                        )
+                    )
 
     (out_dir / "summary.json").write_text(json.dumps(result, indent=2))
     np.savez_compressed(out_dir / "motions.npz", **arrays)
