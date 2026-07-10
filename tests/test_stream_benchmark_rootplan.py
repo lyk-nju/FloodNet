@@ -9,7 +9,7 @@ from utils.inference.root_plan import RootPlan, build_root_plan_stream_payload
 from utils.inference.runtime_update import RootSourceProposal
 from utils.inference.stream_generator import StreamGenerator
 from utils.inference.timeline import RootFrameState, RootTimeline
-from utils.token_frame import token_start_frame
+from utils.token_frame import commit_boundary_frame, token_start_frame
 
 
 class _DummyLdf(nn.Module):
@@ -75,7 +75,7 @@ def _anchored_root_source(
         name="anchored_world_route",
         proposal_traj7=proposal,
         source_kind="root_refiner",
-        start_frame_abs=token_start_frame(start_commit_abs),
+        start_frame_abs=commit_boundary_frame(start_commit_abs),
         start_commit_abs=start_commit_abs,
         timeline_mode="anchor_relative",
     )
@@ -206,7 +206,7 @@ def test_stream_generator_tracks_anchor_relative_route_with_local_frame_index():
         device="cpu",
     )
     proposal = _anchored_root_source(start_commit_abs=10)
-    generated = proposal.to_absolute_timeline()
+    generated = proposal.to_absolute_timeline()[: proposal.start_frame_abs + 1]
     generator.set_active_root_source_proposal(proposal, contract="active_window")
 
     payload = generator.build_root_source_stream_payload(

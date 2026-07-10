@@ -21,6 +21,7 @@ from utils.inference.timeline import RootFrameState, RootTimeline
 from utils.local_frame import canonicalize_5d
 from utils.motion_process import build_physical_7d_from_5d
 from utils.token_frame import (
+    commit_boundary_frame,
     frame_idx_to_token_idx,
     num_tokens_for_frame_len,
     prefix_len_from_tail_invalid,
@@ -220,7 +221,7 @@ class StreamGenerator:
             device=self.device,
             dtype=torch.float32,
         )
-        current_frame_abs = token_start_frame(int(absolute_commit))
+        current_frame_abs = commit_boundary_frame(int(absolute_commit))
         route_frame_local = proposal.absolute_to_local_frame(current_frame_abs)
         if self.active_root_source_contract == "absolute_route":
             world_condition = proposal.to_absolute_timeline().to(

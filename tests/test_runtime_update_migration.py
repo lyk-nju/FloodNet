@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from utils.token_frame import token_start_frame
+from utils.token_frame import commit_boundary_frame
 from utils.motion_process import build_physical_7d_from_5d
 
 
@@ -108,7 +108,7 @@ def test_root_source_proposal_can_be_built_from_root_plan_world_route():
     )
     assert proposal.metadata["root_plan_source"] == "root_refiner"
     assert proposal.start_commit_abs == 3
-    assert proposal.start_frame_abs == token_start_frame(3, 4)
+    assert proposal.start_frame_abs == commit_boundary_frame(3, 4)
     assert proposal.timeline_mode == "anchor_relative"
 
 
@@ -121,18 +121,18 @@ def test_root_source_proposal_converts_absolute_and_local_frames_strictly():
         name="anchored_route",
         proposal_traj7=traj7,
         source_kind="root_refiner",
-        start_frame_abs=token_start_frame(3, 4),
+        start_frame_abs=commit_boundary_frame(3, 4),
         start_commit_abs=3,
         timeline_mode="anchor_relative",
     )
 
-    assert proposal.absolute_to_local_frame(token_start_frame(3, 4)) == 0
-    assert proposal.absolute_to_local_frame(token_start_frame(3, 4) + 5) == 5
-    assert proposal.local_to_absolute_frame(4) == token_start_frame(3, 4) + 4
+    assert proposal.absolute_to_local_frame(commit_boundary_frame(3, 4)) == 0
+    assert proposal.absolute_to_local_frame(commit_boundary_frame(3, 4) + 5) == 5
+    assert proposal.local_to_absolute_frame(4) == commit_boundary_frame(3, 4) + 4
     with pytest.raises(ValueError, match="before proposal origin"):
-        proposal.absolute_to_local_frame(token_start_frame(3, 4) - 1)
+        proposal.absolute_to_local_frame(commit_boundary_frame(3, 4) - 1)
     with pytest.raises(ValueError, match="outside proposal"):
-        proposal.absolute_to_local_frame(token_start_frame(3, 4) + 6)
+        proposal.absolute_to_local_frame(commit_boundary_frame(3, 4) + 6)
     with pytest.raises(ValueError, match="outside proposal"):
         proposal.local_to_absolute_frame(6)
 
@@ -145,7 +145,7 @@ def test_root_source_proposal_materializes_route_at_absolute_origin():
     traj7[:, 1] = 1.0
     traj7[:, 3] = 1.0
     start_commit = 2
-    start_frame = token_start_frame(start_commit, 4)
+    start_frame = commit_boundary_frame(start_commit, 4)
     proposal = RootSourceProposal(
         name="anchored_route",
         proposal_traj7=traj7,

@@ -10,7 +10,7 @@ from tools.run_ldf_condition_update_eval import (
 )
 from eval.ldf.runtime_update.root_source import RootSourceProposal
 from utils.motion_process import build_physical_7d_from_5d
-from utils.token_frame import token_start_frame
+from utils.token_frame import commit_boundary_frame
 
 
 def _line_traj7(num_frames: int) -> torch.Tensor:
@@ -283,7 +283,7 @@ def test_root_source_refinement_preserves_proposal_time_origin(monkeypatch):
         name="anchored_source",
         proposal_traj7=route,
         source_kind="root_refiner",
-        start_frame_abs=token_start_frame(5),
+        start_frame_abs=commit_boundary_frame(5),
         start_commit_abs=5,
         timeline_mode="anchor_relative",
     )

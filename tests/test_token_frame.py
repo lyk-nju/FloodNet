@@ -8,6 +8,7 @@ from __future__ import annotations
 import torch
 
 from utils.token_frame import (
+    commit_boundary_frame,
     FRAMES_PER_TOKEN_DEFAULT,
     frame_idx_to_token_idx,
     num_frames_for_tokens,
@@ -19,6 +20,12 @@ from utils.token_frame import (
     token_range_to_frame_slice,
     token_start_frame,
 )
+
+
+def test_commit_boundary_frame_uses_last_committed_prefix_frame():
+    assert commit_boundary_frame(0, 4) == 0
+    assert commit_boundary_frame(1, 4) == 0
+    assert commit_boundary_frame(10, 4) == 36
 
 
 # ---------------------------------------------------------------------------

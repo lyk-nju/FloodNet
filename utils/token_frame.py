@@ -44,6 +44,22 @@ def token_end_frame(
     return frames_per_token * token_idx
 
 
+def commit_boundary_frame(
+    commit_idx: int,
+    frames_per_token: int = FRAMES_PER_TOKEN_DEFAULT,
+) -> int:
+    """Latest generated frame available before producing ``commit_idx``.
+
+    Commit zero starts from the initial frame. For later commits, the observable
+    actor state is the final frame covered by the previously committed token.
+    """
+
+    commit = int(commit_idx)
+    if commit <= 0:
+        return 0
+    return token_end_frame(commit - 1, frames_per_token)
+
+
 def num_frames_for_tokens(
     num_tokens: int,
     frames_per_token: int = FRAMES_PER_TOKEN_DEFAULT,
@@ -196,6 +212,7 @@ __all__ = [
     "FRAMES_PER_TOKEN_DEFAULT",
     "token_start_frame",
     "token_end_frame",
+    "commit_boundary_frame",
     "num_frames_for_tokens",
     "num_tokens_for_frame_len",
     "frame_idx_to_token_idx",

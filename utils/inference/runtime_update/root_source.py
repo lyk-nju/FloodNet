@@ -8,7 +8,7 @@ from typing import Any, Literal
 import torch
 
 from utils.motion_process import build_physical_7d_from_5d
-from utils.token_frame import token_start_frame
+from utils.token_frame import commit_boundary_frame
 
 
 RootSourceTimelineMode = Literal["absolute_timeline", "anchor_relative"]
@@ -59,7 +59,7 @@ class RootSourceProposal:
             raise ValueError(
                 f"start_commit_abs must be >= 0, got {self.start_commit_abs}"
             )
-        expected_start_frame = token_start_frame(int(self.start_commit_abs))
+        expected_start_frame = commit_boundary_frame(int(self.start_commit_abs))
         if int(self.start_frame_abs) != int(expected_start_frame):
             raise ValueError(
                 "start_frame_abs must match start_commit_abs under the shared "
@@ -118,7 +118,7 @@ class RootSourceProposal:
         meta.setdefault("root_plan_source", str(getattr(root_plan, "source", "")))
         meta.setdefault("root_plan_anchor_commit_idx", int(root_plan.anchor_commit_idx))
         start_commit_abs = int(root_plan.anchor_commit_idx)
-        start_frame_abs = token_start_frame(start_commit_abs)
+        start_frame_abs = commit_boundary_frame(start_commit_abs)
         return cls(
             name=str(name or getattr(root_plan, "source", "root_plan")),
             proposal_traj7=world.cpu(),
