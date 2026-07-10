@@ -60,6 +60,23 @@ def commit_boundary_frame(
     return token_end_frame(commit - 1, frames_per_token)
 
 
+def first_future_frame_abs(
+    commit_idx: int,
+    frames_per_token: int = FRAMES_PER_TOKEN_DEFAULT,
+) -> int:
+    """Return the absolute frame index immediately after committed tokens."""
+    return num_frames_for_tokens(max(0, int(commit_idx)), frames_per_token)
+
+
+def last_generated_frame_abs(
+    commit_idx: int,
+    frames_per_token: int = FRAMES_PER_TOKEN_DEFAULT,
+) -> int | None:
+    """Return the last generated absolute frame, or ``None`` at cold start."""
+    future = first_future_frame_abs(commit_idx, frames_per_token)
+    return None if future == 0 else future - 1
+
+
 def num_frames_for_tokens(
     num_tokens: int,
     frames_per_token: int = FRAMES_PER_TOKEN_DEFAULT,
@@ -213,6 +230,8 @@ __all__ = [
     "token_start_frame",
     "token_end_frame",
     "commit_boundary_frame",
+    "first_future_frame_abs",
+    "last_generated_frame_abs",
     "num_frames_for_tokens",
     "num_tokens_for_frame_len",
     "frame_idx_to_token_idx",

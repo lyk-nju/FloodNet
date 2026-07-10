@@ -10,7 +10,9 @@ import torch
 from utils.token_frame import (
     commit_boundary_frame,
     FRAMES_PER_TOKEN_DEFAULT,
+    first_future_frame_abs,
     frame_idx_to_token_idx,
+    last_generated_frame_abs,
     num_frames_for_tokens,
     num_tokens_for_frame_len,
     prefix_len_from_tail_invalid,
@@ -26,6 +28,13 @@ def test_commit_boundary_frame_uses_last_committed_prefix_frame():
     assert commit_boundary_frame(0, 4) == 0
     assert commit_boundary_frame(1, 4) == 0
     assert commit_boundary_frame(10, 4) == 36
+
+
+def test_future_and_last_generated_frames_cover_cold_start_and_commit10():
+    assert first_future_frame_abs(0) == 0
+    assert last_generated_frame_abs(0) is None
+    assert first_future_frame_abs(10) == 37
+    assert last_generated_frame_abs(10) == 36
 
 
 # ---------------------------------------------------------------------------
