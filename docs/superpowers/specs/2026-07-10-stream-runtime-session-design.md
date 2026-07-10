@@ -213,6 +213,7 @@ Composition returns, but does not commit, progress:
 ```python
 @dataclass(frozen=True)
 class ComposeResult:
+    frame_start_abs: int
     world_condition_7d: Tensor
     frame_mask: Tensor
     segment_labels: Tensor
@@ -243,7 +244,7 @@ absolute commit indices.
 Web/API code may:
 
 - submit versioned commands;
-- consume `StreamCommitEvent` frames and diagnostics;
+- consume `RuntimeEvent` frames and diagnostics;
 - react to route lifecycle events by submitting another command.
 
 It may not mutate the active source, timeline, VAE cache, recovery, generated
@@ -364,8 +365,8 @@ root-feedback policy, history/horizon/denoise controls, and reset intent.
 Pause is worker scheduling rather than model state and takes effect only between
 steps. Reset requires an exclusive quiescent boundary and starts a new session
 epoch; it cannot partially apply during a token transaction. When a reset is the
-final prepared command, the worker performs an exclusive reset transaction and
-does not generate a motion token in that call.
+final prepared command, the worker performs an exclusive reset transaction,
+emits `SessionResetEvent`, and does not generate a motion token in that call.
 
 At the beginning of `step()` for commit `N`, the worker prepares all due
 commands:
@@ -459,6 +460,10 @@ survive.
 
 ## Event Contract
 
+```python
+RuntimeEvent = StreamCommitEvent | SessionResetEvent
+```
+
 `StreamCommitEvent` includes:
 
 - local and absolute commit indices before and after execution;
@@ -486,6 +491,7 @@ class StreamCommitEvent:
     committed_latent: Tensor
     decoded_chunk: Tensor
     joint_frames: Tensor
+    root_frames_start_abs: int
     root_frames: Tensor
     timeline_state: RootFrameState
     actual_payload: dict | None
@@ -493,6 +499,12 @@ class StreamCommitEvent:
     source_version: int | None
     actual_activation_commit: int | None
     lifecycle_events: tuple
+
+@dataclass(frozen=True)
+class SessionResetEvent:
+    previous_session_epoch: int
+    session_epoch: int
+    applied_command_version: int
 ```
 
 All tensor/array payloads are detached clones, moved to CPU where appropriate,
