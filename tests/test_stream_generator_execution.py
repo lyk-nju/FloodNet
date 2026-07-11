@@ -56,6 +56,17 @@ def test_execute_step_rejects_hidden_per_step_state_changes():
         generator.execute_step(num_denoise_steps=10)
 
 
+def test_attached_generator_rejects_direct_reset_and_initialization():
+    generator = _generator()
+    session = SimpleNamespace(kernel=generator, step=lambda: object())
+    generator.attach_runtime_session(session)
+
+    with pytest.raises(RuntimeError, match="authoritative runtime session"):
+        generator.reset()
+    with pytest.raises(RuntimeError, match="authoritative runtime session"):
+        generator.init_ldf_generation(history_length=4, num_denoise_steps=10)
+
+
 def test_stream_generator_has_no_duplicate_execution_or_route_state():
     generator = _generator()
 

@@ -42,7 +42,12 @@ from utils.inference.route_condition import (
 from utils.inference.timeline import (
     RootFrameState,
 )
-from utils.token_frame import commit_boundary_frame, num_frames_for_tokens, token_start_frame
+from utils.token_frame import (
+    commit_boundary_frame,
+    frame_idx_to_token_idx,
+    num_frames_for_tokens,
+    token_start_frame,
+)
 from utils.inference.geometry import (
     assign_uniform_timestamps,
     build_remaining_polyline,
@@ -68,6 +73,7 @@ from web_demo.runtime.model_loader import (
 )
 from web_demo.runtime.state import GenerationState
 from web_demo.runtime.trajectory_controller import TrajectoryController
+from web_demo.runtime.trajectory_diagnostics import TrajectoryDiagnosticsStore
 from web_demo.runtime.web_runtime import WebRuntime
 
 
@@ -99,6 +105,7 @@ class ModelManager(WebRuntime):
             default=0,
         )
         self._runtime_command_lock = threading.RLock()
+        self.trajectory_diagnostics = TrajectoryDiagnosticsStore()
         
         # Frame buffer
         self.frame_buffer = FrameBuffer(target_buffer_size=4)
@@ -108,9 +115,9 @@ class ModelManager(WebRuntime):
         self.stream_recovery = self.runtime_session.recovery
         self._root_timeline = self.runtime_session.timeline
         self._session_anchor_state = self.runtime_session.session_anchor_state
-        self.root_feedback_enabled = bool(traj_mask_cfg.get("root_feedback_enabled", False))
+        self.root_feedback_enabled = bool(traj_mask_cfg.get("root_feedback_enabled", True))
         self.root_feedback_xz_blend_alpha = self._coerce_root_feedback_alpha(
-            traj_mask_cfg.get("root_feedback_xz_blend_alpha", 0.5)
+            traj_mask_cfg.get("root_feedback_xz_blend_alpha", 1.0)
         )
         
         # Generation state
@@ -164,6 +171,19 @@ class ModelManager(WebRuntime):
         # Compatibility fields for app.py / status endpoints.
         self.current_traj_waypoints = None
         self.current_traj_times = None
+        self._debug_repeat_enabled = False
+        self._debug_repeat_template = None
+        self._debug_repeat_duration_seconds = None
+        self._debug_repeat_angle_min = 0.0
+        self._debug_repeat_angle_max = 0.0
+        self._debug_repeat_random_sign = True
+        self._debug_repeat_max_repeats = 0
+        self._debug_repeat_prefetch_tokens = 5
+        self._debug_repeat_count = 0
+        self._debug_repeat_cumulative_angle = 0.0
+        self._debug_repeat_scheduled_from_version = None
+        self._debug_repeat_rng = np.random.default_rng(1234)
+        self._last_generation_error = None
         print(
             "Trajectory config: "
             f"time_mode={self.traj_time_mode}, "
@@ -204,9 +224,9 @@ class ModelManager(WebRuntime):
         xz_blend_alpha=None,
     ) -> None:
         if not hasattr(self, "root_feedback_enabled"):
-            self.root_feedback_enabled = False
+            self.root_feedback_enabled = True
         if not hasattr(self, "root_feedback_xz_blend_alpha"):
-            self.root_feedback_xz_blend_alpha = 0.5
+            self.root_feedback_xz_blend_alpha = 1.0
         if enabled is not None:
             self.root_feedback_enabled = TrajectoryController._coerce_bool(
                 enabled,
@@ -438,6 +458,122 @@ class ModelManager(WebRuntime):
             # This allows continuous generation with text changes
             print(f"Text updated: '{old_text}' -> '{text}' (continuous generation)")
 
+    def configure_debug_repeat(
+        self,
+        reference_points,
+        config=None,
+        *,
+        duration_seconds=None,
+    ) -> None:
+        """Configure an upper-layer repeat policy for Web debug sessions."""
+        cfg = config or {}
+        enabled = bool(cfg.get("enabled", False))
+        points = ensure_xyz(np.asarray(reference_points, dtype=np.float32))
+        if enabled and len(points) < 2:
+            raise ValueError("debug repeat requires at least two route points")
+        angle_min = float(cfg.get("angle_min_degrees", 20.0))
+        angle_max = float(cfg.get("angle_max_degrees", 45.0))
+        if angle_min < 0.0 or angle_max < angle_min:
+            raise ValueError("debug repeat angle range must satisfy 0 <= min <= max")
+
+        self._debug_repeat_enabled = enabled
+        self._debug_repeat_template = (
+            points - points[0][None, :] if len(points) else points
+        ).astype(np.float32)
+        self._debug_repeat_duration_seconds = (
+            None if duration_seconds is None else float(duration_seconds)
+        )
+        self._debug_repeat_angle_min = angle_min
+        self._debug_repeat_angle_max = angle_max
+        self._debug_repeat_random_sign = bool(cfg.get("random_sign", True))
+        self._debug_repeat_max_repeats = max(0, int(cfg.get("max_repeats", 0)))
+        self._debug_repeat_prefetch_tokens = max(
+            1, int(cfg.get("prefetch_tokens", 5))
+        )
+        self._debug_repeat_count = 0
+        self._debug_repeat_cumulative_angle = 0.0
+        self._debug_repeat_scheduled_from_version = None
+        self._debug_repeat_rng = np.random.default_rng(int(cfg.get("seed", 1234)))
+
+    def _submit_next_debug_repeat(self, *, activation_commit=None) -> bool:
+        if not bool(getattr(self, "_debug_repeat_enabled", False)):
+            return False
+        template = getattr(self, "_debug_repeat_template", None)
+        if template is None or len(template) < 2:
+            return False
+        count = int(getattr(self, "_debug_repeat_count", 0))
+        limit = int(getattr(self, "_debug_repeat_max_repeats", 0))
+        if limit > 0 and count >= limit:
+            return False
+
+        rng = self._debug_repeat_rng
+        angle = float(
+            rng.uniform(
+                float(self._debug_repeat_angle_min),
+                float(self._debug_repeat_angle_max),
+            )
+        )
+        if self._debug_repeat_random_sign and int(rng.integers(0, 2)) == 0:
+            angle = -angle
+        self._debug_repeat_cumulative_angle += angle
+        theta = np.deg2rad(self._debug_repeat_cumulative_angle)
+        cos_theta = float(np.cos(theta))
+        sin_theta = float(np.sin(theta))
+        rotated = np.asarray(template, dtype=np.float32).copy()
+        x = rotated[:, 0].copy()
+        z = rotated[:, 2].copy()
+        rotated[:, 0] = cos_theta * x + sin_theta * z
+        rotated[:, 2] = -sin_theta * x + cos_theta * z
+
+        self._debug_repeat_count = count + 1
+        delay_tokens = 0
+        if activation_commit is not None:
+            delay_tokens = max(
+                0, int(activation_commit) - int(self._get_commit_index())
+            )
+        self.update_trajectory(
+            rotated,
+            source=f"debug_repeat_{self._debug_repeat_count}",
+            duration_seconds=self._debug_repeat_duration_seconds,
+            route_mode=RouteReferenceMode.RELATIVE_TO_ACTOR.value,
+            delay_enabled=delay_tokens > 0,
+            delay_tokens=delay_tokens,
+        )
+        return True
+
+    def _maybe_prefetch_debug_repeat(self, event: StreamCommitEvent) -> bool:
+        if not bool(getattr(self, "_debug_repeat_enabled", False)):
+            return False
+        active = getattr(
+            getattr(self, "runtime_session", None), "source_manager", None
+        )
+        active = None if active is None else active.active
+        if active is None or active.proposal.version != event.source_version:
+            return False
+        source_id = str(event.source_id or "")
+        if not source_id.startswith(("debug_preset:", "debug_repeat_")):
+            return False
+        if self._debug_repeat_scheduled_from_version == event.source_version:
+            return False
+        mask = active.proposal.future_frame_mask
+        invalid = torch.nonzero(~mask, as_tuple=False)
+        valid_frames = int(mask.shape[0]) if not len(invalid) else int(invalid[0, 0])
+        if valid_frames <= 0:
+            return False
+        terminal_frame_abs = active.first_future_frame_abs + valid_frames - 1
+        activation_commit = frame_idx_to_token_idx(terminal_frame_abs) + 1
+        remaining_tokens = activation_commit - int(event.absolute_commit_after)
+        if remaining_tokens > int(self._debug_repeat_prefetch_tokens):
+            return False
+        if remaining_tokens <= 0:
+            return False
+        submitted = self._submit_next_debug_repeat(
+            activation_commit=activation_commit
+        )
+        if submitted:
+            self._debug_repeat_scheduled_from_version = event.source_version
+        return submitted
+
     @staticmethod
     def _path_length_xz(points_xyz: np.ndarray) -> float:
         points = np.asarray(points_xyz, dtype=np.float32)
@@ -466,11 +602,30 @@ class ModelManager(WebRuntime):
         delay_enabled=None, delay_tokens=None, blend_enabled=None,
         blend_tokens=None,
     ):
-        """Update trajectory control with optional delayed blended replace.
+        controller = self._trajectory_controller()
+        with controller.lock:
+            return self._update_trajectory_locked(
+                waypoints,
+                mode,
+                source=source,
+                duration_seconds=duration_seconds,
+                route_mode=route_mode,
+                horizon_tokens=horizon_tokens,
+                delay_enabled=delay_enabled,
+                delay_tokens=delay_tokens,
+                blend_enabled=blend_enabled,
+                blend_tokens=blend_tokens,
+            )
 
-        Does NOT immediately overwrite the active plan.  Instead creates a
-        pending ``RouteUpdate`` that takes effect after
-        ``update_delay_tokens`` tokens with a smooth blend transition.
+    def _update_trajectory_locked(
+        self, waypoints, mode="replace_future", *, source="manual",
+        duration_seconds=None, route_mode=None, horizon_tokens=None,
+        delay_enabled=None, delay_tokens=None, blend_enabled=None,
+        blend_tokens=None,
+    ):
+        """Build and submit one delayed atomic trajectory replacement.
+
+        The active plan changes only when the runtime commits the source command.
         ``waypoints is None`` clears trajectory.
         """
         mode = mode or "replace_future"
@@ -537,6 +692,7 @@ class ModelManager(WebRuntime):
                 duration_seconds=duration_seconds,
                 route_mode=route_reference_mode,
             )
+        self._trajectory_diagnostics_store().set_authored_route(points)
 
         new_plan = RoutePlan(
             times=times.astype(np.float32),
@@ -654,7 +810,8 @@ class ModelManager(WebRuntime):
 
     @traj_state_lock.setter
     def traj_state_lock(self, value):
-        self._trajectory_controller().lock = value
+        del value
+        self._trajectory_controller().lock = threading.RLock()
 
     @property
     def active_traj_plan(self):
@@ -772,6 +929,7 @@ class ModelManager(WebRuntime):
 
     def _clear_runtime_route_state(self) -> None:
         self._trajectory_controller().clear()
+        self._trajectory_diagnostics_store().clear()
         self._model_traj_plan_version = None
         if getattr(self, "runtime_session", None) is not None:
             self._submit_runtime_command(ClearRootSource)
@@ -968,9 +1126,11 @@ class ModelManager(WebRuntime):
             duration = max(0.0, float(np.max(plan.times) - np.min(plan.times)))
         duration_tokens = int(np.ceil(duration / max(token_dt, 1e-6))) + 1
         num_tokens_pred = max(1, min_tokens, duration_tokens)
-        valid_frames = num_frames_for_tokens(num_tokens_pred, frames_per_token)
+        tensor_frames = num_frames_for_tokens(num_tokens_pred, frames_per_token)
+        actual_valid_frames = int(np.ceil(duration / max(frame_dt, 1e-6))) + 1
+        valid_frames = min(tensor_frames, max(1, actual_valid_frames))
 
-        query_times = np.arange(valid_frames, dtype=np.float32) * np.float32(frame_dt)
+        query_times = np.arange(tensor_frames, dtype=np.float32) * np.float32(frame_dt)
         xyz = sample_timestamped_trajectory(plan.times, plan.points_xyz, query_times)
         xyz_t = torch.as_tensor(xyz, device=device, dtype=torch.float32)
 
@@ -1139,6 +1299,7 @@ class ModelManager(WebRuntime):
         self.root_xz_history.clear()
         self.root_5d_history.clear()
         self._trajectory_controller().clear()
+        self._trajectory_diagnostics_store().clear()
         self._model_traj_plan_version = None
         
         if history_length is not None:
@@ -1185,12 +1346,21 @@ class ModelManager(WebRuntime):
             num_denoise_steps=self.denoise_steps,
         )
         self._set_root_feedback_controls(
-            enabled=root_feedback_enabled,
-            xz_blend_alpha=root_feedback_xz_blend_alpha,
+            enabled=(
+                getattr(self, "root_feedback_enabled", False)
+                if root_feedback_enabled is None
+                else root_feedback_enabled
+            ),
+            xz_blend_alpha=(
+                getattr(self, "root_feedback_xz_blend_alpha", 0.5)
+                if root_feedback_xz_blend_alpha is None
+                else root_feedback_xz_blend_alpha
+            ),
         )
         current_text = str(getattr(self, "current_text", ""))
         if current_text:
             self._submit_runtime_command(SetText, text=current_text)
+        self._last_generation_error = None
         self.generation_state = GenerationState.IDLE
         print(
             f"Model reset - history: {self.history_length}, "
@@ -1242,7 +1412,10 @@ class ModelManager(WebRuntime):
                         print(f"Error in generation: {e}")
                         import traceback
                         traceback.print_exc()
-                        time.sleep(0.1)
+                        self._last_generation_error = str(e)
+                        self.generation_state = GenerationState.ERROR
+                        self.is_generating = False
+                        break
                 else:
                     # Buffer is full, wait a bit
                     time.sleep(0.01)
@@ -1266,6 +1439,11 @@ class ModelManager(WebRuntime):
             raise TypeError(f"unexpected runtime event: {type(event).__name__}")
 
         self._reconcile_runtime_route_event(event)
+        self._trajectory_diagnostics_store().update_from_commit(
+            event,
+            getattr(self.runtime_session, "source_manager", None),
+            self.runtime_session.timeline,
+        )
 
         frame_batch = [
             joints.detach().cpu().numpy() for joints in event.joint_frames
@@ -1317,12 +1495,48 @@ class ModelManager(WebRuntime):
                 route_state.route.active_route(event.absolute_commit_before)
         if "route_cleared" in event.lifecycle_events:
             controller.clear()
+            condition_manager = getattr(
+                getattr(self, "stream_generator", None),
+                "condition_manager",
+                None,
+            )
+            if condition_manager is not None:
+                condition_manager.route.clear()
         elif "route_exhausted" in event.lifecycle_events:
             controller.state = "exhausted"
+            source_id = str(event.source_id or "")
+            if (
+                source_id.startswith(("debug_preset:", "debug_repeat_"))
+                and (
+                    event.source_version is None
+                    or self._debug_repeat_scheduled_from_version
+                    != event.source_version
+                )
+            ):
+                self._submit_next_debug_repeat()
+        else:
+            self._maybe_prefetch_debug_repeat(event)
     
     def get_display_traj(self):
         """Return a copy of the latest world-space trajectory for frontend viz, or None."""
         return self._trajectory_controller().get_display()
+
+    def _trajectory_diagnostics_store(self) -> TrajectoryDiagnosticsStore:
+        store = getattr(self, "trajectory_diagnostics", None)
+        if store is None:
+            store = TrajectoryDiagnosticsStore()
+            self.trajectory_diagnostics = store
+        return store
+
+    def get_trajectory_debug(
+        self,
+        *,
+        client_snapshot_revision: int | None = None,
+    ) -> dict:
+        """Return a presentation-only snapshot of committed trajectory state."""
+        return self._trajectory_diagnostics_store().to_payload(
+            client_snapshot_revision=client_snapshot_revision,
+        )
 
     def get_next_frame(self):
         """Get the next frame from buffer and optional trajectory display data."""
@@ -1338,6 +1552,7 @@ class ModelManager(WebRuntime):
             "target_size": self.frame_buffer.target_size,
             "is_generating": self.is_generating,
             "generation_state": self.generation_state.value,
+            "generation_error": getattr(self, "_last_generation_error", None),
             "current_text": self.current_text,
             "trajectory_state": self._trajectory_state,
             "trajectory_active": plan is not None,

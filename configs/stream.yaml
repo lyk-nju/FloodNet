@@ -67,3 +67,11 @@ web_demo_debug:
     raw_data_dir: /data1/yuankai/text2Motion/FloodDiffusion/raw_data
     feature_path: new_joint_vecs
     text_path: texts
+    repeat:
+        enabled: true
+        angle_min_degrees: 20.0
+        angle_max_degrees: 45.0
+        random_sign: true
+        seed: 1234
+        prefetch_tokens: 5
+        max_repeats: 0  # 0 = repeat until the Web session stops

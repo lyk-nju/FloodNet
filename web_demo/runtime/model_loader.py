@@ -221,10 +221,10 @@ def build_runtime_session(
         text_guidance_scale=float(getattr(model, "cfg_scale_text", 1.0)),
         trajectory_guidance_scale=float(getattr(model, "cfg_scale_traj", 1.0)),
         root_feedback_enabled=bool(
-            traj_mask_cfg.get("root_feedback_enabled", False)
+            traj_mask_cfg.get("root_feedback_enabled", True)
         ),
         root_feedback_xz_blend_alpha=float(
-            traj_mask_cfg.get("root_feedback_xz_blend_alpha", 0.5)
+            traj_mask_cfg.get("root_feedback_xz_blend_alpha", 1.0)
         ),
         history_tokens=int(getattr(stream_generator, "history_length", 30)),
         horizon_tokens=int(

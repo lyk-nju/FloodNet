@@ -119,6 +119,11 @@ def register_routes(
 
             debug_target_traj = None
             if debug_sample is not None:
+                mm.configure_debug_repeat(
+                    debug_sample["trajectory"],
+                    debug_sample.get("repeat", {}),
+                    duration_seconds=debug_sample.get("duration_seconds"),
+                )
                 debug_target_traj = mm.update_trajectory(
                     debug_sample["trajectory"],
                     mode="replace_future",
@@ -449,6 +454,20 @@ def register_routes(
                 }
                 if traj is not None:
                     response["trajectory"] = traj.tolist()
+                snapshot_revision = request.args.get(
+                    "trajectory_snapshot_revision"
+                )
+                try:
+                    snapshot_revision = (
+                        None
+                        if snapshot_revision is None
+                        else int(snapshot_revision)
+                    )
+                except ValueError:
+                    snapshot_revision = None
+                response["trajectory_debug"] = model_manager.get_trajectory_debug(
+                    client_snapshot_revision=snapshot_revision,
+                )
                 return jsonify(response)
             return jsonify({
                 "status": "waiting",

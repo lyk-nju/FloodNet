@@ -12,6 +12,8 @@ from utils.inference.stream_runtime import (
     ConditionComposer,
     GeneratedRootHistory,
     RootSourceProposal,
+    RootSourceCommand,
+    RootSourceManager,
     RouteProgressState,
     RouteStatus,
     SegmentLabel,
@@ -71,15 +73,18 @@ def _activated(
         world_yaw=torch.tensor(boundary_yaw, dtype=route.dtype),
         source="activation",
     )
-    return ActivatedRootSource(
-        proposal=proposal,
-        requested_activation_commit=activation_commit,
-        actual_activation_commit=activation_commit,
-        boundary_state=boundary,
-        first_future_frame_abs=first_future_frame_abs(activation_commit),
-        space_contract=space_contract,
-        progress=RouteProgressState.initial(),
+    prepared = RootSourceManager().prepare_transition(
+        RootSourceCommand.replace(
+            proposal=proposal,
+            command_version=1,
+            requested_activation_commit=activation_commit,
+            space_contract=space_contract,
+        ),
+        boundary,
+        activation_commit,
     )
+    assert prepared.active is not None
+    return prepared.active
 
 
 def _empty_history(frame_abs: int = 0) -> GeneratedRootHistory:
@@ -215,6 +220,9 @@ def test_relative_route_rotates_remaining_shape_to_actor_boundary_pose():
         boundary_yaw=float(torch.pi / 2),
     )
 
+    materialized_anchor = activated.proposal.metadata["anchor_frame_7d"]
+    assert materialized_anchor[[0, 2]].tolist() == pytest.approx([3.0, 4.0])
+
     result = ConditionComposer().compose(
         activated,
         _empty_history(),
@@ -230,6 +238,74 @@ def test_relative_route_rotates_remaining_shape_to_actor_boundary_pose():
     assert torch.atan2(
         result.world_condition_7d[0, 4], result.world_condition_7d[0, 3]
     ).item() == pytest.approx(torch.pi / 2)
+
+
+def test_relative_route_world_geometry_stays_frozen_after_activation():
+    route = _traj7([(0.0, 0.5 * index) for index in range(12)])
+    activated = _activated(
+        route,
+        space_contract=SpaceContract.RELATIVE_ROUTE,
+        boundary_xz=(0.0, 0.0),
+    )
+    history = GeneratedRootHistory(
+        base_frame_abs=0,
+        frames_7d=_traj7([(0.0, 0.0)]),
+    )
+    drifted_boundary = RootFrameState(
+        commit_idx=1,
+        world_xz=torch.tensor([2.0, 0.0]),
+        world_yaw=torch.tensor(0.0),
+        source="drifted",
+    )
+
+    result = ConditionComposer().compose(
+        activated,
+        history,
+        drifted_boundary,
+        1,
+        RouteProgressState.initial(),
+        10,
+        bridge_frames=2,
+    )
+
+    route_points = result.world_condition_7d[
+        result.segment_labels == SegmentLabel.ROUTE.value
+    ]
+    assert int(route_points.shape[0]) > 0
+    assert torch.allclose(route_points[:, 0], torch.zeros_like(route_points[:, 0]))
+
+
+def test_relative_route_exhausts_instead_of_bridging_back_to_terminal():
+    route = _traj7([(0.0, float(index)) for index in range(6)])
+    activated = _activated(route, space_contract=SpaceContract.RELATIVE_ROUTE)
+    history = GeneratedRootHistory(
+        base_frame_abs=0,
+        frames_7d=_traj7([(0.0, 8.0)]),
+    )
+    boundary = RootFrameState(
+        commit_idx=1,
+        world_xz=torch.tensor([0.0, 8.0]),
+        world_yaw=torch.tensor(0.0),
+        source="past-terminal",
+    )
+
+    result = ConditionComposer().compose(
+        activated,
+        history,
+        boundary,
+        1,
+        RouteProgressState.initial(),
+        8,
+        bridge_frames=4,
+    )
+
+    assert result.route_status is RouteStatus.EXHAUSTED
+    assert result.diagnostics["bridge_frames_emitted"] == 0
+    assert not bool(result.frame_mask[1:].any())
+    assert torch.allclose(
+        result.world_condition_7d[1:, [0, 2]],
+        torch.tensor([[0.0, 8.0]]).expand(8, -1),
+    )
 
 
 def test_bridge_frames_controls_exact_emitted_bridge_span():

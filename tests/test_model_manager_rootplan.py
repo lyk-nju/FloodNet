@@ -525,6 +525,26 @@ def test_first_update_trajectory_returns_display_preview_immediately():
     np.testing.assert_allclose(mgr.get_display_traj(), preview)
 
 
+def test_short_manual_route_does_not_mark_terminal_tensor_padding_valid():
+    mgr = _trajectory_manager()
+    mgr.history_length = 30
+    mgr.traj_horizon_tokens = 20
+    mgr.model.chunk_size = 5
+    route = RoutePlan(
+        times=np.array([0.0, 4.0], dtype=np.float32),
+        points_xyz=np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 4.0]], dtype=np.float32),
+        start_commit_index=0,
+        version=1,
+        source="manual",
+    )
+
+    root_plan = mgr._stream_plan_to_root_plan(route, _state(0))
+
+    assert root_plan.num_tokens_pred == 55
+    assert root_plan.waypoints_local_7d.shape[0] == 217
+    assert root_plan.valid_frames == 81
+
+
 def test_reset_clears_model_manager_and_stream_generator_route_state():
     mgr = _trajectory_manager()
     mgr.frame_buffer = _FakeFrameBuffer()
@@ -587,6 +607,37 @@ def test_reset_accepts_root_feedback_runtime_controls():
     status = mgr.get_buffer_status()
     assert status["root_feedback_enabled"] is True
     assert status["root_feedback_xz_blend_alpha"] == 0.75
+
+
+def test_reset_resubmits_existing_root_feedback_controls_when_arguments_are_omitted():
+    mgr = _trajectory_manager()
+    mgr.frame_buffer = _FakeFrameBuffer()
+    mgr.vae = _FakeVae()
+    mgr.first_chunk = False
+    mgr.root_xz_history = []
+    mgr.root_5d_history = []
+    mgr._generated_frame_count = 5
+    mgr._absolute_commit_index = 2
+    mgr.is_generating = False
+    mgr.reset_pending = False
+    mgr.smoothing_alpha = 1.0
+    mgr.denoise_steps = 10
+    mgr.current_text = ""
+    mgr.generation_state = GenerationState.IDLE
+    mgr._model_traj_plan_version = None
+    mgr.root_feedback_enabled = True
+    mgr.root_feedback_xz_blend_alpha = 0.75
+
+    assert mgr.reset() is True
+
+    feedback_commands = [
+        command
+        for command in mgr.runtime_session.command_queue.snapshot()
+        if command.__class__.__name__ == "SetRootFeedback"
+    ]
+    assert len(feedback_commands) == 1
+    assert feedback_commands[0].enabled is True
+    assert feedback_commands[0].xz_blend_alpha == pytest.approx(0.75)
 
 
 def test_owned_reset_rewires_current_recovery_and_shared_timeline():

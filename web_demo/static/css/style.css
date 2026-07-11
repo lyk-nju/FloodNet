@@ -168,6 +168,32 @@ body {
     margin-top: 8px;
 }
 
+.trajectory-layer-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 12px;
+    margin: 0 0 8px;
+    font-size: 0.78em;
+    color: #555;
+}
+
+.trajectory-layer-controls label {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin: 0;
+}
+
+.trajectory-swatch {
+    width: 14px;
+    height: 3px;
+    display: inline-block;
+}
+
+.trajectory-swatch.authored { background: #00c8ff; }
+.trajectory-swatch.proposal { background: #24a148; }
+.trajectory-swatch.payload { background: #ff8c1a; }
+
 .input-hint {
     display: inline-block;
     margin-left: 10px;

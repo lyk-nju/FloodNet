@@ -138,11 +138,13 @@ class _FakeRecovery:
         self.__init__()
 
 
-def _session(*, seed=1234, model=None, initial_config=None):
+def _session(*, seed=1234, model=None, initial_config=None, chunk_size=1):
     torch.manual_seed(seed)
     initial = RootFrameState.initial(dtype=torch.float32)
+    kernel = _FakeKernel(model=model)
+    kernel.chunk_size = int(chunk_size)
     return StreamRuntimeSession(
-        kernel=_FakeKernel(model=model),
+        kernel=kernel,
         vae=_FakeVae(),
         recovery=_FakeRecovery(),
         timeline=RootTimeline(initial),
@@ -267,6 +269,62 @@ def test_runtime_history_and_denoise_changes_require_fresh_epoch():
             )
         )
 
+    assert session.command_queue.pending_versions == ()
+
+
+def test_reset_only_control_submitted_during_first_step_is_rejected_without_losing_text():
+    session = _session()
+    entered = threading.Event()
+    release = threading.Event()
+    original = session.kernel.generate_token
+
+    def blocking_generate(*args, **kwargs):
+        entered.set()
+        release.wait(timeout=5.0)
+        return original(*args, **kwargs)
+
+    session.kernel.generate_token = blocking_generate
+    worker = threading.Thread(target=session.step)
+    worker.start()
+    assert entered.wait(timeout=2.0)
+    session.submit(SetText(version=1, requested_commit_abs=0, text="turn"))
+    with pytest.raises(RuntimeError, match="require a reset"):
+        session.submit(
+            SetRuntimeControls(
+                version=2,
+                requested_commit_abs=0,
+                history_tokens=8,
+            )
+        )
+    release.set()
+    worker.join(timeout=5.0)
+
+    session.step()
+
+    assert session.config.text == "turn"
+    assert session.command_queue.pending_versions == ()
+
+
+def test_denoise_steps_must_be_divisible_by_kernel_chunk_size():
+    with pytest.raises(ValueError, match="divisible by chunk_size"):
+        _session(
+            chunk_size=5,
+            initial_config=RuntimeStepConfig(
+                history_tokens=4,
+                horizon_tokens=4,
+                num_denoise_steps=7,
+            ),
+        )
+
+    session = _session(chunk_size=5)
+    with pytest.raises(ValueError, match="divisible by chunk_size"):
+        session.submit(
+            SetRuntimeControls(
+                version=1,
+                requested_commit_abs=0,
+                num_denoise_steps=7,
+            )
+        )
     assert session.command_queue.pending_versions == ()
 
 
@@ -465,6 +523,25 @@ def test_route_exhaustion_lifecycle_is_emitted_once_after_commit():
     assert second.route_status is RouteStatus.EXHAUSTED
     assert second.lifecycle_events.count("route_exhausted") == 1
     assert "route_exhausted" not in third.lifecycle_events
+
+
+def test_returned_event_retains_its_payload_body_anchor_state():
+    session = _session(
+        initial_config=RuntimeStepConfig(history_tokens=4, horizon_tokens=4)
+    )
+    session.submit(
+        SetRootSource(
+            version=1,
+            requested_commit_abs=0,
+            proposal=_proposal(),
+            space_contract=SpaceContract.RELATIVE_ROUTE,
+        )
+    )
+
+    for _ in range(8):
+        event = session.step()
+        anchor_commit = int(event.actual_payload["body_anchor_abs_token"])
+        assert session.timeline.has_exact_state(anchor_commit)
 
 
 def test_root_feedback_preview_encode_and_formal_decode_cache_order():

@@ -86,6 +86,11 @@ class StreamGenerator:
         return int(getattr(self.ldf_model, "chunk_size", 1))
 
     def reset(self, initial_state: RootFrameState | None = None, *, text: str = "") -> None:
+        if self._runtime_session is not None:
+            raise RuntimeError(
+                "reset is owned by the authoritative runtime session; "
+                "submit ResetSession instead"
+            )
         del initial_state
         self.condition_manager.reset(text=text)
 
@@ -96,6 +101,10 @@ class StreamGenerator:
         batch_size: int = 1,
         num_denoise_steps: int | None = None,
     ) -> None:
+        if self._runtime_session is not None:
+            raise RuntimeError(
+                "LDF initialization is owned by the authoritative runtime session"
+            )
         if history_length is not None:
             self.history_length = int(history_length)
         self.ldf_model.init_generated(

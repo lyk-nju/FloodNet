@@ -136,39 +136,82 @@ class WorldRouteProgressPolicy:
 
 @dataclass(frozen=True)
 class RelativeRouteProgressPolicy:
-    """Advance an anchor-relative route by immutable absolute future phase."""
+    """Track an activation-frozen relative route without targeting behind the actor."""
 
     lookahead_m: float = 0.25
+    heading_weight: float = 0.15
+    search_forward: int = 96
+    behind_tolerance_m: float = 0.02
 
     def __post_init__(self) -> None:
         if float(self.lookahead_m) < 0.0:
             raise ValueError("lookahead_m must be >= 0")
+        if float(self.heading_weight) < 0.0:
+            raise ValueError("heading_weight must be >= 0")
+        if int(self.search_forward) < 1:
+            raise ValueError("search_forward must be >= 1")
+        if float(self.behind_tolerance_m) < 0.0:
+            raise ValueError("behind_tolerance_m must be >= 0")
         object.__setattr__(self, "lookahead_m", float(self.lookahead_m))
+        object.__setattr__(self, "heading_weight", float(self.heading_weight))
+        object.__setattr__(self, "search_forward", int(self.search_forward))
+        object.__setattr__(self, "behind_tolerance_m", float(self.behind_tolerance_m))
 
     def project(
         self,
         activated: ActivatedRootSource,
         *,
         current_first_future_frame_abs: int,
+        actor_xz: Tensor,
+        actor_yaw: Tensor | float,
         previous_progress: RouteProgressState,
-    ) -> RouteProjection:
-        """Advance from the active source's absolute future-frame phase only."""
+    ) -> RouteProjection | None:
+        """Use phase as a lower bound, then project onto forward route geometry."""
         if not isinstance(activated, ActivatedRootSource):
             raise TypeError("activated must be ActivatedRootSource")
         if not isinstance(previous_progress, RouteProgressState):
             raise TypeError("previous_progress must be RouteProgressState")
-        _, _, arc = _route_geometry(activated.proposal.future_traj7)
-        last_index = int(arc.shape[0]) - 1
+        xz, yaw, arc = _route_geometry(activated.proposal.future_traj7)
+        current_xz = torch.as_tensor(actor_xz, dtype=xz.dtype).detach().cpu().reshape(-1)
+        if int(current_xz.numel()) != 2:
+            raise ValueError("actor_xz must contain exactly two coordinates")
+        current_yaw = torch.as_tensor(actor_yaw, dtype=xz.dtype).detach().cpu().reshape(())
+        actor_heading = heading_dir_xz(current_yaw).reshape(1, 2)
+
+        last_index = int(xz.shape[0]) - 1
         consumed_phase = int(current_first_future_frame_abs) - activated.first_future_frame_abs
         phase_index = min(last_index, max(0, consumed_phase))
-        route_index = min(last_index, max(previous_progress.route_index, phase_index))
+        lower_bound = min(last_index, max(previous_progress.route_index, phase_index))
+        upper_bound = min(last_index + 1, lower_bound + self.search_forward + 1)
+        candidates = xz[lower_bound:upper_bound]
+        displacement = candidates - current_xz[None, :]
+        forward_dot = (displacement * actor_heading).sum(dim=-1)
+        route_heading = heading_dir_xz(yaw[lower_bound:upper_bound])
+        heading_dot = (route_heading * actor_heading).sum(dim=-1).clamp(-1.0, 1.0)
+        eligible = (forward_dot >= -self.behind_tolerance_m) & (heading_dot >= 0.0)
+        if not bool(eligible.any()):
+            return None
+
+        distance = torch.linalg.norm(displacement, dim=-1)
+        cost = distance + self.heading_weight * (1.0 - heading_dot)
+        cost = torch.where(eligible, cost, torch.full_like(cost, float("inf")))
+        selected_local = int(torch.argmin(cost).item())
+        route_index = lower_bound + selected_local
         future_index = _lookahead_index(arc, route_index, self.lookahead_m)
+
+        # Curved or self-intersecting routes can put the nominal lookahead back
+        # behind the actor. Fall back toward the selected forward projection.
+        while future_index > route_index:
+            future_displacement = xz[future_index] - current_xz
+            if float((future_displacement * actor_heading[0]).sum().item()) >= -self.behind_tolerance_m:
+                break
+            future_index -= 1
 
         return RouteProjection(
             route_index=route_index,
             future_index=future_index,
-            distance=0.0,
-            heading_dot=1.0,
+            distance=float(distance[selected_local].item()),
+            heading_dot=float(heading_dot[selected_local].item()),
             proposed_progress=_proposed_progress(previous_progress, route_index, arc),
         )
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import threading
+from dataclasses import replace
 
 import numpy as np
 import torch
@@ -82,6 +83,7 @@ class StreamRuntimeSession:
         self.session_anchor_state = copy.deepcopy(timeline.earliest)
         self.session_epoch = 0
         self._step_lock = threading.Lock()
+        self._validate_reset_only_config(initial_config)
         self._initialize_model_stream_state(initial_config)
         if hasattr(self.vae, "clear_cache"):
             self.vae.clear_cache()
@@ -100,14 +102,44 @@ class StreamRuntimeSession:
                 command.num_denoise_steps is not UNSET
                 and command.num_denoise_steps != self.config.num_denoise_steps
             )
-            if (
-                (changes_history or changes_denoise)
-                and int(self.timeline.head.commit_idx) > 0
-            ):
-                raise RuntimeError(
-                    "history_tokens and num_denoise_steps require a reset"
-                )
+            if changes_history or changes_denoise:
+                if not self._step_lock.acquire(blocking=False):
+                    raise RuntimeError(
+                        "history_tokens and num_denoise_steps require a reset "
+                        "while a step is running"
+                    )
+                try:
+                    if int(self.timeline.head.commit_idx) > 0:
+                        raise RuntimeError(
+                            "history_tokens and num_denoise_steps require a reset"
+                        )
+                    proposed = self.config
+                    if command.history_tokens is not UNSET:
+                        proposed = replace(
+                            proposed,
+                            history_tokens=int(command.history_tokens),
+                        )
+                    if command.num_denoise_steps is not UNSET:
+                        proposed = replace(
+                            proposed,
+                            num_denoise_steps=command.num_denoise_steps,
+                        )
+                    self._validate_reset_only_config(proposed)
+                    return self.command_queue.submit(command)
+                finally:
+                    self._step_lock.release()
         return self.command_queue.submit(command)
+
+    def _validate_reset_only_config(self, config: RuntimeStepConfig) -> None:
+        steps = config.num_denoise_steps
+        if steps is None:
+            return
+        chunk_size = int(getattr(self.kernel, "chunk_size", 1))
+        if int(steps) % chunk_size != 0:
+            raise ValueError(
+                "num_denoise_steps must be divisible by chunk_size "
+                f"({chunk_size}), got {steps}"
+            )
 
     def _initialize_model_stream_state(self, config: RuntimeStepConfig) -> None:
         model = self.model
@@ -284,7 +316,7 @@ class StreamRuntimeSession:
     ) -> None:
         earliest_anchor_commit = max(
             0,
-            int(absolute_commit_after) + 1 - int(config.history_tokens),
+            int(absolute_commit_after) - int(config.history_tokens),
         )
         self.timeline.trim_before(earliest_anchor_commit)
         earliest_frame = int(
@@ -322,8 +354,6 @@ class StreamRuntimeSession:
                 and reset_controls_changed
                 and commit_abs > 0
             ):
-                self.command_queue.ack(batch)
-                batch = None
                 raise RuntimeError(
                     "history_tokens and num_denoise_steps require a reset"
                 )

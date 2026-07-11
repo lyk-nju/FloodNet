@@ -322,17 +322,23 @@ def decode_token_with_root_feedback(
             debug={"reason": target_reason},
         )
 
-    corrected = replace_root_channels_263_window_from_7d(
-        decoded_raw,
+    corrected = decoded_raw.clone()
+    correction_frames = min(
+        int(decoded_raw.shape[0]),
+        max(0, int(target.shape[0]) - 1),
+    )
+    corrected[:correction_frames] = replace_root_channels_263_window_from_7d(
+        decoded_raw[:correction_frames],
         target,
         start_frame=0,
+        hold_tail=False,
     )
     encoded = vae.stream_encode(
         corrected.to(device=device).unsqueeze(0),
         first_chunk=bool(first_chunk),
     )[0].detach()
     corrected_latent = encoded[-1:].detach().cpu()
-    _decode_latent_token(
+    decoded_corrected = _decode_latent_token(
         vae,
         corrected_latent,
         first_chunk=first_chunk,
@@ -341,7 +347,7 @@ def decode_token_with_root_feedback(
     _write_committed_latent(model, corrected_latent, int(local_commit_index))
     return RootFeedbackResult(
         latent_token=corrected_latent,
-        decoded_motion_chunk=corrected.detach().cpu(),
+        decoded_motion_chunk=decoded_corrected,
         applied=True,
         debug={"reason": "applied"},
     )

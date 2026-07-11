@@ -25,6 +25,7 @@ from eval.ldf.stream_metrics import run_stream_generate_step_sample
 from eval.ldf.stream_generation import (
     _replace_chunk_root_from_condition,
 )
+from utils.inference.stream_generator import StreamGenerator
 from utils.motion_process import recover_root_rot_pos
 
 
@@ -219,13 +220,28 @@ class _FakeStepModel:
     def stream_generate_step(self, step_input, first_chunk=True, condition=None):
         self.payloads.append(dict(step_input))
         self.commit_index += 1
-        return {"generated": [torch.zeros(1, self.input_dim)]}
+        return {"generated": torch.zeros(1, 1, self.input_dim)}
 
     def preprocess(self, x):
         return x.permute(0, 2, 1).unsqueeze(-1).unsqueeze(-1)
 
 
 class _FakeRollingStepModel(_FakeStepModel):
+    def __init__(self):
+        super().__init__()
+        self.latent_buffer_start_commit_abs = 0
+        self.latent_buffer_epoch = 0
+
+    def stream_buffer_metadata(self):
+        return type(
+            "Metadata",
+            (),
+            {
+                "start_commit_abs": self.latent_buffer_start_commit_abs,
+                "epoch": self.latent_buffer_epoch,
+            },
+        )()
+
     def stream_generate_step(self, step_input, first_chunk=True, condition=None):
         out = super().stream_generate_step(
             step_input,
@@ -234,6 +250,8 @@ class _FakeRollingStepModel(_FakeStepModel):
         )
         if self.commit_index == 3:
             self.commit_index = 1
+            self.latent_buffer_start_commit_abs = 2
+            self.latent_buffer_epoch += 1
         return out
 
 
@@ -242,7 +260,8 @@ class _FakeStepVAE:
         pass
 
     def stream_decode(self, latent, first_chunk=True):
-        return torch.zeros(1, 1, 263)
+        frames = 1 if first_chunk else 4
+        return torch.zeros(1, frames, 263)
 
 
 class _FakeCausalStepVAE(_FakeStepVAE):
@@ -277,7 +296,7 @@ class _FakeFeedbackStepModel(_FakeStepModel):
         self.payloads.append(dict(step_input))
         value = float(self.commit_index + 1)
         self.commit_index += 1
-        return {"generated": [torch.full((1, self.input_dim), value)]}
+        return {"generated": torch.full((1, 1, self.input_dim), value)}
 
 
 class _FakeFeedbackVAE(_FakeCausalStepVAE):
@@ -359,6 +378,39 @@ def test_ldf_stream_generate_step_uses_direct_7d_payload_when_available():
     assert all("traj_cond_frame_mask" in payload for payload in model.payloads)
     assert all("traj_features" not in payload for payload in model.payloads)
     assert all("traj" not in payload for payload in model.payloads)
+
+
+def test_ldf_stream_generate_step_does_not_open_a_second_stream_owner(monkeypatch):
+    traj7 = torch.zeros(1, 5, 7, dtype=torch.float32)
+    traj7[0, :, 2] = torch.arange(5, dtype=torch.float32)
+    traj7[0, :, 3] = 1.0
+    sample_batch = {
+        "name": ["sample"],
+        "dataset": ["HumanML3D"],
+        "text": ["walk"],
+        "token": torch.zeros(1, 2, 4, dtype=torch.float32),
+        "token_length": torch.tensor([2], dtype=torch.long),
+        "feature_length": torch.tensor([5], dtype=torch.long),
+        "traj_cond_7d": traj7,
+        "traj_cond_mask": torch.ones(1, 5, dtype=torch.float32),
+    }
+
+    def forbidden_init(*args, **kwargs):
+        raise AssertionError("eval must let StreamRuntimeSession initialize LDF state")
+
+    monkeypatch.setattr(StreamGenerator, "init_ldf_generation", forbidden_init)
+
+    output = run_stream_generate_step_sample(
+        model=_FakeStepModel(),
+        vae=_FakeStepVAE(),
+        sample_batch=sample_batch,
+        device=torch.device("cpu"),
+        history_length=2,
+        num_denoise_steps=1,
+        traj_horizon_tokens=1,
+    )
+
+    assert output["decoded_feature"].shape[0] == 5
 
 
 def test_ldf_stream_generate_step_can_roll_past_original_length():

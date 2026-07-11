@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+import torch
+
 from utils.inference.timeline import RootFrameState
+from utils.local_frame import transform_xz_local_delta_to_world, wrap_angle
+from utils.motion_process import build_physical_7d_from_5d
 from utils.token_frame import first_future_frame_abs
 
 from .contracts import (
@@ -12,7 +16,68 @@ from .contracts import (
     RootSourceCommand,
     RouteProgressState,
     RouteStatus,
+    RootSourceProposal,
+    SpaceContract,
 )
+
+
+def _materialize_relative_proposal(
+    proposal: RootSourceProposal,
+    boundary_state: RootFrameState,
+) -> RootSourceProposal:
+    """Freeze an actor-relative proposal in world space at activation."""
+    route_5d = proposal.future_traj7[:, :5].detach().cpu().float()
+    metadata = dict(proposal.metadata)
+    source_anchor = metadata.get("anchor_frame_7d")
+    if source_anchor is None:
+        source_anchor_5d = route_5d[0]
+    else:
+        source_anchor_5d = torch.as_tensor(source_anchor).detach().cpu().float()[:5]
+    source_yaw = torch.atan2(source_anchor_5d[4], source_anchor_5d[3])
+    boundary_yaw = boundary_state.world_yaw.detach().cpu().float().reshape(())
+    yaw_offset = wrap_angle(boundary_yaw - source_yaw)
+    relative_xz = route_5d[:, [0, 2]] - source_anchor_5d[[0, 2]]
+    world_xz = boundary_state.world_xz.detach().cpu().float()[None, :] + (
+        transform_xz_local_delta_to_world(relative_xz, yaw_offset)
+    )
+    route_yaw = torch.atan2(route_5d[:, 4], route_5d[:, 3])
+    world_yaw = boundary_yaw + wrap_angle(route_yaw - source_yaw)
+    world_5d = torch.stack(
+        [
+            world_xz[:, 0],
+            route_5d[:, 1],
+            world_xz[:, 1],
+            torch.cos(world_yaw),
+            torch.sin(world_yaw),
+        ],
+        dim=-1,
+    )
+    activation_anchor_5d = torch.stack(
+        [
+            boundary_state.world_xz.detach().cpu().float()[0],
+            source_anchor_5d[1],
+            boundary_state.world_xz.detach().cpu().float()[1],
+            torch.cos(boundary_yaw),
+            torch.sin(boundary_yaw),
+        ]
+    )
+    metadata.update(
+        {
+            "relative_materialized_at_activation": True,
+            "activation_world_xz": boundary_state.world_xz.detach().cpu().float(),
+            "activation_world_yaw": boundary_yaw,
+            "anchor_frame_7d": build_physical_7d_from_5d(
+                activation_anchor_5d.unsqueeze(0)
+            )[0],
+        }
+    )
+    return RootSourceProposal(
+        future_traj7=build_physical_7d_from_5d(world_5d),
+        future_frame_mask=proposal.future_frame_mask,
+        source_id=proposal.source_id,
+        version=proposal.version,
+        metadata=metadata,
+    )
 
 
 @dataclass(frozen=True)
@@ -74,8 +139,11 @@ class RootSourceManager:
             )
 
         requested = 0 if reset_epoch else int(command.requested_activation_commit)
+        proposal = command.proposal
+        if command.space_contract is SpaceContract.RELATIVE_ROUTE:
+            proposal = _materialize_relative_proposal(proposal, boundary_state)
         activated = ActivatedRootSource(
-            proposal=command.proposal,
+            proposal=proposal,
             requested_activation_commit=min(requested, commit),
             actual_activation_commit=commit,
             boundary_state=boundary_state,

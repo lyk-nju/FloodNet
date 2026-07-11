@@ -40,12 +40,12 @@
 
                 <div class="param-item param-slider">
                     <label class="param-checkbox-label" for="rootFeedbackEnabled">
-                        <input type="checkbox" id="rootFeedbackEnabled">
+                        <input type="checkbox" id="rootFeedbackEnabled" checked>
                         Root Feedback
                     </label>
                     <div class="slider-container">
-                        <input type="range" id="rootFeedbackAlpha" min="0" max="1" step="0.05" value="0.5">
-                        <span id="rootFeedbackValue" class="slider-value">0.50</span>
+                        <input type="range" id="rootFeedbackAlpha" min="0" max="1" step="0.05" value="1.0">
+                        <span id="rootFeedbackValue" class="slider-value">1.00</span>
                     </div>
                     <span class="param-hint">blend decoded root toward active 7D condition</span>
                 </div>
@@ -88,7 +88,7 @@
                 </div>
                 <div class="status-item">
                     <span class="status-label">Root Feedback:</span>
-                    <span id="currentRootFeedback" class="status-value">Off · 0.50</span>
+                    <span id="currentRootFeedback" class="status-value">On · 1.00</span>
                 </div>
             </div>
 
@@ -122,6 +122,12 @@
                         <input type="number" id="trajectoryDelayTokens" min="0" max="200"
                             value="{{ trajectory_defaults.delay_tokens | default(20) }}">
                     </div>
+                </div>
+                <div class="trajectory-layer-controls" aria-label="Trajectory layers">
+                    <label><input type="checkbox" id="showAuthoredTrajectory" checked><span class="trajectory-swatch authored"></span>Authored</label>
+                    <label><input type="checkbox" id="showProposalTrajectory" checked><span class="trajectory-swatch proposal"></span>Root proposal</label>
+                    <label><input type="checkbox" id="showPayloadTrajectory" checked><span class="trajectory-swatch payload"></span>LDF payload</label>
+                    <label><input type="checkbox" id="showTrajectoryHistory" checked>History</label>
                 </div>
                 <textarea id="trajectoryWaypoints" rows="3"
                     placeholder="One waypoint per line: x z  or  x y z&#10;Example:&#10;0 0&#10;1 0&#10;1 1&#10;0 1"></textarea>

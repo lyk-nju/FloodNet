@@ -6,9 +6,22 @@ from typing import Dict, List, Optional
 
 import torch
 
-from eval.ldf.conditioning import LdfEvalStreamConditioner
 from metrics.stream import decode_stream_chunks
+from utils.inference.runtime_update import world_traj7_to_proposal
 from utils.inference.stream_generator import StreamGenerator
+from utils.inference.stream_runtime import (
+    ConditionComposer,
+    GeneratedRootHistory,
+    PayloadBuilder,
+    RootSourceManager,
+    RuntimeCommandQueue,
+    RuntimeStepConfig,
+    SetRootSource,
+    SetText,
+    SpaceContract,
+    StreamRuntimeSession,
+)
+from utils.inference.timeline import RootFrameState, RootTimeline
 from utils.motion_process import (
     StreamJointRecovery263,
     recover_root_rot_pos,
@@ -109,6 +122,8 @@ def _replace_chunk_root_from_condition(
     )
 
 
+# Compatibility helpers for explicit legacy/debug runners. The default
+# stream_generate_step eval below must execute through StreamRuntimeSession.
 def _committed_latent_index_after_step(model, local_commit_index: int) -> int:
     local_commit_index = int(local_commit_index)
     current_commit = int(getattr(model, "commit_index", local_commit_index + 1))
@@ -120,31 +135,23 @@ def _committed_latent_index_after_step(model, local_commit_index: int) -> int:
     return max(0, current_commit - 1)
 
 
-def _write_committed_latent_to_model(model, latent_token: torch.Tensor, local_commit_index: int) -> None:
-    if not hasattr(model, "generated"):
-        return
-    generated = model.generated
+def _write_committed_latent_to_model(model, latent_token, local_commit_index):
+    generated = getattr(model, "generated", None)
     if generated is None:
         return
-    device = generated.device
-    dtype = generated.dtype
-    latent = latent_token.detach().to(device=device, dtype=dtype)
+    latent = latent_token.detach().to(device=generated.device, dtype=generated.dtype)
     if latent.dim() == 1:
         latent = latent.view(1, 1, -1)
     elif latent.dim() == 2:
         latent = latent.unsqueeze(0)
-    if hasattr(model, "preprocess"):
-        latent_pre = model.preprocess(latent)
-    else:
-        latent_pre = latent.permute(0, 2, 1).unsqueeze(-1).unsqueeze(-1)
+    latent_pre = (
+        model.preprocess(latent)
+        if hasattr(model, "preprocess")
+        else latent.permute(0, 2, 1).unsqueeze(-1).unsqueeze(-1)
+    )
     write_index = _committed_latent_index_after_step(model, local_commit_index)
     if 0 <= write_index < generated.shape[2]:
-        generated[
-            : latent_pre.shape[0],
-            :,
-            write_index:write_index + 1,
-            ...,
-        ] = latent_pre
+        generated[: latent_pre.shape[0], :, write_index : write_index + 1, ...] = latent_pre
 
 
 def _clone_cache_value(value):
@@ -163,30 +170,22 @@ def _snapshot_vae_decode_cache(vae):
     model = getattr(vae, "model", None)
     if model is None:
         return None
-    cache = {}
-    for name in ("_conv_num", "_conv_idx", "_feat_map"):
-        if hasattr(model, name):
-            cache[name] = _clone_cache_value(getattr(model, name))
-    return cache
+    return {
+        name: _clone_cache_value(getattr(model, name))
+        for name in ("_conv_num", "_conv_idx", "_feat_map")
+        if hasattr(model, name)
+    }
 
 
 def _restore_vae_decode_cache(vae, cache) -> None:
-    if cache is None:
-        return
     model = getattr(vae, "model", None)
-    if model is None:
+    if model is None or cache is None:
         return
     for name, value in cache.items():
         setattr(model, name, _clone_cache_value(value))
 
 
-def _encode_corrected_chunk_token(
-    vae,
-    corrected_chunk: torch.Tensor,
-    *,
-    first_chunk: bool,
-    device: torch.device,
-) -> torch.Tensor:
+def _encode_corrected_chunk_token(vae, corrected_chunk, *, first_chunk, device):
     encoded = vae.stream_encode(
         corrected_chunk.to(device=device).unsqueeze(0),
         first_chunk=first_chunk,
@@ -194,27 +193,20 @@ def _encode_corrected_chunk_token(
     return encoded[-1:].detach().cpu()
 
 
-def _decode_latent_chunk(
-    vae,
-    latent_token: torch.Tensor,
-    *,
-    first_chunk: bool,
-    device: torch.device,
-) -> torch.Tensor:
-    current = latent_token.to(device=device)
+def _decode_latent_chunk(vae, latent_token, *, first_chunk, device):
     return vae.stream_decode(
-        current.unsqueeze(0),
+        latent_token.to(device=device).unsqueeze(0),
         first_chunk=first_chunk,
     )[0].float().detach().cpu()
 
 
 def _decode_raw_chunk_preserving_feedback_cache(
     vae,
-    latent_token: torch.Tensor,
+    latent_token,
     *,
-    first_chunk: bool,
-    device: torch.device,
-) -> torch.Tensor:
+    first_chunk,
+    device,
+):
     cache = _snapshot_vae_decode_cache(vae)
     decoded = _decode_latent_chunk(
         vae,
@@ -283,119 +275,105 @@ def run_stream_generate_step_sample(
         traj_horizon_tokens=int(traj_horizon_tokens or 0),
         token_dt=float(token_dt),
     )
-    stream.init_ldf_generation(
-        history_length=history_length,
-        batch_size=1,
-        num_denoise_steps=num_denoise_steps,
-    )
-    vae.clear_cache()
-
     text_rollout = StreamTextRolloutController.from_sample_batch(sample_batch)
-    stream_conditioner = (
-        LdfEvalStreamConditioner(
-            sample_batch,
-            history_length=history_length,
-            traj_horizon_tokens=int(traj_horizon_tokens or 0),
-            token_dt=float(token_dt),
-            frames_per_token=int(frames_per_token),
-            device=device,
-            extra_frames=extra_frames,
+    initial_text = text_rollout.get_text_for_commit_index(0)
+    timeline = RootTimeline(
+        RootFrameState.initial(device=device, dtype=torch.float32)
+    )
+    session = StreamRuntimeSession(
+        kernel=stream,
+        vae=vae,
+        recovery=StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0),
+        timeline=timeline,
+        generated_history=GeneratedRootHistory.empty(device=device),
+        command_queue=RuntimeCommandQueue(),
+        source_manager=RootSourceManager(),
+        composer=ConditionComposer(),
+        payload_builder=PayloadBuilder(frames_per_token=int(frames_per_token)),
+        initial_config=RuntimeStepConfig(
+            text=initial_text,
+            text_guidance_scale=float(getattr(model, "cfg_scale_text", 1.0)),
+            trajectory_guidance_scale=float(getattr(model, "cfg_scale_traj", 1.0)),
+            root_feedback_enabled=bool(root_replace_feedback),
+            root_feedback_xz_blend_alpha=float(root_feedback_xz_blend_alpha),
+            history_tokens=int(history_length),
+            horizon_tokens=int(traj_horizon_tokens or 0),
+            num_denoise_steps=int(num_denoise_steps),
+        ),
+        bridge_frames=0,
+    )
+    stream.attach_runtime_session(session)
+    command_version = 0
+    traj7 = sample_batch.get("traj_cond_7d")
+    if traj7 is not None:
+        world_traj7 = _sample_traj7(sample_batch)
+        frame_mask = sample_batch.get("traj_cond_mask", sample_batch.get("traj_mask"))
+        if frame_mask is None:
+            mask = torch.ones(world_traj7.shape[0], dtype=torch.bool)
+        else:
+            mask = torch.as_tensor(frame_mask).reshape(-1).bool()
+            mask = mask[: int(world_traj7.shape[0])]
+            if int(mask.shape[0]) < int(world_traj7.shape[0]):
+                mask = torch.cat(
+                    [
+                        mask,
+                        torch.zeros(
+                            int(world_traj7.shape[0]) - int(mask.shape[0]),
+                            dtype=torch.bool,
+                        ),
+                    ]
+                )
+        traj_length = sample_batch.get("traj_length")
+        if traj_length is not None:
+            valid = min(
+                _to_python_int(torch.as_tensor(traj_length).reshape(-1)[0]),
+                int(mask.shape[0]),
+            )
+            mask[valid:] = False
+        command_version += 1
+        session.submit(
+            SetRootSource(
+                version=command_version,
+                requested_commit_abs=0,
+                proposal=world_traj7_to_proposal(
+                    world_traj7,
+                    source_id=str(sample_batch.get("name", ["eval"])[0]),
+                    version=command_version,
+                    metadata={"source_kind": "dataset_eval"},
+                    frame_mask=mask,
+                    strip_anchor=True,
+                ),
+                space_contract=SpaceContract.WORLD_ROUTE,
+            )
         )
-        if "traj_cond_7d" in sample_batch and sample_batch["traj_cond_7d"] is not None
-        else None
-    )
-    stream_recovery = (
-        StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
-        if stream_conditioner is not None
-        else None
-    )
-    first_chunk = True
+
     latent_tokens: List[torch.Tensor] = []
     decoded_chunks: List[torch.Tensor] = []
     chunk_frame_ends: List[int] = []
     generated_frames = 0
+    active_text = initial_text
 
     try:
         for commit_index in range(step_count):
             current_text = text_rollout.get_text_for_commit_index(commit_index)
-            local_commit_index = int(getattr(model, "commit_index", commit_index))
-            if stream_conditioner is not None:
-                chunk_size = int(getattr(model, "chunk_size", 1))
-                traj_input = stream_conditioner.build_step_payload(
-                    local_commit_index=local_commit_index,
-                    absolute_commit_index=commit_index,
-                    chunk_size=chunk_size,
+            if current_text != active_text:
+                command_version += 1
+                session.submit(
+                    SetText(
+                        version=command_version,
+                        requested_commit_abs=commit_index,
+                        text=current_text,
+                    )
                 )
-            else:
-                traj_input = None
-            step_payload = stream.build_step_input(
-                current_text,
-                traj_input=traj_input,
-            )
-            condition_provider = stream.build_ldf_condition_provider(
-                step_payload,
-                first_chunk=first_chunk,
-                device=device,
-            )
-            output = model.stream_generate_step(
-                step_payload,
-                first_chunk=first_chunk,
-                condition=condition_provider,
-            )
-            latent_token = output["generated"][0].detach().cpu()
-            if root_replace_feedback:
-                decoded_chunk_raw = _decode_raw_chunk_preserving_feedback_cache(
-                    vae,
-                    latent_token,
-                    first_chunk=first_chunk,
-                    device=device,
-                )
-            else:
-                decoded_chunk_raw = vae.stream_decode(
-                    output["generated"][0][None, :],
-                    first_chunk=first_chunk,
-                )[0].float().detach().cpu()
-            chunk_start_frame = int(generated_frames)
-            if root_replace_feedback:
-                decoded_chunk = _replace_chunk_root_from_condition(
-                    decoded_chunk_raw,
-                    sample_batch,
-                    start_frame=chunk_start_frame,
-                    previous_decoded_chunks=decoded_chunks,
-                    xz_blend_alpha=float(root_feedback_xz_blend_alpha),
-                )
-                corrected_latent = _encode_corrected_chunk_token(
-                    vae,
-                    decoded_chunk,
-                    first_chunk=first_chunk,
-                    device=device,
-                )
-                _decode_latent_chunk(
-                    vae,
-                    corrected_latent,
-                    first_chunk=first_chunk,
-                    device=device,
-                )
-                _write_committed_latent_to_model(
-                    model,
-                    corrected_latent,
-                    local_commit_index,
-                )
-                latent_token = corrected_latent
-            else:
-                decoded_chunk = decoded_chunk_raw
-            first_chunk = False
+                active_text = current_text
+            event = session.step()
+            latent_token = event.committed_latent.detach().cpu()
+            decoded_chunk = event.decoded_chunk.detach().cpu()
 
             latent_tokens.append(latent_token)
             decoded_chunks.append(decoded_chunk)
             generated_frames += decoded_chunk.shape[0]
             chunk_frame_ends.append(min(generated_frames, target_total_frames))
-            if stream_conditioner is not None and stream_recovery is not None:
-                stream_conditioner.append_decoded(
-                    decoded_chunk,
-                    commit_idx=commit_index + 1,
-                    recovery=stream_recovery,
-                )
     finally:
         vae.clear_cache()
 

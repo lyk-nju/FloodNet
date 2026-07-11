@@ -44,6 +44,9 @@ class MotionApp {
         this.lastTrajectoryPushTime = 0;
         this.trajectoryPushInFlight = false;
         this.pendingTrajectoryPush = false;
+        this.trajectorySnapshotRevision = -1;
+        this.trajectoryAuthoredSignature = '';
+        this.trajectoryProposalVersion = null;
 
         this.initThreeJS();
         this.initUI();
@@ -209,6 +212,12 @@ class MotionApp {
             emissive: 0x003344
         });
         this.initTrajectoryTargetLine();
+        this.trajAuthoredLine = this.trajTargetLine;
+        this.trajProposalLine = this.createTrajectoryDiagnosticLine(0x24a148, 0.9);
+        this.trajPayloadLine = this.createTrajectoryDiagnosticLine(0xff8c1a, 0.95);
+        this.trajHistoryGroup = new THREE.Group();
+        this.scene.add(this.trajHistoryGroup);
+        this.trajectoryHistorySignature = '';
 
         // Handle window resize
         window.addEventListener('resize', () => this.onWindowResize());
@@ -235,6 +244,19 @@ class MotionApp {
         this.trajTargetLine = new THREE.Line(geometry, material);
         this.trajTargetLine.frustumCulled = false;
         this.scene.add(this.trajTargetLine);
+    }
+
+    createTrajectoryDiagnosticLine(color, opacity) {
+        const material = new THREE.LineBasicMaterial({
+            color: color,
+            transparent: true,
+            opacity: opacity,
+        });
+        const line = new THREE.Line(new THREE.BufferGeometry(), material);
+        line.frustumCulled = false;
+        line.visible = true;
+        this.scene.add(line);
+        return line;
     }
 
     clearTrajectoryTargetMarkers() {
@@ -275,6 +297,10 @@ class MotionApp {
         this.trajectoryDelayTokens = document.getElementById('trajectoryDelayTokens');
         this.updateTrajBtn = document.getElementById('updateTrajBtn');
         this.clearTrajBtn = document.getElementById('clearTrajBtn');
+        this.showAuthoredTrajectory = document.getElementById('showAuthoredTrajectory');
+        this.showProposalTrajectory = document.getElementById('showProposalTrajectory');
+        this.showPayloadTrajectory = document.getElementById('showPayloadTrajectory');
+        this.showTrajectoryHistory = document.getElementById('showTrajectoryHistory');
 
         // Track state
         this.isPaused = false;
@@ -307,6 +333,22 @@ class MotionApp {
             this.rootFeedbackAlpha.addEventListener('input', (e) => {
                 const value = parseFloat(e.target.value).toFixed(2);
                 this.rootFeedbackValue.textContent = value;
+            });
+        }
+        const layerBindings = [
+            [this.showAuthoredTrajectory, this.trajAuthoredLine],
+            [this.showProposalTrajectory, this.trajProposalLine],
+            [this.showPayloadTrajectory, this.trajPayloadLine],
+            [this.showTrajectoryHistory, this.trajHistoryGroup],
+        ];
+        for (const [control, object] of layerBindings) {
+            if (!control || !object) continue;
+            object.visible = control.checked;
+            control.addEventListener('change', () => {
+                object.visible = control.checked;
+                if (control === this.showAuthoredTrajectory && this.trajTargetGroup) {
+                    this.trajTargetGroup.visible = control.checked;
+                }
             });
         }
     }
@@ -350,7 +392,7 @@ class MotionApp {
 
         const smoothingAlpha = parseFloat(this.smoothingAlpha.value);
         const rootFeedbackEnabled = Boolean(this.rootFeedbackEnabled && this.rootFeedbackEnabled.checked);
-        const rootFeedbackAlpha = parseFloat(this.rootFeedbackAlpha ? this.rootFeedbackAlpha.value : 0.5);
+        const rootFeedbackAlpha = parseFloat(this.rootFeedbackAlpha ? this.rootFeedbackAlpha.value : 1.0);
 
         this.isProcessing = true;
         this.statusEl.textContent = 'Initializing...';
@@ -670,7 +712,7 @@ class MotionApp {
         const smoothingAlpha = parseFloat(this.smoothingAlpha.value);
         const denoiseSteps = parseInt(this.denoiseSteps.value) || 10;
         const rootFeedbackEnabled = Boolean(this.rootFeedbackEnabled && this.rootFeedbackEnabled.checked);
-        const rootFeedbackAlpha = parseFloat(this.rootFeedbackAlpha ? this.rootFeedbackAlpha.value : 0.5);
+        const rootFeedbackAlpha = parseFloat(this.rootFeedbackAlpha ? this.rootFeedbackAlpha.value : 1.0);
 
         this.isProcessing = true;
         try {
@@ -719,11 +761,7 @@ class MotionApp {
                 // Clear drawn trajectory points (mouse-drawn)
                 this.clearDrawnTrajectoryUI();
 
-                // Clear target trajectory line
-                if (this.trajTargetLine) {
-                    this.trajTargetLine.geometry.setDrawRange(0, 0);
-                    this.trajTargetLine.geometry.attributes.position.needsUpdate = true;
-                }
+                this.updateTrajectoryDiagnostics({ current: {}, snapshots: [] });
 
                 console.log('Reset complete - all state cleared');
             }
@@ -780,7 +818,7 @@ class MotionApp {
             // Mark as fetching to prevent concurrent requests
             this.isFetchingFrame = true;
 
-            fetch(`/api/get_frame?session_id=${this.sessionId}`)
+            fetch(`/api/get_frame?session_id=${this.sessionId}&trajectory_snapshot_revision=${this.trajectorySnapshotRevision}`)
                 .then(response => response.json())
                 .then(data => {
                     if (data.status === 'success') {
@@ -806,7 +844,11 @@ class MotionApp {
                         }
 
                         // Update target line from latest model-space trajectory.
-                        this.updateTrajectoryTargetLine(data.trajectory);
+                        if (data.trajectory_debug) {
+                            this.updateTrajectoryDiagnostics(data.trajectory_debug);
+                        } else {
+                            this.updateTrajectoryTargetLine(data.trajectory);
+                        }
 
                         // Auto-follow (if user hasn't interacted for a while)
                         this.updateAutoFollow();
@@ -840,34 +882,128 @@ class MotionApp {
 
     updateTrajectoryTargetLine(trajPoints) {
         if (!this.trajTargetLine) return;
-
-        const geometry = this.trajTargetLine.geometry;
-        const positions = geometry.attributes.position.array;
         if (!trajPoints || trajPoints.length === 0) {
-            geometry.setDrawRange(0, 0);
-            geometry.attributes.position.needsUpdate = true;
+            this.setTrajectoryLinePoints(this.trajTargetLine, []);
+            this.trajTargetLine.visible = false;
             this.clearTrajectoryTargetMarkers();
             return;
         }
 
-        const n = Math.min(trajPoints.length, 20);
+        this.setTrajectoryLinePoints(this.trajTargetLine, trajPoints, 0.08);
+        this.trajTargetLine.visible = Boolean(this.showAuthoredTrajectory && this.showAuthoredTrajectory.checked);
         this.clearTrajectoryTargetMarkers();
-        for (let i = 0; i < n; i++) {
+        const markerStride = Math.max(1, Math.ceil(trajPoints.length / 80));
+        for (let i = 0; i < trajPoints.length; i += markerStride) {
             // Backend returns world-space trajectory points.
             const x = trajPoints[i][0];
             const y = 0.08;  // visibly above grid/floor
             const z = trajPoints[i][2];
-            positions[i * 3]     = x;
-            positions[i * 3 + 1] = y;
-            positions[i * 3 + 2] = z;
 
             const marker = new THREE.Mesh(this.trajTargetPointGeometry, this.trajTargetPointMaterial);
             marker.position.set(x, y, z);
             this.trajTargetGroup.add(marker);
             this.trajTargetMarkers.push(marker);
         }
-        geometry.setDrawRange(0, n);
-        geometry.attributes.position.needsUpdate = true;
+    }
+
+    setTrajectoryLinePoints(line, trajPoints, yOffset = 0.08) {
+        if (!line) return;
+        const points = trajPoints || [];
+        const count = points.length;
+        let attribute = line.geometry.getAttribute('position');
+        const capacity = attribute ? Math.floor(attribute.array.length / 3) : 0;
+        if (capacity < count) {
+            let nextCapacity = Math.max(2, capacity || 2);
+            while (nextCapacity < count) nextCapacity *= 2;
+            attribute = new THREE.BufferAttribute(
+                new Float32Array(nextCapacity * 3),
+                3,
+            );
+            line.geometry.setAttribute('position', attribute);
+        }
+        if (attribute) {
+            for (let index = 0; index < count; index++) {
+                const point = points[index];
+                attribute.setXYZ(
+                    index,
+                    Number(point[0]),
+                    yOffset,
+                    Number(point[2]),
+                );
+            }
+            attribute.needsUpdate = true;
+        }
+        line.geometry.setDrawRange(0, count);
+        if (attribute && count > 0) line.geometry.computeBoundingSphere();
+        line.userData.trajectoryPointCount = count;
+        line.visible = count > 0;
+    }
+
+    clearTrajectoryHistory() {
+        if (!this.trajHistoryGroup) return;
+        while (this.trajHistoryGroup.children.length > 0) {
+            const child = this.trajHistoryGroup.children[0];
+            this.trajHistoryGroup.remove(child);
+            child.geometry.dispose();
+            child.material.dispose();
+        }
+        this.trajectoryHistorySignature = '';
+    }
+
+    updateTrajectoryDiagnostics(debug) {
+        const current = (debug && debug.current) || {};
+        if (Object.prototype.hasOwnProperty.call(current, 'authored_route')) {
+            const authored = current.authored_route || [];
+            const authoredSignature = JSON.stringify(authored);
+            if (authoredSignature !== this.trajectoryAuthoredSignature) {
+                this.trajectoryAuthoredSignature = authoredSignature;
+                this.updateTrajectoryTargetLine(authored);
+            }
+        }
+        if (Object.prototype.hasOwnProperty.call(current, 'root_source_proposal') && current.source_version !== this.trajectoryProposalVersion) {
+            this.trajectoryProposalVersion = current.source_version;
+            this.setTrajectoryLinePoints(this.trajProposalLine, current.root_source_proposal || [], 0.09);
+        }
+        const payloadFuture = current.actual_payload_future || [];
+        this.setTrajectoryLinePoints(this.trajPayloadLine, payloadFuture, 0.10);
+        if (this.trajProposalLine) {
+            this.trajProposalLine.visible = Boolean(
+                this.showProposalTrajectory
+                && this.showProposalTrajectory.checked
+                && this.trajProposalLine.userData.trajectoryPointCount
+            );
+        }
+        if (this.trajPayloadLine) {
+            this.trajPayloadLine.visible = Boolean(this.showPayloadTrajectory && this.showPayloadTrajectory.checked && payloadFuture.length);
+        }
+
+        if (debug && Number.isInteger(debug.snapshot_revision)) {
+            this.trajectorySnapshotRevision = debug.snapshot_revision;
+        }
+        if (!Object.prototype.hasOwnProperty.call(debug, 'snapshots')) return;
+        const snapshots = debug.snapshots || [];
+        const signature = snapshots.map((item) => item.source_version).join(',');
+        if (signature === this.trajectoryHistorySignature) return;
+        this.clearTrajectoryHistory();
+        this.trajectoryHistorySignature = signature;
+        for (const snapshot of snapshots) {
+            for (const [key, color] of [['proposal', 0x24a148], ['payload', 0xff8c1a]]) {
+                const points = (snapshot[key] || []).map((point) => (
+                    new THREE.Vector3(Number(point[0]), 0.065, Number(point[2]))
+                ));
+                if (points.length < 2) continue;
+                const material = new THREE.LineBasicMaterial({
+                    color: color,
+                    transparent: true,
+                    opacity: 0.2,
+                });
+                this.trajHistoryGroup.add(new THREE.Line(
+                    new THREE.BufferGeometry().setFromPoints(points),
+                    material,
+                ));
+            }
+        }
+        this.trajHistoryGroup.visible = Boolean(this.showTrajectoryHistory && this.showTrajectoryHistory.checked);
     }
 
     updateAutoFollow() {

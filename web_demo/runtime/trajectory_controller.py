@@ -13,7 +13,7 @@ class TrajectoryController:
 
     def __init__(self, controls: TrajectoryRuntimeControls):
         self.controls = controls
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.active_route = None
         self.pending_update = None
         self.current_waypoints = None
@@ -88,8 +88,9 @@ class TrajectoryController:
         self.set_display(None)
 
     def next_plan_version(self) -> int:
-        self.plan_version_counter += 1
-        return self.plan_version_counter
+        with self.lock:
+            self.plan_version_counter += 1
+            return self.plan_version_counter
 
     def set_active_route(self, route, *, waypoints=None, times=None, mode="replace_future"):
         with self.lock:

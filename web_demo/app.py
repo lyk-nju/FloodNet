@@ -123,6 +123,7 @@ def load_debug_preset_sample():
         "num_frames": int(len(feature)),
         "duration_seconds": float(max(0, len(root) - 1) * waypoint_dt),
         "waypoint_dt": waypoint_dt,
+        "repeat": dict(cfg.get("repeat", {}) or {}),
     }
 
 

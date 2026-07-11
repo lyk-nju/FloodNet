@@ -40,7 +40,11 @@ class _FakeVae:
         self.model._conv_idx[0] += 1
         self.model._feat_map[0] += 1.0
         frames = 1 if first_chunk else 4
-        return torch.zeros(1, frames, 263, dtype=torch.float32)
+        return torch.full(
+            (1, frames, 263),
+            float(len(self.decode_calls)),
+            dtype=torch.float32,
+        )
 
     def stream_encode(self, motion, first_chunk=True):
         self.encode_calls.append((motion.detach().clone(), bool(first_chunk)))
@@ -179,6 +183,30 @@ def test_enabled_root_feedback_reencodes_and_writes_corrected_token():
     assert len(vae.encode_calls) == 1
     assert torch.equal(result.latent_token, torch.full((1, 2), 7.0))
     assert torch.equal(model.generated[0, :, 3, 0, 0], torch.tensor([7.0, 7.0]))
+    assert torch.all(result.decoded_motion_chunk == 2.0)
+
+
+def test_root_feedback_only_replaces_partial_valid_prefix():
+    model = _FakeLdf()
+    vae = _FakeVae()
+    payload = _payload()
+    payload["traj_cond_frame_mask"][0, 3:] = False
+
+    result = decode_token_with_root_feedback(
+        model=model,
+        vae=vae,
+        latent_token=torch.tensor([[2.0, 3.0]]),
+        traj_payload=payload,
+        generated_frame_count=0,
+        local_commit_index=3,
+        first_chunk=False,
+        config=RootFeedbackConfig(enabled=True, xz_blend_alpha=1.0),
+        device=torch.device("cpu"),
+    )
+
+    corrected_before_encode = vae.encode_calls[0][0][0]
+    assert result.applied is True
+    assert torch.equal(corrected_before_encode[2:], torch.ones_like(corrected_before_encode[2:]))
 
 
 def test_root_feedback_ignores_invalid_padding_frames():

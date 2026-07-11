@@ -90,27 +90,33 @@ def test_world_policy_is_monotonic_and_heading_aware():
     assert heading_projection.heading_dot == pytest.approx(1.0)
 
 
-def test_relative_policy_advances_by_absolute_future_phase_not_world_projection():
+def test_relative_policy_uses_phase_as_lower_bound_and_advances_to_actor_position():
     activated = _activated(_route([(100.0, float(index)) for index in range(12)]))
     policy = RelativeRouteProgressPolicy(lookahead_m=0.25)
 
     projection = policy.project(
         activated,
         current_first_future_frame_abs=activated.first_future_frame_abs + 8,
+        actor_xz=torch.tensor([100.0, 10.0]),
+        actor_yaw=torch.tensor(0.0),
         previous_progress=RouteProgressState.initial(),
     )
 
-    assert projection.route_index == 8
-    assert projection.proposed_progress.route_index == 8
+    assert projection is not None
+    assert projection.route_index == 10
+    assert projection.proposed_progress.route_index == 10
     assert projection.distance == 0.0
     assert projection.heading_dot == 1.0
 
     later = policy.project(
         activated,
         current_first_future_frame_abs=activated.first_future_frame_abs + 3,
+        actor_xz=torch.tensor([100.0, 5.0]),
+        actor_yaw=torch.tensor(0.0),
         previous_progress=projection.proposed_progress,
     )
-    assert later.route_index == 8
+    assert later is not None
+    assert later.route_index == 10
     assert not hasattr(policy, "_last_index")
     with pytest.raises(FrozenInstanceError):
         policy.lookahead_m = 1.0
@@ -125,10 +131,13 @@ def test_relative_policy_subtracts_nonzero_activation_frame_base():
     projection = RelativeRouteProgressPolicy(lookahead_m=0.25).project(
         activated,
         current_first_future_frame_abs=45,
+        actor_xz=torch.tensor([100.0, 8.0]),
+        actor_yaw=torch.tensor(0.0),
         previous_progress=RouteProgressState.initial(),
     )
 
     assert activated.first_future_frame_abs == 37
+    assert projection is not None
     assert projection.route_index == 8
     assert projection.proposed_progress.route_index == 8
 
@@ -152,12 +161,29 @@ def test_relative_policy_clamps_single_frame_exact_end_and_past_end(
     projection = RelativeRouteProgressPolicy().project(
         activated,
         current_first_future_frame_abs=current_first_future_frame_abs,
+        actor_xz=torch.tensor([0.0, float(expected_index)]),
+        actor_yaw=torch.tensor(0.0),
         previous_progress=RouteProgressState.initial(),
     )
 
+    assert projection is not None
     assert projection.route_index == expected_index
     assert projection.future_index == expected_index
     assert projection.proposed_progress.route_index == expected_index
+
+
+def test_relative_policy_returns_exhausted_when_all_remaining_points_are_behind_actor():
+    activated = _activated(_route([(0.0, float(index)) for index in range(6)]))
+
+    projection = RelativeRouteProgressPolicy().project(
+        activated,
+        current_first_future_frame_abs=activated.first_future_frame_abs + 3,
+        actor_xz=torch.tensor([0.0, 8.0]),
+        actor_yaw=torch.tensor(0.0),
+        previous_progress=RouteProgressState.initial(),
+    )
+
+    assert projection is None
 
 
 def test_world_policy_clamps_a_single_frame_route():

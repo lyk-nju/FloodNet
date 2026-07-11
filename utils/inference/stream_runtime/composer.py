@@ -10,7 +10,6 @@ from torch import Tensor
 from utils.inference.timeline import RootFrameState
 from utils.local_frame import (
     heading_dir_xz,
-    transform_xz_local_delta_to_world,
     wrap_angle,
 )
 from utils.motion_process import build_physical_7d_from_5d
@@ -97,38 +96,6 @@ def _build_bridge_5d(start_5d: Tensor, end_5d: Tensor, frames: int) -> Tensor:
     )
 
 
-def _relative_suffix_5d(
-    route_5d: Tensor,
-    *,
-    route_index: int,
-    boundary_5d: Tensor,
-) -> Tensor:
-    """Rigidly place a remaining authored suffix at the actor boundary."""
-    suffix = route_5d[route_index:]
-    route_anchor = suffix[0]
-    route_yaw = torch.atan2(suffix[:, 4], suffix[:, 3])
-    route_anchor_yaw = route_yaw[0]
-    boundary_yaw = torch.atan2(boundary_5d[4], boundary_5d[3])
-    yaw_offset = wrap_angle(boundary_yaw - route_anchor_yaw)
-    relative_xz = suffix[:, [0, 2]] - route_anchor[[0, 2]]
-    world_xz = boundary_5d[[0, 2]][None, :] + transform_xz_local_delta_to_world(
-        relative_xz,
-        yaw_offset,
-    )
-    world_y = boundary_5d[1] + suffix[:, 1] - route_anchor[1]
-    world_yaw = boundary_yaw + wrap_angle(route_yaw - route_anchor_yaw)
-    return torch.stack(
-        [
-            world_xz[:, 0],
-            world_y,
-            world_xz[:, 1],
-            torch.cos(world_yaw),
-            torch.sin(world_yaw),
-        ],
-        dim=-1,
-    )
-
-
 @dataclass(frozen=True)
 class ConditionComposer:
     """Statelessly combine generated history with one activated route future."""
@@ -179,6 +146,8 @@ class ConditionComposer:
         return self.relative_progress_policy.project(
             valid_activated,
             current_first_future_frame_abs=first_future_frame_abs,
+            actor_xz=boundary_state.world_xz,
+            actor_yaw=boundary_state.world_yaw,
             previous_progress=previous_progress,
         )
 
@@ -302,16 +271,18 @@ class ConditionComposer:
         else:
             assert route_index is not None and future_index is not None
             route_5d = route_7d[:valid_prefix, :5]
+            materialized = route_5d
             if activated.space_contract is SpaceContract.RELATIVE_ROUTE:
-                materialized = _relative_suffix_5d(
-                    route_5d,
-                    route_index=route_index,
-                    boundary_5d=boundary_5d,
+                # RootFrameState intentionally owns only XZ/yaw. Keep the
+                # activation-frozen horizontal route while carrying generated
+                # root height continuously through the active window.
+                materialized = route_5d.clone()
+                materialized[:, 1] = (
+                    boundary_5d[1]
+                    + route_5d[:, 1]
+                    - route_5d[route_index, 1]
                 )
-                target_local = future_index - route_index
-            else:
-                materialized = route_5d
-                target_local = future_index
+            target_local = future_index
 
             target_5d = materialized[target_local]
             bridge_5d = _build_bridge_5d(boundary_5d, target_5d, bridge_count)
