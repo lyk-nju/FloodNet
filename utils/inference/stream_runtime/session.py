@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import threading
 
 import numpy as np
 import torch
@@ -25,7 +26,13 @@ from utils.inference.timeline import (
 from utils.motion_process import build_physical_7d_from_5d
 from utils.token_frame import first_future_frame_abs, token_range_to_frame_slice
 
-from .commands import RuntimeCommandEnvelope, RuntimeCommandQueue, reduce_commands
+from .commands import (
+    UNSET,
+    RuntimeCommandEnvelope,
+    RuntimeCommandQueue,
+    SetRuntimeControls,
+    reduce_commands,
+)
 from .composer import ConditionComposer
 from .contracts import (
     RouteProgressState,
@@ -74,6 +81,8 @@ class StreamRuntimeSession:
         self.first_chunk = generated_history.next_frame_abs == 0
         self.session_anchor_state = copy.deepcopy(timeline.earliest)
         self.session_epoch = 0
+        self._step_lock = threading.Lock()
+        self._initialize_model_stream_state(initial_config)
         if hasattr(self.vae, "clear_cache"):
             self.vae.clear_cache()
 
@@ -82,7 +91,53 @@ class StreamRuntimeSession:
         return self.kernel.ldf_model
 
     def submit(self, command: RuntimeCommandEnvelope) -> int:
+        if isinstance(command, SetRuntimeControls):
+            changes_history = (
+                command.history_tokens is not UNSET
+                and int(command.history_tokens) != int(self.config.history_tokens)
+            )
+            changes_denoise = (
+                command.num_denoise_steps is not UNSET
+                and command.num_denoise_steps != self.config.num_denoise_steps
+            )
+            if (
+                (changes_history or changes_denoise)
+                and int(self.timeline.head.commit_idx) > 0
+            ):
+                raise RuntimeError(
+                    "history_tokens and num_denoise_steps require a reset"
+                )
         return self.command_queue.submit(command)
+
+    def _initialize_model_stream_state(self, config: RuntimeStepConfig) -> None:
+        model = self.model
+        num_steps = (
+            int(config.num_denoise_steps)
+            if config.num_denoise_steps is not None
+            else int(getattr(model, "noise_steps", 1))
+        )
+        if hasattr(model, "init_generated"):
+            model.init_generated(
+                int(config.history_tokens),
+                batch_size=int(getattr(self.kernel, "batch_size", 1)),
+                num_denoise_steps=num_steps,
+                traj_buffer=None,
+            )
+            return
+        if hasattr(model, "commit_index"):
+            model.commit_index = 0
+        if hasattr(model, "current_step"):
+            model.current_step = 0
+
+    @staticmethod
+    def _reset_only_controls_changed(
+        before: RuntimeStepConfig,
+        after: RuntimeStepConfig,
+    ) -> bool:
+        return (
+            int(before.history_tokens) != int(after.history_tokens)
+            or before.num_denoise_steps != after.num_denoise_steps
+        )
 
     def _rng_devices(self):
         device = torch.device(getattr(self.kernel, "device", "cpu"))
@@ -129,32 +184,14 @@ class StreamRuntimeSession:
             device=self.timeline.earliest.world_xz.device,
             dtype=self.timeline.earliest.world_xz.dtype,
         )
-        self.timeline = RootTimeline(state)
-        self.generated_history = GeneratedRootHistory.empty(
-            0,
-            device=state.world_xz.device,
-            dtype=state.world_xz.dtype,
-        )
+        self.timeline.reset_to(state)
+        self.generated_history.reset_to(0)
         self.session_anchor_state = copy.deepcopy(state)
         self.source_manager.reset()
         self.config = self.initial_config
         self.first_chunk = True
         self.session_epoch += 1
-        model = self.model
-        if hasattr(model, "init_generated") and hasattr(model, "seq_len"):
-            model.init_generated(
-                int(model.seq_len),
-                batch_size=int(getattr(model, "batch_size", 1)),
-                num_denoise_steps=int(
-                    getattr(model, "num_denoise_steps", getattr(model, "noise_steps", 1))
-                ),
-                traj_buffer=getattr(model, "_traj_buf", None),
-            )
-        else:
-            if hasattr(model, "commit_index"):
-                model.commit_index = 0
-            if hasattr(model, "current_step"):
-                model.current_step = 0
+        self._initialize_model_stream_state(self.initial_config)
         if hasattr(self.recovery, "reset"):
             self.recovery.reset()
         if hasattr(self.vae, "clear_cache"):
@@ -171,10 +208,15 @@ class StreamRuntimeSession:
         *,
         applied_command_version: int = 0,
     ) -> SessionResetEvent:
-        return self._reset_owned(
-            initial_state=initial_state,
-            applied_command_version=applied_command_version,
-        )
+        if not self._step_lock.acquire(blocking=False):
+            raise RuntimeError("concurrent StreamRuntimeSession reset/step is forbidden")
+        try:
+            return self._reset_owned(
+                initial_state=initial_state,
+                applied_command_version=applied_command_version,
+            )
+        finally:
+            self._step_lock.release()
 
     def _compose_payload(self, active, config, commit_abs):
         if active is None:
@@ -234,20 +276,67 @@ class StreamRuntimeSession:
             root_7d = build_physical_7d_from_5d(root_5d)
         return torch.as_tensor(np.stack(joints), dtype=torch.float32), root_7d
 
+    def _trim_retained_state(
+        self,
+        *,
+        absolute_commit_after: int,
+        config: RuntimeStepConfig,
+    ) -> None:
+        earliest_anchor_commit = max(
+            0,
+            int(absolute_commit_after) + 1 - int(config.history_tokens),
+        )
+        self.timeline.trim_before(earliest_anchor_commit)
+        earliest_frame = int(
+            token_range_to_frame_slice(earliest_anchor_commit, 1).start
+        )
+        earliest_frame = min(earliest_frame, self.generated_history.next_frame_abs)
+        self.generated_history.trim_before(earliest_frame)
+
     def step(self) -> RuntimeEvent:
+        if not self._step_lock.acquire(blocking=False):
+            raise RuntimeError("concurrent StreamRuntimeSession.step() is forbidden")
+        try:
+            return self._step_unlocked()
+        finally:
+            self._step_lock.release()
+
+    def _step_unlocked(self) -> RuntimeEvent:
         snapshot = self._snapshot()
         batch = None
         try:
             commit_abs = int(self.timeline.head.commit_idx)
             batch = self.command_queue.prepare_due(commit_abs)
-            transition = reduce_commands(self.config, batch, self.timeline.head)
+            transition = reduce_commands(
+                self.config,
+                batch,
+                self.timeline.head,
+                reset_base_config=self.initial_config,
+            )
+            reset_controls_changed = self._reset_only_controls_changed(
+                self.config,
+                transition.proposed_config,
+            )
+            if (
+                transition.reset_intent is None
+                and reset_controls_changed
+                and commit_abs > 0
+            ):
+                self.command_queue.ack(batch)
+                batch = None
+                raise RuntimeError(
+                    "history_tokens and num_denoise_steps require a reset"
+                )
             if transition.reset_intent is not None and transition.diagnostics.get(
                 "reset_is_exclusive"
             ):
                 event = self._reset_owned(
                     applied_command_version=transition.reset_intent.version
                 )
-                self.command_queue.ack(batch)
+                self.command_queue.ack(
+                    batch,
+                    discard_through_version=transition.reset_intent.version,
+                )
                 return event
 
             reset_epoch = transition.reset_intent is not None
@@ -256,6 +345,11 @@ class StreamRuntimeSession:
                     applied_command_version=transition.reset_intent.version
                 )
                 commit_abs = 0
+            if self._reset_only_controls_changed(
+                self.config,
+                transition.proposed_config,
+            ):
+                self._initialize_model_stream_state(transition.proposed_config)
             boundary = self.timeline.head
             prepared_source = self.source_manager.prepare_transition(
                 transition.root_source_command,
@@ -277,6 +371,12 @@ class StreamRuntimeSession:
                 first_chunk=self.first_chunk,
                 num_denoise_steps=config.num_denoise_steps,
             )
+            if int(kernel_result.absolute_commit_before) != commit_abs:
+                raise RuntimeError(
+                    "LDF/timeline commit mismatch: "
+                    f"model={kernel_result.absolute_commit_before}, "
+                    f"timeline={commit_abs}"
+                )
             feedback = decode_token_with_root_feedback(
                 model=self.model,
                 vae=self.vae,
@@ -350,7 +450,18 @@ class StreamRuntimeSession:
                 route_status=self.source_manager.route_status,
                 root_feedback_diagnostics=feedback.debug,
             )
-            self.command_queue.ack(batch)
+            self._trim_retained_state(
+                absolute_commit_after=absolute_after,
+                config=config,
+            )
+            self.command_queue.ack(
+                batch,
+                discard_through_version=(
+                    None
+                    if transition.reset_intent is None
+                    else transition.reset_intent.version
+                ),
+            )
             return event
         except Exception:
             if batch is not None:

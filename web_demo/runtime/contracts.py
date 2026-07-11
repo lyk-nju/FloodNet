@@ -22,8 +22,8 @@ class TrajectoryRuntimeControls:
             "trajectory_delay_tokens": self.delay_tokens,
             "trajectory_blend_enabled": self.blend_enabled,
             "trajectory_blend_tokens": self.blend_tokens,
+            "trajectory_blend_supported": False,
         }
 
 
 __all__ = ["TrajectoryRuntimeControls"]
-

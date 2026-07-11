@@ -15,6 +15,7 @@ from utils.inference.route_condition import RoutePlan
 from utils.inference.timeline import RootFrameState
 from utils.inference.stream_runtime import KernelStepResult
 from utils.local_frame import canonicalize_5d
+from utils.motion_process import build_physical_7d_from_5d
 from utils.token_frame import (
     frame_idx_to_token_idx,
     num_tokens_for_frame_len,

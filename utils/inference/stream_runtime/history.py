@@ -84,5 +84,10 @@ class GeneratedRootHistory:
         self.frames_7d = self.frames_7d[target - self.base_frame_abs :]
         self.base_frame_abs = target
 
+    def reset_to(self, base_frame_abs: int = 0) -> None:
+        """Clear retained frames in place while preserving object identity."""
+        self.base_frame_abs = int(base_frame_abs)
+        self.frames_7d = self.frames_7d.new_empty((0, 7))
+
 
 __all__ = ["GeneratedRootHistory"]

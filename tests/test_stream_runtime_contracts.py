@@ -104,6 +104,17 @@ def test_proposal_rejects_ambiguous_future_or_mask(future, mask, error):
         )
 
 
+def test_root_source_proposal_rejects_non_prefix_validity_mask():
+    with pytest.raises(ValueError, match="contiguous valid prefix"):
+        RootSourceProposal(
+            future_traj7=torch.zeros(3, 7),
+            future_frame_mask=torch.tensor([True, False, True]),
+            source_id="invalid-mask",
+            version=1,
+            metadata={},
+        )
+
+
 def test_root_source_command_enforces_replace_and_clear_contracts():
     proposal = RootSourceProposal(
         future_traj7=_future(),

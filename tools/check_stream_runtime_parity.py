@@ -104,11 +104,6 @@ def _prepare_bundle(args):
                 "not applied implicitly because they would make the parity inputs differ"
             )
     session = bundle.runtime_session
-    bundle.stream_generator.init_ldf_generation(
-        history_length=session.config.history_tokens,
-        batch_size=1,
-        num_denoise_steps=session.config.num_denoise_steps,
-    )
     session.submit(SetText(version=1, requested_commit_abs=0, text="walk forward"))
     session.submit(
         SetRootFeedback(

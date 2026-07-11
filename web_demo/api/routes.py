@@ -235,8 +235,6 @@ def register_routes(
                 horizon_tokens=req.horizon_tokens,
                 delay_enabled=req.delay_enabled,
                 delay_tokens=req.delay_tokens,
-                blend_enabled=req.blend_enabled,
-                blend_tokens=req.blend_tokens,
             )
             target_len = 0 if target_traj is None else len(target_traj)
             print(
@@ -262,16 +260,6 @@ def register_routes(
                 "delay_tokens": getattr(
                     model_manager,
                     "traj_update_delay_tokens",
-                    None,
-                ),
-                "blend_enabled": getattr(
-                    model_manager,
-                    "traj_update_blend_enabled",
-                    None,
-                ),
-                "blend_tokens": getattr(
-                    model_manager,
-                    "traj_update_blend_tokens",
                     None,
                 ),
                 "trajectory": (

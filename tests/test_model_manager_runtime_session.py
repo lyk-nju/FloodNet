@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+import time
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -16,6 +19,8 @@ from utils.inference.timeline import RootFrameState, RootTimeline
 from web_demo.model_manager import ModelManager
 from web_demo.runtime.model_bundle import ModelBundle
 from web_demo.runtime.model_loader import build_runtime_session
+from web_demo.runtime.contracts import TrajectoryRuntimeControls
+from web_demo.runtime.trajectory_controller import TrajectoryController
 
 
 class _FakeGenerator:
@@ -102,9 +107,15 @@ def test_text_and_route_updates_only_submit_commands():
 class _FrameBuffer:
     def __init__(self):
         self.frames = []
+        self.atomic_batches = 0
 
     def add_frame(self, frame):
         self.frames.append(frame)
+
+    def add_frames_atomic(self, frames):
+        batch = list(frames)
+        self.frames.extend(batch)
+        self.atomic_batches += 1
 
     def size(self):
         return len(self.frames)
@@ -168,13 +179,107 @@ def test_generate_once_only_consumes_authoritative_session_event():
     manager.runtime_session.step.assert_called_once_with()
     assert event.absolute_commit_after == 2
     assert manager.frame_buffer.size() == 4
+    assert manager.frame_buffer.atomic_batches == 1
     assert torch.equal(
         torch.as_tensor(manager.frame_buffer.frames[-1]),
         event.joint_frames[-1],
     )
 
 
+def test_web_runtime_command_version_and_submit_are_serialized():
+    manager = ModelManager.__new__(ModelManager)
+    manager._runtime_command_version = 0
+    manager._runtime_command_lock = threading.RLock()
+    manager.runtime_session = SimpleNamespace(
+        timeline=RootTimeline(RootFrameState.initial()),
+    )
+    active_submits = 0
+    overlap = False
+    submitted = []
+    submit_lock = threading.Lock()
+
+    def submit(command):
+        nonlocal active_submits, overlap
+        with submit_lock:
+            active_submits += 1
+            overlap |= active_submits > 1
+        time.sleep(0.005)
+        submitted.append(command)
+        with submit_lock:
+            active_submits -= 1
+
+    manager.runtime_session.submit = submit
+    threads = [
+        threading.Thread(
+            target=lambda index=index: manager._submit_runtime_command(
+                SetText,
+                text=f"text-{index}",
+            )
+        )
+        for index in range(12)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2.0)
+
+    assert overlap is False
+    assert sorted(command.version for command in submitted) == list(range(1, 13))
+
+
+def test_web_pending_route_promotes_on_route_active_event():
+    manager = ModelManager.__new__(ModelManager)
+    event = replace(
+        _commit_event(),
+        source_id="manual:2",
+        source_version=2,
+        actual_activation_commit=1,
+        lifecycle_events=("route_active",),
+    )
+    timeline = RootTimeline(RootFrameState.initial())
+    timeline.append(event.timeline_state)
+    manager.runtime_session = SimpleNamespace(
+        step=Mock(return_value=event),
+        timeline=timeline,
+        session_anchor_state=timeline.earliest,
+        recovery=object(),
+        first_chunk=False,
+        generated_history=SimpleNamespace(next_frame_abs=1),
+    )
+    manager.frame_buffer = _FrameBuffer()
+    manager.root_xz_history = []
+    manager.root_5d_history = []
+    manager.trajectory_controller = TrajectoryController(
+        TrajectoryRuntimeControls(
+            route_mode="relative_to_actor",
+            horizon_tokens=20,
+            delay_enabled=True,
+            delay_tokens=5,
+            blend_enabled=False,
+            blend_tokens=0,
+        )
+    )
+    old_route = SimpleNamespace(version=1)
+    new_route = SimpleNamespace(version=2)
+    manager.trajectory_controller.active_route = old_route
+    manager.trajectory_controller.pending_update = SimpleNamespace(
+        version=2,
+        new_route=new_route,
+        effective_commit_index=1,
+    )
+    manager.trajectory_controller.state = "pending"
+
+    manager._generate_once()
+
+    assert manager.trajectory_controller.active_route is new_route
+    assert manager.trajectory_controller.pending_update is None
+    assert manager.trajectory_controller.state == "active_7d"
+    assert manager._active_source_version == 2
+    assert manager._actual_activation_commit == 1
+
+
 def test_web_manager_has_no_legacy_payload_execution_api():
     assert not hasattr(ModelManager, "_build_stream_traj_input")
     assert not hasattr(ModelManager, "_build_rootplan_stream_traj_input")
     assert not hasattr(ModelManager, "_build_temporary_rootplan_payload")
+    assert "use_owned_stream_execution" not in ModelManager.__init__.__code__.co_names

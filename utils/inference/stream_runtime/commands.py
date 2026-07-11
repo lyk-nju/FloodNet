@@ -108,7 +108,10 @@ class SetRootFeedback(RuntimeCommand):
         if self.enabled is not None:
             object.__setattr__(self, "enabled", bool(self.enabled))
         if self.xz_blend_alpha is not None:
-            object.__setattr__(self, "xz_blend_alpha", float(self.xz_blend_alpha))
+            alpha = float(self.xz_blend_alpha)
+            if not 0.0 <= alpha <= 1.0:
+                raise ValueError("xz_blend_alpha must be in [0, 1]")
+            object.__setattr__(self, "xz_blend_alpha", alpha)
 
 
 @dataclass(frozen=True)
@@ -128,11 +131,20 @@ class SetRuntimeControls(RuntimeCommand):
         ):
             raise ValueError("SetRuntimeControls requires at least one control")
         if self.history_tokens is not UNSET:
-            object.__setattr__(self, "history_tokens", int(self.history_tokens))
+            history = int(self.history_tokens)
+            if history < 1:
+                raise ValueError("history_tokens must be >= 1")
+            object.__setattr__(self, "history_tokens", history)
         if self.horizon_tokens is not UNSET:
-            object.__setattr__(self, "horizon_tokens", int(self.horizon_tokens))
+            horizon = int(self.horizon_tokens)
+            if horizon < 0:
+                raise ValueError("horizon_tokens must be >= 0")
+            object.__setattr__(self, "horizon_tokens", horizon)
         if self.num_denoise_steps is not UNSET and self.num_denoise_steps is not None:
-            object.__setattr__(self, "num_denoise_steps", int(self.num_denoise_steps))
+            steps = int(self.num_denoise_steps)
+            if steps <= 0:
+                raise ValueError("num_denoise_steps must be > 0")
+            object.__setattr__(self, "num_denoise_steps", steps)
 
 
 @dataclass(frozen=True)
@@ -268,7 +280,12 @@ class RuntimeCommandQueue:
             self._issued_batches[token] = batch
         return batch
 
-    def ack(self, batch: PreparedCommandBatch) -> None:
+    def ack(
+        self,
+        batch: PreparedCommandBatch,
+        *,
+        discard_through_version: int | None = None,
+    ) -> None:
         if not isinstance(batch, PreparedCommandBatch):
             raise TypeError("batch must be PreparedCommandBatch")
         with self._lock:
@@ -277,6 +294,13 @@ class RuntimeCommandQueue:
             if issued is not batch:
                 raise ValueError("batch was not issued by this queue or is no longer valid")
             versions = set(batch.versions)
+            if discard_through_version is not None:
+                cutoff = int(discard_through_version)
+                versions.update(
+                    command.version
+                    for command in self._pending
+                    if command.version <= cutoff
+                )
             pending_versions = {command.version for command in self._pending}
             if not versions.issubset(pending_versions):
                 self._issued_batches.pop(token, None)
@@ -304,6 +328,8 @@ def reduce_commands(
     base_config: RuntimeStepConfig,
     batch: PreparedCommandBatch,
     boundary_state: RootFrameState,
+    *,
+    reset_base_config: RuntimeStepConfig | None = None,
 ) -> PreparedRuntimeTransition:
     """Purely reduce a command snapshot into the next commit-boundary intent."""
 
@@ -325,7 +351,11 @@ def reduce_commands(
     )
     reset_intent = None if reset_index is None else commands[reset_index]
     start_index = 0 if reset_index is None else reset_index + 1
-    config = RuntimeStepConfig.default() if reset_intent is not None else base_config
+    config = (
+        (reset_base_config or RuntimeStepConfig.default())
+        if reset_intent is not None
+        else base_config
+    )
     root_source_command: RootSourceCommand | None = None
     winning_versions: set[int] = set()
     field_versions: dict[str, int] = {}

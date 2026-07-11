@@ -166,8 +166,6 @@ def get_trajectory_defaults() -> dict:
         "delay_tokens": int(
             traj_cfg.get("update_delay_tokens", traj_cfg.get("horizon_tokens", 20))
         ),
-        "blend_enabled": bool(traj_cfg.get("update_blend_enabled", True)),
-        "blend_tokens": int(traj_cfg.get("update_blend_tokens", 4)),
     }
 
 

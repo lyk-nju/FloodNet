@@ -67,6 +67,7 @@ def _payload(num_frames=12):
     traj[..., 2] = torch.arange(num_frames, dtype=torch.float32) * 0.1
     return {
         "traj_cond_7d_frame": traj,
+        "traj_cond_frame_mask": torch.ones(1, num_frames),
         "traj_abs_start_token": 0,
     }
 
@@ -178,3 +179,26 @@ def test_enabled_root_feedback_reencodes_and_writes_corrected_token():
     assert len(vae.encode_calls) == 1
     assert torch.equal(result.latent_token, torch.full((1, 2), 7.0))
     assert torch.equal(model.generated[0, :, 3, 0, 0], torch.tensor([7.0, 7.0]))
+
+
+def test_root_feedback_ignores_invalid_padding_frames():
+    model = _FakeLdf()
+    vae = _FakeVae()
+    payload = _payload()
+    payload["traj_cond_frame_mask"].zero_()
+
+    result = decode_token_with_root_feedback(
+        model=model,
+        vae=vae,
+        latent_token=torch.tensor([[2.0, 3.0]]),
+        traj_payload=payload,
+        generated_frame_count=0,
+        local_commit_index=3,
+        first_chunk=False,
+        config=RootFeedbackConfig(enabled=True, xz_blend_alpha=1.0),
+        device=torch.device("cpu"),
+    )
+
+    assert result.applied is False
+    assert result.debug["reason"] == "invalid_route_frames"
+    assert not vae.encode_calls

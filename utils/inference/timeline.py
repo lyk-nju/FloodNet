@@ -122,6 +122,12 @@ class RootTimeline:
             )
         self._states.append(state)
 
+    def reset_to(self, state: RootFrameState) -> None:
+        """Reset this timeline in place so external references stay valid."""
+        if not isinstance(state, RootFrameState):
+            raise TypeError(f"state must be RootFrameState, got {type(state)}")
+        self._states[:] = [state]
+
     def _binary_search_exact(self, commit_idx: int) -> int | None:
         lo, hi = 0, len(self._states) - 1
         while lo <= hi:

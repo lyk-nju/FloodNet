@@ -273,8 +273,6 @@ class MotionApp {
         this.trajectoryHorizonTokens = document.getElementById('trajectoryHorizonTokens');
         this.trajectoryDelayEnabled = document.getElementById('trajectoryDelayEnabled');
         this.trajectoryDelayTokens = document.getElementById('trajectoryDelayTokens');
-        this.trajectoryBlendEnabled = document.getElementById('trajectoryBlendEnabled');
-        this.trajectoryBlendTokens = document.getElementById('trajectoryBlendTokens');
         this.updateTrajBtn = document.getElementById('updateTrajBtn');
         this.clearTrajBtn = document.getElementById('clearTrajBtn');
 
@@ -294,12 +292,6 @@ class MotionApp {
         if (this.clearTrajBtn) this.clearTrajBtn.addEventListener('click', () => this.clearTrajectory());
         if (this.trajectoryDelayEnabled) {
             this.trajectoryDelayEnabled.addEventListener(
-                'change',
-                () => this.syncTrajectoryRuntimeControls()
-            );
-        }
-        if (this.trajectoryBlendEnabled) {
-            this.trajectoryBlendEnabled.addEventListener(
                 'change',
                 () => this.syncTrajectoryRuntimeControls()
             );
@@ -516,9 +508,6 @@ class MotionApp {
         if (this.trajectoryDelayTokens && this.trajectoryDelayEnabled) {
             this.trajectoryDelayTokens.disabled = !this.trajectoryDelayEnabled.checked;
         }
-        if (this.trajectoryBlendTokens && this.trajectoryBlendEnabled) {
-            this.trajectoryBlendTokens.disabled = !this.trajectoryBlendEnabled.checked;
-        }
     }
 
     parsePositiveIntInput(input, fallback, minValue = 0) {
@@ -533,9 +522,7 @@ class MotionApp {
             route_mode: this.getTrajectoryRouteMode(),
             horizon_tokens: this.parsePositiveIntInput(this.trajectoryHorizonTokens, 20, 1),
             delay_enabled: this.trajectoryDelayEnabled ? this.trajectoryDelayEnabled.checked : true,
-            delay_tokens: this.parsePositiveIntInput(this.trajectoryDelayTokens, 20, 0),
-            blend_enabled: this.trajectoryBlendEnabled ? this.trajectoryBlendEnabled.checked : true,
-            blend_tokens: this.parsePositiveIntInput(this.trajectoryBlendTokens, 4, 0)
+            delay_tokens: this.parsePositiveIntInput(this.trajectoryDelayTokens, 20, 0)
         };
     }
 

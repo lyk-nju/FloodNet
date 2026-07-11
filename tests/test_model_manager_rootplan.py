@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import numpy as np
+import pytest
 import torch
 from torch import nn
 
@@ -142,7 +143,7 @@ def test_model_manager_init_uses_model_bundle_not_stream_generator_helper(monkey
     assert mgr.cfg is fake_bundle.cfg
     assert mgr.stream_generator is fake_stream_generator
     assert not hasattr(mgr, "rootplan_controller")
-    assert mgr.use_owned_stream_execution is False
+    assert not hasattr(mgr, "use_owned_stream_execution")
     assert mgr.runtime_session.vae is fake_bundle.vae
     assert mgr.runtime_session.recovery is mgr.stream_recovery
 
@@ -448,7 +449,7 @@ def test_update_trajectory_second_edit_uses_route_update_contract():
     assert root_commands[0].space_contract.value == "relative_route"
 
 
-def test_update_trajectory_accepts_per_update_horizon_delay_blend_controls():
+def test_update_trajectory_accepts_horizon_delay_and_rejects_fake_blend_controls():
     mgr = _trajectory_manager()
     first = np.array([[0.0, 0.0], [0.0, 1.0]], dtype=np.float32)
     second = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float32)
@@ -460,33 +461,29 @@ def test_update_trajectory_accepts_per_update_horizon_delay_blend_controls():
         horizon_tokens=5,
         delay_enabled=True,
         delay_tokens=8,
-        blend_enabled=True,
-        blend_tokens=2,
     )
 
     assert preview is not None
     assert len(preview) == 5
     assert mgr.traj_horizon_tokens == 5
 
-    mgr.update_trajectory(
-        second,
-        source="manual",
-        route_mode="relative_to_actor",
-        horizon_tokens=7,
-        delay_enabled=False,
-        delay_tokens=8,
-        blend_enabled=True,
-        blend_tokens=6,
-    )
+    with pytest.raises(ValueError, match="route blending is not supported"):
+        mgr.update_trajectory(
+            second,
+            source="manual",
+            route_mode="relative_to_actor",
+            horizon_tokens=7,
+            delay_enabled=False,
+            delay_tokens=8,
+            blend_enabled=True,
+            blend_tokens=6,
+        )
 
-    assert mgr.traj_horizon_tokens == 7
-    assert mgr.traj_update_delay_enabled is False
+    assert mgr.traj_horizon_tokens == 5
+    assert mgr.traj_update_delay_enabled is True
     assert mgr.traj_update_delay_tokens == 8
-    assert mgr.traj_update_blend_enabled is True
-    assert mgr.traj_update_blend_tokens == 6
-    assert mgr.pending_update_event is not None
-    assert mgr.pending_update_event.delay_tokens == 0
-    assert mgr.pending_update_event.blend_tokens == 6
+    assert mgr.traj_update_blend_enabled is False
+    assert mgr.traj_update_blend_tokens == 0
 
 
 def test_update_trajectory_sets_absolute_route_mode_without_reanchoring():

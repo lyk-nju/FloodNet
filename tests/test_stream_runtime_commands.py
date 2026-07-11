@@ -260,3 +260,42 @@ def test_prepared_transition_requires_a_reset_session_for_reset_intent():
             diagnostics={},
             reset_intent=SetText(version=1, requested_commit_abs=0, text="walk"),
         )
+
+
+def test_invalid_runtime_command_never_enters_queue():
+    queue = RuntimeCommandQueue()
+
+    with pytest.raises(ValueError, match="xz_blend_alpha"):
+        queue.submit(
+            SetRootFeedback(
+                version=1,
+                requested_commit_abs=0,
+                xz_blend_alpha=1.1,
+            )
+        )
+    with pytest.raises(ValueError, match="history_tokens"):
+        queue.submit(
+            SetRuntimeControls(
+                version=1,
+                requested_commit_abs=0,
+                history_tokens=0,
+            )
+        )
+    with pytest.raises(ValueError, match="horizon_tokens"):
+        queue.submit(
+            SetRuntimeControls(
+                version=1,
+                requested_commit_abs=0,
+                horizon_tokens=-1,
+            )
+        )
+    with pytest.raises(ValueError, match="num_denoise_steps"):
+        queue.submit(
+            SetRuntimeControls(
+                version=1,
+                requested_commit_abs=0,
+                num_denoise_steps=0,
+            )
+        )
+
+    assert queue.pending_versions == ()

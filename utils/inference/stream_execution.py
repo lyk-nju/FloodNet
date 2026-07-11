@@ -162,16 +162,16 @@ def _root_feedback_target(
     *,
     generated_frame_count: int,
     xz_blend_alpha: float,
-) -> torch.Tensor | None:
+) -> tuple[torch.Tensor | None, str]:
     if not isinstance(traj_payload, dict):
-        return None
+        return None, "missing_target"
     condition = traj_payload.get("traj_cond_7d_frame")
     if condition is None:
-        return None
+        return None, "missing_target"
     traj = condition[0] if torch.is_tensor(condition) and condition.dim() == 3 else condition
     traj = torch.as_tensor(traj, device=decoded_chunk.device, dtype=decoded_chunk.dtype)
     if traj.dim() != 2 or traj.shape[-1] < 5 or int(traj.shape[0]) == 0:
-        return None
+        return None, "missing_target"
 
     absolute_start_token = int(
         traj_payload.get(
@@ -189,7 +189,36 @@ def _root_feedback_target(
         )
     target = traj[local_start:needed].clone()
     if int(target.shape[0]) < 2:
-        return None
+        return None, "missing_target"
+
+    frame_mask = traj_payload.get("traj_cond_frame_mask")
+    if frame_mask is not None:
+        mask = torch.as_tensor(frame_mask, device=decoded_chunk.device).bool()
+        if mask.dim() == 2:
+            mask = mask[0]
+        if mask.dim() != 1:
+            return None, "invalid_route_frames"
+        if int(mask.shape[0]) < needed:
+            mask = torch.cat(
+                [
+                    mask,
+                    torch.zeros(
+                        needed - int(mask.shape[0]),
+                        dtype=torch.bool,
+                        device=mask.device,
+                    ),
+                ]
+            )
+        target_mask = mask[local_start:needed]
+        invalid = torch.nonzero(~target_mask, as_tuple=False)
+        valid_prefix = (
+            int(target_mask.shape[0])
+            if int(invalid.shape[0]) == 0
+            else int(invalid[0, 0].item())
+        )
+        if valid_prefix < 2:
+            return None, "invalid_route_frames"
+        target = target[:valid_prefix]
 
     alpha = float(xz_blend_alpha)
     if alpha < 1.0:
@@ -202,7 +231,7 @@ def _root_feedback_target(
         target[:, [0, 2]] = (
             (1.0 - alpha) * generated_xyz[:, [0, 2]] + alpha * target_xz
         )
-    return target
+    return target, "applied"
 
 
 def _committed_latent_index_after_step(model, local_commit_index: int) -> int:
@@ -273,7 +302,7 @@ def decode_token_with_root_feedback(
         device=device,
     )
     restore_vae_stream_state(vae, cache)
-    target = _root_feedback_target(
+    target, target_reason = _root_feedback_target(
         traj_payload,
         decoded_raw,
         generated_frame_count=int(generated_frame_count),
@@ -290,7 +319,7 @@ def decode_token_with_root_feedback(
             latent_token=latent_token.detach().cpu(),
             decoded_motion_chunk=decoded,
             applied=False,
-            debug={"reason": "missing_target"},
+            debug={"reason": target_reason},
         )
 
     corrected = replace_root_channels_263_window_from_7d(

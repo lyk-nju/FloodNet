@@ -18,6 +18,11 @@ class FrameBuffer:
         with self.lock:
             self.buffer.append(joints)
 
+    def add_frames_atomic(self, frames):
+        batch = list(frames)
+        with self.lock:
+            self.buffer.extend(batch)
+
     def get_frame(self):
         with self.lock:
             if len(self.buffer) > 0:
@@ -37,4 +42,3 @@ class FrameBuffer:
 
 
 __all__ = ["FrameBuffer"]
-

@@ -16,8 +16,6 @@ class UpdateTrajectoryRequest:
     horizon_tokens: int | None = None
     delay_enabled: bool | None = None
     delay_tokens: int | None = None
-    blend_enabled: bool | None = None
-    blend_tokens: int | None = None
 
     @classmethod
     def from_payload(cls, payload: dict):
@@ -32,8 +30,6 @@ class UpdateTrajectoryRequest:
             horizon_tokens=payload.get("horizon_tokens"),
             delay_enabled=payload.get("delay_enabled"),
             delay_tokens=payload.get("delay_tokens"),
-            blend_enabled=payload.get("blend_enabled"),
-            blend_tokens=payload.get("blend_tokens"),
         )
 
 

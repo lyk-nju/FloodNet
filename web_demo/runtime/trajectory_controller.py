@@ -35,6 +35,23 @@ class TrajectoryController:
         blend_tokens=None,
     ) -> TrajectoryRuntimeControls:
         current = self.controls
+        if blend_enabled is not None and self._coerce_bool(
+            blend_enabled,
+            default=False,
+            name="blend_enabled",
+        ):
+            raise ValueError(
+                "route blending is not supported by the authoritative runtime"
+            )
+        if blend_tokens is not None and self._coerce_int(
+            blend_tokens,
+            default=0,
+            min_value=0,
+            name="blend_tokens",
+        ) > 0:
+            raise ValueError(
+                "route blending is not supported by the authoritative runtime"
+            )
         controls = TrajectoryRuntimeControls(
             route_mode=str(route_mode or current.route_mode),
             horizon_tokens=self._coerce_int(
@@ -54,17 +71,8 @@ class TrajectoryController:
                 min_value=0,
                 name="delay_tokens",
             ),
-            blend_enabled=self._coerce_bool(
-                blend_enabled,
-                default=current.blend_enabled,
-                name="blend_enabled",
-            ),
-            blend_tokens=self._coerce_int(
-                blend_tokens,
-                default=current.blend_tokens,
-                min_value=0,
-                name="blend_tokens",
-            ),
+            blend_enabled=False,
+            blend_tokens=0,
         )
         self.controls = controls
         return controls

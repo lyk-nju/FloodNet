@@ -54,7 +54,6 @@ from utils.inference.geometry import (
     resample_polyline,
     resample_polyline_by_arclength,
     sample_timestamped_trajectory,
-    smoothstep01,
     translate_plan_to_current_root,
 )
 from web_demo.runtime.frame_buffer import FrameBuffer
@@ -79,10 +78,6 @@ class ModelManager(WebRuntime):
         print(f"Using device: {self.device}")
 
         traj_mask_cfg = traj_mask_cfg or {}
-        runtime_cfg = traj_mask_cfg.get("runtime", {}) or {}
-        self.use_owned_stream_execution = bool(
-            runtime_cfg.get("use_owned_stream_execution", False)
-        )
         self.traj_mask_enabled = bool(traj_mask_cfg.get("enabled", False))
         self.traj_mask_keep_ratio_min = float(traj_mask_cfg.get("keep_ratio_min", 0.2))
         self.traj_mask_keep_ratio_max = float(traj_mask_cfg.get("keep_ratio_max", 0.3))
@@ -103,6 +98,7 @@ class ModelManager(WebRuntime):
             self.runtime_session.command_queue.pending_versions,
             default=0,
         )
+        self._runtime_command_lock = threading.RLock()
         
         # Frame buffer
         self.frame_buffer = FrameBuffer(target_buffer_size=4)
@@ -143,8 +139,8 @@ class ModelManager(WebRuntime):
         self.traj_repeat_policy = str(traj_mask_cfg.get("repeat_policy", "translate_from_current_root"))
         self.traj_update_delay_enabled = bool(traj_mask_cfg.get("update_delay_enabled", True))
         self.traj_update_delay_tokens = int(traj_mask_cfg.get("update_delay_tokens", self.traj_horizon_tokens))
-        self.traj_update_blend_enabled = bool(traj_mask_cfg.get("update_blend_enabled", True))
-        self.traj_update_blend_tokens = int(traj_mask_cfg.get("update_blend_tokens", 4))
+        self.traj_update_blend_enabled = False
+        self.traj_update_blend_tokens = 0
         self.trajectory_runtime_controls = TrajectoryRuntimeControls(
             route_mode=self.route_reference_mode,
             horizon_tokens=self.traj_horizon_tokens,
@@ -177,7 +173,6 @@ class ModelManager(WebRuntime):
             f"horizon_tokens={self.traj_horizon_tokens}, "
             f"repeat_policy={self.traj_repeat_policy}, "
             f"update_delay={self.traj_update_delay_enabled}:{self.traj_update_delay_tokens}, "
-            f"update_blend={self.traj_update_blend_enabled}:{self.traj_update_blend_tokens}, "
             f"root_feedback={self.root_feedback_enabled}:{self.root_feedback_xz_blend_alpha:.2f}"
         )
         
@@ -353,9 +348,17 @@ class ModelManager(WebRuntime):
         )
 
     def _next_runtime_command_version(self) -> int:
-        current = int(getattr(self, "_runtime_command_version", 0)) + 1
-        self._runtime_command_version = current
-        return current
+        with self._runtime_command_guard():
+            current = int(getattr(self, "_runtime_command_version", 0)) + 1
+            self._runtime_command_version = current
+            return current
+
+    def _runtime_command_guard(self):
+        lock = getattr(self, "_runtime_command_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._runtime_command_lock = lock
+        return lock
 
     def _runtime_commit_abs(self) -> int:
         return int(self.runtime_session.timeline.head.commit_idx)
@@ -367,17 +370,18 @@ class ModelManager(WebRuntime):
         requested_commit_abs=None,
         **kwargs,
     ):
-        command = command_type(
-            version=self._next_runtime_command_version(),
-            requested_commit_abs=(
-                self._runtime_commit_abs()
-                if requested_commit_abs is None
-                else int(requested_commit_abs)
-            ),
-            **kwargs,
-        )
-        self.runtime_session.submit(command)
-        return command
+        with self._runtime_command_guard():
+            command = command_type(
+                version=self._next_runtime_command_version(),
+                requested_commit_abs=(
+                    self._runtime_commit_abs()
+                    if requested_commit_abs is None
+                    else int(requested_commit_abs)
+                ),
+                **kwargs,
+            )
+            self.runtime_session.submit(command)
+            return command
 
     def _submit_root_source(
         self,
@@ -637,8 +641,8 @@ class ModelManager(WebRuntime):
                     horizon_tokens=getattr(self, "traj_horizon_tokens", 20),
                     delay_enabled=getattr(self, "traj_update_delay_enabled", True),
                     delay_tokens=getattr(self, "traj_update_delay_tokens", 20),
-                    blend_enabled=getattr(self, "traj_update_blend_enabled", True),
-                    blend_tokens=getattr(self, "traj_update_blend_tokens", 4),
+                    blend_enabled=False,
+                    blend_tokens=0,
                 )
             controller = TrajectoryController(controls)
             self.trajectory_controller = controller
@@ -1261,15 +1265,22 @@ class ModelManager(WebRuntime):
         if not isinstance(event, StreamCommitEvent):
             raise TypeError(f"unexpected runtime event: {type(event).__name__}")
 
-        for offset, (joints, root7) in enumerate(
-            zip(event.joint_frames, event.root_frames)
-        ):
+        self._reconcile_runtime_route_event(event)
+
+        frame_batch = [
+            joints.detach().cpu().numpy() for joints in event.joint_frames
+        ]
+        root_xz_batch = []
+        root_5d_batch = []
+        for offset, root7 in enumerate(event.root_frames):
             root_np = root7.detach().cpu().numpy().astype(np.float32)
-            self.root_xz_history.append(root_np[[0, 2]].copy())
-            self.root_5d_history.append(
+            root_xz_batch.append(root_np[[0, 2]].copy())
+            root_5d_batch.append(
                 (int(event.root_frames_start_abs + offset), root_np[:5].copy())
             )
-            self.frame_buffer.add_frame(joints.detach().cpu().numpy())
+        self.frame_buffer.add_frames_atomic(frame_batch)
+        self.root_xz_history.extend(root_xz_batch)
+        self.root_5d_history.extend(root_5d_batch)
 
         self._root_timeline = self.runtime_session.timeline
         self._session_anchor_state = self.runtime_session.session_anchor_state
@@ -1278,6 +1289,36 @@ class ModelManager(WebRuntime):
         self._generated_frame_count = self.runtime_session.generated_history.next_frame_abs
         self._absolute_commit_index = event.absolute_commit_after
         return event
+
+    def _reconcile_runtime_route_event(self, event: StreamCommitEvent) -> None:
+        """Advance Web presentation state from the committed runtime event."""
+        previous_version = getattr(self, "_active_source_version", None)
+        self._active_source_version = event.source_version
+        self._actual_activation_commit = event.actual_activation_commit
+        controller = self._trajectory_controller()
+        if "route_active" in event.lifecycle_events:
+            if previous_version not in {None, event.source_version}:
+                self._superseded_source_version = previous_version
+            pending, _active = controller.snapshot()
+            if (
+                pending is not None
+                and event.source_version is not None
+                and int(getattr(pending, "version", -1))
+                == int(event.source_version)
+            ):
+                controller.replace_with_pending(pending)
+            controller.state = "active_7d"
+            route_state = getattr(
+                getattr(self, "stream_generator", None),
+                "condition_manager",
+                None,
+            )
+            if route_state is not None:
+                route_state.route.active_route(event.absolute_commit_before)
+        if "route_cleared" in event.lifecycle_events:
+            controller.clear()
+        elif "route_exhausted" in event.lifecycle_events:
+            controller.state = "exhausted"
     
     def get_display_traj(self):
         """Return a copy of the latest world-space trajectory for frontend viz, or None."""
@@ -1310,6 +1351,17 @@ class ModelManager(WebRuntime):
             "root_feedback_xz_blend_alpha": float(
                 getattr(self, "root_feedback_xz_blend_alpha", 0.0)
             ),
+            "active_source_version": getattr(self, "_active_source_version", None),
+            "actual_activation_commit": getattr(
+                self,
+                "_actual_activation_commit",
+                None,
+            ),
+            "superseded_source_version": getattr(
+                self,
+                "_superseded_source_version",
+                None,
+            ),
         }
         controls = getattr(self, "trajectory_runtime_controls", None)
         if controls is not None:
@@ -1320,8 +1372,9 @@ class ModelManager(WebRuntime):
                 "trajectory_horizon_tokens": self.traj_horizon_tokens,
                 "trajectory_delay_enabled": self.traj_update_delay_enabled,
                 "trajectory_delay_tokens": self.traj_update_delay_tokens,
-                "trajectory_blend_enabled": self.traj_update_blend_enabled,
-                "trajectory_blend_tokens": self.traj_update_blend_tokens,
+                "trajectory_blend_enabled": False,
+                "trajectory_blend_tokens": 0,
+                "trajectory_blend_supported": False,
             })
         if plan is not None:
             status["active_plan_version"] = plan.version
@@ -1333,14 +1386,8 @@ class ModelManager(WebRuntime):
             status["pending_plan_version"] = ev.version
             status["edit_commit_index"] = ev.edit_commit_index
             status["effective_commit_index"] = ev.effective_commit_index
+            status["requested_activation_commit"] = ev.effective_commit_index
             status["update_delay_tokens"] = ev.delay_tokens
-            status["update_blend_tokens"] = ev.blend_tokens
-            status["update_blend_weight"] = round(
-                smoothstep01(
-                    (self._get_commit_index() - ev.edit_commit_index - ev.delay_tokens)
-                    / max(ev.blend_tokens, 1)
-                ), 4,
-            ) if self._trajectory_state == "blend" else 0.0
         return status
 
 

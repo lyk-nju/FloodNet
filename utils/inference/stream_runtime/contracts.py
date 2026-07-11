@@ -120,6 +120,12 @@ class RootSourceProposal:
             raise TypeError("future_frame_mask dtype must be torch.bool")
         if int(mask.shape[0]) != int(future.shape[0]):
             raise ValueError("future_frame_mask must have the same length as future_traj7")
+        if bool((~mask).any()):
+            first_invalid = int(torch.nonzero(~mask, as_tuple=False)[0, 0].item())
+            if bool(mask[first_invalid:].any()):
+                raise ValueError(
+                    "future_frame_mask must be a contiguous valid prefix"
+                )
         source_id = str(self.source_id)
         version = int(self.version)
         if not source_id:
@@ -318,8 +324,10 @@ class RuntimeStepConfig:
             None if self.num_denoise_steps is None else int(self.num_denoise_steps)
         )
         alpha = float(self.root_feedback_xz_blend_alpha)
-        if history_tokens < 0 or horizon_tokens < 0:
-            raise ValueError("history_tokens and horizon_tokens must be >= 0")
+        if history_tokens < 1:
+            raise ValueError("history_tokens must be >= 1")
+        if horizon_tokens < 0:
+            raise ValueError("horizon_tokens must be >= 0")
         if num_denoise_steps is not None and num_denoise_steps <= 0:
             raise ValueError("num_denoise_steps must be > 0 when set")
         if not 0.0 <= alpha <= 1.0:
@@ -360,7 +368,9 @@ class KernelStepResult:
             raise ValueError("rolling-buffer metadata must be >= 0")
         if self.actual_payload is not None and not isinstance(self.actual_payload, Mapping):
             raise TypeError("actual_payload must be a mapping or None")
-        object.__setattr__(self, "raw_latent", _clone_tensor(self.raw_latent, name="raw_latent"))
+        if not isinstance(self.raw_latent, Tensor):
+            raise TypeError("raw_latent must be a torch.Tensor")
+        object.__setattr__(self, "raw_latent", self.raw_latent.detach().clone())
         # The kernel result is internal, so downstream commit publication can
         # observe the exact payload passed to the model without device copies.
         object.__setattr__(self, "actual_payload", self.actual_payload)
@@ -368,6 +378,14 @@ class KernelStepResult:
         object.__setattr__(self, "local_commit_after", local_after)
         object.__setattr__(self, "latent_buffer_start_commit_abs", buffer_start)
         object.__setattr__(self, "latent_buffer_epoch", buffer_epoch)
+
+    @property
+    def absolute_commit_before(self) -> int:
+        return self.latent_buffer_start_commit_abs + self.local_commit_before
+
+    @property
+    def absolute_commit_after(self) -> int:
+        return self.latent_buffer_start_commit_abs + self.local_commit_after
 
 
 @dataclass(frozen=True)

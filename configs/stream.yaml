@@ -24,10 +24,6 @@ model:
 # model checkpoint, CFG scales, debug preset, and interactive trajectory policy
 # are always reviewed together.
 traj_mask:
-    runtime:
-        # Gradual migration switch. False preserves the legacy web execution loop.
-        use_owned_stream_execution: true
-
     # User-drawn waypoints are treated as a HumanML3D-style 20 FPS root path
     # unless explicit timestamps are provided as [t, x, y, z].
     enabled: false
@@ -39,10 +35,9 @@ traj_mask:
     horizon_tokens: 20
     repeat_policy: translate_from_current_root
 
-    # Delayed blended trajectory update policy.
-    update_policy: delayed_blended_replace
+    # Delayed atomic trajectory replacement policy.
+    update_policy: delayed_replace
     update_delay_tokens: 20
-    update_blend_tokens: 4
 
     # Fallback for non-timestamped/polyline mode. Keep this conservative; 0.25
     # was too fast in pred-root closed-loop diagnostics.

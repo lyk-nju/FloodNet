@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import threading
 
 import numpy as np
 import pytest
@@ -17,8 +18,11 @@ from utils.inference.stream_runtime import (
     RuntimeCommandQueue,
     RuntimeStepConfig,
     ResetSession,
+    SessionResetEvent,
     SetRootFeedback,
     SetRootSource,
+    SetRuntimeControls,
+    SetText,
     SpaceContract,
     StreamRuntimeSession,
 )
@@ -27,11 +31,12 @@ from utils.inference.timeline import RootFrameState, RootTimeline
 
 class _FakeModel:
     def __init__(self):
-        self.generated = torch.zeros(1, 2, 8, 1, 1)
+        self.generated = torch.zeros(1, 2, 256, 1, 1)
         self.commit_index = 0
         self.current_step = 0
         self.cfg_scale_text = 1.0
         self.cfg_scale_traj = 1.0
+        self.noise_steps = 10
 
     def snapshot_stream_state(self):
         return {
@@ -52,8 +57,8 @@ class _FakeModel:
 
 
 class _FakeKernel:
-    def __init__(self):
-        self.ldf_model = _FakeModel()
+    def __init__(self, model=None):
+        self.ldf_model = model or _FakeModel()
         self.device = torch.device("cpu")
         self.chunk_size = 1
 
@@ -133,11 +138,11 @@ class _FakeRecovery:
         self.__init__()
 
 
-def _session(*, seed=1234):
+def _session(*, seed=1234, model=None, initial_config=None):
     torch.manual_seed(seed)
     initial = RootFrameState.initial(dtype=torch.float32)
     return StreamRuntimeSession(
-        kernel=_FakeKernel(),
+        kernel=_FakeKernel(model=model),
         vae=_FakeVae(),
         recovery=_FakeRecovery(),
         timeline=RootTimeline(initial),
@@ -146,7 +151,11 @@ def _session(*, seed=1234):
         source_manager=RootSourceManager(),
         composer=ConditionComposer(),
         payload_builder=PayloadBuilder(),
-        initial_config=RuntimeStepConfig(history_tokens=4, horizon_tokens=4),
+        initial_config=(
+            initial_config
+            if initial_config is not None
+            else RuntimeStepConfig(history_tokens=4, horizon_tokens=4)
+        ),
     )
 
 
@@ -167,6 +176,209 @@ def test_session_initializes_owned_vae_cache_before_first_step():
     session = _session()
 
     assert session.vae.clear_count == 1
+
+
+class _FreshModel:
+    def __init__(self):
+        self.cfg_scale_text = 1.0
+        self.cfg_scale_traj = 1.0
+        self.noise_steps = 10
+        self.chunk_size = 1
+        self.init_calls = []
+
+    def init_generated(self, seq_len, *, batch_size, num_denoise_steps, traj_buffer):
+        self.init_calls.append((seq_len, batch_size, num_denoise_steps, traj_buffer))
+        self.seq_len = int(seq_len)
+        self.batch_size = int(batch_size)
+        self.num_denoise_steps = int(num_denoise_steps)
+        self.dt = 1.0 / float(num_denoise_steps)
+        self.generated = torch.zeros(batch_size, 2, seq_len * 2 + 1, 1, 1)
+        self.commit_index = 0
+        self.current_step = 0
+        self.text_condition_list = [[] for _ in range(batch_size)]
+        self.latent_buffer_start_commit_abs = 0
+        self.latent_buffer_epoch = 0
+
+    def snapshot_stream_state(self):
+        return copy.deepcopy(self.__dict__)
+
+    def restore_stream_state(self, state):
+        self.__dict__.update(copy.deepcopy(state))
+
+
+def test_fresh_model_session_initializes_before_first_step():
+    model = _FreshModel()
+
+    session = _session(
+        model=model,
+        initial_config=RuntimeStepConfig(
+            history_tokens=6,
+            horizon_tokens=4,
+            num_denoise_steps=10,
+        ),
+    )
+
+    assert model.init_calls == [(6, 1, 10, None)]
+    assert model.seq_len == 6
+    assert model.commit_index == 0
+    assert model.current_step == 0
+    assert model.dt == pytest.approx(0.1)
+    assert model.text_condition_list == [[]]
+    assert model.latent_buffer_start_commit_abs == 0
+    event = session.step()
+    assert event.absolute_commit_after == 1
+
+
+def test_session_rejects_model_timeline_absolute_commit_mismatch():
+    session = _session()
+    session.timeline.append(
+        RootFrameState(
+            commit_idx=1,
+            world_xz=torch.zeros(2),
+            world_yaw=torch.tensor(0.0),
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="LDF/timeline commit mismatch"):
+        session.step()
+
+    assert session.model.commit_index == 0
+    assert session.timeline.head.commit_idx == 1
+
+
+def test_runtime_history_and_denoise_changes_require_fresh_epoch():
+    session = _session()
+    session.step()
+
+    with pytest.raises(RuntimeError, match="require a reset"):
+        session.submit(
+            SetRuntimeControls(
+                version=1,
+                requested_commit_abs=1,
+                history_tokens=8,
+            )
+        )
+    with pytest.raises(RuntimeError, match="require a reset"):
+        session.submit(
+            SetRuntimeControls(
+                version=2,
+                requested_commit_abs=1,
+                num_denoise_steps=20,
+            )
+        )
+
+    assert session.command_queue.pending_versions == ()
+
+
+def test_future_old_epoch_command_is_discarded_by_reset():
+    session = _session()
+    session.submit(
+        SetRootSource(
+            version=1,
+            requested_commit_abs=100,
+            proposal=_proposal(),
+            space_contract=SpaceContract.WORLD_ROUTE,
+        )
+    )
+    session.submit(ResetSession(version=2, requested_commit_abs=0))
+
+    event = session.step()
+
+    assert isinstance(event, SessionResetEvent)
+    assert session.command_queue.pending_versions == ()
+    assert session.source_manager.active is None
+
+
+def test_nonexclusive_reset_reduces_from_session_initial_config():
+    initial = RuntimeStepConfig(
+        text_guidance_scale=1.25,
+        trajectory_guidance_scale=3.0,
+        root_feedback_enabled=True,
+        history_tokens=4,
+        horizon_tokens=7,
+    )
+    session = _session(initial_config=initial)
+    session.submit(ResetSession(version=1, requested_commit_abs=0))
+    session.submit(SetText(version=2, requested_commit_abs=0, text="walk"))
+
+    session.step()
+
+    assert session.config.text == "walk"
+    assert session.config.text_guidance_scale == pytest.approx(1.25)
+    assert session.config.trajectory_guidance_scale == pytest.approx(3.0)
+    assert session.config.root_feedback_enabled is True
+    assert session.config.horizon_tokens == 7
+
+
+def test_failed_nonexclusive_reset_restores_object_identity():
+    session = _session()
+    timeline = session.timeline
+    history = session.generated_history
+    session.submit(ResetSession(version=1, requested_commit_abs=0))
+    session.submit(SetText(version=2, requested_commit_abs=0, text="walk"))
+
+    def fail_generation(*args, **kwargs):
+        raise RuntimeError("generation failed")
+
+    session.kernel.generate_token = fail_generation
+
+    with pytest.raises(RuntimeError, match="generation failed"):
+        session.step()
+
+    assert session.timeline is timeline
+    assert session.generated_history is history
+    assert session.timeline.head.commit_idx == 0
+    assert session.generated_history.next_frame_abs == 0
+
+
+def test_concurrent_session_steps_are_rejected():
+    session = _session()
+    entered = threading.Event()
+    release = threading.Event()
+    original = session.kernel.generate_token
+    calls = 0
+
+    def blocking_generate(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            release.wait(timeout=5.0)
+        return original(*args, **kwargs)
+
+    session.kernel.generate_token = blocking_generate
+    errors = []
+
+    def run_step():
+        try:
+            session.step()
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    worker = threading.Thread(target=run_step)
+    worker.start()
+    assert entered.wait(timeout=2.0)
+    try:
+        with pytest.raises(RuntimeError, match="concurrent.*step"):
+            session.step()
+    finally:
+        release.set()
+        worker.join(timeout=5.0)
+    assert not errors
+
+
+def test_long_rollout_keeps_history_and_timeline_bounded():
+    session = _session(
+        initial_config=RuntimeStepConfig(history_tokens=4, horizon_tokens=4)
+    )
+
+    for _ in range(100):
+        session.step()
+
+    assert session.timeline.head.commit_idx == 100
+    assert len(session.timeline) <= 5
+    assert int(session.generated_history.frames_7d.shape[0]) <= 20
+    assert session.generated_history.next_frame_abs == 397
 
 
 def test_two_steps_commit_frame0_then_frame4():
