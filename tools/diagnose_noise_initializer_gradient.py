@@ -32,6 +32,8 @@ from models.noise_initializer import NoiseInitializer  # noqa: E402
 from utils.inference.stream_generator import StreamGenerator  # noqa: E402
 from utils.initialize import load_config  # noqa: E402
 from utils.motion_process import StreamJointRecovery263  # noqa: E402
+from utils.token_frame import token_range_to_frame_slice  # noqa: E402
+from utils.training.noise_initializer.free_delta import optimize_free_delta  # noqa: E402
 from utils.training.noise_initializer.losses import anchored_root_xz_loss  # noqa: E402
 from utils.training.noise_initializer.overfit_runner import (  # noqa: E402
     _build_initializer_context_for_commit,
@@ -68,6 +70,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", required=True)
     parser.add_argument("--commits", default="0,5,10,15")
     parser.add_argument("--etas", default="0.001,0.005,0.01,0.02")
+    parser.add_argument("--free_delta_steps", type=int, default=0)
+    parser.add_argument("--free_delta_lr", type=float, default=0.02)
+    parser.add_argument("--free_delta_max_norm_ratio", type=float, default=None)
+    parser.add_argument("--free_delta_lambda", type=float, default=0.0)
+    parser.add_argument("--free_delta_log_every", type=int, default=50)
     parser.add_argument("--override", nargs="*", default=None)
     return parser.parse_args()
 
@@ -137,6 +144,7 @@ def _rollin_to_commit(
         device=device,
     )
     recovery = StreamJointRecovery263(joints_num=22, smoothing_alpha=1.0)
+    committed_latent_tokens = []
     vae.clear_cache()
     first_chunk = True
     for commit_index in range(int(target_commit)):
@@ -162,6 +170,7 @@ def _rollin_to_commit(
                 start_step=update_start_step,
                 start_commit=update_start_commit,
             )
+            committed_latent_tokens.append(output["generated"].detach().clone())
             latent_token = output["generated"][0].detach()
             decoded_chunk = vae.stream_decode(
                 latent_token[None, :],
@@ -174,7 +183,14 @@ def _rollin_to_commit(
             )
         first_chunk = False
         model.generated = model.generated.detach()
-    return stream, text_rollout, conditioner, recovery, first_chunk
+    return (
+        stream,
+        text_rollout,
+        conditioner,
+        recovery,
+        first_chunk,
+        committed_latent_tokens,
+    )
 
 
 def _make_rollout_fn(*, vae, stream, text_rollout, conditioner, recovery, start_commit, device):
@@ -230,11 +246,13 @@ def _loss_for_frontier(
     first_chunk: bool,
     target_xz: torch.Tensor,
     target_mask: torch.Tensor,
-    start_frame: int,
-    horizon_frames: int,
+    target_frame_slice: slice,
     history_frames: int,
     generated_anchor_xz: torch.Tensor,
     loss_cfg: dict,
+    committed_prefix_latents: torch.Tensor,
+    shadow_start_token: int,
+    frames_per_token: int,
 ) -> torch.Tensor:
     stream_state = snapshot_stream_state(model)
     vae_state = snapshot_vae_cache(vae)
@@ -249,11 +267,17 @@ def _loss_for_frontier(
             rollout_tokens=int(rollout_tokens),
             first_chunk=bool(first_chunk),
         )
-        pred_xz = _decode_latents_to_root_xz(vae, shadow_latents)
+        pred_xz = _decode_latents_to_root_xz(
+            vae,
+            shadow_latents,
+            committed_prefix_latents=committed_prefix_latents,
+            shadow_start_token=int(shadow_start_token),
+            frames_per_token=int(frames_per_token),
+        )
         loss, _ = anchored_root_xz_loss(
             pred_xz[0] if pred_xz.dim() == 3 else pred_xz,
-            target_xz[start_frame : start_frame + horizon_frames],
-            target_mask[start_frame : start_frame + horizon_frames],
+            target_xz[target_frame_slice],
+            target_mask[target_frame_slice],
             history_frames=int(history_frames),
             lambda_vel=float(loss_cfg.get("lambda_vel", 0.0)),
             anchor_mode=str(loss_cfg.get("anchor_mode", "generated_anchor_abs")),
@@ -329,14 +353,20 @@ def main() -> int:
     base_noise = torch.randn(initial_shape, device=device)
     frames_per_token = int(cfg.get("frames_per_token", 4))
     rollout_tokens = int(cfg.get("loss_horizon_tokens", 10))
-    horizon_frames = rollout_tokens * frames_per_token
     loss_cfg = dict(cfg.get("loss") or {})
     commits = [int(v) for v in str(args.commits).split(",") if v.strip()]
     etas = [float(v) for v in str(args.etas).split(",") if v.strip()]
     results = []
 
     for commit in commits:
-        stream, text_rollout, conditioner, recovery, first_chunk = _rollin_to_commit(
+        (
+            stream,
+            text_rollout,
+            conditioner,
+            recovery,
+            first_chunk,
+            committed_latent_tokens,
+        ) = _rollin_to_commit(
             model=model,
             vae=vae,
             sample_batch=sample_batch,
@@ -375,7 +405,11 @@ def main() -> int:
             start_commit=commit,
             device=device,
         )
-        start_frame = commit * frames_per_token
+        target_frame_slice = token_range_to_frame_slice(
+            commit,
+            rollout_tokens,
+            frames_per_token,
+        )
         history_frames = affected_history_frames(
             context,
             frames_per_token=frames_per_token,
@@ -383,6 +417,11 @@ def main() -> int:
         generated_anchor_xz = conditioner.timeline.head.world_xz.detach().clone()
         sync_vae_decode_cache(vae, training_vae)
         z_base = context.frontier_base_zT.detach()
+        committed_prefix_latents = (
+            torch.cat(committed_latent_tokens, dim=1)
+            if committed_latent_tokens
+            else z_base[:, :0]
+        )
         z_var = z_base.clone().requires_grad_(True)
         base_loss = _loss_for_frontier(
             model=model,
@@ -394,11 +433,13 @@ def main() -> int:
             first_chunk=first_chunk,
             target_xz=target_xz,
             target_mask=target_mask,
-            start_frame=start_frame,
-            horizon_frames=horizon_frames,
+            target_frame_slice=target_frame_slice,
             history_frames=history_frames,
             generated_anchor_xz=generated_anchor_xz,
             loss_cfg=loss_cfg,
+            committed_prefix_latents=committed_prefix_latents,
+            shadow_start_token=commit,
+            frames_per_token=frames_per_token,
         )
         base_loss.backward()
         grad = z_var.grad.detach()
@@ -438,11 +479,13 @@ def main() -> int:
                     first_chunk=first_chunk,
                     target_xz=target_xz,
                     target_mask=target_mask,
-                    start_frame=start_frame,
-                    horizon_frames=horizon_frames,
+                    target_frame_slice=target_frame_slice,
                     history_frames=history_frames,
                     generated_anchor_xz=generated_anchor_xz,
                     loss_cfg=loss_cfg,
+                    committed_prefix_latents=committed_prefix_latents,
+                    shadow_start_token=commit,
+                    frames_per_token=frames_per_token,
                 )
                 row["learned_alpha1_loss"] = float(learned_loss.detach().cpu().item())
         for eta in etas:
@@ -457,11 +500,13 @@ def main() -> int:
                 first_chunk=first_chunk,
                 target_xz=target_xz,
                 target_mask=target_mask,
-                start_frame=start_frame,
-                horizon_frames=horizon_frames,
+                target_frame_slice=target_frame_slice,
                 history_frames=history_frames,
                 generated_anchor_xz=generated_anchor_xz,
                 loss_cfg=loss_cfg,
+                committed_prefix_latents=committed_prefix_latents,
+                shadow_start_token=commit,
+                frames_per_token=frames_per_token,
             )
             row["eta_results"].append(
                 {
@@ -470,14 +515,92 @@ def main() -> int:
                     "delta_vs_base": float(loss.detach().cpu().item() - row["base_loss"]),
                 }
             )
+        if int(args.free_delta_steps) > 0:
+            def free_delta_loss(frontier_zT: torch.Tensor) -> torch.Tensor:
+                return _loss_for_frontier(
+                    model=model,
+                    vae=training_vae,
+                    context=context,
+                    frontier_zT=frontier_zT,
+                    rollout_fn=rollout_fn,
+                    rollout_tokens=rollout_tokens,
+                    first_chunk=first_chunk,
+                    target_xz=target_xz,
+                    target_mask=target_mask,
+                    target_frame_slice=target_frame_slice,
+                    history_frames=history_frames,
+                    generated_anchor_xz=generated_anchor_xz,
+                    loss_cfg=loss_cfg,
+                    committed_prefix_latents=committed_prefix_latents,
+                    shadow_start_token=commit,
+                    frames_per_token=frames_per_token,
+                )
+
+            def report_free_delta_progress(progress_row: dict) -> None:
+                print(
+                    json.dumps(
+                        {
+                            "event": "free_delta_progress",
+                            "commit_index": int(commit),
+                            **progress_row,
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+
+            free_result = optimize_free_delta(
+                base_zT=z_base,
+                loss_fn=free_delta_loss,
+                steps=int(args.free_delta_steps),
+                lr=float(args.free_delta_lr),
+                lambda_delta=float(args.free_delta_lambda),
+                max_delta_norm_ratio=args.free_delta_max_norm_ratio,
+                log_every=int(args.free_delta_log_every),
+                progress_fn=report_free_delta_progress,
+            )
+            row["free_delta"] = {
+                "steps": int(args.free_delta_steps),
+                "lr": float(args.free_delta_lr),
+                "lambda_delta": float(args.free_delta_lambda),
+                "max_delta_norm_ratio": args.free_delta_max_norm_ratio,
+                "initial_task_loss": free_result.initial_task_loss,
+                "final_task_loss": free_result.final_task_loss,
+                "final_total_loss": free_result.final_total_loss,
+                "relative_task_improvement": (
+                    (free_result.initial_task_loss - free_result.final_task_loss)
+                    / max(abs(free_result.initial_task_loss), 1e-12)
+                ),
+                "raw_delta_norm": float(free_result.raw_delta_zT.float().norm().cpu().item()),
+                "clipped_delta_norm": float(free_result.delta_zT.float().norm().cpu().item()),
+                "base_zT_norm": float(z_base.float().norm().cpu().item()),
+                "clip_saturation_ratio": free_result.clip_saturation_ratio,
+                "loss_curve": free_result.loss_curve,
+            }
+            print(
+                json.dumps(
+                    {
+                        "event": "free_delta_commit_complete",
+                        "commit_index": int(commit),
+                        **{key: value for key, value in row["free_delta"].items() if key != "loss_curve"},
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
         results.append(row)
 
     out = {
-        "mode": "one_step_frontier_zT_gradient_diagnostic",
+        "mode": (
+            "frontier_zT_gradient_and_free_delta_diagnostic"
+            if int(args.free_delta_steps) > 0
+            else "one_step_frontier_zT_gradient_diagnostic"
+        ),
         "initializer_ckpt": args.initializer_ckpt,
         "commits": commits,
         "etas": etas,
         "loss_horizon_tokens": int(rollout_tokens),
+        "free_delta_steps": int(args.free_delta_steps),
         "results": results,
     }
     out_path = Path(args.out)

@@ -107,23 +107,43 @@ class NoiseInitializerLightningModule(pl.LightningModule):
             generated_anchor_xz=batch.get("generated_anchor_xz"),
         )
         delta_reg = delta_zT_l2_regularization(result.raw_delta_zT)
-        loss = traj_loss + float(loss_cfg.get("lambda_delta", 0.0)) * delta_reg
+        base_zT = batch["context"].frontier_base_zT.to(
+            device=result.frontier_zT.device,
+            dtype=result.frontier_zT.dtype,
+        )
+        applied_delta = result.frontier_zT - base_zT
+        applied_norm = applied_delta.reshape(int(applied_delta.shape[0]), -1).norm(dim=1)
+        base_norm = base_zT.reshape(int(base_zT.shape[0]), -1).norm(dim=1)
+        applied_ratio = applied_norm / base_norm.clamp(min=1e-12)
+        delta_ratio_reg = applied_ratio.pow(2).mean()
+        loss = (
+            traj_loss
+            + float(loss_cfg.get("lambda_delta", 0.0)) * delta_reg
+            + float(loss_cfg.get("lambda_delta_ratio", 0.0)) * delta_ratio_reg
+        )
         raw_norm = result.raw_delta_zT.detach().float().reshape(
             int(result.raw_delta_zT.shape[0]), -1
         ).norm(dim=1)
         clipped_norm = result.delta_zT.detach().float().reshape(
             int(result.delta_zT.shape[0]), -1
         ).norm(dim=1)
-        base_norm = batch["context"].frontier_base_zT.detach().float().reshape(
+        base_norm_diag = batch["context"].frontier_base_zT.detach().float().reshape(
             int(result.delta_zT.shape[0]), -1
         ).norm(dim=1)
         scale = result.delta_scale.detach().float().reshape(int(result.delta_zT.shape[0]), -1)
         self.last_step_diagnostics = {
+            "traj_loss": float(parts["traj_loss"]),
+            "vel_loss": float(parts["vel_loss"]),
+            "delta_reg": float(delta_reg.detach().cpu().item()),
+            "applied_delta_norm": float(applied_norm.detach().float().mean().cpu().item()),
+            "applied_delta_ratio": float(applied_ratio.detach().float().mean().cpu().item()),
+            "delta_ratio_reg": float(delta_ratio_reg.detach().cpu().item()),
+            "optimized_frames": int(parts["optimized_frames"]),
             "raw_delta_norm": float(raw_norm.mean().cpu().item()),
             "clipped_delta_norm": float(clipped_norm.mean().cpu().item()),
-            "base_zT_norm": float(base_norm.mean().cpu().item()),
+            "base_zT_norm": float(base_norm_diag.mean().cpu().item()),
             "clipped_to_base_ratio": float(
-                (clipped_norm / base_norm.clamp(min=1e-12)).mean().cpu().item()
+                (clipped_norm / base_norm_diag.clamp(min=1e-12)).mean().cpu().item()
             ),
             "delta_scale_mean": float(scale.mean().cpu().item()),
             "clip_saturation_ratio": float((scale < 0.999999).float().mean().cpu().item()),
@@ -133,6 +153,7 @@ class NoiseInitializerLightningModule(pl.LightningModule):
             self.log("train/traj_loss", torch.as_tensor(parts["traj_loss"], device=loss.device))
             self.log("train/vel_loss", torch.as_tensor(parts["vel_loss"], device=loss.device))
             self.log("train/delta_reg", delta_reg)
+            self.log("train/delta_ratio_reg", delta_ratio_reg)
         return loss
 
     def configure_optimizers(self):

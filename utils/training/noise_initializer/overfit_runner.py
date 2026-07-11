@@ -148,6 +148,26 @@ def should_log_train_progress(train_step: int, *, log_every_train_steps: int) ->
     return log_every > 0 and step > 0 and step % log_every == 0
 
 
+def resolve_train_progress_log_step(
+    *,
+    completed_steps: int,
+    inner_step: int,
+    log_every_train_steps: int,
+) -> int | None:
+    """Return the displayed step, including the pre-update snapshot baseline."""
+
+    if int(log_every_train_steps) <= 0:
+        return None
+    if int(inner_step) == 0:
+        return max(0, int(completed_steps) - 1)
+    if should_log_train_progress(
+        int(completed_steps),
+        log_every_train_steps=int(log_every_train_steps),
+    ):
+        return int(completed_steps)
+    return None
+
+
 def format_train_progress_log(*, train_step: int, row: dict) -> dict:
     payload = {
         "event": "noise_initializer_train_progress",
@@ -159,6 +179,12 @@ def format_train_progress_log(*, train_step: int, row: dict) -> dict:
         "history_frames": int(row["history_frames"]),
     }
     for key in (
+        "traj_loss",
+        "vel_loss",
+        "delta_reg",
+        "applied_delta_norm",
+        "applied_delta_ratio",
+        "delta_ratio_reg",
         "raw_delta_norm",
         "clipped_delta_norm",
         "base_zT_norm",
@@ -167,6 +193,7 @@ def format_train_progress_log(*, train_step: int, row: dict) -> dict:
         "clip_saturation_ratio",
     ):
         payload[key] = float(row[key])
+    payload["optimized_frames"] = int(row["optimized_frames"])
     return payload
 
 
@@ -690,6 +717,27 @@ def run_single_sample_overfit(cfg: dict) -> dict:
     )
     optimizer = lightning.configure_optimizers()
 
+    if str(cfg.get("training_mode", "online_multi_commit")) == "two_stage_snapshot_replay":
+        from utils.training.noise_initializer.replay_runner import (
+            run_two_stage_snapshot_replay,
+        )
+
+        return run_two_stage_snapshot_replay(
+            cfg=cfg,
+            model=model,
+            vae=vae,
+            training_vae=training_vae,
+            initializer=initializer,
+            initializer_text_encoder=initializer_text_encoder,
+            lightning=lightning,
+            optimizer=optimizer,
+            sample_batch=sample_batch,
+            target_xz=target_xz,
+            target_mask=target_mask,
+            target_tokens=int(target_tokens),
+            device=device,
+        )
+
     history_tokens = int(cfg.get("history_tokens", cfg.get("history_length", 30)))
     traj_horizon_tokens = int(cfg.get("traj_horizon_tokens", 20))
     frames_per_token = int(cfg.get("frames_per_token", 4))
@@ -816,14 +864,16 @@ def run_single_sample_overfit(cfg: dict) -> dict:
                 }
                 row.update(lightning.last_step_diagnostics)
                 rows.append(row)
-                if should_log_train_progress(
-                    len(rows),
+                progress_step = resolve_train_progress_log_step(
+                    completed_steps=len(rows),
+                    inner_step=inner_step,
                     log_every_train_steps=log_every_train_steps,
-                ):
+                )
+                if progress_step is not None:
                     print(
                         json.dumps(
                             format_train_progress_log(
-                                train_step=len(rows),
+                                train_step=progress_step,
                                 row=rows[-1],
                             ),
                             sort_keys=True,
@@ -932,6 +982,7 @@ __all__ = [
     "build_noise_initializer_from_ldf",
     "encode_initializer_text_embedding",
     "format_train_progress_log",
+    "resolve_train_progress_log_step",
     "resolve_training_commit_indices",
     "make_ldf_shadow_rollout_fn",
     "run_single_sample_overfit",

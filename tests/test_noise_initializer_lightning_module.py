@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 from torch import nn
 
@@ -117,6 +118,13 @@ def test_noise_initializer_lightning_training_step_backprops_to_initializer():
     assert model.weight.grad is None
     assert vae.weight.grad is None
     diagnostics = module.last_step_diagnostics
+    assert diagnostics["traj_loss"] > 0.0
+    assert diagnostics["vel_loss"] > 0.0
+    assert diagnostics["delta_reg"] > 0.0
+    assert diagnostics["applied_delta_norm"] > 0.0
+    assert diagnostics["applied_delta_ratio"] > 0.0
+    assert diagnostics["delta_ratio_reg"] > 0.0
+    assert diagnostics["optimized_frames"] == 2
     assert diagnostics["raw_delta_norm"] > 0.0
     assert diagnostics["clipped_delta_norm"] > 0.0
     assert diagnostics["base_zT_norm"] > 0.0
@@ -172,6 +180,48 @@ def test_noise_initializer_lightning_delta_regularization_uses_raw_delta_before_
     expected = traj_loss + 0.01 * raw_delta.pow(2).mean()
 
     assert torch.allclose(loss.detach(), expected.detach())
+
+
+def test_noise_initializer_lightning_regularizes_applied_delta_ratio():
+    initializer = _FakeInitializer()
+    initializer.scale.data.fill_(10.0)
+    model = _FakeFrozenModel()
+    vae = _FakeFrozenVae()
+    module = NoiseInitializerLightningModule(
+        cfg={
+            "loss": {
+                "lambda_vel": 0.0,
+                "lambda_delta": 0.0,
+                "lambda_delta_ratio": 2.0,
+            },
+            "rollout": {
+                "alpha": 1.0,
+                "loss_horizon_tokens": 2,
+                "max_delta_norm_ratio": 0.1,
+            },
+        },
+        initializer=initializer,
+        ldf_model=model,
+        vae=vae,
+        rollout_fn=_rollout_fn,
+        decode_latents_fn=_decode_latents_fn,
+    )
+    batch = {
+        "context": _context(model),
+        "target_xz": torch.zeros(2, 2),
+        "target_mask": torch.ones(2),
+        "history_frames": 0,
+        "first_chunk": False,
+    }
+
+    loss = module.training_step(batch, 0)
+
+    diagnostics = module.last_step_diagnostics
+    assert diagnostics["applied_delta_ratio"] == pytest.approx(0.1)
+    assert diagnostics["delta_ratio_reg"] == pytest.approx(0.01)
+    assert loss.detach().item() == pytest.approx(
+        diagnostics["traj_loss"] + 2.0 * diagnostics["delta_ratio_reg"]
+    )
 
 
 def test_noise_initializer_lightning_passes_generated_anchor_xz_to_loss():

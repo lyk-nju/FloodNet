@@ -25,6 +25,7 @@ class _FakeFrozenModel(nn.Module):
         self.generated = torch.arange(1 * 2 * 8, dtype=torch.float32).view(1, 2, 8, 1, 1)
         self.commit_index = 2
         self.current_step = 5
+        self.token_update_count = torch.tensor([3, 2, 1, 0], dtype=torch.long)
 
 
 class _FakeFrozenVae(nn.Module):
@@ -64,6 +65,7 @@ def _rollout_fn(model, *, rollout_tokens: int, first_chunk: bool):
     frontier = model.generated[:, :, 5 : 5 + rollout_tokens, 0, 0].permute(0, 2, 1)
     model.commit_index += int(rollout_tokens)
     model.current_step += int(rollout_tokens)
+    model.token_update_count += 1
     return frontier * model.weight
 
 
@@ -87,6 +89,7 @@ def test_shadow_rollout_injects_only_frontier_and_restores_state():
     assert torch.equal(model.generated, original_generated)
     assert model.commit_index == 2
     assert model.current_step == 5
+    assert model.token_update_count.tolist() == [3, 2, 1, 0]
     assert vae.cache_restored
     assert torch.equal(result.injected_generated[:, :, :5], original_generated[:, :, :5])
     assert torch.equal(result.injected_generated[:, :, 7:], original_generated[:, :, 7:])

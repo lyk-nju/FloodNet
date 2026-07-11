@@ -50,7 +50,11 @@ def validate_noise_initializer_overfit_config(cfg: dict) -> None:
                 "text_encoder.precomputed_text_emb_path"
             )
     training_mode = str(cfg.get("training_mode", "online_multi_commit"))
-    if training_mode not in {"online_multi_commit", "fixed_snapshot_overfit"}:
+    if training_mode not in {
+        "online_multi_commit",
+        "fixed_snapshot_overfit",
+        "two_stage_snapshot_replay",
+    }:
         raise ValueError(f"unknown training_mode: {training_mode!r}")
     if training_mode == "fixed_snapshot_overfit":
         fixed_commit = int(cfg.get("fixed_commit_index", 0))
@@ -60,6 +64,18 @@ def validate_noise_initializer_overfit_config(cfg: dict) -> None:
             raise ValueError(
                 "fixed_snapshot_overfit requires apply_initializer_rollin=false"
             )
+    if training_mode == "two_stage_snapshot_replay":
+        replay = cfg.get("replay") or {}
+        train_seeds = list(replay.get("train_seeds") or [])
+        if not train_seeds:
+            raise ValueError("two_stage_snapshot_replay requires replay.train_seeds")
+        if int(replay.get("stage1_steps", 0)) <= 0:
+            raise ValueError("replay.stage1_steps must be positive")
+        if int(replay.get("stage2_steps", 0)) < 0:
+            raise ValueError("replay.stage2_steps must be non-negative")
+        initializer_probability = float(replay.get("initializer_probability", 0.3))
+        if not 0.0 <= initializer_probability <= 1.0:
+            raise ValueError("replay.initializer_probability must be in [0,1]")
 
 
 __all__ = ["validate_noise_initializer_overfit_config"]

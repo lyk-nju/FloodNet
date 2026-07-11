@@ -88,3 +88,16 @@ def test_anchored_root_xz_loss_rejects_unknown_anchor_mode():
             history_frames=0,
             anchor_mode="bad",
         )
+
+
+def test_anchored_root_xz_loss_reports_only_valid_optimized_frames():
+    loss, parts = anchored_root_xz_loss(
+        torch.zeros(4, 2),
+        torch.zeros(4, 2),
+        torch.tensor([1.0, 1.0, 0.0, 0.0]),
+        history_frames=1,
+        anchor_mode="absolute",
+    )
+
+    assert torch.equal(loss, torch.tensor(0.0))
+    assert parts["optimized_frames"] == 1

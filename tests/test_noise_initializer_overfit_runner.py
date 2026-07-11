@@ -23,6 +23,7 @@ from utils.training.noise_initializer.overfit_runner import (
     affected_history_frames,
     encode_initializer_text_embedding,
     format_train_progress_log,
+    resolve_train_progress_log_step,
     resolve_training_commit_indices,
     should_apply_initializer,
     should_train_commit,
@@ -217,6 +218,29 @@ def test_should_log_train_progress_respects_positive_interval():
     assert not should_log_train_progress(50, log_every_train_steps=0)
 
 
+def test_resolve_train_progress_log_step_emits_snapshot_baseline_and_intervals():
+    assert resolve_train_progress_log_step(
+        completed_steps=1,
+        inner_step=0,
+        log_every_train_steps=50,
+    ) == 0
+    assert resolve_train_progress_log_step(
+        completed_steps=50,
+        inner_step=49,
+        log_every_train_steps=50,
+    ) == 50
+    assert resolve_train_progress_log_step(
+        completed_steps=51,
+        inner_step=50,
+        log_every_train_steps=50,
+    ) is None
+    assert resolve_train_progress_log_step(
+        completed_steps=101,
+        inner_step=0,
+        log_every_train_steps=50,
+    ) == 100
+
+
 def test_format_train_progress_log_preserves_training_diagnostics():
     row = {
         "commit_index": 5,
@@ -224,6 +248,13 @@ def test_format_train_progress_log_preserves_training_diagnostics():
         "loss": 0.125,
         "grad_norm_sum": 1.5,
         "history_frames": 16,
+        "traj_loss": 0.1,
+        "vel_loss": 0.2,
+        "delta_reg": 0.3,
+        "applied_delta_norm": 0.45,
+        "applied_delta_ratio": 0.09,
+        "delta_ratio_reg": 0.0081,
+        "optimized_frames": 24,
         "raw_delta_norm": 1.0,
         "clipped_delta_norm": 0.5,
         "base_zT_norm": 5.0,
@@ -242,6 +273,13 @@ def test_format_train_progress_log_preserves_training_diagnostics():
         "loss": 0.125,
         "grad_norm_sum": 1.5,
         "history_frames": 16,
+        "traj_loss": 0.1,
+        "vel_loss": 0.2,
+        "delta_reg": 0.3,
+        "applied_delta_norm": 0.45,
+        "applied_delta_ratio": 0.09,
+        "delta_ratio_reg": 0.0081,
+        "optimized_frames": 24,
         "raw_delta_norm": 1.0,
         "clipped_delta_norm": 0.5,
         "base_zT_norm": 5.0,

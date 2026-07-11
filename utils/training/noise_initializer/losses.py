@@ -101,7 +101,7 @@ def anchored_root_xz_loss(
         "traj_loss": float(traj_loss.detach().cpu().item()),
         "vel_loss": float(vel_loss.detach().cpu().item()),
         "history_frames": int(history_frames),
-        "optimized_frames": int(n - history_frames),
+        "optimized_frames": int((opt_mask > 0).sum().detach().cpu().item()),
         "anchor_mode": anchor_mode,
     }
 

@@ -41,20 +41,33 @@ def _clone_value(value):
 def snapshot_stream_state(model) -> dict:
     """Snapshot mutable stream state touched by shadow rollout."""
 
-    return {
-        "generated": getattr(model, "generated").detach().clone(),
-        "commit_index": int(getattr(model, "commit_index", 0)),
-        "current_step": int(getattr(model, "current_step", 0)),
-        "text_condition_list": _clone_value(getattr(model, "text_condition_list", [])),
-    }
+    authoritative_snapshot = getattr(model, "snapshot_stream_state", None)
+    if callable(authoritative_snapshot):
+        state = _clone_value(authoritative_snapshot())
+    else:
+        state = {
+            "generated": getattr(model, "generated").detach().clone(),
+            "commit_index": int(getattr(model, "commit_index", 0)),
+            "current_step": int(getattr(model, "current_step", 0)),
+            "text_condition_list": _clone_value(getattr(model, "text_condition_list", [])),
+        }
+    if hasattr(model, "token_update_count"):
+        state["token_update_count"] = _clone_value(model.token_update_count)
+    return state
 
 
 def restore_stream_state(model, state: dict) -> None:
+    authoritative_restore = getattr(model, "restore_stream_state", None)
+    if callable(authoritative_restore):
+        authoritative_restore(_clone_value(state))
+        return
     model.generated = state["generated"].detach().clone()
     model.commit_index = int(state["commit_index"])
     model.current_step = int(state["current_step"])
     if hasattr(model, "text_condition_list"):
         model.text_condition_list = _clone_value(state.get("text_condition_list", []))
+    if "token_update_count" in state:
+        model.token_update_count = _clone_value(state["token_update_count"])
 
 
 def snapshot_vae_cache(vae):
